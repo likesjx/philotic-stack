@@ -447,16 +447,26 @@ Seam IDs: `session-compaction`
 
 ## Atlas Follow-Through (2026-10-05)
 
-Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a detailed plan. All are `proposed`, waiting on operator approval, and each plan ends with "Operator decisions needed".
+Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a detailed plan. Operator approved implementing all of them with the recommended option at every decision point (2026-10-07). Cloud sessions so far could not download crates (`static.crates.io` not allowlisted) or push `.github/workflows/*` (GitHub App lacks `workflows` permission): all Rust slices are still open, and workflow changes wait as patches in [process/workflow-patches/](process/workflow-patches/README.md).
 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
-  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking step in `pr-check.yml`; make blocking after one week).
-  - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Remaining lint warnings: VERIFICATION_LADDER (`process-documentation`), MEMORY_CULTIVATION_TRUE_UP (status vs disposition). Graph rescan (`phil graph scan`) pending from the main checkout after merge.
+  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step parked as workflow patch 0001; make blocking after one week).
+  - [x] W4 enablement (2026-10-07): ansible `philotic_memory_hygiene_enabled` (on for jane-vps). Proof window starts at the next vps deploy.
+  - [ ] W1, W3, W5, W6 need hotel access; W3 step 5 and W7 are Rust.
+  - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Lint warnings cleared. Graph rescan (`phil graph scan`) pending from the main checkout after merge.
 - [ ] IPC dispatch split (S0–S6): [IPC_DISPATCH_SPLIT_PROPOSAL.md](architecture/IPC_DISPATCH_SPLIT_PROPOSAL.md). `ipc.rs` → `ipc/` family modules, plus park-path fixes.
 - [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
+  - [x] R0 runbook ([process/RELEASE.md](process/RELEASE.md)); `release/packages.toml` + `scripts/release-packages.sh`; `scripts/release-manifest.py`; R4 `just vps-deploy-release` + ansible release/rollback tasks; R5 `scripts/install-release-mac.sh`; R6/R7 `just rollback`, `just verify-release` (2026-10-07, validated locally: actionlint, shellcheck, ansible syntax + fake-tarball runs, 16 unit tests).
+  - [ ] R3 workflow changes: apply workflow patches 0002 + 0003, then rehearse `v0.2.0-rc.1`.
+  - [ ] R1 main sync, R2 version stamp (Rust), live installs + rollback drill per platform.
 - [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
+  - [x] P1 step 4: provisioning scripts register as `operator` via shared `scripts/philotic_ipc.py` (also DEF-209).
+  - [x] P7 firewall: nftables `inet philotic` hotel-port filter (on for jane-vps, validated with `nft -c`); ONNX ufw allow narrowed to tailnet; dead `PHILOTIC_MESH_PSK` removed.
+  - [ ] P1–P6 Rust slices; P7 mesh-config plaintext scrub (Rust `aiua load`), DEF-089, blob quota.
 - [ ] Agent frontdoor next slices (F1–F7): [AGENT_FRONTDOOR_PROPOSAL.md § Next slices](architecture/AGENT_FRONTDOOR_PROPOSAL.md). DEF-211 rest, DEF-209, caller tags, schemas, rotation.
+  - [x] F2 DEF-209 script framing fix; F5 schema export/import in `provision-agent-frontdoor.py` (2026-10-07). Live re-provision pairs with the F6 rotation drill.
+  - [ ] F1, F3, F6 (Rust/doctor); F4 operator decision; F7 after F1+F6.
 
 Cross-plan coordination: mesh L5 ⟷ frontdoor F1 (same change); IPC split S3/S5 must not run concurrently with perimeter P2/P3 or mesh L5; release R2 feeds watch-live W7.
 
