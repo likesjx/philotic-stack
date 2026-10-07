@@ -22,6 +22,8 @@ philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub 
 # (e.g. built manually on the VPS for the first smoke).
 philotic_artifacts_dir: "{{ playbook_dir }}/../dist"
 philotic_artifacts_remote: false
+# Must stay a subset of `scripts/release-packages.sh bins --platform linux`
+# (release/packages.toml); scripts/tests/test_release_packages.py enforces it.
 philotic_binaries:
   - aiua
   - philote
@@ -37,8 +39,6 @@ philotic_binaries:
   - agent-datasource
   - life-graph-runner
   - tool-runner
-  - agent-core
-  - hegemon
   - model-router
   - model-controller-gemini
   - model-controller-elevenlabs
