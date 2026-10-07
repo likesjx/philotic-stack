@@ -1,0 +1,21 @@
+diff --git a/.github/workflows/pr-check.yml b/.github/workflows/pr-check.yml
+index 8a9597aa..e7da9092 100644
+--- a/.github/workflows/pr-check.yml
++++ b/.github/workflows/pr-check.yml
+@@ -94,6 +94,16 @@ jobs:
+       - name: cargo fmt --all --check
+         run: cargo fmt --all --check
+ 
++      # Watch-live burn-down W0: proposal-status and DEFECTS status vocabulary
++      # lint. NON-BLOCKING for now (continue-on-error, and --warn-only keeps the
++      # vocabulary checks as warnings); the older required-keys checks still
++      # report pre-existing failures on develop. Make it blocking once green.
++      - name: docs metadata lint (non-blocking)
++        continue-on-error: true
++        run: |
++          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
++          python3 scripts/docs-metadata-check.py --warn-only
++
+   # proposal:pr-linux-compile-check — vps-jane runs Linux, but the test job is
+   # macOS-only (the workspace has Apple-only crates, which is why
+   # build-linux.yml builds a selective package set rather than --workspace).
