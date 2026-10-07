@@ -3,9 +3,9 @@ title: Reflexive Life Graph — Skills That Own Their Structure
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-disposition: proposed
+disposition: accepted-current-slice
 verification_level: none
-last_updated: 2026-09-30
+last_updated: 2026-10-07
 tags:
   - lifegraph
   - skills
@@ -217,7 +217,7 @@ closing step meaningful.
 
 ## Disposition
 
-Accepted for current slice. Slice 1 = R1 (typed properties) SHIPPED 2026-09-15: the
+`accepted-current-slice` (frontmatter disposition aligned 2026-10-07, watch-live burn-down W2; R2–R5 are unbuilt and are not watch-live items). Slice 1 = R1 (typed properties) SHIPPED 2026-09-15: the
 runner declares per-label typed properties (`ExtensionProperty` kind/range/allowed
 values), `life.observe` rejects undeclared keys, and the schema doc's typed-properties
 section reflects it — "difficulty 0–100" is a validated number, not a sentence.

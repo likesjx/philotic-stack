@@ -2,9 +2,9 @@
 title: Philotic Deployment and Environment Model
 doc_type: proposal
 domain: deployment-distribution
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-04-11
+last_updated: 2026-10-07
 tags:
 - deployment
 - environments
@@ -41,7 +41,7 @@ Treat environment isolation as a path-namespacing problem solved once by `PHILOT
 
 ## Disposition
 
-`proposed` — decisions settled in planning; implementation not yet started.
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2). `PHILOTIC_PROFILE` path namespacing is implemented; the current slice is below.
 
 ## Current Slice
 

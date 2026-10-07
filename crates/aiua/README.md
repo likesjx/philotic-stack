@@ -35,7 +35,6 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 
 | Variable                              | Default                    | Description                           |
 | ------------------------------------- | -------------------------- | ------------------------------------- |
-| `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK` | Mesh auth key                         |
 | `PHILOTIC_HOTEL_SOCKET`               | derived by hotel           | guest-facing IPC socket path exported to materialized guests |
 | `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                        | 1 = enforce HMAC auth on mesh         |
 | `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                        | 1 = start outbound inter-hotel dispatcher |

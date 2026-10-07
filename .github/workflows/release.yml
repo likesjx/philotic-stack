@@ -1,29 +1,31 @@
 name: Release
 
-# Tag convention:
-#   v1.0.0              → stable release   — must be tagged from main
-#   v1.0.0-alpha.1      → alpha pre-release — must be tagged from develop
-#   v1.0.0-beta.1       → beta pre-release  — must be tagged from develop
-#   v1.0.0-rc.1         → release candidate — must be tagged from develop
+# Runbook: docs/process/RELEASE.md (proposal:release-train R3).
 #
-# What each tag type does:
-#   stable:     build → GitHub Release → bump Homebrew tap
-#   pre-release: build → GitHub Release (marked pre-release) → tap unchanged
+# Tag convention — tags need THREE numeric parts (`v0.2` never triggers):
+#   v0.2.0              → stable release      — must be tagged on main
+#   v0.2.0-rc.1         → release candidate   — must be tagged on develop
+#   v0.2.0-alpha.1 / -beta.1 → pre-release    — must be tagged on develop
 #
-# Targets (6):
-#   macOS:   aarch64-apple-darwin, x86_64-apple-darwin
-#   Linux:   aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu
-#   Windows: aarch64-pc-windows-msvc, x86_64-pc-windows-msvc
+# Targets — exactly the fleet:
+#   x86_64-unknown-linux-gnu  (ubuntu-24.04: glibc >= 2.38 for the ort
+#                              prebuilt libs, matches vps-jane)
+#   aarch64-apple-darwin      (macos-14: mac-jane, mbp-jane)
 #
-# Prerequisites (one-time setup):
-#   - Create a GitHub PAT with `repo` scope on likesjx/homebrew-philotic
-#   - Add it as a secret named TAP_GITHUB_TOKEN on this repo
+# Assets per release:
+#   philotic-<tag>-<os>-<arch>.tar.gz          bin/*, SHA256SUMS, manifest.json
+#   philotic-<tag>-<os>-<arch>.manifest.json   the same manifest, standalone
+#                                              (scripts/verify-release.sh reads it)
+#   SHA256SUMS                                 over the tarballs + manifests
+# plus a build-provenance attestation per tarball
+# (`gh attestation verify <tarball> -R likesjx/philotic-stack`).
 #
-# To cut a pre-release (from develop):
-#   git tag v0.2.0-alpha.1 && git push origin v0.2.0-alpha.1
-#
-# To cut a stable release (from main):
-#   git tag v0.2.0 && git push origin v0.2.0
+# Package set: release/packages.toml via scripts/release-packages.sh.
+# Desktop UI: the committed jaredlikes-desktop dist/ is staged when the
+# DESKTOP_REPO_TOKEN secret exists; otherwise philotic-web embeds the
+# placeholder UI. PHILOTIC_DESKTOP_DIR is never set (it runs the broken npm build).
+# Homebrew tap: stable tags only; skipped with a notice when TAP_GITHUB_TOKEN
+# is not configured.
 
 on:
   push:
@@ -33,15 +35,21 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+-beta.*"    # beta:       v1.0.0-beta.1
       - "v[0-9]+.[0-9]+.[0-9]+-rc.*"      # candidate:  v1.0.0-rc.1
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  # audiopus_sys falls back to a bundled CMake build if pkg-config misses Opus;
+  # that CMakeLists is rejected by CMake 4 without this (see pr-check.yml).
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   # ── Guard: enforce branch discipline ────────────────────────────────────────
   # Stable tags must come from main. Pre-release tags must come from develop.
   validate-branch:
     name: Validate tag source branch
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,71 +87,40 @@ jobs:
     name: Build ${{ matrix.artifact }}
     needs: validate-branch
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── macOS ──
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            platform: linux
+            artifact: linux-x86_64
           - target: aarch64-apple-darwin
             runner: macos-14
+            platform: darwin
             artifact: darwin-arm64
-            os: macos
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            artifact: darwin-x86_64
-            os: macos
-          # ── Linux ──
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            artifact: linux-arm64
-            os: linux
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            artifact: linux-x86_64
-            os: linux
-          # ── Windows ──
-          - target: aarch64-pc-windows-msvc
-            runner: windows-latest
-            artifact: windows-arm64
-            os: windows
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            artifact: windows-x86_64
-            os: windows
+    env:
+      HAS_DESKTOP_TOKEN: ${{ secrets.DESKTOP_REPO_TOKEN != '' }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      ARTIFACT: ${{ matrix.artifact }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # Desktop UI is macOS-only (embedded in philotic-web serve)
-      - name: Checkout jaredlikes-desktop (for embedded UI)
-        if: matrix.os == 'macos'
-        uses: actions/checkout@v4
-        with:
-          repository: likesjx/jaredlikes-desktop
-          token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: jaredlikes-desktop
-
-      - name: Build desktop UI
-        if: matrix.os == 'macos'
-        run: |
-          cd jaredlikes-desktop
-          npm ci
-          npm run build
-
-      # Cross-compilation tools for Linux ARM64
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          sudo apt-get install -y libopus-dev pkg-config
+
+      - name: Install system dependencies (macOS)
+        if: matrix.platform == 'darwin'
+        run: brew install opus pkg-config
 
       - name: Install Rust toolchain
-        # Pinned to match rust-toolchain.toml. Must be bumped in lockstep with
-        # it: the toolchain file decides which rustc cargo uses, so the matrix
-        # target has to be installed against that exact toolchain.
+        # Pinned to match rust-toolchain.toml; bump in lockstep with it.
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
@@ -156,135 +133,160 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
+          key: release-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-${{ matrix.target }}-cargo-
+            ${{ matrix.artifact }}-cargo-
 
-      - name: Build binaries
+      # Same staging as build-linux.yml: copy the private repo's COMMITTED
+      # dist/ into crates/philotic-web/ui-dist (build.rs reuses it, no npm).
+      - name: Check out jaredlikes-desktop (private UI)
+        id: desktop_checkout
+        if: env.HAS_DESKTOP_TOKEN == 'true'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: likesjx/jaredlikes-desktop
+          ref: main
+          token: ${{ secrets.DESKTOP_REPO_TOKEN }}
+          path: jaredlikes-desktop
+          persist-credentials: false
+
+      - name: Report desktop UI source
         env:
-          PHILOTIC_DESKTOP_DIR: ${{ matrix.os == 'macos' && format('{0}/jaredlikes-desktop', github.workspace) || '' }}
-        shell: bash
+          DESKTOP_OUTCOME: ${{ steps.desktop_checkout.outcome }}
         run: |
-          cargo build --release --target ${{ matrix.target }} \
-            -p philotic-web \
-            -p aiua \
-            -p philote \
-            -p membrane-telegram \
-            -p model-router \
-            -p tool-runner
-
-      - name: Package binaries
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          STAGING="philotic-${TAG}-${{ matrix.artifact }}"
-          mkdir -p "$STAGING"
-
-          EXT=""
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            EXT=".exe"
+          if [ "${HAS_DESKTOP_TOKEN}" != "true" ]; then
+            echo "::notice::DESKTOP_REPO_TOKEN not configured — shipping philotic-web with the placeholder UI"
+          elif [ "${DESKTOP_OUTCOME}" = "success" ]; then
+            echo "::notice::desktop UI checked out — staging committed dist/"
+          else
+            echo "::warning::desktop checkout failed (token?) — shipping the placeholder UI"
           fi
 
-          for bin in philotic-web aiua philote membrane-telegram model-router tool-runner; do
-            SRC="target/${{ matrix.target }}/release/${bin}${EXT}"
-            if [ -f "$SRC" ]; then
-              cp "$SRC" "$STAGING/${bin}-${{ matrix.artifact }}${EXT}"
+      - name: Stage committed desktop dist into ui-dist
+        if: steps.desktop_checkout.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if [ -f jaredlikes-desktop/dist/index.html ]; then
+            rm -rf crates/philotic-web/ui-dist
+            mkdir -p crates/philotic-web/ui-dist
+            cp -R jaredlikes-desktop/dist/. crates/philotic-web/ui-dist/
+            echo "::notice::staged committed desktop dist into ui-dist"
+          else
+            echo "::warning::jaredlikes-desktop/dist/index.html missing — leaving ui-dist as-is (placeholder fallback)"
+          fi
+
+      - name: Build release binaries
+        env:
+          # Baked in via philotic_client::build_sha(); verify-release compares it.
+          PHILOTIC_BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          read -r -a PKG_FLAGS <<< "$(scripts/release-packages.sh cargo-flags --platform "${PLATFORM}")"
+          [ "${#PKG_FLAGS[@]}" -gt 0 ] || { echo "::error::release-packages.sh returned no packages"; exit 1; }
+          echo "packages: ${PKG_FLAGS[*]}"
+          cargo build --release --target "${TARGET}" --bins "${PKG_FLAGS[@]}"
+
+      - name: Package tarball + manifest
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NAME="philotic-${TAG}-${ARTIFACT}"
+          SRC="target/${TARGET}/release"
+          STAGE="stage/${NAME}"
+          rm -rf stage dist && mkdir -p "${STAGE}/bin" dist
+
+          mapfile -t BINS < <(scripts/release-packages.sh bins --platform "${PLATFORM}")
+          mapfile -t REQUIRED < <(scripts/release-packages.sh required-bins --platform "${PLATFORM}")
+          for bin in "${BINS[@]}"; do
+            if [ -f "${SRC}/${bin}" ]; then
+              cp "${SRC}/${bin}" "${STAGE}/bin/${bin}"
+              chmod 755 "${STAGE}/bin/${bin}"
+            else
+              echo "::warning::optional binary not produced: ${bin}"
             fi
           done
 
-          [ -f mesh-config.example.json ] && cp mesh-config.example.json "$STAGING/"
-
-          # Generate checksums
-          cd "$STAGING"
-          if command -v sha256sum &> /dev/null; then
-            sha256sum * > SHA256SUMS
-          else
-            shasum -a 256 * > SHA256SUMS
+          # Ad-hoc sign on macOS BEFORE hashing, so the manifest hashes are
+          # of the signed bytes the Macs run (install-release-mac.sh re-signs
+          # and records post-sign hashes if they differ).
+          if [ "${PLATFORM}" = "darwin" ]; then
+            for f in "${STAGE}"/bin/*; do codesign -f -s - "$f"; done
           fi
-          cd ..
 
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            7z a "$STAGING.zip" "$STAGING"
-            if command -v sha256sum &> /dev/null; then
-              sha256sum "$STAGING.zip" > "$STAGING.zip.sha256"
-            else
-              shasum -a 256 "$STAGING.zip" > "$STAGING.zip.sha256"
-            fi
-          else
-            tar czf "$STAGING.tar.gz" "$STAGING"
-            if command -v sha256sum &> /dev/null; then
-              sha256sum "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
-            else
-              shasum -a 256 "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
-            fi
-          fi
+          python3 scripts/release-manifest.py generate --dir "${STAGE}" \
+            --tag "${TAG}" --sha "${GITHUB_SHA}" --target "${TARGET}" \
+            --require "${REQUIRED[@]}"
+          python3 scripts/release-manifest.py verify --dir "${STAGE}"
+
+          # manifest.json last: installers treat its presence as "fully unpacked".
+          tar -C "${STAGE}" -czf "dist/${NAME}.tar.gz" bin SHA256SUMS manifest.json
+          cp "${STAGE}/manifest.json" "dist/${NAME}.manifest.json"
+
+          echo "--- smoke: bin/aiua --version"
+          "${STAGE}/bin/aiua" --version || echo "::warning::aiua --version exited non-zero"
+          ls -la dist/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz
-            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz.sha256
-            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.zip
-            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.zip.sha256
+          name: release-${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error
 
   # ── Create GitHub Release ────────────────────────────────────────────────────
   release:
     name: Create GitHub Release
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     outputs:
-      source_sha256: ${{ steps.source.outputs.sha256 }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
-      arm64_sha256: ${{ steps.binary_sha256.outputs.arm64 }}
-      x86_64_sha256: ${{ steps.binary_sha256.outputs.x86_64 }}
+      darwin_arm64_sha256: ${{ steps.sums.outputs.darwin_arm64 }}
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Release metadata
         id: meta
         run: |
           TAG="${GITHUB_REF_NAME}"
           if [[ "$TAG" == *-alpha* || "$TAG" == *-beta* || "$TAG" == *-rc* ]]; then
-            echo "is_prerelease=true" >> $GITHUB_OUTPUT
-            echo "channel=$(echo $TAG | grep -oP '(alpha|beta|rc)')" >> $GITHUB_OUTPUT
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "channel=$(echo "$TAG" | grep -oE '(alpha|beta|rc)' | head -1)" >> "$GITHUB_OUTPUT"
           else
-            echo "is_prerelease=false" >> $GITHUB_OUTPUT
-            echo "channel=stable" >> $GITHUB_OUTPUT
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download all build artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
 
-      - name: Create source archive
-        id: source
+      - name: Outer SHA256SUMS
+        id: sums
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          PREFIX="philotic-stack-$VERSION"
-          git archive --format=tar.gz --prefix="$PREFIX/" HEAD \
-            > "philotic-stack-$VERSION.tar.gz"
-          SHA=$(sha256sum "philotic-stack-$VERSION.tar.gz" | cut -d' ' -f1)
-          echo "sha256=$SHA" >> $GITHUB_OUTPUT
-
-      - name: Collect release assets
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p release-assets
-          cp "philotic-stack-$VERSION.tar.gz" release-assets/
-          find artifacts -name "*.tar.gz" -o -name "*.sha256" -o -name "*.zip" | \
-            xargs -I{} cp {} release-assets/
-
-      - name: Extract binary sha256s for Homebrew tap
-        id: binary_sha256
-        run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          ARM64=$(awk '{print $1}' "artifacts/darwin-arm64/philotic-${TAG}-darwin-arm64.tar.gz.sha256")
-          X86=$(awk '{print $1}' "artifacts/darwin-x86_64/philotic-${TAG}-darwin-x86_64.tar.gz.sha256")
-          echo "arm64=$ARM64" >> $GITHUB_OUTPUT
-          echo "x86_64=$X86" >> $GITHUB_OUTPUT
+          cd release-assets
+          for a in linux-x86_64 darwin-arm64; do
+            for f in "philotic-${TAG}-${a}.tar.gz" "philotic-${TAG}-${a}.manifest.json"; do
+              [ -f "$f" ] || { echo "::error::missing release asset $f"; exit 1; }
+            done
+          done
+          sha256sum ./*.tar.gz ./*.manifest.json | sed 's#  \./#  #' > SHA256SUMS
+          cat SHA256SUMS
+          echo "darwin_arm64=$(awk -v f="philotic-${TAG}-darwin-arm64.tar.gz" '$2 == f {print $1}' SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: release-assets/*.tar.gz
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -294,96 +296,85 @@ jobs:
           draft: false
           prerelease: ${{ steps.meta.outputs.is_prerelease }}
           name: >-
-            ${{ steps.meta.outputs.is_prerelease
+            ${{ steps.meta.outputs.is_prerelease == 'true'
               && format('{0} ({1})', github.ref_name, steps.meta.outputs.channel)
               || github.ref_name }}
 
   # ── Update Homebrew tap (stable releases only) ───────────────────────────────
+  # Writes Formula/philotic-web.rb (the formula README.md documents) from the
+  # darwin-arm64 tarball. Skips with a notice when TAP_GITHUB_TOKEN is absent.
   update-tap:
-    name: Bump Homebrew formulae
+    name: Bump Homebrew formula (philotic-web)
     needs: release
-    # Only runs for stable releases — pre-release tags skip this entirely
     if: needs.release.outputs.is_prerelease == 'false'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    env:
+      HAS_TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN != '' }}
 
     steps:
-      - name: Bump aiua formula (source build)
-        uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          formula-name: aiua
-          formula-path: Formula/aiua.rb
-          homebrew-tap: likesjx/homebrew-philotic
-          base-branch: main
-          tag-name: ${{ github.ref_name }}
-          download-url: >-
-            https://github.com/likesjx/philotic-stack/archive/refs/tags/${{ github.ref_name }}.tar.gz
-          download-sha256: ${{ needs.release.outputs.source_sha256 }}
-          commit-message: |
-            aiua {{version}}
+      - name: Check tap token
+        id: gate
+        run: |
+          if [ "${HAS_TAP_TOKEN}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::TAP_GITHUB_TOKEN not configured — skipping Homebrew tap update for ${GITHUB_REF_NAME}"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
 
-            Release: https://github.com/likesjx/philotic-stack/releases/tag/{{tag}}
-        env:
-          COMMITTER_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-
-      - name: Update phil formula (pre-built binary with embedded desktop UI)
+      - name: Update philotic-web formula
+        if: steps.gate.outputs.enabled == 'true'
         env:
           TAG: ${{ github.ref_name }}
-          ARM64_SHA: ${{ needs.release.outputs.arm64_sha256 }}
-          X86_SHA: ${{ needs.release.outputs.x86_64_sha256 }}
+          ARM64_SHA: ${{ needs.release.outputs.darwin_arm64_sha256 }}
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
-          VERSION="${TAG#v}"
+          set -euo pipefail
+          [ -n "${ARM64_SHA}" ] || { echo "::error::darwin-arm64 sha256 missing from release job outputs"; exit 1; }
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/likesjx/homebrew-philotic.git" tap
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p Formula
 
-          python3 << 'PYEOF'
-          import os, textwrap
-          tag     = os.environ['TAG']
-          version = os.environ['VERSION']
-          arm64   = os.environ['ARM64_SHA']
-          x86     = os.environ['X86_SHA']
-          base    = f"https://github.com/likesjx/philotic-stack/releases/download/{tag}"
-          formula = (
-            'class Phil < Formula\n'
-            '  desc "Operator CLI for the Philotic Web mesh"\n'
-            '  homepage "https://github.com/likesjx/philotic-stack"\n'
-            f'  version "{version}"\n'
-            '  license "MIT"\n'
-            '\n'
-            '  on_macos do\n'
-            '    on_arm do\n'
-            f'      url "{base}/philotic-{tag}-darwin-arm64.tar.gz"\n'
-            f'      sha256 "{arm64}"\n'
-            '    end\n'
-            '    on_intel do\n'
-            f'      url "{base}/philotic-{tag}-darwin-x86_64.tar.gz"\n'
-            f'      sha256 "{x86}"\n'
-            '    end\n'
-            '  end\n'
-            '\n'
-            '  def install\n'
-            '    arch = Hardware::CPU.arm? ? "darwin-arm64" : "darwin-x86_64"\n'
-            '    bin.install "philotic-web-#{arch}" => "phil"\n'
-            '  end\n'
-            '\n'
-            '  test do\n'
-            '    assert_match version.to_s, shell_output("#{bin}/phil --version")\n'
-            '  end\n'
-            'end\n'
-          )
-          with open('Formula/phil.rb', 'w') as f:
-              f.write(formula)
+          python3 - <<'PYEOF'
+          import os
+          tag = os.environ["TAG"]
+          version = tag[1:] if tag.startswith("v") else tag
+          sha = os.environ["ARM64_SHA"]
+          url = f"https://github.com/likesjx/philotic-stack/releases/download/{tag}/philotic-{tag}-darwin-arm64.tar.gz"
+          formula = f'''class PhiloticWeb < Formula
+            desc "Philotic Stack: phil operator CLI and hotel runtime binaries"
+            homepage "https://github.com/likesjx/philotic-stack"
+            url "{url}"
+            version "{version}"
+            sha256 "{sha}"
+            license "MIT"
+
+            depends_on arch: :arm64
+            depends_on :macos
+            depends_on "opus"
+
+            def install
+              bin.install Dir["bin/*"]
+              bin.install_symlink "philotic-web" => "phil"
+            end
+
+            test do
+              system bin/"aiua", "--version"
+            end
+          end
+          '''
+          with open("Formula/philotic-web.rb", "w") as fh:
+              fh.write(formula)
           PYEOF
 
-          git add Formula/phil.rb
+          cat Formula/philotic-web.rb
+          git add Formula/philotic-web.rb
           if git diff --cached --quiet; then
-            echo "No changes to phil formula — skipping commit"
+            echo "No changes to philotic-web formula — skipping commit"
           else
-            git commit -m "phil ${TAG}
-
-          Release: https://github.com/likesjx/philotic-stack/releases/tag/${TAG}"
+            git commit -m "philotic-web ${TAG}" -m "Release: https://github.com/likesjx/philotic-stack/releases/tag/${TAG}"
             git push
           fi

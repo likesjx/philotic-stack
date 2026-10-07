@@ -18,10 +18,10 @@ Usage:
 import hashlib
 import json
 import os
-import socket
-import struct
 import sys
 import time
+
+from philotic_ipc import Ipc, IpcError, secret_ref_of
 
 SOCKET_PATH = os.environ.get("PHILOTIC_HOTEL_SOCKET", "/run/philotic/vps-jane.sock")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
@@ -46,33 +46,6 @@ try:
 except ImportError:
     print("blake3 not available (install with: python3 -m pip install blake3)", file=sys.stderr)
     sys.exit(1)
-
-
-def send_frame(sock, payload: dict) -> None:
-    data = json.dumps(payload).encode()
-    sock.sendall(struct.pack(">I", len(data)) + data)
-
-
-def recv_frame(sock) -> dict:
-    raw_len = b""
-    while len(raw_len) < 4:
-        chunk = sock.recv(4 - len(raw_len))
-        if not chunk:
-            raise RuntimeError("socket closed")
-        raw_len += chunk
-    length = struct.unpack(">I", raw_len)[0]
-    data = b""
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            raise RuntimeError("socket closed mid-frame")
-        data += chunk
-    return json.loads(data)
-
-
-def ipc_call(sock, operation: str, payload: dict) -> dict:
-    send_frame(sock, {"operation": operation, "payload": payload})
-    return recv_frame(sock)
 
 
 def response_payload(resp: dict) -> dict:
@@ -182,23 +155,14 @@ def main() -> None:
     token_hash_hex = blake3_hex(BEARER_TOKEN.encode())
     print(f"Bearer token SHA-256 preview: {hashlib.sha256(BEARER_TOKEN.encode()).hexdigest()[:12]}")
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(SOCKET_PATH)
-    sock.settimeout(10.0)
+    ipc = Ipc(SOCKET_PATH)
+    try:
+        ipc.register_operator(OWNER_AGENT_ID, "lifegraph-mcp-provisioner")
+    except IpcError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-    reg_resp = ipc_call(
-        sock,
-        "register_guest",
-        {
-            "guest_id": "lifegraph-mcp-provisioner",
-            "role": "hotel.internal",
-            "supported_tools": [],
-        },
-    )
-    print(f"Register: {reg_resp}")
-
-    add_resp = ipc_call(
-        sock,
+    add_resp = ipc.call(
         "add_vault_entry",
         {
             "vault_name": "default",
@@ -212,7 +176,7 @@ def main() -> None:
         print("ERROR: AddVaultEntry failed", file=sys.stderr)
         sys.exit(1)
 
-    secret_ref = add_resp.get("secret_ref") or add_resp.get("data", {}).get("secret_ref")
+    secret_ref = secret_ref_of(add_resp)
     if not secret_ref:
         print(f"Full response: {json.dumps(add_resp, indent=2)}", file=sys.stderr)
         sys.exit(1)
@@ -250,9 +214,11 @@ def main() -> None:
             }
         )
 
-    provision_resp = ipc_call(sock, "provision_mcp_endpoint", {"config": config})
+    provision_resp = ipc.call(
+        "provision_mcp_endpoint", {"config": config}, expect_keys=("endpoint_id",)
+    )
     print(f"ProvisionMcpEndpoint: {provision_resp}")
-    sock.close()
+    ipc.close()
 
     if not is_endpoint_success(provision_resp):
         print("ERROR: ProvisionMcpEndpoint failed", file=sys.stderr)

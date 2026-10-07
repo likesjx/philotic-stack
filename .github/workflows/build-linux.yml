@@ -105,23 +105,11 @@ jobs:
           # with code from an unmerged branch, undetectable from the outside.
           PHILOTIC_BUILD_SHA: ${{ github.sha }}
         run: |
-          cargo build --release --target "${TARGET}" --bins \
-            -p aiua \
-            -p philote \
-            -p membrane-telegram \
-            -p membrane-discord \
-            -p membrane-mcp \
-            -p membrane-mcp-client \
-            -p egress-http-runner \
-            -p model-router \
-            -p tool-runner \
-            -p graph-datasource \
-            -p table-datasource \
-            -p router-listener \
-            -p agent-datasource \
-            -p heal-dispatcher \
-            -p data-memorygraphrag \
-            -p philotic-web
+          # Package set comes from release/packages.toml (single manifest).
+          read -r -a PKG_FLAGS <<< "$(scripts/release-packages.sh cargo-flags --platform linux)"
+          [ "${#PKG_FLAGS[@]}" -gt 0 ] || { echo "::error::release-packages.sh returned no packages"; exit 1; }
+          echo "packages: ${PKG_FLAGS[*]}"
+          cargo build --release --target "${TARGET}" --bins "${PKG_FLAGS[@]}"
 
       - name: Assemble dist/
         run: |
@@ -149,19 +137,12 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          # Only binaries the package set actually emits. agent-core/hegemon are
-          # in philotic_binaries but are not build outputs (the ansible remote
-          # path stats-and-skips them), so they are intentionally NOT required here.
-          for bin in aiua philote philote-worker membrane-telegram membrane-discord membrane-mcp \
-                     membrane-mcp-client egress-http-runner \
-                     model-router model-controller-elevenlabs \
-                     model-controller-gemini model-controller-openai \
-                     model-controller-anthropic \
-                     model-controller-onnx model-controller-ollama \
-                     model-controller-decisions \
-                     tool-runner graph-datasource \
-                     agent-datasource heal-dispatcher life-graph-runner \
-                     philotic-web; do
+          # Required bins come from release/packages.toml (`required`). Bins a
+          # package may emit but that are optional (mlx, parakeet, ...) are not
+          # required here; the ansible remote path stats-and-skips them.
+          mapfile -t REQUIRED < <(scripts/release-packages.sh required-bins --platform linux)
+          [ "${#REQUIRED[@]}" -gt 0 ] || { echo "::error::release-packages.sh returned no required bins"; exit 1; }
+          for bin in "${REQUIRED[@]}"; do
             if [ ! -f "dist/$bin" ]; then
               echo "::error::expected binary missing from dist/: $bin"
               missing=$((missing + 1))

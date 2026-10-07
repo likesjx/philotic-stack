@@ -445,12 +445,37 @@ Seam IDs: `session-compaction`
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 - [x] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
 
+## Atlas Follow-Through (2026-10-05)
+
+Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a detailed plan. Operator approved implementing all of them with the recommended option at every decision point (2026-10-07). Cloud sessions so far could not download crates (`static.crates.io` not allowlisted) or push `.github/workflows/*` (GitHub App lacks `workflows` permission). The parked workflow patches 0001–0003 were applied from mac-jane on 2026-10-07 (PR into develop); Rust slices proceed from mac-jane per [HANDOFF-2026-10-07-atlas-followthrough-mac-jane.md](HANDOFF-2026-10-07-atlas-followthrough-mac-jane.md).
+
+- [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
+- [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
+  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step (workflow patch 0001, applied 2026-10-07); make blocking after one week).
+  - [x] W4 enablement (2026-10-07): ansible `philotic_memory_hygiene_enabled` (on for jane-vps). Proof window starts at the next vps deploy.
+  - [ ] W1, W3, W5, W6 need hotel access; W3 step 5 and W7 are Rust.
+  - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Lint warnings cleared. Graph rescan (`phil graph scan`) pending from the main checkout after merge.
+- [ ] IPC dispatch split (S0–S6): [IPC_DISPATCH_SPLIT_PROPOSAL.md](architecture/IPC_DISPATCH_SPLIT_PROPOSAL.md). `ipc.rs` → `ipc/` family modules, plus park-path fixes.
+- [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
+  - [x] R0 runbook ([process/RELEASE.md](process/RELEASE.md)); `release/packages.toml` + `scripts/release-packages.sh`; `scripts/release-manifest.py`; R4 `just vps-deploy-release` + ansible release/rollback tasks; R5 `scripts/install-release-mac.sh`; R6/R7 `just rollback`, `just verify-release` (2026-10-07, validated locally: actionlint, shellcheck, ansible syntax + fake-tarball runs, 16 unit tests).
+  - [x] R3 workflow changes: patches 0002 + 0003 applied 2026-10-07 (manifest package list re-verified identical: 16 `-p` flags after merging develop @ `36466d8b`).
+  - [ ] R3 rehearsal: tag `v0.2.0-rc.1` on develop after R2.
+  - [ ] R1 main sync, R2 version stamp (Rust), live installs + rollback drill per platform.
+- [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
+  - [x] P1 step 4: provisioning scripts register as `operator` via shared `scripts/philotic_ipc.py` (also DEF-209).
+  - [x] P7 firewall: nftables `inet philotic` hotel-port filter (on for jane-vps, validated with `nft -c`); ONNX ufw allow narrowed to tailnet; dead `PHILOTIC_MESH_PSK` removed.
+  - [ ] P1–P6 Rust slices; P7 mesh-config plaintext scrub (Rust `aiua load`), DEF-089, blob quota.
+- [ ] Agent frontdoor next slices (F1–F7): [AGENT_FRONTDOOR_PROPOSAL.md § Next slices](architecture/AGENT_FRONTDOOR_PROPOSAL.md). DEF-211 rest, DEF-209, caller tags, schemas, rotation.
+  - [x] F2 DEF-209 script framing fix; F5 schema export/import in `provision-agent-frontdoor.py` (2026-10-07). Live re-provision pairs with the F6 rotation drill.
+  - [ ] F1, F3, F6 (Rust/doctor); F4 operator decision; F7 after F1+F6.
+
+Cross-plan coordination: mesh L5 ⟷ frontdoor F1 (same change); IPC split S3/S5 must not run concurrently with perimeter P2/P3 or mesh L5; release R2 feeds watch-live W7.
+
 ## New Project: Agent Frontdoor (remote agents → Muninn + intel-graph)
 
 Proposal: [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md). Handoff: [HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md](HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md).
 Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-muninn-bootstrap`, `frontdoor-proxy-loopback-trust`
 
-- [ ] S1 `McpUpstream` route target + cross-hotel endpoint-config dispatch + caller principal (code on `claude/stoic-goldberg-f8w99b`; not yet compiled — cloud session had no crates.io download access).
 - [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
 - [x] S1 compiled + tested on mac-jane after merging develop (5 new tests green, `just check` green).
 - [x] S3 upstreams `muninn-cortex` (vps-jane) + `intel-graph` (mac-jane) registered with grants; endpoint provisioned; Traefik `/agent/mcp` + iptables live.
@@ -2108,7 +2133,7 @@ Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 - [ ] L2 `skills.curate`: `provenance` / `last_invoked_at` / `invocation_count` on `AbstractSkillRecord`, nightly sweep after the `fire_memory_hygiene` pattern, never deletes, `pinned` marker — smoke-green + `phil skill list --stale`
 - [ ] L3 `skill.patch` tool + `skill_registration_pending` nodes + philotic-web `/api/skills/pending` approve/reject
 - [ ] L4 standing-notes: `agent_notes` 2,200 / `operator_profile` 1,375 chars, `notes.add|replace|remove`, fail-loud cap, usage header — first task: audit what `InjectionBudget.memory_snapshot_chars` feeds today
-- [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — watched-live on the vps Chronos check-in
+- [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — **unbuilt (proposed; taken off the watch-live backlog 2026-10-07)** — acceptance once built: watched-live on the vps Chronos check-in
 - [ ] L7 `session_turn_fts` FTS5 table + `SearchSessionTurns` IPC + `session.search` tool — smoke-green on vps-jane Beacon history
 
 ## New Project: Procedural Graphs
@@ -2230,7 +2255,7 @@ Order: G0 → G1 → G2 → G3 → G6 → G4 → G5 → G7.
 
 - [ ] G0 `graph_registry` node kind + seed (`life`, `agents`, `sandbox`); vps-jane compose split into three Memgraph services (life keeps its volume, MAGE image); provider resolves endpoint by graph id — smoke-green: `life` answers with the same node count after the split
 - [ ] G1 `crates/cypher-guard` classifier wall (read / algorithm / mutation / admin / refused), destructive-shape floor, ≥100-statement corpus, wired ahead of every Bolt call
-- [ ] G2 `graph.query` on the wall with bounds + forced LIMIT; `life.query` with ontology injection; Bjork's `music.practice-log` + rewritten `music.weekly-practice-review` on `virtuosa`/`orchestrator`; Beacon rule reduced to "whisper Bjork's virtuosa" — watched-live: Beacon whisper → Bjork Event in Memgraph → her review's `life.query` returns it
+- [ ] G2 `graph.query` on the wall with bounds + forced LIMIT; `life.query` with ontology injection; Bjork's `music.practice-log` + rewritten `music.weekly-practice-review` on `virtuosa`/`orchestrator`; Beacon rule reduced to "whisper Bjork's virtuosa" — **unbuilt (proposed; taken off the watch-live backlog 2026-10-07)** — acceptance once built (watched-live): Beacon whisper → Bjork Event in Memgraph → her review's `life.query` returns it
 - [ ] G3 `graph.mutate` (dry run, provenance stamps, audit + reversal hint, destructive floor); `life.observe`/`commit`/`resolve`/`patch` re-based; lane `graph.mutate` ConfirmFirst per graph
 - [ ] G6 `AbstractSkillRecord.guidance` + register/patch args + rendering + prompt-guard scan; distill brief may fill it
 - [ ] G4 `graph.analyze` MAGE allowlist + lane budget; `life.analyze`
@@ -2330,10 +2355,10 @@ Order: R1 → R2 → R4 (declarative) → R3 → R5 → R4b. Prerequisite tracke
 - [ ] Index the proposal from the main checkout (`phil graph scan` / `graph_scan`) once merged — doc-backed proposals index only from there.
 - [x] R1 `lifegraph-typed-properties` — **test-green 2026-09-15** (`codex/lifegraph-typed-properties`): `EvidencePacket.properties` (scalars; universal `title`/`status` or declared per label), `OntologyExtensions.properties[]` declarations through the schema-patch pipeline (validated + merged), plan-time validation naming the allowed keys, `n += $properties` on create and match, `life.list` folds `prop__*` columns into `properties`; philote tool schema tells the model where structured facts go. 9 tests. Remaining for R1: bjork declares `CreativeWork{key,tempo,difficulty,accuracy}` + `MusicSection{measure_span,focus}` via `life.patch.propose` (operator confirms) — watched-live: she records difficulty on the Handel and `life.list` returns it typed. `life.recall` packets do not yet carry properties (follow-up).
 - [x] **Prerequisite found 2026-09-15 (DEF-142, `codex/skill-projection-from-records`): projection reads the hotel's skill records.** Runtime-registered skills could never project (compiled tables only). Hotel ships `effective_skill_records`; philote projects from record tools/text/rules. Watched-live 2026-09-15 22:54 EDT: projection CORRECT (gardener in the request's projection list on every message) but `[Skill guidance]` showed 3 of 12 entries — the persona budget cut it (DEF-145, fixed: own `skills_chars` budget). Same thread: every `life.observe` with `evidence.properties` failed on a stringified map and the receipt still said written (DEF-146 — the runner-side half also landed as #531's DEF-144, fixed: schema-aware argument repair + lenient runner parse + `Tool call failed:` recognized as an error). PROVEN LIVE 2026-09-16 14:46 EDT (mac-jane smoke, develop bfc64ec7 + #534): the model again stringified `evidence.properties`; `tool_args` repaired it (log 14:46:59Z), `life:event:organ_warmup_20260920` landed in Memgraph with typed `title`/`status` (the operator's lost 8am warmup item, re-recorded); the prompt carried no persona truncation and `[Skill guidance]` listed `music.repertoire-gardener` first. Still lost from the 2026-09-16 morning thread and owed by the operator: the Sunday 2026-09-20 sacrament-music event (hymn assignments, #1069 by the choir with Rachel Hammond on piano, Jared in the choir, 9:00 choir warmup) and tonight's SATB practice with Rachel. Telegram gate still open: bjork's next piece/repertoire message runs the gardener inline. Left over from the delegation review: tool descriptions lack scope/limits (`delegate.whisper` = own roles only; worker cannot run tools; `skill.register` frames every skill as a worker); worker hooks/timeouts not surfaced; Beacon has no `delegate.to_peer`; vps datasource controller rejects auto-recall tasks ("uninterpretable datasource task", 38× today).
-- [ ] R2 `skill-ontology-binding`: `AbstractSkillRecord.ontology_scope`, `SKILL_SCOPE_UNKNOWN` at register, projection vocabulary block, out-of-scope warning on observe — watched-live: a `Project` claim from the repertoire skill is warned.
-- [ ] R4 `skill-invariants` (declarative tier): `Invariant` record, `life.invariants` runner tool, closing step of the skill's procedure, violations → gardening reflex — watched-live: a parentless section is reported and tidied in the same turn.
-- [ ] R3 `skill-procedure-binding`: `procedure_id` on the record, inline `procedure.register` at skill register, seeded plan on projection, `id_from` deterministic ids — watched-live: a piece named twice yields one node.
-- [ ] R5 `lifegraph-reflex-triggers`: trigger records + auto-recall classification hook + `trigger_fired` event — watched-live: "I'm starting the Mendelssohn" projects the repertoire skill with no prose rule.
+- [ ] R2 `skill-ontology-binding`: `AbstractSkillRecord.ontology_scope`, `SKILL_SCOPE_UNKNOWN` at register, projection vocabulary block, out-of-scope warning on observe — **unbuilt (proposed; taken off the watch-live backlog 2026-10-07)** — acceptance once built (watched-live): a `Project` claim from the repertoire skill is warned.
+- [ ] R4 `skill-invariants` (declarative tier): `Invariant` record, `life.invariants` runner tool, closing step of the skill's procedure, violations → gardening reflex — **unbuilt (proposed; taken off the watch-live backlog 2026-10-07)** — acceptance once built (watched-live): a parentless section is reported and tidied in the same turn.
+- [ ] R3 `skill-procedure-binding`: `procedure_id` on the record, inline `procedure.register` at skill register, seeded plan on projection, `id_from` deterministic ids — **unbuilt (proposed; taken off the watch-live backlog 2026-10-07)** — acceptance once built (watched-live): a piece named twice yields one node.
+- [ ] R5 `lifegraph-reflex-triggers`: trigger records + auto-recall classification hook + `trigger_fired` event — **unbuilt (proposed; taken off the watch-live backlog 2026-10-07)** — acceptance once built (watched-live): "I'm starting the Mendelssohn" projects the repertoire skill with no prose rule.
 - [ ] R4b raw-Cypher invariants behind `cypher-guard` — after Graph Doors G1.
 - [ ] Renumber the colliding defect ids in DEFECTS.md (two `DEF-130`, two `DEF-136`) before the next id is taken.
 - [x] Operator cleanup 2026-09-17: removed the two dead vps cron jobs (`069f52a1` workout_reminder, `1a0c3dea` Chronos whisper_practice_update) plus the superseded `ddc5ce66` gardening payload, via a management IPC client on the vps (no `phil` CLI there). Beacon re-registered `ac6e8d5f` (10:30 UTC, full message) and also REMOVED the older named `lifegraph-gardening:vps-jane`. DEF-155 filed for the swallowed delegation refusal.

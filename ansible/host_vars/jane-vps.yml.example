@@ -33,4 +33,4 @@ philotic_agents:
       default_model: "{{ philotic_default_model }}"
 
 # Secrets file rendered separately and never committed.
-# philotic_mesh_psk comes from vault.
+# Mesh auth uses per-peer HMAC keys from the invite handshake; there is no shared PSK.

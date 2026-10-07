@@ -2,9 +2,9 @@
 title: MLX Model Controller
 doc_type: proposal
 domain: tooling-execution
-status: proposed
+status: implemented
 disposition: implemented
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - mlx
 - local-inference
@@ -26,6 +26,10 @@ active_seams:
 ---
 
 # MLX Model Controller
+
+## Disposition
+
+`implemented` (status aligned to the existing `disposition: implemented` on 2026-10-07, watch-live burn-down W2). The runner ships as `crates/mlx-runner`.
 
 ## Goal
 
