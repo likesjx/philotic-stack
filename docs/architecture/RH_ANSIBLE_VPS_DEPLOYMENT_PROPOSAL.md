@@ -149,7 +149,7 @@ Long-term intent is a native VPN built through the hotels themselves. That work 
 |---|---|---|
 | `mesh-config.json` | Rendered by Ansible from `host_vars/<host>.yml` | `/opt/philotic/etc/mesh-config.json` |
 | encrypted vault bootstrap (optional) | Rendered from Ansible vault | `/opt/philotic/etc/vault-bootstrap.json.enc` |
-| `PHILOTIC_MESH_PSK` | Ansible vault / platform secret store | Loaded into the hotel-owned vault or injected through a non-persistent secret-store path |
+| ~~`PHILOTIC_MESH_PSK`~~ | — | Removed 2026-10-07: never read by code; mesh auth is per-peer HMAC from the invite handshake |
 | Telegram bot tokens | Ansible vault per-agent | Stored in the hotel vault or platform secret store, never rendered into plaintext `mesh-config.json` |
 
 ### Secret Handling Rule

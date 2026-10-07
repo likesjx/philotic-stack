@@ -68,7 +68,7 @@ Environment="PHILOTIC_HEAL_DECISIONS_FALLBACK=1"
 Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.db"
 {% endif %}
 
-# Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
+# Hotel secrets (vault master key, provider keys) — rendered from Ansible vault
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
 
 ExecStart={{ philotic_runtime_bin_dir }}/aiua --hotel {{ philotic_hotel_runtime_name }}
