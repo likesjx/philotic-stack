@@ -17676,3 +17676,70 @@ mod delivery_hardening {
         );
     }
 }
+
+/// IPC_DISPATCH_SPLIT rule 4: `handle_client` post-processes a
+/// `ComponentRegistered` response by marking hotel state dirty so peers learn
+/// the new roster. Pin that coupling before the component family moves out of
+/// `ipc/mod.rs`.
+#[tokio::test]
+async fn register_component_marks_hotel_state_dirty() {
+    let _env_guard = ipc_env_guard();
+    let socket_path = test_socket_path();
+    let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+    let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+    let (dirty_tx, mut dirty_rx) = mpsc::channel::<()>(4);
+    let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+        .with_hotel_state_dirty_tx(dirty_tx);
+    let server_task = tokio::spawn(async move {
+        server.run().await.expect("ipc server should run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    unsafe {
+        std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+    }
+
+    let mut client = PhiloticClient::connect(GuestIdentity {
+        guest_id: "philotic-web".into(),
+        role: "operator".into(),
+        supported_tools: Vec::new(),
+    })
+    .await
+    .expect("client connect");
+    assert!(
+        dirty_rx.try_recv().is_err(),
+        "registering a guest connection alone must not mark hotel state dirty"
+    );
+
+    let resp = client
+        .send_request(IpcRequest::RegisterComponent {
+            manifest: ComponentManifest {
+                guest_id: "model-test-01".into(),
+                role: "model.test".into(),
+                hotel: "default".into(),
+                command: "model-test".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                component_config: serde_json::Value::Null,
+                auto_start: false,
+            },
+        })
+        .await
+        .expect("register component");
+    assert!(
+        matches!(resp, IpcResponse::ComponentRegistered { .. }),
+        "expected ComponentRegistered, got {resp:?}"
+    );
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), dirty_rx.recv())
+        .await
+        .expect("ComponentRegistered must mark hotel state dirty")
+        .expect("dirty channel open");
+
+    unsafe {
+        std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+    }
+    server_task.abort();
+    let _ = server_task.await;
+    if std::path::Path::new(&socket_path).exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
+}
