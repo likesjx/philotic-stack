@@ -19,10 +19,10 @@
 //! # Mesh trap (load-bearing) — no local opt-in flag here
 //!
 //! Like Memory Transparency Slice M4's hygiene sweep
-//! (`crate::memory_hygiene`), `CronJobSync` replicates a hotel's `CronJob`
-//! *definitions* to every mesh-connected peer unconditionally
-//! (`handle_cron_job_sync` in `aiua::main` upserts without checking any
-//! local flag). M4 handles this with a *local opt-in* re-check
+//! (`crate::memory_hygiene`), a hotel can hold another hotel's `CronJob`
+//! *definition* (originally via `CronJobSync` replication, which never ran
+//! and was deleted under DEF-184 option (a); still via a copied or restored
+//! context DB). M4 handles this with a *local opt-in* re-check
 //! (`enabled_locally`) because that sweep itself is optional per hotel.
 //!
 //! This sweep is different: it is **always-on** — there is no operator
