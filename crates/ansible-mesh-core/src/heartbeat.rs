@@ -25,7 +25,40 @@ const MAX_SYNC_PAYLOAD_BYTES: usize = 900;
 /// ACTIVE [`crate::WireEncoding`] — once senders flip to base64 (see
 /// `PHILOTIC_BEACON_PAYLOAD_B64`) the same budget fits ~3-4x more state per
 /// datagram.
-const MAX_HOTEL_STATE_WIRE_BYTES: usize = 9_000;
+pub const MAX_HOTEL_STATE_WIRE_BYTES: usize = 9_000;
+
+/// 75% of [`MAX_HOTEL_STATE_WIRE_BYTES`]: past this the roster is close enough
+/// to the datagram ceiling to alarm (MESH_DELIVERY_GUARANTEES L2, DEF-192).
+pub const HOTEL_STATE_BUDGET_WARN_BYTES: usize = MAX_HOTEL_STATE_WIRE_BYTES * 3 / 4;
+
+/// Heal-queue pattern tag for a roster near or over the datagram budget.
+pub const HOTEL_STATE_BUDGET_TAG: &str = "hotel_state_budget";
+/// Heal-queue pattern tag for a hotel-state broadcast that failed to send.
+pub const HOTEL_STATE_SEND_FAILED_TAG: &str = "hotel_state_send_failed";
+
+/// Wire size of the part of a hotel-state datagram that cannot be chunked:
+/// guests, agents and placement homes ride every datagram, while model
+/// profiles are split across as many as needed. This is what the budget
+/// alarm measures.
+pub fn hotel_state_roster_wire_len(payload: &HotelStateSyncPayload) -> Result<usize> {
+    hotel_state_wire_len(&HotelStateSyncPayload {
+        model_profiles: Vec::new(),
+        ..payload.clone()
+    })
+}
+
+/// Budget level for a roster wire size: `None` under 75% of the ceiling,
+/// `Some("warning")` above it, `Some("critical")` over the ceiling (every
+/// datagram would then fail EMSGSIZE on macOS senders).
+pub fn hotel_state_budget_level(roster_wire_bytes: usize) -> Option<&'static str> {
+    if roster_wire_bytes > MAX_HOTEL_STATE_WIRE_BYTES {
+        Some("critical")
+    } else if roster_wire_bytes > HOTEL_STATE_BUDGET_WARN_BYTES {
+        Some("warning")
+    } else {
+        None
+    }
+}
 
 /// A single peer record included in a [`MeshCatalogSyncPayload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -621,6 +654,32 @@ mod tests {
     /// The binding ceiling is macOS's default `net.inet.udp.maxdgram`, not the
     /// theoretical 65507-byte UDP maximum — Mac hotels send with EMSGSIZE above it.
     const UDP_DATAGRAM_MAX: usize = 9_216;
+
+    #[test]
+    fn hotel_state_budget_alarm_threshold() {
+        assert_eq!(HOTEL_STATE_BUDGET_WARN_BYTES, 6_750);
+        assert_eq!(hotel_state_budget_level(0), None);
+        assert_eq!(hotel_state_budget_level(6_750), None);
+        assert_eq!(hotel_state_budget_level(6_751), Some("warning"));
+        assert_eq!(hotel_state_budget_level(9_000), Some("warning"));
+        assert_eq!(hotel_state_budget_level(9_001), Some("critical"));
+    }
+
+    #[test]
+    fn hotel_state_roster_wire_len_ignores_model_profiles() {
+        // The wire encoding is process-global and other tests switch it, so
+        // pin it for both measurements.
+        with_wire_encoding(WireEncoding::Base64, || {
+            let small = hotel_state_payload(1);
+            let large = hotel_state_payload(40);
+            assert_eq!(small.guests.len(), large.guests.len());
+            assert_eq!(
+                hotel_state_roster_wire_len(&large).expect("encode"),
+                hotel_state_roster_wire_len(&small).expect("encode"),
+                "profiles are chunked, so they must not count against the roster budget"
+            );
+        });
+    }
 
     #[test]
     fn hotel_state_single_datagram_when_small() {
