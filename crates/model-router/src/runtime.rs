@@ -2888,6 +2888,10 @@ mod openrouter_default_tests {
 }
 
 #[cfg(test)]
+#[path = "context_ipc_contract_tests.rs"]
+mod context_ipc_contract_tests;
+
+#[cfg(test)]
 mod context_dispatch_tests {
     use super::*;
     use crate::providers::OpenAIProvider;
