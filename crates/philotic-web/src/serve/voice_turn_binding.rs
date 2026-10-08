@@ -1,10 +1,22 @@
 //! Admission seam for authenticated voice cancellation.
 //!
-//! Deliberately not installed in the edge handler: the hotel must first provide
-//! authenticated cancellation through to provider generation. Never advertise
+//! The ledger is installed for correlated edge submissions, but its runtime
+//! cancellation adapter is absent pending trusted hotel authority. Never advertise
 //! `turn_cancel_v1` merely because this ledger can suppress outgoing audio.
 
 use std::collections::HashMap;
+use std::{future::Future, pin::Pin};
+
+/// Install only from the server-owned runtime composition root after verified
+/// IPC authority exists. Resolving this binding must not trust GuestIdentity or
+/// task JSON. Success means generation/retry/publication cancellation completed;
+/// committed tool effects are outside this interface.
+pub(super) trait RuntimeTurnCancellation: Send + Sync {
+    fn cancel<'a>(
+        &'a self,
+        binding: &'a TurnBinding,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
 
 /// Construct only from the edge's verified device session, never payload JSON.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +52,14 @@ pub(super) struct TurnBindings {
 }
 
 impl TurnBindings {
+    /// Untracked legacy events remain compatible. A known revoked/finished turn
+    /// cannot publish even when it was already queued before cancellation.
+    pub fn may_publish_turn(&self, device: &str, turn: &str) -> bool {
+        self.entries
+            .values()
+            .find(|(binding, _)| binding.device == device && binding.turn == turn)
+            .is_none_or(|(_, phase)| *phase == Phase::Accepted)
+    }
     pub fn new(per_device_limit: usize) -> Self {
         Self {
             entries: HashMap::new(),

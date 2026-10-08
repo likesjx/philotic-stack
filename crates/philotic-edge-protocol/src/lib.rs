@@ -89,6 +89,9 @@ pub enum EdgeMessage {
     Hello(EdgeHello),
     /// Server -> client: accepts the hello and opens the session.
     HelloAck {
+        /// Negotiated capabilities; absence preserves legacy behavior.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
         /// Server-assigned session identifier.
         session_id: String,
         /// Opaque cursor the replay starts from, if any replay occurs.
@@ -97,6 +100,9 @@ pub enum EdgeMessage {
     },
     /// Client -> server: submit an operator/agent turn to a target agent.
     TurnSubmit {
+        /// Client correlation only; never grants authorization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         /// Hotel node that hosts the target agent.
         target_node_id: String,
         /// Agent (guest) the turn is addressed to.
@@ -115,6 +121,16 @@ pub enum EdgeMessage {
         /// `voice_response_policy` (persona TTS). Absent = plain text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_kind: Option<String>,
+    },
+    /// Client -> server: cancel a bound turn, only with turn_cancel_v1.
+    /// Identity comes from the verified connection, never these fields.
+    TurnCancel {
+        target_node_id: String,
+        target_agent_id: String,
+        conversation_id: String,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     /// Client -> server: open an uplink audio stream bound to a target
     /// agent. Chunks follow as `AudioChunk`; `AudioStreamEnd` seals the
@@ -197,6 +213,9 @@ pub enum EdgeMessage {
     },
     /// Server -> client: streamed turn output and status.
     TurnEvent {
+        /// Client correlation only; never grants authorization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         /// Conversation this event belongs to.
         conversation_id: String,
         /// What kind of event this is.
@@ -423,10 +442,12 @@ mod tests {
     #[test]
     fn round_trip_hello_ack() {
         round_trip(EdgeMessage::HelloAck {
+            features: vec![],
             session_id: "sess-1".to_string(),
             replay_from: Some("cur-opaque-42".to_string()),
         });
         round_trip(EdgeMessage::HelloAck {
+            features: vec![],
             session_id: "sess-1".to_string(),
             replay_from: None,
         });
@@ -435,6 +456,7 @@ mod tests {
     #[test]
     fn round_trip_turn_submit() {
         round_trip(EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: "mbp-jane".to_string(),
             target_agent_id: "jane".to_string(),
             conversation_id: Some("conv-9".to_string()),
@@ -447,12 +469,35 @@ mod tests {
             message_kind: Some("voice".to_string()),
         });
         round_trip(EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: "mbp-jane".to_string(),
             target_agent_id: "jane".to_string(),
             conversation_id: None,
             content: "hello".to_string(),
             blob_refs: vec![],
             message_kind: None,
+        });
+    }
+
+    #[test]
+    fn correlated_voice_wire_contract_matches_swift() {
+        let cancel = r#"{"v":1,"seq":7,"msg":{"type":"turn_cancel","target_node_id":"hotel","target_agent_id":"philote","conversation_id":"conv","request_id":"request"}}"#;
+        let decoded: EdgeEnvelope = serde_json::from_str(cancel).unwrap();
+        assert!(matches!(
+            decoded.msg,
+            EdgeMessage::TurnCancel { turn_id: None, .. }
+        ));
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), cancel);
+        let accepted = r#"{"v":1,"seq":8,"msg":{"type":"turn_event","request_id":"request","conversation_id":"conv","event_kind":"status","content":"accepted","turn_id":"turn"}}"#;
+        let decoded: EdgeEnvelope = serde_json::from_str(accepted).unwrap();
+        assert!(
+            matches!(&decoded.msg, EdgeMessage::TurnEvent { request_id: Some(id), .. } if id == "request")
+        );
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), accepted);
+        round_trip(EdgeMessage::HelloAck {
+            features: vec!["turn_cancel_v1".into()],
+            session_id: "session".into(),
+            replay_from: None,
         });
     }
 
@@ -601,6 +646,7 @@ mod tests {
             TurnEventKind::Error,
         ] {
             round_trip(EdgeMessage::TurnEvent {
+                request_id: None,
                 conversation_id: "conv-9".to_string(),
                 event_kind: kind,
                 content: "chunk".to_string(),
@@ -762,6 +808,7 @@ mod tests {
             2,
             None,
             EdgeMessage::TurnSubmit {
+                request_id: None,
                 target_node_id: "mbp-jane".to_string(),
                 target_agent_id: "jane".to_string(),
                 conversation_id: Some("conv-9".to_string()),
@@ -793,6 +840,7 @@ mod tests {
             3,
             None,
             EdgeMessage::TurnSubmit {
+                request_id: None,
                 target_node_id: "mbp-jane".to_string(),
                 target_agent_id: "jane".to_string(),
                 conversation_id: None,
@@ -913,6 +961,7 @@ mod tests {
             12,
             Some(5),
             EdgeMessage::TurnEvent {
+                request_id: None,
                 conversation_id: "conv-9".to_string(),
                 event_kind: TurnEventKind::Token,
                 content: "Hel".to_string(),

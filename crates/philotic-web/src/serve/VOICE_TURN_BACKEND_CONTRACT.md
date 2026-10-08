@@ -1,9 +1,29 @@
 # Voice turn backend admission seam
 
-This patch provides a bounded, authenticated-device turn-binding ledger and
-source tests. It is not wired into the WebSocket handler and does not advertise
-`turn_cancel_v1`. It does not echo accepted `request_id` yet. Neither relay abort
-nor outgoing chunk suppression is evidence of provider generation cancellation.
+The initial ledger checkpoint (`9da6ba37`) was uninstalled. The follow-up installs
+correlated edge admission and echoes accepted `request_id`/canonical `turn_id`
+before spawning the reply relay. Request IDs are validated and reserved before
+IPC validation; correlated validation runs in a separate task so the socket can
+receive a pre-accept cancel. Duplicate IDs cannot dispatch a second turn.
+
+Server-owned connection handles fence superseded sockets before submit/cancel and are rechecked before pending acceptance. This uses the verified edge session only; it does not authenticate a hotel agent. HelloAck advertises no features by default. `RuntimeTurnCancellation` is an
+in-process adapter seam, present only in synthetic tests. `TurnCancel` otherwise
+returns `turn_cancel_unavailable`. When a verified adapter is installed, exact
+verified-device/request/target/conversation/optional-turn admission revokes the
+ledger before invoking the adapter. Failure remains revoked and reports failure.
+Its success contract requires pending/retry/active generation cancellation, not
+merely aborting the web relay. No production implementation exists yet.
+
+Cancelled audio/text is filtered before retention, live delivery and replay.
+Reply metadata cannot replace the relay's canonical conversation/session/turn;
+present mismatched or malformed IDs are dropped. These are correlation barriers,
+not authenticated agent provenance. Bytes already admitted to a socket send
+cannot be recalled; the client turn gate rejects stale playback independently.
+
+The bounded ledger currently rejects after 256 unique correlated requests per
+device in the process lifetime, including tombstones. It does not evict/reuse
+revoked IDs. Production authority installation must define session expiry and
+safe ledger cleanup before treating this checkpoint as an unrestricted release.
 
 Production installation requires these interfaces, coordinated by the parent:
 
@@ -43,9 +63,15 @@ dirty login fencing in `serve.rs`; no files in that worktree were edited. The
 privacy owner retains core/model-router/IPC authority work. Apple client code is
 in the preceding isolated commits c4c3ff4d and 46f871d2.
 
-Verification: compile the ledger with a wrapper module using `rustc --test` and
-execute its tests. These establish admission state transitions only; they do not
-establish WebSocket ordering, actual runtime/provider cancellation, privacy
-authority installation, simulator audio routing, device AEC or live ElevenLabs.
-ElevenLabs stays unavailable pending trusted dispatch; macOS AEC still requires
-a shared duplex audio engine. iOS duplex configuration is in the client slice.
+Verification: 30 protocol tests (legacy fixtures unchanged), 29 edge unit tests,
+five ledger unit tests and all 11 fake-hotel loopback WebSocket tests pass. Mock
+adapter tests cover cancellation before acceptance, wrong device/target/agent/
+conversation/turn, adapter failure, queued/replayed stale output and a running
+synthetic job whose committed tool effect survives cancellation. These do not
+establish real hotel/philote/provider cancellation, privacy authority installation,
+physical-device audio, macOS AEC or live ElevenLabs. The existing client slice
+verification remains unchanged. No external provider traffic or microphone use.
+
+ElevenLabs profile preparation is described in [the profile handoff](ELEVENLABS_PROFILE_HANDOFF.md).
+The guarded registry and verified dispatch context remain the only supported
+privacy seam; no second trust mechanism or client eligibility flag was added.

@@ -63,7 +63,7 @@ This is not the place for full design arguments. For those, follow the linked pr
 
 ## Apple voice source checkpoint — 2026-10-08
 
-Isolated Apple client commits `c4c3ff4d`/`46f871d2` implement local recognition, playback lifecycle guards, iOS duplex configuration and correlated voice controls. Backend `9da6ba37` adds an uninstalled binding ledger. This is test-green source evidence, not deployed complete voice. Accepted request_id echo, provider cancellation, trusted privacy authority, ElevenLabs eligibility and macOS AEC remain open. Hotel registration identity is caller-supplied; verified authority must span IPC parked delivery and model dispatch before those capabilities activate. [Disposition and verification](VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08); [owner tasks](../task.md#apple-voice-privacy-and-cancellation).
+Isolated Apple client commits `c4c3ff4d`/`46f871d2` implement local recognition, playback lifecycle guards, iOS duplex configuration and correlated voice controls. Backend checkpoint `9da6ba37` adds the ledger; the follow-up wires correlated acceptance before generation and mock-tested cancellation admission/delivery barriers, with no production runtime adapter. This is test-green source evidence, not deployed complete voice. Provider cancellation, trusted privacy authority, session-ledger cleanup, ElevenLabs eligibility and macOS AEC remain open. Hotel registration identity is caller-supplied; verified authority must span IPC parked delivery and model dispatch before those capabilities activate. [Disposition and verification](VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08); [owner tasks](../task.md#apple-voice-privacy-and-cancellation).
 
 ## How To Read This
 

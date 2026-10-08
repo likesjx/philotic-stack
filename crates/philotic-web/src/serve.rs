@@ -3235,6 +3235,38 @@ async fn submit_operator_chat_turn(
     message_kind: Option<String>,
     attachments: Vec<Value>,
 ) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError> {
+    submit_operator_chat_turn_with_accept(
+        state,
+        target_node_id,
+        agent_id,
+        operator_session_id,
+        conversation_id,
+        content,
+        message_kind,
+        attachments,
+        None,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Acceptance callback runs before generation starts. Edge uses it to retain
+/// the correlated accepted event, eliminating accepted/output ordering races.
+async fn submit_operator_chat_turn_with_accept<F>(
+    state: &AppState,
+    target_node_id: &str,
+    agent_id: &str,
+    operator_session_id: &str,
+    conversation_id: String,
+    content: String,
+    message_kind: Option<String>,
+    attachments: Vec<Value>,
+    reserved_turn_id: Option<String>,
+    on_accepted: F,
+) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError>
+where
+    F: FnOnce(&OperatorChatAcceptedView) -> Result<(), OperatorChatSubmitError>,
+{
     let targets = ipc_desktop_membrane_targets(&state.socket)
         .await
         .map_err(|err| OperatorChatSubmitError {
@@ -3261,7 +3293,7 @@ async fn submit_operator_chat_turn(
     let local_node_id = local_target.target_node_id.clone();
 
     let session_id = scoped_operator_session_id(operator_session_id, &conversation_id);
-    let turn_id = new_operator_chat_id("operator-chat-turn");
+    let turn_id = reserved_turn_id.unwrap_or_else(|| new_operator_chat_id("operator-chat-turn"));
     let accepted = OperatorChatAcceptedView {
         accepted: true,
         target_node_id: target_node_id.to_string(),
@@ -3276,6 +3308,8 @@ async fn submit_operator_chat_turn(
             "router-routed".into()
         },
     };
+
+    on_accepted(&accepted)?;
 
     let tx = state.tx.clone();
     let socket = state.socket.as_ref().clone();
@@ -3341,6 +3375,28 @@ async fn handle_event_log(
         )
             .into_response(),
     }
+}
+
+/// Reply metadata can confirm this relay's canonical binding, never replace it.
+/// Missing fields preserve legacy replies; present malformed/mismatched IDs deny.
+/// This is correlation filtering, not authenticated IPC provenance.
+fn operator_reply_matches_turn(
+    payload: &Value,
+    conversation: &str,
+    session: &str,
+    turn: &str,
+) -> bool {
+    [
+        ("chat_id", conversation),
+        ("session_id", session),
+        ("turn_id", turn),
+    ]
+    .iter()
+    .all(|(key, expected)| {
+        payload
+            .get(*key)
+            .is_none_or(|value| value.as_str() == Some(*expected))
+    })
 }
 
 async fn stream_operator_chat_turn(
@@ -3428,6 +3484,9 @@ async fn stream_operator_chat_turn(
             continue;
         };
         let payload: Value = serde_json::from_str(&task_json)?;
+        if !operator_reply_matches_turn(&payload, &conversation_id, &session_id, &turn_id) {
+            continue;
+        }
         let action = payload
             .get("action")
             .and_then(Value::as_str)
@@ -3441,9 +3500,9 @@ async fn stream_operator_chat_turn(
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "event": payload.get("event").and_then(Value::as_str).unwrap_or("unknown")
                         }
                     })
@@ -3458,9 +3517,9 @@ async fn stream_operator_chat_turn(
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
                         }
                     })
@@ -3475,9 +3534,9 @@ async fn stream_operator_chat_turn(
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
                             "audio_artifact": payload.get("audio_artifact").cloned().unwrap_or(Value::Null),
                             "chunk_seq": payload.get("chunk_seq").cloned().unwrap_or(Value::Null),
@@ -3495,9 +3554,9 @@ async fn stream_operator_chat_turn(
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "reply_action": action,
                             "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
                             // Synthesized persona-voice replies ride the same
@@ -3519,9 +3578,9 @@ async fn stream_operator_chat_turn(
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "action": other,
                             "payload": payload
                         }
