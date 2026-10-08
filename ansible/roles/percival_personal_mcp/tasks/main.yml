@@ -1,0 +1,188 @@
+---
+- name: Scoped rollout only when explicitly enabled
+  when: percival_enabled | bool
+  block:
+    - name: Require reviewed nonsecret rollout inputs
+      ansible.builtin.assert:
+        that:
+          - percival_gateway_user == 'percival-gateway'
+          - percival_gateway_uid is integer
+          - percival_gateway_uid > 0
+          - percival_gateway_uid != percival_hotel_uid
+          - percival_hotel_uid == 999
+          - percival_source_dir is match('^/')
+          - percival_source_commit is match('^[0-9a-f]{40}$')
+          - percival_hotel_sha256 is match('^[0-9a-f]{64}$')
+          - percival_secret_ref is match('^secret://hotel/default/percival-muninn-observe/[A-Za-z0-9_-]+$')
+          - percival_introspection_secret_ref is match('^secret://hotel/default/percival-issuer-introspection/[A-Za-z0-9_-]+$')
+          - percival_gateway_config.issuer.clientSecret is not defined
+          - percival_gateway_config.issuer.clientSecretEnv is not defined
+          - percival_gateway_config.issuer.credentialBrokerSocketPath == '/run/percival-personal-vault-broker.sock'
+          - percival_gateway_config.upstreams.muninn_recall.credentialBrokerSocketPath == '/run/percival-personal-vault-broker.sock'
+          - percival_gateway_config.muninnVault == 'percival_connection_test'
+          - percival_gateway_config.enabledTools == ['muninn_recall']
+          - percival_gateway_config.upstreams.muninn_recall.credentialEnv is not defined
+          - percival_gateway_config.upstreams.muninn_recall.credentialSecretRef is not defined
+          - percival_gateway_config.upstreams.muninn_recall.credentialSecretRefFile is not defined
+          - percival_source_sha256.keys() | list | sort == ['gateway.mjs', 'package.json', 'server.mjs', 'vault.mjs']
+        fail_msg: Supply the approved artifact, free UID, public config and two already vaulted credential references.
+    - name: Hash the four approved nonsecret gateway source files on controller
+      ansible.builtin.stat:
+        path: '{{ percival_source_dir }}/{{ item }}'
+        checksum_algorithm: sha256
+        follow: false
+      delegate_to: localhost
+      become: false
+      loop: [server.mjs, gateway.mjs, vault.mjs, package.json]
+      register: percival_source_files
+    - name: Require exact reviewed source file hashes
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - percival_source_sha256[item.item] is match('^[0-9a-f]{64}$')
+          - item.stat.checksum | default('') == percival_source_sha256[item.item]
+      loop: '{{ percival_source_files.results }}'
+    - name: Check installed hotel artifact before enabling its socket
+      ansible.builtin.stat:
+        path: '{{ percival_hotel_binary }}'
+        checksum_algorithm: sha256
+      register: percival_hotel_artifact
+    - name: Require the reviewed hotel build
+      ansible.builtin.assert:
+        that:
+          - percival_hotel_artifact.stat.executable | default(false)
+          - percival_hotel_artifact.stat.checksum | default('') == percival_hotel_sha256
+    - name: Inspect UID ownership without altering existing accounts
+      ansible.builtin.getent:
+        database: passwd
+        key: '{{ percival_gateway_uid | string }}'
+        fail_key: false
+      register: percival_uid_owner
+    - name: Reject a UID owned by another account
+      ansible.builtin.assert:
+        that:
+          - (percival_uid_owner.ansible_facts.getent_passwd.keys() | list | difference([percival_gateway_user, percival_gateway_uid | string]) | length) == 0
+    - name: Inspect gateway account if it exists
+      ansible.builtin.getent:
+        database: passwd
+        key: '{{ percival_gateway_user }}'
+        fail_key: false
+      register: percival_named_owner
+    - name: Never migrate an existing gateway account UID
+      ansible.builtin.assert:
+        that:
+          - percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user] == none or (percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][1] | int == percival_gateway_uid)
+    - name: Create isolated gateway group
+      ansible.builtin.getent:
+        database: group
+        key: '{{ percival_gateway_uid | string }}'
+        fail_key: false
+      register: percival_gid_owner
+    - name: Reject a GID owned by another group
+      ansible.builtin.assert:
+        that:
+          - (percival_gid_owner.ansible_facts.getent_group.keys() | list | difference([percival_gateway_user, percival_gateway_uid | string]) | length) == 0
+    - name: Inspect gateway group if it exists
+      ansible.builtin.getent:
+        database: group
+        key: '{{ percival_gateway_user }}'
+        fail_key: false
+      register: percival_named_group
+    - name: Never migrate an existing gateway group GID
+      ansible.builtin.assert:
+        that:
+          - percival_named_group.ansible_facts.getent_group[percival_gateway_user] == none or (percival_named_group.ansible_facts.getent_group[percival_gateway_user][1] | int == percival_gateway_uid)
+    - name: Inspect existing group membership before account creation
+      ansible.builtin.getent:
+        database: group
+      register: percival_groups
+    - name: Reject an unexpected existing gateway identity
+      ansible.builtin.assert:
+        that:
+          - percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user] == none or (percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][2] | int == percival_gateway_uid and percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][5] == '/usr/sbin/nologin')
+          - item.key == percival_gateway_user or percival_gateway_user not in (item.value[2].split(',') if item.value[2] else [])
+      loop: '{{ percival_groups.ansible_facts.getent_group | dict2items }}'
+    - name: Create isolated gateway group with verified GID
+      ansible.builtin.group:
+        name: '{{ percival_gateway_user }}'
+        gid: '{{ percival_gateway_uid }}'
+        system: true
+    - name: Create isolated gateway account
+      when: percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user] == none
+      ansible.builtin.user:
+        name: '{{ percival_gateway_user }}'
+        uid: '{{ percival_gateway_uid }}'
+        group: '{{ percival_gateway_user }}'
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+    - name: Create root-owned gateway and policy directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /opt/percival-personal-mcp
+        - '/opt/percival-personal-mcp/{{ percival_source_commit }}'
+        - /etc/percival-personal-mcp
+        - /etc/systemd/system/philotic-hotel.service.d
+    - name: Install only the gateway runtime source files
+      ansible.builtin.copy:
+        src: '{{ percival_source_dir }}/{{ item }}'
+        dest: '/opt/percival-personal-mcp/{{ percival_source_commit }}/{{ item }}'
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [server.mjs, gateway.mjs, vault.mjs, package.json]
+      notify: Restart scoped gateway
+    - name: Select the reviewed gateway release
+      ansible.builtin.file:
+        src: '/opt/percival-personal-mcp/{{ percival_source_commit }}'
+        dest: /opt/percival-personal-mcp/current
+        state: link
+        owner: root
+        group: root
+      notify: Restart scoped gateway
+    - name: Write public gateway configuration without credential values
+      ansible.builtin.copy:
+        content: '{{ percival_gateway_config | to_nice_json }}'
+        dest: /etc/percival-personal-mcp/gateway.json
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart scoped gateway
+    - name: Render the two fixed vault references and numeric peer identity
+      ansible.builtin.template:
+        src: scoped-vault-policy.json.j2
+        dest: /etc/percival-personal-mcp/scoped-vault-policy.json
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart scoped hotel
+    - name: Install additive units preserving existing hotel drop-ins
+      ansible.builtin.copy:
+        src: '{{ role_path }}/../../../services/personal-mcp/deploy/{{ item.source }}'
+        dest: '{{ item.destination }}'
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - {source: percival-personal-mcp.service, destination: /etc/systemd/system/percival-personal-mcp.service}
+        - {source: percival-personal-vault.socket, destination: /etc/systemd/system/percival-personal-vault.socket}
+        - {source: philotic-hotel-scoped-vault.conf, destination: /etc/systemd/system/philotic-hotel.service.d/percival-scoped-vault.conf}
+      notify:
+        - Reload scoped systemd units
+        - Start scoped vault socket
+        - Restart scoped hotel
+        - Restart scoped gateway
+    - name: Apply supervisor changes in socket-before-hotel order
+      ansible.builtin.meta: flush_handlers
+    - name: Enable scoped gateway and socket after ordered activation
+      ansible.builtin.systemd_service:
+        name: '{{ item }}'
+        enabled: true
+        state: started
+      loop: [percival-personal-vault.socket, percival-personal-mcp.service]

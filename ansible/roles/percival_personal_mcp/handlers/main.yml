@@ -1,0 +1,17 @@
+---
+# Definition order is deliberate: FD exists before the hotel's new exec.
+- name: Reload scoped systemd units
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+- name: Start scoped vault socket
+  ansible.builtin.systemd_service:
+    name: percival-personal-vault.socket
+    state: started
+- name: Restart scoped hotel
+  ansible.builtin.systemd_service:
+    name: philotic-hotel.service
+    state: restarted
+- name: Restart scoped gateway
+  ansible.builtin.systemd_service:
+    name: percival-personal-mcp.service
+    state: restarted

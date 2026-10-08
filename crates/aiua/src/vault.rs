@@ -139,9 +139,35 @@ pub fn resolve_secret(
     secret_ref: &str,
     access: &SecretAccess,
 ) -> Result<Option<String>> {
+    resolve_secret_with_acl(graph, secret_ref, access, false)
+}
+
+/// Narrow hotel endpoints require singleton ACLs. Check and decrypt the same
+/// fetched record: a second lookup would race concurrent ACL/secret replacement.
+pub fn resolve_secret_exact_acl(
+    graph: &GraphDomain,
+    secret_ref: &str,
+    access: &SecretAccess,
+) -> Result<Option<String>> {
+    resolve_secret_with_acl(graph, secret_ref, access, true)
+}
+
+fn resolve_secret_with_acl(
+    graph: &GraphDomain,
+    secret_ref: &str,
+    access: &SecretAccess,
+    exact_acl: bool,
+) -> Result<Option<String>> {
     let Some(secret) = graph.get_secret(secret_ref)? else {
         return Ok(None);
     };
+
+    if exact_acl
+        && (secret.allowed_roles != [access.role.as_str()]
+            || secret.allowed_guests != [access.guest_id.as_str()])
+    {
+        bail!("credential_unavailable");
+    }
 
     if !secret.allowed_roles.is_empty()
         && !secret.allowed_roles.iter().any(|role| role == &access.role)

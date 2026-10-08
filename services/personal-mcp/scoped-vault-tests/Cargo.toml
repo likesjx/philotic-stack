@@ -1,0 +1,28 @@
+[package]
+name = "percival-scoped-vault-tests"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[dependencies]
+libc = "0.2"
+anyhow = "1"
+aes-gcm = { version = "0.10", features = ["std"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "stuck-storage-fixture"
+path = "stuck_storage_fixture.rs"
+
+[[bin]]
+name = "linux-listener-fixture"
+path = "linux_listener_fixture.rs"
+
+[[bin]]
+name = "activation-exec-fixture"
+path = "activation_exec_fixture.rs"
