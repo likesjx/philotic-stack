@@ -66,13 +66,13 @@
 //! daily budget, ProposalOnly-is-the-action posture — mirrors Slice A3's
 //! `fleet.heal_slices` heal-work-item filing).
 //!
-//! **Mesh note:** `CronJobSync` replicates a hotel's `CronJob` *definitions*
-//! to every mesh-connected peer unconditionally (see `handle_cron_job_sync`
-//! in `aiua::main`) — job registration is not itself a per-hotel opt-in once
-//! a mesh is involved. `CronTicker` re-checks each hotel's own
-//! `PHILOTIC_MEMORY_HYGIENE_ENABLED` at fire time
+//! **Mesh note:** job registration alone is not a per-hotel opt-in: a
+//! `CronJob` record can reach a hotel that never opted in (the never-live
+//! `CronJobSync` replication was deleted under DEF-184 option (a), but a
+//! copied or restored context DB still carries jobs). `CronTicker` re-checks
+//! each hotel's own `PHILOTIC_MEMORY_HYGIENE_ENABLED` at fire time
 //! (`MemoryHygieneCronContext::enabled_locally`) so one hotel opting in never
-//! silently sweeps its peers.
+//! silently sweeps another.
 
 use std::collections::HashSet;
 

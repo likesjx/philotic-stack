@@ -157,8 +157,6 @@ impl IpcServer {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_register_cron_job(
         mut job: CronJob,
-        local_node_id: &str,
-        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &GraphDomain,
         current_identity: &mut Option<GuestIdentity>,
     ) -> IpcResponse {
@@ -232,13 +230,10 @@ impl IpcServer {
         job.session_target = ansible_mesh_core::cron::CronSessionTarget::Isolated;
         info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
         match graph.upsert_cron_job(&job) {
-            Ok(_) => {
-                Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
-                IpcResponse::success(
-                    "register_cron_job",
-                    Some(serde_json::json!({ "job_id": job.id })),
-                )
-            }
+            Ok(_) => IpcResponse::success(
+                "register_cron_job",
+                Some(serde_json::json!({ "job_id": job.id })),
+            ),
             Err(e) => IpcResponse::Error(format!("RegisterCronJob failed: {e}")),
         }
     }
@@ -246,8 +241,6 @@ impl IpcServer {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_remove_cron_job(
         job_id: CronJobId,
-        local_node_id: &str,
-        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &GraphDomain,
         current_identity: &mut Option<GuestIdentity>,
     ) -> IpcResponse {
@@ -258,10 +251,7 @@ impl IpcServer {
             return refusal;
         }
         match graph.remove_cron_job(&job_id) {
-            Ok(_) => {
-                Self::broadcast_cron_sync_remove(dispatcher_tx, local_node_id, &job_id).await;
-                IpcResponse::success("remove_cron_job", None)
-            }
+            Ok(_) => IpcResponse::success("remove_cron_job", None),
             Err(e) => IpcResponse::Error(format!("RemoveCronJob failed: {e}")),
         }
     }
@@ -287,8 +277,6 @@ impl IpcServer {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_enable_cron_job(
         job_id: CronJobId,
-        local_node_id: &str,
-        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &GraphDomain,
         current_identity: &mut Option<GuestIdentity>,
     ) -> IpcResponse {
@@ -299,10 +287,7 @@ impl IpcServer {
                 }
                 job.enabled = true;
                 match graph.upsert_cron_job(&job) {
-                    Ok(_) => {
-                        Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
-                        IpcResponse::success("enable_cron_job", None)
-                    }
+                    Ok(_) => IpcResponse::success("enable_cron_job", None),
                     Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
                 }
             }
@@ -314,8 +299,6 @@ impl IpcServer {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_disable_cron_job(
         job_id: CronJobId,
-        local_node_id: &str,
-        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &GraphDomain,
         current_identity: &mut Option<GuestIdentity>,
     ) -> IpcResponse {
@@ -326,10 +309,7 @@ impl IpcServer {
                 }
                 job.enabled = false;
                 match graph.upsert_cron_job(&job) {
-                    Ok(_) => {
-                        Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
-                        IpcResponse::success("disable_cron_job", None)
-                    }
+                    Ok(_) => IpcResponse::success("disable_cron_job", None),
                     Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
                 }
             }

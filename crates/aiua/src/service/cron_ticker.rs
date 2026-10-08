@@ -9,15 +9,18 @@
 //!   (`offset_ms = PHILOTIC_CRON_OFFSET_SECS * 1000`).
 //! - Before firing: checks `last_fired_epoch == Some(next_fire_at)` — if true,
 //!   another hotel already handled this epoch; skip.
-//! - After firing: appends a `CronFired` envelope (broadcast) so peer hotels can
-//!   suppress their offset-delayed fire for the same epoch.
 //! - Recovery scan at startup: guaranteed jobs where `next_fire_at < now` and
 //!   `last_fired_epoch != Some(next_fire_at)` are fired immediately.
 //!
-//! ## Slice 3 (CronJobSync — mesh job propagation)
-//! At startup, all local cron jobs are broadcast as `CronJobSync` upsert events
-//! so that peer hotels replicate the definitions and can participate in
-//! guaranteed firing without requiring a shared config file.
+//! ## Cron is hotel-local (DEF-184)
+//! Slices 2 and 3 once broadcast `CronFired` and `CronJobSync` envelopes so
+//! peers could replicate job definitions and suppress duplicate guaranteed
+//! fires. Those envelopes carried no target node, and hotels do not broadcast,
+//! so the ledger dropped every one: the paths never ran live. They were deleted
+//! (MESH_DELIVERY_GUARANTEES L6, option (a)). The per-hotel fire-time guards
+//! below (`enabled_locally`, own-job-id checks) still stay. A job record can
+//! still reach a hotel that never opted in, for example through a copied or
+//! restored context DB.
 //!
 //! ## Slice 4 (template interpolation)
 //! The `payload` field supports `{timestamp}`, `{iso_timestamp}`, `{job_id}`,
@@ -282,9 +285,6 @@ impl CronTicker {
     pub async fn run(self) {
         info!("CronTicker: started (offset_ms={})", self.offset_ms);
 
-        // Slice 3: advertise local job definitions to mesh peers.
-        self.startup_sync().await;
-
         // Slice 2: fire any missed guaranteed jobs before entering the tick loop.
         self.recovery_scan().await;
 
@@ -321,28 +321,6 @@ impl CronTicker {
                 self.fire(&job, now_ms).await;
             }
         }
-    }
-
-    /// Broadcast all locally-registered cron jobs as `CronJobSync` upsert events
-    /// so that peer hotels replicate the definitions on connect.
-    async fn startup_sync(&self) {
-        let jobs = match self.graph.list_cron_jobs() {
-            Ok(j) => j,
-            Err(e) => {
-                error!("CronTicker: startup_sync failed to list jobs: {e}");
-                return;
-            }
-        };
-
-        if jobs.is_empty() {
-            return;
-        }
-
-        let now_ms = now_ms();
-        for job in &jobs {
-            self.broadcast_cron_job_sync_upsert(job, now_ms).await;
-        }
-        info!("CronTicker: startup_sync broadcast {} job(s)", jobs.len());
     }
 
     /// On startup, fire any guaranteed jobs whose epoch was missed while the
@@ -574,11 +552,6 @@ impl CronTicker {
             job.id, job.target_role, fire_epoch
         );
 
-        // Guaranteed: broadcast CronFired so peer hotels suppress their offset fire.
-        if job.guaranteed {
-            self.broadcast_cron_fired(job, fire_epoch, now_ms).await;
-        }
-
         if let Err(e) = self.advance_schedule(job, fire_epoch) {
             error!(
                 "CronTicker: failed to advance schedule for job {}: {e}",
@@ -686,114 +659,6 @@ impl CronTicker {
             return;
         }
         crate::autonomy_sweep::run_scheduled_sweep(&self.graph, &ctx.hotel_name, now_ms / 1000);
-    }
-
-    async fn broadcast_cron_fired(&self, job: &CronJob, fire_epoch: u64, now_ms: u64) {
-        let payload = serde_json::json!({
-            "job_id": job.id,
-            "fire_epoch": fire_epoch,
-            "fired_by": self.local_node_id,
-        })
-        .to_string();
-
-        let env = EventEnvelope {
-            event_id: Uuid::new_v4(),
-            seq: 0,
-            source_node_id: self.local_node_id.clone(),
-            target_node_id: None,
-            source_agent_id: "cron-ticker".into(),
-            target_agent_id: None,
-            kind: EventKind::CronFired,
-            corr_id: format!("cron-fired:{}:{}", job.id, fire_epoch),
-            attempt: 0,
-            created_at: now_ms,
-            expires_at: None,
-            payload: EventPayload::Inline { data: payload },
-            trace: vec![format!("cron-ticker:{}", job.id)],
-        };
-
-        if let Err(e) = self
-            .dispatcher_tx
-            .send(LedgerCommand::AppendLocal(env))
-            .await
-        {
-            warn!(
-                "CronTicker: failed to broadcast CronFired for job {}: {e}",
-                job.id
-            );
-        }
-    }
-
-    /// Broadcast a `CronJobSync` upsert so peer hotels replicate this job definition.
-    pub(crate) async fn broadcast_cron_job_sync_upsert(&self, job: &CronJob, now_ms: u64) {
-        let payload = serde_json::json!({
-            "op": "upsert",
-            "job": job,
-        })
-        .to_string();
-
-        let env = EventEnvelope {
-            event_id: Uuid::new_v4(),
-            seq: 0,
-            source_node_id: self.local_node_id.clone(),
-            target_node_id: None,
-            source_agent_id: "cron-ticker".into(),
-            target_agent_id: None,
-            kind: EventKind::CronJobSync,
-            corr_id: format!("cron-sync:{}", job.id),
-            attempt: 0,
-            created_at: now_ms,
-            expires_at: None,
-            payload: EventPayload::Inline { data: payload },
-            trace: vec![format!("cron-sync:{}", job.id)],
-        };
-
-        if let Err(e) = self
-            .dispatcher_tx
-            .send(LedgerCommand::AppendLocal(env))
-            .await
-        {
-            warn!(
-                "CronTicker: failed to broadcast CronJobSync upsert for {}: {e}",
-                job.id
-            );
-        }
-    }
-
-    /// Broadcast a `CronJobSync` remove so peer hotels drop this job definition.
-    pub(crate) async fn broadcast_cron_job_sync_remove(&self, job_id: &str, now_ms: u64) {
-        let payload = serde_json::json!({
-            "op": "remove",
-            "job_id": job_id,
-        })
-        .to_string();
-
-        let env = EventEnvelope {
-            event_id: Uuid::new_v4(),
-            seq: 0,
-            source_node_id: self.local_node_id.clone(),
-            target_node_id: None,
-            source_agent_id: "cron-ticker".into(),
-            target_agent_id: None,
-            kind: EventKind::CronJobSync,
-            corr_id: format!("cron-sync-remove:{}", job_id),
-            attempt: 0,
-            created_at: now_ms,
-            expires_at: None,
-            payload: EventPayload::Inline { data: payload },
-            trace: vec![format!("cron-sync-remove:{}", job_id)],
-        };
-
-        if let Err(e) = self
-            .dispatcher_tx
-            .send(LedgerCommand::AppendLocal(env))
-            .await
-        {
-            warn!(
-                "CronTicker: failed to broadcast CronJobSync remove for {}: {e}",
-                job_id
-            );
-        }
     }
 
     fn advance_schedule(&self, job: &CronJob, fire_epoch: u64) -> anyhow::Result<()> {

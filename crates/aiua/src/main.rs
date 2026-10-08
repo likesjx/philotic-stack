@@ -39,7 +39,7 @@ use std::net::{SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 mod architect_charter;
 mod auth;
@@ -1092,140 +1092,6 @@ fn mesh_targets_for_graph(
             (node_id, addr)
         })
         .collect())
-}
-
-/// Handle an inbound `CronFired` broadcast from a peer hotel.
-///
-/// Updates the local `CronJob` record so that this hotel's `CronTicker`
-/// suppresses its staggered-offset fire for the same epoch.
-fn handle_cron_fired_broadcast(graph: &GraphDomain, payload_json: &str) {
-    #[derive(serde::Deserialize)]
-    struct CronFiredPayload {
-        job_id: String,
-        fire_epoch: u64,
-    }
-
-    let parsed: CronFiredPayload = match serde_json::from_str(payload_json) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("handle_cron_fired_broadcast: invalid payload: {e}");
-            return;
-        }
-    };
-
-    match graph.get_cron_job(&parsed.job_id) {
-        Ok(Some(job)) => {
-            // Only update if this epoch is still pending on this hotel.
-            if job.last_fired_epoch == Some(parsed.fire_epoch) {
-                return; // already up-to-date
-            }
-            if job.next_fire_at != parsed.fire_epoch {
-                return; // epoch mismatch — stale or duplicate broadcast
-            }
-            let next =
-                match ansible_mesh_core::cron::next_fire_after(&job.schedule, parsed.fire_epoch) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!(
-                            "handle_cron_fired_broadcast: no next fire for job {}: {e}",
-                            parsed.job_id
-                        );
-                        return;
-                    }
-                };
-            let mut updated = job;
-            updated.last_fired_epoch = Some(parsed.fire_epoch);
-            updated.next_fire_at = next;
-            if let Err(e) = graph.upsert_cron_job(&updated) {
-                warn!(
-                    "handle_cron_fired_broadcast: failed to update job {}: {e}",
-                    parsed.job_id
-                );
-            } else {
-                info!(
-                    "CronFired broadcast applied: job={} epoch={}",
-                    parsed.job_id, parsed.fire_epoch
-                );
-            }
-        }
-        Ok(None) => {
-            debug!(
-                "handle_cron_fired_broadcast: job {} not found locally (ok if not registered here)",
-                parsed.job_id
-            );
-        }
-        Err(e) => {
-            warn!(
-                "handle_cron_fired_broadcast: graph lookup failed for job {}: {e}",
-                parsed.job_id
-            );
-        }
-    }
-}
-
-fn strip_replicated_cron_policy(job: &mut ansible_mesh_core::cron::CronJob) {
-    job.policy = None;
-    if let Ok(serde_json::Value::Object(mut payload)) =
-        serde_json::from_str::<serde_json::Value>(&job.payload)
-    {
-        if payload.remove("preapproved_tools").is_some() {
-            job.payload = serde_json::Value::Object(payload).to_string();
-        }
-    }
-}
-
-/// Handle an inbound `CronJobSync` broadcast from a peer hotel.
-///
-/// Replicates job definitions locally so this hotel can participate in
-/// guaranteed firing without requiring a shared config file.
-fn handle_cron_job_sync(graph: &GraphDomain, payload_json: &str) {
-    #[derive(serde::Deserialize)]
-    struct CronJobSyncPayload {
-        op: String,
-        job: Option<ansible_mesh_core::cron::CronJob>,
-        job_id: Option<String>,
-    }
-
-    let parsed: CronJobSyncPayload = match serde_json::from_str(payload_json) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("handle_cron_job_sync: invalid payload: {e}");
-            return;
-        }
-    };
-
-    match parsed.op.as_str() {
-        "upsert" => {
-            if let Some(mut job) = parsed.job {
-                // Turn policy is operator-owned per hotel: a peer-supplied job
-                // never brings standing tool grants with it (a mesh peer is not
-                // this hotel's operator). Drops both the typed policy and the
-                // legacy payload `preapproved_tools` key.
-                strip_replicated_cron_policy(&mut job);
-                if let Err(e) = graph.upsert_cron_job(&job) {
-                    warn!("handle_cron_job_sync: upsert failed for {}: {e}", job.id);
-                } else {
-                    info!("CronJobSync: replicated upsert for job {}", job.id);
-                }
-            } else {
-                warn!("handle_cron_job_sync: upsert op missing job field");
-            }
-        }
-        "remove" => {
-            if let Some(job_id) = parsed.job_id {
-                if let Err(e) = graph.remove_cron_job(&job_id) {
-                    warn!("handle_cron_job_sync: remove failed for {job_id}: {e}");
-                } else {
-                    info!("CronJobSync: replicated remove for job {job_id}");
-                }
-            } else {
-                warn!("handle_cron_job_sync: remove op missing job_id field");
-            }
-        }
-        other => {
-            warn!("handle_cron_job_sync: unknown op '{other}'");
-        }
-    }
 }
 
 /// Handle an inbound `ProjectedUserIdentitySync` broadcast from a peer hotel.
@@ -8528,8 +8394,8 @@ async fn main() -> Result<()> {
             hotel_name.clone(),
             intel_graph_url,
             // Local-hotel opt-in, re-checked at fire time (not just at
-            // registration): CronJobSync replicates the job definition to
-            // every mesh peer regardless of that peer's own opt-in.
+            // registration): a job record can reach a hotel that never opted
+            // in (see the cron_ticker module docs on DEF-184).
             memory_hygiene::sweep_enabled(|k| std::env::var(k).ok()),
             // A9 Piece 3: lets a fresh hygiene filing push an unresolved
             // pending-outcome breadcrumb into the same heal queue A3 already
@@ -8550,8 +8416,8 @@ async fn main() -> Result<()> {
             // Local-hotel opt-in, re-checked at fire time by job id (not
             // just target_role, unlike memory.hygiene — see
             // `architect_charter.rs`'s "Fire-time re-check" module docs):
-            // CronJobSync replicates a hotel's charter job definition to
-            // every mesh peer regardless of that peer's own opt-in.
+            // a hotel can hold another hotel's charter job definition (see
+            // the cron_ticker module docs on DEF-184).
             architect_charter::charter_enabled(&|k| std::env::var(k).ok())
                 && architect_charter::charter_agent_id(&|k| std::env::var(k).ok()).is_some(),
         );

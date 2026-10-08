@@ -276,6 +276,8 @@ asserts the broadcast first, then move.
    `cron_fire_unserved` and release the claim.
 4. **P-d:** one cron sync envelope builder, or deletion of both if DEF-184
    option (a) is chosen.
+   **Done (2026-10-07):** both builders deleted with DEF-184 option (a)
+   (MESH_DELIVERY_GUARANTEES L6).
 5. **Doc hygiene:** close the stale `DEFECTS.md:465` tech-debt row, and
    refresh `CODEBASE_HEALTH.md` (line counts, test counts, unwrap density:
    4 in production code today).
