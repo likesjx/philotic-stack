@@ -76,3 +76,70 @@ pub(in crate::service) fn handle_apply_surface_messages(
         Some(serde_json::to_value(&record).unwrap_or(serde_json::Value::Null)),
     )
 }
+
+impl IpcServer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_apply_surface_messages(
+        surface_id: Option<String>,
+        messages: Vec<serde_json::Value>,
+        title: Option<String>,
+        session_id: Option<String>,
+        chat_id: Option<String>,
+        transport: Option<String>,
+        local_node_id: &str,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        handle_apply_surface_messages(
+            current_identity.as_ref(),
+            graph,
+            &local_node_id,
+            surface_id,
+            messages,
+            SurfaceAttribution {
+                title,
+                session_id,
+                chat_id,
+                transport,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_get_surface(surface_id: String, graph: &GraphDomain) -> IpcResponse {
+        match graph.get_surface(&surface_id) {
+            Ok(Some(s)) => IpcResponse::success(
+                "get_surface",
+                Some(serde_json::to_value(&s).unwrap_or(serde_json::Value::Null)),
+            ),
+            Ok(None) => IpcResponse::error(
+                "get_surface",
+                "SURFACE_NOT_FOUND",
+                format!("no surface {surface_id}"),
+            ),
+            Err(e) => IpcResponse::error("get_surface", "SURFACE_ERROR", e.to_string()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_list_surfaces(
+        owner_agent_id: Option<String>,
+        session_id: Option<String>,
+        include_deleted: bool,
+        limit: Option<usize>,
+        graph: &GraphDomain,
+    ) -> IpcResponse {
+        match graph.list_surfaces(
+            owner_agent_id.as_deref(),
+            session_id.as_deref(),
+            include_deleted,
+            limit.unwrap_or(50).min(500),
+        ) {
+            Ok(list) => IpcResponse::success(
+                "list_surfaces",
+                Some(serde_json::json!({ "surfaces": list })),
+            ),
+            Err(e) => IpcResponse::error("list_surfaces", "SURFACE_ERROR", e.to_string()),
+        }
+    }
+}

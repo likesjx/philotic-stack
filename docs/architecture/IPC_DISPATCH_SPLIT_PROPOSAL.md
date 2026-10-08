@@ -214,6 +214,23 @@ For the pre-dispatch families, keep the early-return interception in
 `handle_client`. Only the bodies move. The "UNREACHABLE" stub arms in the main
 match (8,448–8,487) stay.
 
+**Status (2026-10-07): done** on `codex/ipc-split-s2`.
+- Already-method families moved as whole methods into `impl IpcServer`
+  blocks: `components` (6), `memory` (4: token self-heal, Muninn probe loop,
+  delta digest), `media_setup` (8: training samples, ASR, vision).
+- Inline arms became `handle_*` methods with one-line delegates: `cron` (6),
+  `surfaces` (3), `hotel_status` (5).
+- **Rule 3 deviation:** the extracted handlers take `current_identity:
+  &mut Option<GuestIdentity>` (the type `process_request` declares), not
+  `Option<&GuestIdentity>`. Changing the type would have meant editing every
+  body. Narrow it per family later, as its own PR.
+- Rule 4: `register_component_marks_hotel_state_dirty` now pins the
+  `ComponentRegistered` → dirty-signal coupling (655 tests).
+- The `FetchMemoryConfig`/`RefreshMemoryConfig`/`HealMemoryToken`
+  interception in `handle_client` is unchanged; only the bodies that were
+  already methods moved.
+- `mod.rs` 15,673 → 14,244 lines; aiua tests 654 → 655.
+
 ### S3 — Self-contained mid-size families (M, about 14 PRs)
 
 `heal_autonomy`, `routing_policy`, `integrations`, `mcp_endpoint`,

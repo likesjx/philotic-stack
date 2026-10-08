@@ -667,14 +667,18 @@ mod tests {
 
     #[test]
     fn hotel_state_roster_wire_len_ignores_model_profiles() {
-        let small = hotel_state_payload(1);
-        let large = hotel_state_payload(40);
-        assert_eq!(small.guests.len(), large.guests.len());
-        assert_eq!(
-            hotel_state_roster_wire_len(&large).expect("encode"),
-            hotel_state_roster_wire_len(&small).expect("encode"),
-            "profiles are chunked, so they must not count against the roster budget"
-        );
+        // The wire encoding is process-global and other tests switch it, so
+        // pin it for both measurements.
+        with_wire_encoding(WireEncoding::Base64, || {
+            let small = hotel_state_payload(1);
+            let large = hotel_state_payload(40);
+            assert_eq!(small.guests.len(), large.guests.len());
+            assert_eq!(
+                hotel_state_roster_wire_len(&large).expect("encode"),
+                hotel_state_roster_wire_len(&small).expect("encode"),
+                "profiles are chunked, so they must not count against the roster budget"
+            );
+        });
     }
 
     #[test]
