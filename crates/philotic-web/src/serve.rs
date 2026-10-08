@@ -98,6 +98,9 @@
 mod cortex;
 pub(crate) mod edge;
 mod surface_routes;
+// Awaiting the authenticated hotel/runtime cancellation adapter; see contract.
+#[allow(dead_code)]
+mod voice_turn_binding;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
