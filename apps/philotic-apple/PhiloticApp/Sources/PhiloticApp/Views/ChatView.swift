@@ -25,6 +25,12 @@ struct ChatView: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal, 12)
                     .padding(.top, 4)
+            } else if let status = session.voiceStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
             }
 
             ScrollViewReader { proxy in
@@ -94,11 +100,11 @@ struct ChatView: View {
         }
         .navigationTitle(session.currentAgent?.displayName ?? "Chat")
         .toolbar {
-            if voice.isPlaying {
+            if voice.hasPendingReplyAudio {
                 ToolbarItem(placement: .automatic) {
-                    Label("Speaking", systemImage: "speaker.wave.2.fill")
-                        .labelStyle(.iconOnly)
-                        .foregroundStyle(.tint)
+                    Button { session.interruptVoiceReply() } label: {
+                        Label("Stop speech", systemImage: "speaker.slash.fill")
+                    }
                 }
             }
         }
@@ -180,6 +186,7 @@ struct ChatView: View {
             Task { await session.sendVoiceMessage(text: trimmed) }
         } else if session.transcribeOnDevice {
             draft = ""
+            session.interruptVoiceReply()
             Task { await voice.startListening() }
         } else {
             Task { await session.startVoiceStreaming() }

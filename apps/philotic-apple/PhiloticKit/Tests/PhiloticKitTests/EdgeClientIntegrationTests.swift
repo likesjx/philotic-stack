@@ -40,7 +40,7 @@ final class EdgeClientIntegrationTests: XCTestCase {
             return
         }
 
-        guard case .helloAck(let sessionId, _) = first else {
+        guard case .helloAck(let sessionId, _, _) = first else {
             XCTFail("expected HelloAck as the first message, got \(first)")
             await client.disconnect()
             return

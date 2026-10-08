@@ -32,6 +32,9 @@ public final class ChatSessionManager {
     public var currentAgent: AgentTarget? {
         didSet {
             guard currentAgent != oldValue else { return }
+            invalidateVoiceOutput()
+            voiceController.stopListening()
+            voiceController.cancelRecording()
             // Both app and companion can change selection. Never expose the old
             // conversation underneath the new recipient while history loads.
             currentConversation = nil
@@ -49,19 +52,40 @@ public final class ChatSessionManager {
     /// Domain state for the Life surface: lens packets from the LifeGraph
     /// read plane plus live `LifeGraphChange` frames (badge + recent list).
     public let lifeGraph = LifeGraphStore()
-    /// User preference: speak every agent reply via fallback/serverside
-    /// audio, even for turns the operator typed rather than spoke.
+    /// User preference: speak every correlated agent reply locally, including
+    /// turns the operator typed rather than dictated.
     /// Persisted directly to `UserDefaults` (not part of `ConnectionSettings`
     /// — it's a local UI preference, not connection config).
     public var speakAllReplies: Bool {
-        didSet { UserDefaults.standard.set(speakAllReplies, forKey: Self.speakAllRepliesDefaultsKey) }
+        didSet {
+            voiceDefaults.set(speakAllReplies, forKey: Self.speakAllRepliesDefaultsKey)
+            if !speakAllReplies { invalidateVoiceOutput() }
+        }
     }
-    /// User preference: transcribe speech on-device (SFSpeechRecognizer
-    /// dictation) and submit text, instead of the default — uploading the
-    /// raw recording for hotel-side transcription. Default OFF.
-    public var transcribeOnDevice: Bool {
-        didSet { UserDefaults.standard.set(transcribeOnDevice, forKey: Self.transcribeOnDeviceDefaultsKey) }
+    /// Local STT is mandatory until trusted source policy is wired to dispatch.
+    /// A legacy UserDefaults preference cannot grant external eligibility.
+    public var transcribeOnDevice: Bool { true }
+    public var speakingProvider: VoiceProviderPreference {
+        didSet {
+            voiceDefaults.set(speakingProvider.rawValue, forKey: Self.speakingProviderDefaultsKey)
+            invalidateVoiceOutput()
+        }
     }
+    public var appleVoiceIdentifier: String {
+        didSet {
+            voiceDefaults.set(appleVoiceIdentifier, forKey: Self.appleVoiceDefaultsKey)
+            invalidateVoiceOutput()
+        }
+    }
+    public private(set) var voiceStatus: String?
+    public private(set) var serverSupportsTurnCancellation = false
+    private var voiceTurnGate = VoiceTurnGate()
+    @ObservationIgnored private var voiceCancellationTask: Task<Void, Never>?
+    private var expectedVoiceTicket: VoiceTurnGate.Ticket?
+    /// Transitional hard denial. Only the trusted privacy adapter may replace
+    /// this boundary; neither user preferences nor server userJSON are grants.
+    private var externalVoiceEligible: Bool { false }
+    public var voiceProviderExplanation: String? { speakingProvider.availabilityExplanation }
     /// True while a recorded voice message is being uploaded + submitted
     /// (HTTP blob fallback path only — used when the WS is not connected).
     public private(set) var isSendingVoice = false
@@ -77,22 +101,22 @@ public final class ChatSessionManager {
     public private(set) var isConversationActive = false
 
     private static let speakAllRepliesDefaultsKey = "com.philotic.apple.speakAllReplies"
-    private static let transcribeOnDeviceDefaultsKey = "com.philotic.apple.transcribeOnDevice"
+    private static let speakingProviderDefaultsKey = "com.philotic.apple.speakingProvider"
+    private static let appleVoiceDefaultsKey = "com.philotic.apple.appleVoice"
 
     private let edgeClient: EdgeClient
     private let endpointSelector: EndpointSelector
     private let conversationStore: ConversationStore
+    @ObservationIgnored private let voiceDefaults: UserDefaults
+    @ObservationIgnored private let turnSender: ((EdgeMessage) async throws -> Void)?
+    @ObservationIgnored private let localSpeaker: ((String, String) -> Void)?
+    @ObservationIgnored private let localSpeechDelayNanoseconds: UInt64
     private var streamTask: Task<Void, Never>?
     private var statePollTask: Task<Void, Never>?
     private var isConnectPending = false
 
-    /// Conversation ids for which the operator's last turn was submitted as
-    /// voice — used to decide whether a Final `TurnEvent` (which always
-    /// arrives, voice or not) should schedule a fallback TTS read-aloud if
-    /// no `VoiceReply` shows up in time.
-    private var voiceExpectedConversations: Set<String> = []
-    /// Pending fallback-TTS timers, keyed by conversation id, so a
-    /// `VoiceReply` (or a new turn) can cancel a stale one.
+    /// Timers retain an exact VoiceTurnGate ticket as well as this history
+    /// key. Neither a late Final nor a conversation match can authorize them.
     private var fallbackTasks: [String: Task<Void, Never>] = [:]
 
     /// Forwards captured audio chunks over the WS while streaming; resolves
@@ -103,11 +127,6 @@ public final class ChatSessionManager {
     /// True when the current capture is the record→HTTP-upload fallback
     /// (WS was not connected when the mic was pressed).
     private var voiceCaptureIsFallback = false
-
-    /// Identity ("conversationId|turnId") of the chunked voice reply whose
-    /// chunks are currently accepted into the playback queue. Chunks keyed
-    /// to anything else (a superseded turn) are dropped.
-    private var activeChunkedReplyKey: String?
 
     /// The "🎤 Voice message" placeholder bubble of the most recent streamed
     /// voice turn, so a late `transcript_partial(is_final:true)` (it usually
@@ -129,10 +148,6 @@ public final class ChatSessionManager {
     private var conversationStreamId: String?
     /// chunk_seq for the open conversation utterance (resets per utterance).
     @ObservationIgnored private var conversationChunkSeq: UInt64 = 0
-    /// Conversations whose in-flight agent reply the user barged in on:
-    /// VoiceReply frames for them are dropped until the next Final
-    /// TurnEvent (which belongs to the user's NEW turn) clears the flag.
-    private var suppressedVoiceReplyConversations: Set<String> = []
 
     /// Auto-reconnect triggers: network-path recovery, app activation, and
     /// a gentle periodic retry while frontmost. All of them only act on
@@ -146,14 +161,26 @@ public final class ChatSessionManager {
     public init(
         edgeClient: EdgeClient = EdgeClient(),
         endpointSelector: EndpointSelector? = nil,
-        conversationStore: ConversationStore = ConversationStore()
+        conversationStore: ConversationStore = ConversationStore(),
+        initialSettings: ConnectionSettings? = nil,
+        startsReconnectTriggers: Bool = true,
+        voiceDefaults: UserDefaults = .standard,
+        turnSender: ((EdgeMessage) async throws -> Void)? = nil,
+        localSpeaker: ((String, String) -> Void)? = nil,
+        localSpeechDelayNanoseconds: UInt64 = 2_500_000_000
     ) {
-        let loaded = ConnectionSettingsStore.load()
+        let loaded = initialSettings ?? ConnectionSettingsStore.load()
         self.settings = loaded
         self.edgeClient = edgeClient
         self.conversationStore = conversationStore
-        self.speakAllReplies = UserDefaults.standard.bool(forKey: Self.speakAllRepliesDefaultsKey)
-        self.transcribeOnDevice = UserDefaults.standard.bool(forKey: Self.transcribeOnDeviceDefaultsKey)
+        self.voiceDefaults = voiceDefaults
+        self.turnSender = turnSender
+        self.localSpeaker = localSpeaker
+        self.localSpeechDelayNanoseconds = localSpeechDelayNanoseconds
+        self.speakAllReplies = voiceDefaults.bool(forKey: Self.speakAllRepliesDefaultsKey)
+        self.speakingProvider = voiceDefaults.string(forKey: Self.speakingProviderDefaultsKey)
+            .flatMap(VoiceProviderPreference.init(rawValue:)) ?? .elevenLabs
+        self.appleVoiceIdentifier = voiceDefaults.string(forKey: Self.appleVoiceDefaultsKey) ?? ""
         if let endpointSelector {
             self.endpointSelector = endpointSelector
         } else if let anchorURL = loaded.anchorURL {
@@ -161,7 +188,7 @@ public final class ChatSessionManager {
         } else {
             self.endpointSelector = EndpointSelector()
         }
-        startReconnectTriggers()
+        if startsReconnectTriggers { startReconnectTriggers() }
     }
 
     // MARK: - Auto-reconnect triggers
@@ -275,6 +302,7 @@ public final class ChatSessionManager {
             streamTask = Task { [weak self] in
                 guard let self else { return }
                 for await message in stream {
+                    guard !Task.isCancelled else { return }
                     await self.handleInbound(message)
                 }
             }
@@ -304,6 +332,12 @@ public final class ChatSessionManager {
     }
 
     public func disconnect() async {
+        invalidateVoiceOutput()
+        await voiceCancellationTask?.value
+        voiceCancellationTask = nil
+        serverSupportsTurnCancellation = false
+        voiceController.stopListening()
+        voiceController.cancelRecording()
         streamTask?.cancel()
         streamTask = nil
         statePollTask?.cancel()
@@ -335,7 +369,18 @@ public final class ChatSessionManager {
             guard let self else { return }
             while !Task.isCancelled {
                 let state = await self.edgeClient.state
-                await MainActor.run { self.connectionState = state }
+                await MainActor.run {
+                    if self.connectionState != state {
+                        switch state {
+                        case .connected:
+                            break
+                        default:
+                            self.invalidateVoiceOutput(sendCancellation: false)
+                            self.serverSupportsTurnCancellation = false
+                        }
+                    }
+                    self.connectionState = state
+                }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
@@ -371,38 +416,29 @@ public final class ChatSessionManager {
     // MARK: - Sending / receiving
 
     public func send(_ text: String) async {
-        // "Speak replies" prefers the agent's PERSONA voice over local TTS:
-        // tagging the typed turn voice-modality sets philote's
-        // had_voice_input, so a `mode: auto` voice policy synthesizes the
-        // reply (ElevenLabs) server-side. Local Apple TTS remains only the
-        // 2.5s no-VoiceReply fallback (e.g. agents on pre-voice hotels).
-        if speakAllReplies {
-            if let conversation = currentConversation {
-                voiceExpectedConversations.insert(conversation.conversationId)
-            }
-            await submitTurn(content: text, messageKind: "voice")
-        } else {
-            await submitTurn(content: text, messageKind: nil)
-        }
+        await submitTurn(content: text, messageKind: nil, expectsLocalSpeech: speakAllReplies)
     }
 
-    /// Dictation path (on-device STT text), used when the "Transcribe on
-    /// device" setting is ON. Tags the turn `message_kind: "voice"` and marks
-    /// the conversation as expecting a `VoiceReply` (so a Final `TurnEvent`
-    /// with no reply in 2.5s falls back to on-device TTS).
+    /// Local dictation uses the ordinary text turn path and requests local
+    /// speaking only after exact request/turn acceptance has been proven.
     public func sendVoiceMessage(text: String) async {
-        guard let conversation = currentConversation else { return }
-        voiceExpectedConversations.insert(conversation.conversationId)
-        await submitTurn(content: text, messageKind: "voice")
+        // Keep the ordinary philote text reasoning/routing path. A voice
+        // marker would trigger external persona TTS on the current server.
+        await submitTurn(content: text, messageKind: nil, expectsLocalSpeech: true)
     }
 
-    /// Raw-audio path (the default): uploads the recorded file to the
+    /// Legacy raw-audio path (currently denied): uploads the recorded file to the
     /// hotel's blob store, then submits a `voice`-kind turn with empty
     /// content and the returned blob ref attached — the hotel transcribes it
     /// via philote's media routing, like a Telegram voice note. Deletes the
     /// temp file when done either way.
     public func sendVoiceRecording(fileURL: URL) async {
-        guard currentAgent != nil, let conversation = currentConversation else {
+        guard externalVoiceEligible else {
+            voiceController.voiceError = "External transcription is unavailable until source privacy can be verified. Use on-device dictation."
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+        guard currentAgent != nil, currentConversation != nil else {
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
@@ -426,7 +462,6 @@ public final class ChatSessionManager {
                 data: data,
                 mimeType: VoiceController.recordingMimeType
             )
-            voiceExpectedConversations.insert(conversation.conversationId)
             await submitTurn(
                 content: "",
                 displayText: "🎤 Voice message",
@@ -439,7 +474,7 @@ public final class ChatSessionManager {
         }
     }
 
-    // MARK: - Streaming voice capture (default mic behavior)
+    // MARK: - Legacy streaming voice capture (currently denied)
 
     /// Begins voice capture. While the edge WS is connected, raw PCM
     /// (16 kHz mono s16le — what the realtime STT API consumes) streams
@@ -449,6 +484,10 @@ public final class ChatSessionManager {
     /// record-to-m4a → HTTP blob upload (batch transcription still wants a
     /// container) so the mic always works.
     public func startVoiceStreaming() async {
+        guard externalVoiceEligible else {
+            voiceController.voiceError = "External transcription is unavailable until source privacy can be verified. Use on-device dictation."
+            return
+        }
         guard let target = currentAgent, currentConversation != nil else { return }
         guard !isStreamingVoice, !voiceController.isRecording, !voiceController.isCapturingPCM
         else { return }
@@ -560,7 +599,6 @@ public final class ChatSessionManager {
     /// placeholder if partials never arrive — graceful degradation).
     private func concludeVoiceUtterance(streamId: String) async {
         guard let conversation = currentConversation else { return }
-        voiceExpectedConversations.insert(conversation.conversationId)
         let bubbleText = earlyFinalTranscripts.removeValue(forKey: streamId) ?? "🎤 Voice message"
         let message = ChatMessage(role: .operatorUser, content: bubbleText)
         var updated = conversation
@@ -582,6 +620,10 @@ public final class ChatSessionManager {
     /// Requires a live connection (no HTTP fallback — hands-free over batch
     /// upload makes no sense). Push-to-talk is untouched.
     public func startConversation() async {
+        guard externalVoiceEligible else {
+            voiceController.voiceError = "Hands-free mode is unavailable until private local transcription is supported. Use on-device dictation."
+            return
+        }
         guard currentAgent != nil, currentConversation != nil else { return }
         guard !isConversationActive else { return }
         guard !isStreamingVoice, !voiceController.isRecording, !voiceController.isListening,
@@ -651,22 +693,59 @@ public final class ChatSessionManager {
         }
     }
 
-    /// Client-side barge-in: kill the agent's audio locally and drop the
-    /// rest of its reply chunks. Nothing is sent server-side (server-side
-    /// cancel is a later slice) — the interrupted turn's remaining
-    /// VoiceReply frames still arrive and are dropped via
-    /// `suppressedVoiceReplyConversations` until the NEXT turn's Final
-    /// TurnEvent clears the suppression (this also covers the case where
-    /// the interrupted turn's chunk 0 hadn't even arrived yet, which the
-    /// stale-key mechanism alone would miss).
+    /// Revoke this exact presentation generation. No Final event can reopen
+    /// it. Server generation cancellation still requires the negotiated
+    /// turn-cancel contract; committed tools are never rolled back here.
     private func performBargeIn() {
+        invalidateVoiceOutput()
+    }
+
+    @discardableResult
+    private func invalidateVoiceOutput(sendCancellation: Bool = true) -> VoiceTurnGate.Cancellation? {
+        let wasVoiceTurn = expectedVoiceTicket != nil && expectedVoiceTicket == voiceTurnGate.ticket
+        let cancellation = voiceTurnGate.invalidate()
+        expectedVoiceTicket = nil
         voiceController.stopPlayback()
-        voiceController.cancelFallback()
-        if let conversation = currentConversation {
-            cancelScheduledFallback(for: conversation.conversationId)
-            suppressedVoiceReplyConversations.insert(conversation.conversationId)
+        fallbackTasks.values.forEach { $0.cancel() }
+        fallbackTasks.removeAll()
+        if sendCancellation, wasVoiceTurn, serverSupportsTurnCancellation, let cancellation {
+            let scope = cancellation.ticket.scope
+            let message = EdgeMessage.turnCancel(
+                targetNodeId: scope.nodeID, targetAgentId: scope.agentID,
+                conversationId: scope.conversationID, requestId: cancellation.ticket.requestID,
+                turnId: cancellation.turnID)
+            voiceCancellationTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    if let turnSender = self.turnSender {
+                        try await turnSender(message)
+                    } else {
+                        try await self.edgeClient.send(message)
+                    }
+                } catch {
+                    // Never undo local invalidation when transport fails.
+                    if self.voiceTurnGate.ticket == nil {
+                        self.voiceStatus = "Speech stopped locally, but generation cancellation could not be sent."
+                    }
+                }
+            }
         }
-        activeChunkedReplyKey = nil
+        return cancellation
+    }
+
+    public func interruptVoiceReply() {
+        let hadVoice = expectedVoiceTicket != nil || voiceController.hasPendingReplyAudio
+        let cancellation = invalidateVoiceOutput()
+        if cancellation != nil, hadVoice {
+            voiceStatus = serverSupportsTurnCancellation
+                ? "Speech stopped; generation cancellation requested. Already committed actions remain committed."
+                : "Speech stopped locally. This server does not support generation cancellation. Already committed actions remain committed."
+        }
+    }
+
+    public func previewAppleVoice() {
+        invalidateVoiceOutput()
+        voiceController.speakFallback(text: "This is your Philotic speaking voice.", voiceIdentifier: appleVoiceIdentifier)
     }
 
     private func beginConversationUtterance(preRollFrames: [Data]) async {
@@ -754,74 +833,88 @@ public final class ChatSessionManager {
         content: String,
         displayText: String? = nil,
         messageKind: String?,
-        blobRefs: [BlobRef] = []
+        blobRefs: [BlobRef] = [],
+        expectsLocalSpeech: Bool = false
     ) async {
         guard let target = currentAgent, var conversation = currentConversation,
               conversation.agentTarget == target else { return }
         let hasContent = !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         guard hasContent || !blobRefs.isEmpty else { return }
 
+        invalidateVoiceOutput()
+        let ticket = voiceTurnGate.begin(scope: .init(
+            nodeID: target.targetNodeId, agentID: target.targetAgentId,
+            conversationID: conversation.conversationId))
+        if expectsLocalSpeech { expectedVoiceTicket = ticket }
+        voiceStatus = nil
+
         let operatorMessage = ChatMessage(role: .operatorUser, content: displayText ?? content)
         conversation.messages.append(operatorMessage)
         currentConversation = conversation
         await conversationStore.upsert(conversation)
+        guard voiceTurnGate.isCurrent(ticket), currentAgent == target else { return }
 
         do {
-            try await edgeClient.send(
-                .turnSubmit(
+            let message = EdgeMessage.turnSubmit(
                     targetNodeId: target.targetNodeId,
                     targetAgentId: target.targetAgentId,
                     conversationId: conversation.conversationId,
                     content: content,
                     blobRefs: blobRefs,
-                    messageKind: messageKind
+                    messageKind: messageKind,
+                    requestId: ticket.requestID
                 )
-            )
+            if let turnSender {
+                try await turnSender(message)
+            } else {
+                try await edgeClient.send(message)
+            }
         } catch {
-            voiceExpectedConversations.remove(conversation.conversationId)
+            if voiceTurnGate.isCurrent(ticket) { invalidateVoiceOutput() }
             lastError = "Send failed: \(error.localizedDescription)"
             appendSystemMessage("Send failed: \(error.localizedDescription)", isError: true)
         }
     }
 
-    private func handleInbound(_ message: EdgeMessage) async {
+    func handleInbound(_ message: EdgeMessage) async {
         switch message {
-        case .turnEvent(let conversationId, let eventKind, let content, _):
-            await applyTurnEvent(conversationId: conversationId, eventKind: eventKind, content: content)
+        case .helloAck(_, _, let features):
+            // Every handshake, including automatic reconnect, invalidates
+            // old playback before retained turn events are replayed.
+            invalidateVoiceOutput(sendCancellation: false)
+            serverSupportsTurnCancellation = features.contains("turn_cancel_v1")
+
+        case .turnEvent(let conversationId, let eventKind, let content, let turnId, let requestId):
+            if eventKind == .status, content == "accepted" {
+                let accepted = voiceTurnGate.accept(conversationID: conversationId, requestID: requestId, turnID: turnId)
+                if !accepted, expectedVoiceTicket != nil, requestId == nil {
+                    voiceStatus = "Spoken replies are unavailable because this server cannot correlate voice turns. Text chat remains available."
+                }
+            }
+            let maySpeak = eventKind == .final && voiceTurnGate.finish(conversationID: conversationId, turnID: turnId)
+            await applyTurnEvent(conversationId: conversationId, eventKind: eventKind, content: content, turnId: turnId, maySpeak: maySpeak)
 
         case .voiceReply(
             let conversationId, let turnId, let audioBase64, let mimeType, _,
-            let chunkSeq, _):
-            // Barge-in suppression: reply audio for a turn the user talked
-            // over is dropped entirely (chunked AND whole) — the next turn's
-            // Final TurnEvent lifts the suppression before its reply arrives.
-            if suppressedVoiceReplyConversations.contains(conversationId) {
-                return
-            }
+            let chunkSeq, let isFinal):
+            guard externalVoiceEligible, speakingProvider.availableProvider == .elevenLabs,
+                  currentConversation?.conversationId == conversationId,
+                  voiceTurnGate.receiveAudio(conversationID: conversationId, turnID: turnId,
+                      chunkSequence: chunkSeq, isFinal: isFinal) else { return }
             // Audio-only presentation: the matching Final `TurnEvent` carries
             // the text and lands in the transcript separately, so we do not
             // append another bubble here. The first frame (whole reply or
             // chunk 0) cancels any fallback TTS we scheduled.
             cancelScheduledFallback(for: conversationId)
-            voiceExpectedConversations.remove(conversationId)
             if let chunkSeq {
-                // Streamed per-sentence TTS: FIFO into the playback queue.
-                // WS delivery is ordered, so chunk_seq is already monotonic
-                // within a turn — the key only guards against interleave
-                // ACROSS turns: a new turn's chunk 0 flushes anything stale,
-                // and stragglers from a superseded turn are dropped.
-                // `is_final` needs no handling: the queue simply drains.
-                let replyKey = "\(conversationId)|\(turnId ?? "")"
+                // Identity, exact chunk order and terminal chunk closure
+                // have already been checked by VoiceTurnGate.
                 if chunkSeq == 0 {
-                    activeChunkedReplyKey = replyKey
                     voiceController.resetReplyChunkQueue()
-                    voiceController.enqueueReplyChunk(base64: audioBase64, mimeType: mimeType)
-                } else if replyKey == activeChunkedReplyKey {
-                    voiceController.enqueueReplyChunk(base64: audioBase64, mimeType: mimeType)
                 }
+                voiceController.enqueueReplyChunk(base64: audioBase64, mimeType: mimeType)
             } else {
                 // Whole reply: stop-and-replace, exactly as before.
-                activeChunkedReplyKey = nil
                 voiceController.play(base64: audioBase64, mimeType: mimeType)
             }
 
@@ -911,31 +1004,38 @@ public final class ChatSessionManager {
     /// `speakFallback` after a 2.5s grace period for the server's
     /// `VoiceReply` to arrive — a `VoiceReply` for this conversation, or a
     /// new turn superseding it, cancels the timer first.
-    private func scheduleVoiceFallbackIfNeeded(conversationId: String, text: String) {
-        let wasExpectingVoice = voiceExpectedConversations.remove(conversationId) != nil
-        guard wasExpectingVoice || speakAllReplies else { return }
+    private func scheduleVoiceFallbackIfNeeded(conversationId: String, turnId: String?, text: String) {
+        guard let ticket = expectedVoiceTicket, voiceTurnGate.isCurrent(ticket),
+              voiceTurnGate.matches(conversationID: conversationId, turnID: turnId),
+              currentConversation?.conversationId == conversationId else { return }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         // Streamed persona-voice chunks arrive BEFORE the Final turn event —
         // if chunked audio for this conversation already played (or is still
         // playing), the reply has a voice and the fallback must not fire:
         // otherwise macOS TTS repeats the reply after ElevenLabs spoke it.
-        if let key = activeChunkedReplyKey, key.hasPrefix(conversationId + "|") {
-            return
-        }
+        if voiceTurnGate.hasReplyAudio { return }
         if voiceController.hasPendingReplyAudio {
             return
         }
 
         cancelScheduledFallback(for: conversationId)
+        let delay = localSpeechDelayNanoseconds
         fallbackTasks[conversationId] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled, let self else { return }
+            guard self.voiceTurnGate.isCurrent(ticket),
+                  self.voiceTurnGate.matches(conversationID: conversationId, turnID: turnId),
+                  self.currentConversation?.conversationId == conversationId else { return }
             self.fallbackTasks[conversationId] = nil
-            self.voiceController.speakFallback(text: text)
+            if let localSpeaker = self.localSpeaker {
+                localSpeaker(text, self.appleVoiceIdentifier)
+            } else {
+                self.voiceController.speakFallback(text: text, voiceIdentifier: self.appleVoiceIdentifier)
+            }
         }
     }
 
-    private func applyTurnEvent(conversationId: String, eventKind: TurnEventKind, content: String) async {
+    private func applyTurnEvent(conversationId: String, eventKind: TurnEventKind, content: String, turnId: String?, maySpeak: Bool) async {
         // Route the event to the conversation that OWNS it, not just the one
         // on screen: replies that finish streaming after the user switches
         // agents must still be persisted to their conversation's history
@@ -966,9 +1066,6 @@ public final class ChatSessionManager {
             }
 
         case .final:
-            // A Final always belongs to the newest turn: lift any barge-in
-            // suppression so THIS turn's voice reply can play.
-            suppressedVoiceReplyConversations.remove(conversationId)
             let spokenText: String
             if let last = conversation.messages.last, last.role == .agent, last.isStreaming {
                 var updated = last
@@ -987,7 +1084,6 @@ public final class ChatSessionManager {
 
         case .error:
             conversation.messages.append(ChatMessage(role: .agent, content: content, isStreaming: false, isError: true))
-            voiceExpectedConversations.remove(conversationId)
             cancelScheduledFallback(for: conversationId)
         }
 
@@ -996,8 +1092,8 @@ public final class ChatSessionManager {
         }
         await conversationStore.upsert(conversation)
 
-        if let finalSpokenText {
-            scheduleVoiceFallbackIfNeeded(conversationId: conversationId, text: finalSpokenText)
+        if maySpeak, let finalSpokenText {
+            scheduleVoiceFallbackIfNeeded(conversationId: conversationId, turnId: turnId, text: finalSpokenText)
         }
     }
 

@@ -1,5 +1,8 @@
 # Voice controller checkpoint — 2026-10-08
 
+Historical initial checkpoint for `c4c3ff4d`. The resumed follow-up is documented
+in [VOICE_CLIENT_CONTRACT.md](VOICE_CLIENT_CONTRACT.md).
+
 Base: develop `45b6aef9`. Workstream: `codex/apple-voice-privacy`.
 
 This transitional source change owns `Services/VoiceController.swift` and
