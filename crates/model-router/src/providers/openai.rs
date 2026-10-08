@@ -1106,6 +1106,20 @@ impl ModelProvider for OpenAIProvider {
         self.provider_id
     }
 
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        let mut models = vec![self.default_model(task).to_owned()];
+        if self.provider_id == "openrouter" {
+            if let Some(configured) = task.provider_options.get("models") {
+                if let Some(array) = configured.as_array() {
+                    models.extend(array.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            } else {
+                models.extend(self.fallback_models.clone());
+            }
+        }
+        models
+    }
+
     fn supports(&self, task: &ControllerTask) -> bool {
         matches!(
             task.kind,
@@ -1800,6 +1814,38 @@ mod tests {
         assert_eq!(body["verbosity"], "low");
         assert_eq!(body["background"], true);
         assert_eq!(body["tools"][0]["type"], "web_search_preview");
+    }
+
+    #[test]
+    fn context_models_match_actual_default_pin_and_fallback_override() {
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            None,
+            None,
+            None,
+            Some("configured/default".into()),
+            None,
+            vec!["configured/fallback".into()],
+            None,
+        );
+        let mut task =
+            ControllerTask::from_value(&json!({"kind":"text.generate","prompt":"current"}))
+                .unwrap();
+        assert_eq!(
+            provider.context_models(&task),
+            vec!["configured/default", "configured/fallback"]
+        );
+        task.model = Some("explicit/pin".into());
+        task.provider_options
+            .insert("models".into(), json!(["explicit/fallback"]));
+        assert_eq!(
+            provider.context_models(&task),
+            vec!["explicit/pin", "explicit/fallback"]
+        );
+        let body = provider.chat_request_body(&task).unwrap();
+        assert_eq!(body["model"], "explicit/pin");
+        assert_eq!(body["models"], json!(["explicit/fallback"]));
     }
 
     #[test]

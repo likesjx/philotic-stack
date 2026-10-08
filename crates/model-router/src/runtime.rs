@@ -35,9 +35,16 @@ async fn invoke_ordinary_provider_attempt(
     provider: &dyn ModelProvider,
     task: &ControllerTask,
     tokens: Option<tokio::sync::mpsc::Sender<String>>,
+    catalog: &[crate::context_management::ModelCapabilityRecord],
 ) -> Result<ProviderOutput> {
     let prepared = if task.kind == TaskKind::TextGenerate {
-        let (prepared, accounting) = crate::context_management::prepare(task)?;
+        let mut resolved = task.clone();
+        resolved.resolved_context_capabilities = crate::context_management::resolve_capabilities(
+            provider.id(),
+            provider.context_models(task),
+            catalog,
+        );
+        let (prepared, accounting) = crate::context_management::prepare(&resolved)?;
         info!(accounting = %serde_json::to_string(&accounting)?,
             "model context selection (conservative estimate; metadata only)");
         prepared
@@ -925,7 +932,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 });
                                 tokio::time::timeout(
                                     Duration::from_secs(attempt_secs),
-                                    invoke_ordinary_provider_attempt(provider.as_ref(), &controller_task, Some(token_tx)),
+                                    invoke_ordinary_provider_attempt(provider.as_ref(), &controller_task, Some(token_tx), &provider_configs.context_catalog),
                                 )
                                 .await
                                 .unwrap_or_else(|_| {
@@ -937,7 +944,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             } else {
                                 tokio::time::timeout(
                                     Duration::from_secs(attempt_secs),
-                                    invoke_ordinary_provider_attempt(provider.as_ref(), &controller_task, None),
+                                    invoke_ordinary_provider_attempt(provider.as_ref(), &controller_task, None, &provider_configs.context_catalog),
                                 )
                                 .await
                                 .unwrap_or_else(|_| {
@@ -2962,18 +2969,18 @@ mod context_dispatch_tests {
         // failures, repeated attempts, and the next resolved provider all pass
         // through preparation before the real HTTP provider serializes them.
         assert!(
-            invoke_ordinary_provider_attempt(&primary, &original, None)
+            invoke_ordinary_provider_attempt(&primary, &original, None, &[])
                 .await
                 .is_err()
         );
         assert!(
-            invoke_ordinary_provider_attempt(&primary, &original, None)
+            invoke_ordinary_provider_attempt(&primary, &original, None, &[])
                 .await
                 .is_err()
         );
         let mut next = original.clone();
         next.model = Some("openai/gpt-4.1-mini".into());
-        invoke_ordinary_provider_attempt(&fallback, &next, None)
+        invoke_ordinary_provider_attempt(&fallback, &next, None, &[])
             .await
             .unwrap();
         let bodies = captured.lock().await;
@@ -2997,6 +3004,39 @@ mod context_dispatch_tests {
         }
         assert_eq!(format!("{original:?}"), snapshot);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ordinary_attempt_resolves_provider_default_and_fallback_catalog_before_selection() {
+        struct CatalogProbe;
+        #[async_trait::async_trait]
+        impl ModelProvider for CatalogProbe {
+            fn id(&self) -> &'static str {
+                "openrouter"
+            }
+            fn supports(&self, _: &ControllerTask) -> bool {
+                true
+            }
+            fn context_models(&self, _: &ControllerTask) -> Vec<String> {
+                vec!["configured/default".into(), "configured/fallback".into()]
+            }
+            async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
+                assert_eq!(task.resolved_context_capabilities.len(), 2);
+                assert_eq!(crate::context_management::limits(task)?.1, 8000);
+                assert_eq!(task.provider_options["max_tokens"], 4096);
+                bail!("synthetic catalog resolved at ordinary dispatch")
+            }
+        }
+        let catalog = crate::context_management::parse_openrouter_capabilities(
+            r#"[{"id":"configured/default","ctx":100000},{"id":"configured/fallback","ctx":8000}]"#,
+        );
+        let mut original = task();
+        original.model = None;
+        let error = invoke_ordinary_provider_attempt(&CatalogProbe, &original, None, &catalog)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("catalog resolved"));
+        assert!(original.resolved_context_capabilities.is_empty());
     }
 
     struct StreamingProbe;
@@ -3028,13 +3068,13 @@ mod context_dispatch_tests {
     #[tokio::test]
     async fn ordinary_dispatch_streaming_and_mandatory_overflow_use_preparation() {
         let (tx, _) = tokio::sync::mpsc::channel(1);
-        let err = invoke_ordinary_provider_attempt(&StreamingProbe, &task(), Some(tx))
+        let err = invoke_ordinary_provider_attempt(&StreamingProbe, &task(), Some(tx), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("streaming reached"));
         let mut oversized = task();
         oversized.context.active_turn.as_mut().unwrap().text = Some("x".repeat(20000));
-        let err = invoke_ordinary_provider_attempt(&StreamingProbe, &oversized, None)
+        let err = invoke_ordinary_provider_attempt(&StreamingProbe, &oversized, None, &[])
             .await
             .unwrap_err();
         assert!(

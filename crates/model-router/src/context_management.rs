@@ -36,6 +36,9 @@ impl Default for ContextLimits {
 pub struct ContextAccounting {
     pub estimator: &'static str,
     pub model_context_limit: usize,
+    pub reported_context_models: usize,
+    pub unknown_context_models: usize,
+    pub unknown_output_models: usize,
     pub input_limit: usize,
     pub output_limit: usize,
     pub history_selected: usize,
@@ -52,37 +55,108 @@ pub struct ContextAccounting {
     pub tool_result_estimate: usize,
     pub rendered_estimate: usize,
 }
-/// Conservative ceilings for known families; unknown models cannot opt into
-/// a larger window until a capability record is wired into this seam.
-pub fn model_context_limit(model: Option<&str>) -> usize {
-    let m = model.unwrap_or("");
-    if m.starts_with("deepseek/deepseek-v4.1")
-        || m.starts_with("gemini-2.5")
-        || m.starts_with("google/gemini-2.5")
-    {
-        1_000_000
-    } else if m.starts_with("anthropic/claude-sonnet-4") || m.starts_with("claude-sonnet-4") {
-        200_000
-    } else if m.starts_with("openai/gpt-4.1") || m.starts_with("gpt-4.1") {
-        128_000
-    } else {
-        16_384
-    }
+pub const UNKNOWN_CONTEXT_CEILING: usize = 16_384;
+pub const UNKNOWN_OUTPUT_CEILING: usize = 4_096;
+
+/// Runtime-resolved reports, not capability authority. Generic SetConfig has no
+/// authenticated catalog owner, so reports can only tighten conservative limits.
+/// No attestation or caller-controlled expansion bypass is implemented here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCapabilityRecord {
+    pub provider: String,
+    pub model_id: String,
+    pub context_tokens: Option<usize>,
+    pub output_tokens: Option<usize>,
+    pub source: String,
 }
-pub fn model_output_limit(model: Option<&str>) -> usize {
-    let m = model.unwrap_or("");
-    if m.starts_with("deepseek/deepseek-v4.1") {
-        131_072
-    } else if m.starts_with("gemini-2.5") || m.starts_with("google/gemini-2.5") {
-        65_536
-    } else if m.starts_with("anthropic/claude-sonnet-4") || m.starts_with("claude-sonnet-4") {
-        64_000
-    } else if m.starts_with("openai/gpt-4.1") || m.starts_with("gpt-4.1") {
-        32_768
-    } else {
-        4_096
+
+/// Existing compact hotel catalog reports ctx; `out` is price, NOT output size.
+/// Missing/invalid records and ambiguous duplicate IDs remain unknown.
+pub fn parse_openrouter_capabilities(raw: &str) -> Vec<ModelCapabilityRecord> {
+    if raw.len() > 2_000_000 {
+        return Vec::new();
     }
+    let Ok(rows) = serde_json::from_str::<Vec<Value>>(raw) else {
+        return Vec::new();
+    };
+    let mut ids = std::collections::BTreeMap::<String, usize>::new();
+    for row in &rows {
+        if let Some(id) = row.get("id").and_then(Value::as_str) {
+            *ids.entry(id.to_owned()).or_default() += 1;
+        }
+    }
+    rows.into_iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?;
+            if id.trim().is_empty() || ids.get(id) != Some(&1) {
+                return None;
+            }
+            let ctx = row
+                .get("ctx")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .map(|n| n as usize)
+                .filter(|n| *n > 0);
+            Some(ModelCapabilityRecord {
+                provider: "openrouter".into(),
+                model_id: id.into(),
+                context_tokens: ctx,
+                output_tokens: None,
+                source: "hotel_config:model_catalog.openrouter (unversioned snapshot)".into(),
+            })
+        })
+        .collect()
 }
+
+pub fn resolve_capabilities(
+    provider: &str,
+    models: Vec<String>,
+    catalog: &[ModelCapabilityRecord],
+) -> Vec<ModelCapabilityRecord> {
+    let mut unique = std::collections::BTreeSet::new();
+    models
+        .into_iter()
+        .filter(|id| unique.insert(id.clone()))
+        .map(|id| {
+            let mut matches = catalog
+                .iter()
+                .filter(|c| c.provider == provider && c.model_id == id);
+            let first = matches.next();
+            let unambiguous = if matches.next().is_none() {
+                first.cloned()
+            } else {
+                None
+            };
+            unambiguous.unwrap_or(ModelCapabilityRecord {
+                provider: provider.into(),
+                model_id: id,
+                context_tokens: None,
+                output_tokens: None,
+                source: "unknown_conservative_ceiling".into(),
+            })
+        })
+        .collect()
+}
+
+fn model_bounds(task: &ControllerTask) -> (usize, usize) {
+    let mut bounds = task.resolved_context_capabilities.iter().map(|c| {
+        (
+            c.context_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(UNKNOWN_CONTEXT_CEILING)
+                .min(UNKNOWN_CONTEXT_CEILING),
+            c.output_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(UNKNOWN_OUTPUT_CEILING)
+                .min(UNKNOWN_OUTPUT_CEILING),
+        )
+    });
+    let Some(first) = bounds.next() else {
+        return (UNKNOWN_CONTEXT_CEILING, UNKNOWN_OUTPUT_CEILING);
+    };
+    bounds.fold(first, |a, b| (a.0.min(b.0), a.1.min(b.1)))
+}
+
 pub fn estimate_json(value: &Value) -> Result<usize> {
     Ok(serde_json::to_vec(value)?.len().saturating_add(256))
 }
@@ -116,16 +190,20 @@ pub fn limits(task: &ControllerTask) -> Result<(ContextLimits, usize)> {
     if let Some(n) = a.or(b) {
         l.output_tokens = n;
     }
-    let hard = model_context_limit(task.model.as_deref());
+    let (hard, output_ceiling) = model_bounds(task);
     if l.output_tokens == 0
         || l.output_tokens >= hard
         || l.input_tokens == 0
-        || l.output_tokens > model_output_limit(task.model.as_deref())
+        || l.output_tokens > output_ceiling
     {
         bail!("context_budget_invalid: input/output limits exceed model context");
     }
     // An explicit long-task override must itself fit the hard model ceiling.
-    if task.provider_options.contains_key("context_limits")
+    if task
+        .provider_options
+        .get("context_limits")
+        .and_then(|v| v.get("input_tokens"))
+        .is_some()
         && l.input_tokens > hard - l.output_tokens
     {
         bail!("context_budget_invalid: long-task override exceeds model context");
@@ -297,6 +375,23 @@ pub fn prepare(task: &ControllerTask) -> Result<(ControllerTask, ContextAccounti
     let accounting = ContextAccounting {
         estimator: "conservative_utf8_bytes_plus_framing",
         model_context_limit: hard,
+        reported_context_models: t
+            .resolved_context_capabilities
+            .iter()
+            .filter(|c| c.context_tokens.is_some_and(|n| n > 0))
+            .count(),
+        unknown_context_models: t
+            .resolved_context_capabilities
+            .iter()
+            .filter(|c| c.context_tokens.is_none_or(|n| n == 0))
+            .count()
+            .max(usize::from(t.resolved_context_capabilities.is_empty())),
+        unknown_output_models: t
+            .resolved_context_capabilities
+            .iter()
+            .filter(|c| c.output_tokens.is_none_or(|n| n == 0))
+            .count()
+            .max(usize::from(t.resolved_context_capabilities.is_empty())),
         input_limit: l.input_tokens,
         output_limit: l.output_tokens,
         history_selected: t.context.dialogue_window.len(),
@@ -346,8 +441,23 @@ pub fn account_wire(body: &Value, task: &ControllerTask) -> Result<()> {
             .filter_map(Value::as_str),
     );
     for model in candidates {
-        hard = hard.min(model_context_limit(Some(model)));
-        if l.output_tokens > model_output_limit(Some(model)) {
+        let record = task
+            .resolved_context_capabilities
+            .iter()
+            .find(|c| c.model_id == model);
+        hard = hard.min(
+            record
+                .and_then(|c| c.context_tokens)
+                .filter(|n| *n > 0)
+                .unwrap_or(UNKNOWN_CONTEXT_CEILING)
+                .min(UNKNOWN_CONTEXT_CEILING),
+        );
+        if l.output_tokens
+            > record
+                .and_then(|c| c.output_tokens)
+                .filter(|n| *n > 0)
+                .unwrap_or(UNKNOWN_OUTPUT_CEILING)
+        {
             bail!(
                 "context_budget_exceeded: output allowance exceeds provider/fallback model ceiling"
             );
@@ -367,6 +477,7 @@ pub fn account_wire(body: &Value, task: &ControllerTask) -> Result<()> {
     let n = estimate_json(body)?;
     tracing::info!(
         estimator = "conservative_utf8_bytes_plus_framing",
+        capability_basis = "untrusted_catalog_tighten_only",
         serialized_bytes = n - 256,
         input_estimate = n,
         input_limit = l.input_tokens,
@@ -385,12 +496,95 @@ mod tests {
     use super::*;
     use serde_json::json;
     fn task(context: Value) -> ControllerTask {
-        ControllerTask::from_value(
+        let mut task = ControllerTask::from_value(
             &json!({"kind":"text.generate", "model":"deepseek/deepseek-v4.1-flash",
             "prompt":"LEGACY_ENVELOPE_DUPLICATE", "context":context}),
         )
-        .unwrap()
+        .unwrap();
+        task.resolved_context_capabilities = vec![ModelCapabilityRecord {
+            provider: "openrouter".into(),
+            model_id: "deepseek/deepseek-v4.1-flash".into(),
+            context_tokens: Some(1_000_000),
+            output_tokens: Some(131_072),
+            source: "synthetic_test_catalog".into(),
+        }];
+        task
     }
+    #[test]
+    fn exact_catalog_records_and_unknown_fallback_replace_family_guesses() {
+        let catalog = parse_openrouter_capabilities(
+            r#"[{"id":"exact/model","ctx":131072,"out":0.004},{"id":"duplicate","ctx":999999},{"id":"duplicate","ctx":65536},{"id":"invalid","ctx":-1}]"#,
+        );
+        assert!(!catalog.iter().any(|c| c.model_id == "duplicate"));
+        assert_eq!(
+            catalog[0].output_tokens, None,
+            "out is pricing, not an output limit"
+        );
+        let mut t = task(json!({"active_turn":{"text":"now"}}));
+        t.resolved_context_capabilities =
+            resolve_capabilities("openrouter", vec!["exact/model".into()], &catalog);
+        assert_eq!(limits(&t).unwrap().1, UNKNOWN_CONTEXT_CEILING);
+        assert_eq!(limits(&t).unwrap().0.output_tokens, 4096);
+        t.provider_options.insert("max_tokens".into(), json!(8192));
+        assert!(
+            prepare(&t).is_err(),
+            "unreported output capability remains conservatively bounded"
+        );
+        t.provider_options.clear();
+        t.resolved_context_capabilities = resolve_capabilities(
+            "openrouter",
+            vec!["exact/model".into(), "unknown/model".into()],
+            &catalog,
+        );
+        let (l, bound) = limits(&t).unwrap();
+        assert_eq!(bound, UNKNOWN_CONTEXT_CEILING);
+        assert_eq!(l.input_tokens, UNKNOWN_CONTEXT_CEILING - 4096);
+        assert_eq!(
+            resolve_capabilities("gemini", vec!["exact/model".into()], &catalog)[0].context_tokens,
+            None
+        );
+        assert!(parse_openrouter_capabilities("invalid-json").is_empty());
+    }
+
+    #[test]
+    fn forged_positive_catalog_cannot_expand_but_smaller_fallback_tightens() {
+        let catalog = parse_openrouter_capabilities(r#"[{"id":"forged/model","ctx":4000000}]"#);
+        let mut t = task(json!({"active_turn":{"text":"current"}}));
+        t.resolved_context_capabilities =
+            resolve_capabilities("openrouter", vec!["forged/model".into()], &catalog);
+        assert_eq!(limits(&t).unwrap().1, 16384);
+        t.provider_options
+            .insert("context_limits".into(), json!({"input_tokens":65536}));
+        assert!(prepare(&t).is_err());
+        t.provider_options.clear();
+        t.resolved_context_capabilities[0].output_tokens = Some(100000);
+        t.provider_options.insert("max_tokens".into(), json!(8192));
+        assert!(prepare(&t).is_err());
+        t.provider_options.clear();
+        let smaller = parse_openrouter_capabilities(
+            r#"[{"id":"exact/default","ctx":100000},{"id":"exact/fallback","ctx":8000}]"#,
+        );
+        t.resolved_context_capabilities = resolve_capabilities(
+            "openrouter",
+            vec!["exact/default".into(), "exact/fallback".into()],
+            &smaller,
+        );
+        assert_eq!(limits(&t).unwrap().1, 8000);
+        assert_eq!(limits(&t).unwrap().0.input_tokens, 3904);
+    }
+
+    #[test]
+    fn incoming_capability_claims_cannot_expand_unknown_limits() {
+        let t = ControllerTask::from_value(
+            &json!({"kind":"text.generate","model":"deepseek/deepseek-v4.1-flash",
+            "prompt":"current", "resolved_context_capabilities":[{"context_tokens":1000000}],
+            "provider_options":{"model_capabilities":{"context_tokens":1000000}}}),
+        )
+        .unwrap();
+        assert!(t.resolved_context_capabilities.is_empty());
+        assert_eq!(limits(&t).unwrap().1, UNKNOWN_CONTEXT_CEILING);
+    }
+
     #[test]
     fn canonical_renderer_and_repeated_prepare_do_not_inflate_context() {
         let t = task(json!({"identity":[{"text":"PERSONA_MARKER"}],
@@ -466,10 +660,10 @@ mod tests {
         let mut t = task(json!({"active_turn":{"text":"now"}}));
         let (a, _) = prepare(&t).unwrap();
         assert_eq!(a.provider_options["max_tokens"], 4096);
-        t.provider_options.insert("max_tokens".into(), json!(32768));
+        t.provider_options.insert("max_tokens".into(), json!(2048));
         t.provider_options
-            .insert("context_limits".into(), json!({"input_tokens":65536}));
-        assert_eq!(prepare(&t).unwrap().0.provider_options["max_tokens"], 32768);
+            .insert("context_limits".into(), json!({"input_tokens":8192}));
+        assert_eq!(prepare(&t).unwrap().0.provider_options["max_tokens"], 2048);
         t.provider_options
             .insert("context_limits".into(), json!({"input_tokens":1000000}));
         assert!(prepare(&t).is_err());
@@ -504,6 +698,7 @@ mod tests {
     fn unknown_model_cannot_assert_an_unverified_large_context_window() {
         let mut t = task(json!({"active_turn":{"text":"now"}}));
         t.model = Some("unverified-model".into());
+        t.resolved_context_capabilities.clear();
         t.provider_options
             .insert("context_limits".into(), json!({"input_tokens":32768}));
         assert!(prepare(&t).is_err());
@@ -515,16 +710,19 @@ mod tests {
         assert!(prepare(&t).unwrap_err().to_string().contains("mandatory"));
     }
     #[test]
-    fn final_wire_budget_checks_actual_model_fallback_and_output_allowance() {
-        let mut t = task(json!({"active_turn":{"text":"now"}}));
-        t.provider_options.insert(
-            "context_limits".into(),
-            json!({"input_tokens":200000,"output_tokens":32768}),
-        );
-        assert!(account_wire(&json!({"model":"deepseek/deepseek-v4.1-flash","models":["unverified-small-model"]}),&t).is_err());
+    fn final_wire_budget_rejects_oversize_fallback_payload_and_unreserved_output() {
+        let t = task(json!({"active_turn":{"text":"now"}}));
         assert!(
             account_wire(
-                &json!({"model":"deepseek/deepseek-v4.1-flash","max_tokens":32769}),
+                &json!({"model":"deepseek/deepseek-v4.1-flash",
+            "models":["unverified-small-model"],"messages":[{"content":"x".repeat(17000)}]}),
+                &t
+            )
+            .is_err()
+        );
+        assert!(
+            account_wire(
+                &json!({"model":"deepseek/deepseek-v4.1-flash","max_tokens":4097}),
                 &t
             )
             .is_err()

@@ -614,6 +614,10 @@ impl ModelProvider for AnthropicProvider {
         "anthropic"
     }
 
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        vec![self.request_model(task).to_string()]
+    }
+
     fn supports(&self, task: &ControllerTask) -> bool {
         matches!(task.kind, TaskKind::TextGenerate | TaskKind::MediaAnalyze)
     }

@@ -264,6 +264,8 @@ pub struct RoutingHints {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerTask {
+    /// Runtime-only untrusted reports; never parsed from task JSON; tighten-only.
+    pub resolved_context_capabilities: Vec<crate::context_management::ModelCapabilityRecord>,
     pub kind: TaskKind,
     pub request_class: RequestClass,
     pub session_id: Option<String>,
@@ -346,6 +348,7 @@ impl ControllerTask {
             .unwrap_or_default();
 
         let controller_task = Self {
+            resolved_context_capabilities: Vec::new(),
             kind,
             request_class,
             session_id: task
@@ -1526,6 +1529,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderConfigs {
+    pub context_catalog: Vec<crate::context_management::ModelCapabilityRecord>,
     pub anthropic_api_key: Option<String>,
     pub anthropic_base_url: Option<String>,
     pub anthropic_default_model: Option<String>,
@@ -1562,6 +1566,14 @@ pub struct ProviderConfigs {
 impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
+            // Read existing hotel metadata only; never fetch a live provider here.
+            // An absent/failed snapshot leaves capabilities explicitly unknown.
+            context_catalog: fetch_config_string(ipc_client, "model_catalog.openrouter")
+                .await
+                .ok()
+                .flatten()
+                .map(|raw| crate::context_management::parse_openrouter_capabilities(&raw))
+                .unwrap_or_default(),
             // Endpoint-scoped vault ref / PHILOTIC_ANTHROPIC_API_KEY first;
             // the vendor-standard bare ANTHROPIC_API_KEY is the last-resort
             // fallback for ephemeral/CI runs.
@@ -1880,6 +1892,11 @@ impl Default for RetryPolicy {
 pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(&self, task: &ControllerTask) -> bool;
+    /// Exact provider model IDs considered by this attempt, including defaults
+    /// and server-side fallbacks. No family-name capability inference.
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        task.model.clone().into_iter().collect()
+    }
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
 
     /// Per-attempt timing budget.  The runtime enforces `total_secs` as an outer timeout.

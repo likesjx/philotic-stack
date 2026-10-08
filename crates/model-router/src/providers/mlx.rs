@@ -326,6 +326,19 @@ impl ModelProvider for MlxProvider {
         "mlx"
     }
 
+    fn context_models(&self, _task: &ControllerTask) -> Vec<String> {
+        // Health selection is asynchronous inside invoke_text. Bound every
+        // configured text candidate; final wire checks the actual selected ID.
+        self.text_models
+            .iter()
+            .map(|inst| {
+                inst.discovered_model_id
+                    .clone()
+                    .unwrap_or_else(|| inst.config.repo_id.clone())
+            })
+            .collect()
+    }
+
     fn supports(&self, task: &ControllerTask) -> bool {
         match task.kind {
             TaskKind::TextGenerate => !self.text_models.is_empty(),

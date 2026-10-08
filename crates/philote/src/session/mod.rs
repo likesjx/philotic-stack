@@ -2017,12 +2017,13 @@ impl SessionState {
     /// Non-blocking by construction: only the cache is consulted — never the
     /// runner. Entries older than `max_age_secs` are skipped (stale), records are
     /// deduplicated by node id (against both the cache lanes and any memories the
-    /// Muninn lane already recalled), and total injected content is capped at
-    /// `char_budget` chars with a truncation marker. Returns the number of
-    /// records injected.
+    /// Muninn lane already recalled). Whole records fit the legacy `char_budget`
+    /// setting using serialized UTF-8 bytes including metadata, escaping, array
+    /// brackets and separators. Oversized records are omitted, never sliced or
+    /// marked; cached originals remain unchanged. Returns complete records injected.
     ///
     /// Fairness: candidates are round-robin interleaved across strategies
-    /// (one record per strategy per round) before the char budget is applied,
+    /// (one record per strategy per round) before the serialized-byte budget is applied,
     /// so a strategy added later to the auto-recall lane's strategy list —
     /// e.g. `current_prompt_semantic` — isn't starved by two strategies'
     /// worth of records filling the budget first. Dedup precedence (first
@@ -5688,45 +5689,31 @@ fn recalled_content_fingerprint(content: &str) -> Option<u64> {
     (tokens > 0).then(|| hasher.finish())
 }
 
-/// Truncation marker appended when the LifeGraph char budget cuts content.
+/// Legacy marker retained for recognizing older cached records. New selections
+/// never append it or modify record content.
 pub const LIFE_RECALL_TRUNCATION_MARKER: &str = "… [LifeGraph context truncated at char budget]";
 
-/// Enforce the total char budget over LifeGraph records (concept + content).
-///
-/// Records are kept in ranked order until the budget is exhausted. The record
-/// that crosses the budget is content-truncated (when meaningful room remains)
-/// and tagged with [`LIFE_RECALL_TRUNCATION_MARKER`]; everything after it is
-/// dropped so the injected context stays lean.
+/// Select whole upstream cache records within a conservative UTF-8 byte budget.
+/// Account the complete JSON array (including metadata, quotes/escaping,
+/// separators and brackets), not concept/content alone. An oversized ranked
+/// record is skipped so a later complete record can still fit. Inputs remain
+/// unchanged; this request-local view never rewrites the cached originals.
+/// The legacy function/setting name is retained for compatibility.
 pub fn apply_life_recall_char_budget(
     records: Vec<RecalledMemoryRecord>,
     char_budget: usize,
 ) -> Vec<RecalledMemoryRecord> {
-    let mut out: Vec<RecalledMemoryRecord> = Vec::new();
-    let mut used = 0usize;
-    for mut record in records {
-        let record_chars = record.concept.chars().count() + record.content.chars().count();
-        if used + record_chars <= char_budget {
-            used += record_chars;
-            out.push(record);
+    let mut out = Vec::new();
+    let mut used = 2usize; // JSON array brackets
+    for record in records {
+        let Ok(bytes) = serde_json::to_vec(&record) else {
             continue;
-        }
-        // Budget crossed: truncate this record into the remaining room when it
-        // is still meaningful, otherwise just mark the previous record.
-        let remaining = char_budget.saturating_sub(used + record.concept.chars().count());
-        if remaining >= 40 {
-            record.content = record
-                .content
-                .chars()
-                .take(remaining)
-                .collect::<String>()
-                .trim_end()
-                .to_string();
-            record.content.push_str(LIFE_RECALL_TRUNCATION_MARKER);
+        };
+        let cost = bytes.len().saturating_add(usize::from(!out.is_empty()));
+        if cost <= char_budget.saturating_sub(used) && char_budget >= 2 {
+            used += cost;
             out.push(record);
-        } else if let Some(last) = out.last_mut() {
-            last.content.push_str(LIFE_RECALL_TRUNCATION_MARKER);
         }
-        break;
     }
     out
 }
@@ -13188,7 +13175,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_life_recall_char_budget_truncates_with_marker() {
+    fn apply_life_recall_char_budget_selects_complete_records_with_framing() {
         let records = vec![
             life_record("life:1", &"a".repeat(2_000)),
             life_record("life:2", &"b".repeat(2_000)),
@@ -13197,19 +13184,65 @@ mod tests {
 
         let budgeted = apply_life_recall_char_budget(records, 2_500);
 
-        assert_eq!(budgeted.len(), 2, "third record must be dropped");
-        assert_eq!(budgeted[0].content.chars().count(), 2_000);
-        assert!(
-            budgeted[1].content.ends_with(LIFE_RECALL_TRUNCATION_MARKER),
-            "crossing record must carry the truncation marker"
+        assert_eq!(budgeted.len(), 1);
+        assert_eq!(budgeted[0].content, "a".repeat(2_000));
+        assert!(!budgeted[0].content.contains(LIFE_RECALL_TRUNCATION_MARKER));
+        assert!(serde_json::to_vec(&budgeted).unwrap().len() <= 2500);
+    }
+
+    #[test]
+    fn upstream_life_selection_preserves_originals_and_complete_provenance() {
+        let mut oversized = life_record("life:large", &"é".repeat(2000));
+        oversized.annotations = Some(serde_json::json!({"qualification":"TAIL_QUALIFIER"}));
+        let mut small = life_record("life:small", "complete\nqualified");
+        small.annotations = Some(serde_json::json!({"provenance":"SOURCE_VERSION_1"}));
+        let records = vec![oversized, small.clone()];
+        let snapshot = serde_json::to_value(&records).unwrap();
+        let boundary = serde_json::to_vec(&vec![small.clone()]).unwrap().len();
+        let selected = apply_life_recall_char_budget(records.clone(), boundary);
+        assert_eq!(
+            serde_json::to_value(&selected).unwrap(),
+            serde_json::json!([small])
         );
-        let total: usize = budgeted
-            .iter()
-            .map(|record| record.concept.chars().count() + record.content.chars().count())
-            .sum();
-        assert!(
-            total <= 2_500 + LIFE_RECALL_TRUNCATION_MARKER.chars().count(),
-            "total injected chars must respect the budget (marker exempt), got {total}"
+        assert!(apply_life_recall_char_budget(records.clone(), boundary - 1).is_empty());
+        assert_eq!(serde_json::to_value(&records).unwrap(), snapshot);
+        assert!(records[0].content.ends_with(&"é".repeat(2000)));
+    }
+
+    #[test]
+    fn upstream_cache_selection_does_not_rewrite_cached_originals() {
+        let mut state =
+            SessionState::new("cache-whole".into(), "agent-test".into(), "telegram".into());
+        state.start_turn(test_working_turn(None));
+        let large = life_record(
+            "life:oversized",
+            &format!("{} TAIL_QUALIFIER", "é".repeat(2000)),
+        );
+        let small = life_record("life:complete", "complete qualifier");
+        let budget = serde_json::to_vec(&vec![small.clone()]).unwrap().len();
+        let now = 1_800_000_000;
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "synthetic".into(),
+            fetched_at: now,
+            query_text: "synthetic".into(),
+            records: vec![large, small],
+        });
+        let original = serde_json::to_value(&state.life_recall_cache).unwrap();
+        assert_eq!(state.inject_cached_life_context(1800, now, budget), 1);
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories[0]
+                .id
+                .as_deref(),
+            Some("life:complete")
+        );
+        assert_eq!(
+            serde_json::to_value(&state.life_recall_cache).unwrap(),
+            original
+        );
+        assert_eq!(state.inject_cached_life_context(1800, now, budget), 0);
+        assert_eq!(
+            serde_json::to_value(&state.life_recall_cache).unwrap(),
+            original
         );
     }
 

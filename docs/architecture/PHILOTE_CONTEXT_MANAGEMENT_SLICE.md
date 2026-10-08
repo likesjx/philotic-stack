@@ -1,6 +1,8 @@
 # Philote context management: bounded text-call slice
 
-Status: isolated implementation; not deployed. Base: `78eb2f32303823379d6b8c089000e19bf1f69d62`.
+Status: isolated implementation; not deployed. Initial reviewed checkpoint:
+`eb2655e0a1b1182a74d904b40b20e22f95b6e1d1` (base `78eb2f32303823379d6b8c089000e19bf1f69d62`).
+The subsequent capability/cache delta is separately reviewable against that checkpoint.
 
 ## Problem and invariant
 
@@ -49,14 +51,31 @@ remote generation models. No tokenizer downloads or model calls occur here.
 
 Defaults: input 32768, output 4096; user and mandatory sections 16384 each;
 history, tool results and schemas 8192 each; memory 4096. Input is additionally
-bounded by the local model context ceiling minus the reserved output allowance.
-Known model families have conservative context/output ceilings; unknown models
-fall back to 16384 context / 4096 output and cannot request a larger unverified
-window. These are local ceilings, **not live provider-capability attestations**.
-Exact catalog-driven capabilities and tokenizers are integration dependencies.
-Do not describe these hardcoded prefix matches as resolved model capabilities
-or token-accurate limits. In particular, Gemini resolves its model in the URL;
-final body accounting does not resolve that endpoint's configured model.
+bounded by the minimum context allowance across resolved provider candidates,
+minus the output reserve. Family-prefix guesses have been removed. The ordinary
+attempt boundary asks each provider for exact default/pinned/fallback model IDs,
+then resolves exact provider+ID records from the existing hotel compact
+`model_catalog.openrouter` snapshot. No live provider catalog fetch is added.
+The snapshot's `ctx` is an untrusted report; `out` is pricing, not an output
+allowance. Generic IPC `SetConfig` has no catalog-specific authenticated owner.
+Reports can ONLY TIGHTEN conservative ceilings: context min(16384, positive
+reported context), output min(4096, positive reported output), across every exact
+selected/fallback ID. Missing/ambiguous facts retain conservative ceilings;
+forged positive values cannot expand them. Explicit larger overrides fail.
+
+Legitimate larger windows require a protected catalog owner or verified
+attestation bound to authenticated update rights, provider, exact model/endpoint,
+capability fields, source version and freshness. Every fallback, output/reasoning
+allowance and provider framing must also be validated. No attestation flag or
+caller-controlled expansion bypass is added; IPC ownership/authentication stays
+unchanged. These reports are not endpoint attestations or exact tokenization.
+Gemini's provider-owned URL model is now included in resolution, but there is no
+Gemini capability snapshot wired here, so it remains explicitly unknown. MLX
+health selection occurs later; every configured text candidate is conservatively
+bounded and the final wire checks the actual selected ID. Suitable generation
+model tokenizers are not available in this router's existing dependencies; the
+embedding/Whisper tokenizers are not a substitute. Estimates retain their
+`conservative_utf8_bytes_plus_framing` label. No dependencies are installed.
 Final HTTP accounting also checks the serialized model and every configured
 OpenRouter fallback candidate, and rejects output fields exceeding the reserve.
 
@@ -109,9 +128,16 @@ truncation remains. The existing `recalled_memory_chars` setting name is retaine
 for compatibility, but this render/admission boundary uses a conservative byte
 budget.
 
-The routing layer still needs catalog-backed resolved model facts rather than
-local family ceilings, catalog-backed operator capability validation, and tighter native
-realtime/voice accounting. No IPC dispatch/schema files are edited, preserving
+The upstream LifeGraph cache selector also now keeps or omits complete records;
+it counts the serialized JSON array including metadata, Unicode/escaping and
+brackets/separators. It clones cached candidates and leaves original cache/checkpoint
+records unchanged. Oversized entries do not prevent later smaller records fitting.
+Old cached records already sliced by earlier code are not reconstructed or migrated;
+the legacy truncation-marker constant remains for recognizing historical records.
+
+The routing layer still needs versioned/fresh catalog facts for other providers,
+reported output/reasoning limits, catalog-backed operator capability validation,
+suitable generation tokenizers, and tighter native realtime/voice accounting. No IPC dispatch/schema files are edited, preserving
 the active architecture work. The separate Beacon refresh fix is not included.
 
 ## Diagnostics and verification

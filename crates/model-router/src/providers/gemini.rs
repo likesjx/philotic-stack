@@ -1820,6 +1820,10 @@ impl ModelProvider for GeminiProvider {
         "gemini"
     }
 
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        vec![self.request_model(task).to_string()]
+    }
+
     fn supports(&self, task: &ControllerTask) -> bool {
         matches!(
             task.kind,
@@ -2699,6 +2703,7 @@ mod tests {
 
     fn minimal_text_task_with_tools(tools: Vec<serde_json::Value>) -> ControllerTask {
         ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::TextGenerate,
             request_class: RequestClass::Cognitive,
             session_id: None,
@@ -2915,6 +2920,7 @@ mod tests {
             None,
         );
         let task = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::MediaAnalyze,
             request_class: RequestClass::Transform,
             session_id: None,
@@ -2963,6 +2969,7 @@ mod tests {
             None,
         );
         let task = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::AudioTranscribe,
             request_class: RequestClass::Transform,
             session_id: None,
@@ -3011,6 +3018,7 @@ mod tests {
             None,
         );
         let task = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::AudioTranscribe,
             request_class: RequestClass::Transform,
             session_id: None,
@@ -3051,6 +3059,7 @@ mod tests {
             None,
         );
         let response_generate = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::ResponseGenerate,
             request_class: RequestClass::Cognitive,
             session_id: None,
@@ -3077,6 +3086,7 @@ mod tests {
             tools: vec![],
         };
         let voice_dialogue = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::VoiceDialogue,
             request_class: RequestClass::Cognitive,
             session_id: None,
@@ -3121,6 +3131,7 @@ mod tests {
     #[test]
     fn live_setup_payload_enables_audio_transcription_for_voice_dialogue() {
         let task = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::VoiceDialogue,
             request_class: RequestClass::Cognitive,
             session_id: None,
@@ -3859,6 +3870,7 @@ mod tests {
             }),
         );
         let task = ControllerTask {
+            resolved_context_capabilities: Vec::new(),
             kind: TaskKind::ResponseGenerate,
             request_class: RequestClass::Cognitive,
             session_id: Some("session-1".into()),

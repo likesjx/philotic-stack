@@ -52,6 +52,14 @@ impl ModelProvider for OllamaProvider {
         "ollama"
     }
 
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        vec![
+            task.model
+                .clone()
+                .unwrap_or_else(|| self.default_model.clone()),
+        ]
+    }
+
     fn supports(&self, task: &ControllerTask) -> bool {
         task.kind == TaskKind::TextGenerate
     }
