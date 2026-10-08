@@ -2,7 +2,9 @@
 
 Base: `78eb2f32303823379d6b8c089000e19bf1f69d62`, last verified remote develop.
 Candidate: scoped runtime/gateway files selectively applied from `55f0136c`.
-Remote refresh this turn failed DNS resolution; refresh before publication.
+Parent verified the remote via GitHub at 19:31 UTC: identical to this base,
+ahead zero/behind zero, closing the local DNS uncertainty at that timestamp.
+Refresh again if publication occurs after further develop changes.
 
 Preserved: split IPC modules, Beacon worktree, release/packages.toml, existing
 PR Check/Build Linux/release workflows, release Ansible tasks and current version
@@ -13,7 +15,8 @@ Implemented source additions:
 
 - Dedicated disabled-by-default Ansible play/role: fixed two-reference policy,
   separate numeric gateway identity, account/group collision preflight, installed
-  hotel SHA256 check, four gateway file SHA256 checks, root-owned runtime/config,
+  effective ExecStart and running `/proc/MainPID/exe` path/identity/SHA256 checks,
+  four gateway file SHA256 checks, root-owned runtime/config,
   additive hotel drop-in, ordered socket/hotel/gateway handlers.
 - Explicit operator legacy rollback procedure, preserving unrelated drop-ins,
   encrypted state and Muninn. No backup or live rollback was performed.
@@ -21,6 +24,8 @@ Implemented source additions:
   numeric peers, FD inheritance, bounded stuck jobs, full hotel bootstrap with
   two synthetic encrypted SQLite credentials, startup failure and lifecycle.
   No live keys or host service mounts. CI has not been dispatched or run here.
+  Fixture FD handoff and DAC checks do not prove real systemd Sockets/dependencies,
+  restart ordering, InaccessiblePaths or rollback; those remain operator checks.
 
 Local checks on this reconciliation:
 
@@ -33,6 +38,12 @@ Local checks on this reconciliation:
 - Ansible syntax check, synthetic policy-template JSON rendering and workflow
   YAML parsing: passed using existing tooling, without credential config files.
 - Dedicated play, local connection, enabled=false: zero changed, 24 skipped.
+- Eight synthetic provenance tests: approved/versioned path accepted; legacy,
+  stale running executable, bad hash, deleted process, reload and ambiguity denied.
+- Actual Ansible role gate tested locally using a temporary systemctl stub:
+  legacy ExecStart rejected, approved symlink admitted, restart failure stops the
+  stub gateway and fails rollout. Only a temporary stop marker changes; no live
+  systemd calls. Log: `/tmp/percival-role-provenance-tests.log`.
 - Egress inventory: 34 classified callers and three migration guards, passed.
 
 Logs: `/tmp/percival-reconciled-{node-tests,harness-tests,clippy,aiua-check,ansible-disabled}.log`.

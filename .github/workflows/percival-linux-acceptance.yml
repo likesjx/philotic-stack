@@ -8,6 +8,8 @@ on:
       - 'services/personal-mcp/**'
       - 'ansible/roles/percival_personal_mcp/**'
       - 'ansible/deploy_personal_mcp.yml'
+      - 'ansible/library/percival_hotel_provenance.py'
+      - 'ansible/module_utils/percival_provenance.py'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.github/workflows/percival-linux-acceptance.yml'
@@ -19,6 +21,8 @@ on:
       - 'services/personal-mcp/**'
       - 'ansible/roles/percival_personal_mcp/**'
       - 'ansible/deploy_personal_mcp.yml'
+      - 'ansible/library/percival_hotel_provenance.py'
+      - 'ansible/module_utils/percival_provenance.py'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.github/workflows/percival-linux-acceptance.yml'
@@ -57,6 +61,8 @@ jobs:
       - name: Gateway policy and protocol tests
         working-directory: services/personal-mcp
         run: npm test
+      - name: Synthetic role executable provenance tests
+        run: python3 services/personal-mcp/scoped-vault-tests/provenance_test.py
       - name: Build real hotel and specialized source harness
         run: |
           cargo build --locked -p aiua --target-dir /hotel-target

@@ -1,0 +1,52 @@
+---
+- name: Synthetic production-role provenance gate, no live systemd
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    fixture_effective: '{{ fixture_approved_link }}'
+  environment:
+    PATH: '{{ fixture_path }}'
+    PERCIVAL_SYNTHETIC_EXECUTABLE: '{{ fixture_effective }}'
+    PERCIVAL_SYNTHETIC_STOP_MARKER: '{{ fixture_stop_marker }}'
+  tasks:
+    - name: Reject a legacy ExecStart while the supplied approved file hashes correctly
+      block:
+        - name: Exercise production role gate against legacy executable
+          ansible.builtin.include_tasks: ../../../ansible/roles/percival_personal_mcp/tasks/verify_hotel.yml
+          vars:
+            fixture_effective: '{{ fixture_legacy }}'
+        - name: Fail if legacy mismatch was admitted
+          ansible.builtin.fail:
+            msg: Legacy mismatch was unexpectedly admitted.
+      rescue:
+        - name: Require provenance rejection rather than another failure
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_task.name == 'Verify effective or running hotel executable provenance'
+              - "'Hotel executable provenance failed' in ansible_failed_result.msg"
+    - name: Exercise production role gate against approved versioned path
+      ansible.builtin.include_tasks: ../../../ansible/roles/percival_personal_mcp/tasks/verify_hotel.yml
+      vars:
+        fixture_effective: '{{ fixture_approved_link }}'
+    - name: A hotel restart failure must close the gateway and fail rollout
+      block:
+        - name: Exercise production activation rescue using stubbed systemctl
+          ansible.builtin.include_tasks: ../../../ansible/roles/percival_personal_mcp/tasks/activate_hotel.yml
+        - name: Fail if supervisor failure was admitted
+          ansible.builtin.fail:
+            msg: Supervisor failure was unexpectedly admitted.
+      rescue:
+        - name: Require explicit failed activation after gateway closure
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_task.name == 'Fail scoped rollout after gateway closure'
+              - "'gateway stopped' in ansible_failed_result.msg"
+        - name: Inspect synthetic gateway-stop marker
+          ansible.builtin.stat:
+            path: '{{ fixture_stop_marker }}'
+          register: fixture_stop
+        - name: Require stop action was executed against the stub
+          ansible.builtin.assert:
+            that: fixture_stop.stat.exists

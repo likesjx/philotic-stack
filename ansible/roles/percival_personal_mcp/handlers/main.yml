@@ -1,17 +1,6 @@
 ---
-# Definition order is deliberate: FD exists before the hotel's new exec.
-- name: Reload scoped systemd units
-  ansible.builtin.systemd_service:
-    daemon_reload: true
-- name: Start scoped vault socket
-  ansible.builtin.systemd_service:
-    name: percival-personal-vault.socket
-    state: started
-- name: Restart scoped hotel
-  ansible.builtin.systemd_service:
-    name: philotic-hotel.service
-    state: restarted
+# Definition order is deliberate: shared rescue covers activation before gateway.
+- name: Activate scoped hotel
+  ansible.builtin.include_tasks: ../tasks/activate_hotel.yml
 - name: Restart scoped gateway
-  ansible.builtin.systemd_service:
-    name: percival-personal-mcp.service
-    state: restarted
+  ansible.builtin.include_tasks: ../tasks/activate_gateway.yml
