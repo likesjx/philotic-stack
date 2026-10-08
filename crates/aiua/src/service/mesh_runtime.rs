@@ -22,10 +22,9 @@ use crate::service::ipc::IpcServer;
 use crate::service::role_materialization::{DeliveryOutcome, DropReason};
 use crate::{
     LedgerCommand, capability_sync_fingerprint, execution_reachability_for_hotel,
-    handle_cron_fired_broadcast, handle_cron_job_sync, handle_mesh_membership_accept,
-    handle_projected_user_identity_sync, local_capability_advertisements, mesh_auth_key_for_node,
-    mesh_target_addr_for_node, mesh_targets_for_graph, reconcile_peer_execution_reachability,
-    sample_node_health,
+    handle_mesh_membership_accept, handle_projected_user_identity_sync,
+    local_capability_advertisements, mesh_auth_key_for_node, mesh_target_addr_for_node,
+    mesh_targets_for_graph, reconcile_peer_execution_reachability, sample_node_health,
 };
 
 /// Does an inbound event's claimed source match the peer whose per-pair
@@ -954,30 +953,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                 if event_is_addressed_elsewhere(event, &inbound_local_node_id) {
                                     continue;
                                 }
-                                // Cron control-plane broadcasts.
                                 match &event.kind {
-                                        ansible_mesh_core::event::EventKind::CronFired => {
-                                            if let ansible_mesh_core::event::EventPayload::Inline {
-                                                data,
-                                            } = &event.payload
-                                            {
-                                                handle_cron_fired_broadcast(
-                                                    inbound_graph.as_ref(),
-                                                    data,
-                                                );
-                                            }
-                                        }
-                                        ansible_mesh_core::event::EventKind::CronJobSync => {
-                                            if let ansible_mesh_core::event::EventPayload::Inline {
-                                                data,
-                                            } = &event.payload
-                                            {
-                                                handle_cron_job_sync(
-                                                    inbound_graph.as_ref(),
-                                                    data,
-                                                );
-                                            }
-                                        }
                                         ansible_mesh_core::event::EventKind::ProjectedUserIdentitySync => {
                                             if let ansible_mesh_core::event::EventPayload::Inline {
                                                 data,

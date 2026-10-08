@@ -8066,45 +8066,17 @@ impl IpcServer {
             }
             // ── Cron scheduler ──────────────────────────────────────────────
             IpcRequest::RegisterCronJob { job } => {
-                Self::handle_register_cron_job(
-                    job,
-                    local_node_id,
-                    dispatcher_tx,
-                    graph,
-                    current_identity,
-                )
-                .await
+                Self::handle_register_cron_job(job, graph, current_identity).await
             }
             IpcRequest::RemoveCronJob { job_id } => {
-                Self::handle_remove_cron_job(
-                    job_id,
-                    local_node_id,
-                    dispatcher_tx,
-                    graph,
-                    current_identity,
-                )
-                .await
+                Self::handle_remove_cron_job(job_id, graph, current_identity).await
             }
             IpcRequest::ListCronJobs => Self::handle_list_cron_jobs(graph, current_identity),
             IpcRequest::EnableCronJob { job_id } => {
-                Self::handle_enable_cron_job(
-                    job_id,
-                    local_node_id,
-                    dispatcher_tx,
-                    graph,
-                    current_identity,
-                )
-                .await
+                Self::handle_enable_cron_job(job_id, graph, current_identity).await
             }
             IpcRequest::DisableCronJob { job_id } => {
-                Self::handle_disable_cron_job(
-                    job_id,
-                    local_node_id,
-                    dispatcher_tx,
-                    graph,
-                    current_identity,
-                )
-                .await
+                Self::handle_disable_cron_job(job_id, graph, current_identity).await
             }
             IpcRequest::SetCronPolicy { job_id, policy } => {
                 Self::handle_set_cron_policy(job_id, policy, graph, current_identity)
@@ -11443,66 +11415,6 @@ impl IpcServer {
                 "audit_id": audit_id,
             })),
         )
-    }
-
-    /// Broadcast a `CronJobSync` upsert envelope for a job definition change.
-    async fn broadcast_cron_sync_upsert(
-        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
-        local_node_id: &str,
-        job: &ansible_mesh_core::cron::CronJob,
-    ) {
-        use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let payload = serde_json::json!({ "op": "upsert", "job": job }).to_string();
-        let env = EventEnvelope {
-            event_id: Uuid::new_v4(),
-            seq: 0,
-            source_node_id: local_node_id.to_string(),
-            target_node_id: None,
-            source_agent_id: "ipc-server".into(),
-            target_agent_id: None,
-            kind: EventKind::CronJobSync,
-            corr_id: format!("cron-sync:{}", job.id),
-            attempt: 0,
-            created_at: now_ms,
-            expires_at: None,
-            payload: EventPayload::Inline { data: payload },
-            trace: vec!["ipc:cron-sync".into()],
-        };
-        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-    }
-
-    /// Broadcast a `CronJobSync` remove envelope when a job is deleted.
-    async fn broadcast_cron_sync_remove(
-        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
-        local_node_id: &str,
-        job_id: &str,
-    ) {
-        use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let payload = serde_json::json!({ "op": "remove", "job_id": job_id }).to_string();
-        let env = EventEnvelope {
-            event_id: Uuid::new_v4(),
-            seq: 0,
-            source_node_id: local_node_id.to_string(),
-            target_node_id: None,
-            source_agent_id: "ipc-server".into(),
-            target_agent_id: None,
-            kind: EventKind::CronJobSync,
-            corr_id: format!("cron-sync-remove:{job_id}"),
-            attempt: 0,
-            created_at: now_ms,
-            expires_at: None,
-            payload: EventPayload::Inline { data: payload },
-            trace: vec!["ipc:cron-sync-remove".into()],
-        };
-        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
     }
 
     // ── Autonomy lane consult (Autopoiesis Slice A2) ──────────────────────────
