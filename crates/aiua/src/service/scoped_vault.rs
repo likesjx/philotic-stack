@@ -675,25 +675,38 @@ mod tests {
     }
     #[tokio::test]
     async fn timed_out_blocking_resolver_retains_worker_until_completion() {
-        struct Slow;
+        struct Slow {
+            started: Arc<tokio::sync::Notify>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
         impl Resolver for Slow {
             fn resolve(&self, _: &Policy) -> io::Result<Zeroizing<String>> {
-                std::thread::sleep(Duration::from_millis(100));
+                self.started.notify_one();
+                // Sender drop also releases this job if the test fails early.
+                let _ = self.release.lock().unwrap().recv();
                 Ok(Zeroizing::new("mk_synthetic".into()))
             }
         }
+        let (release, wait) = std::sync::mpsc::channel();
+        let started = Arc::new(tokio::sync::Notify::new());
         let slots = Arc::new(Semaphore::new(1));
         let permit = Arc::new(slots.clone().acquire_owned().await.unwrap());
         let (mut client, server) = UnixStream::pair().unwrap();
         let task = tokio::spawn(handle_peer(
             server,
             policy(),
-            Arc::new(Slow),
+            Arc::new(Slow {
+                started: started.clone(),
+                release: std::sync::Mutex::new(wait),
+            }),
             permit,
-            Duration::from_millis(20),
+            Duration::from_secs(2),
             Some(1234),
         ));
         send(&mut client, br#"{"operation":"get_percival_credential"}"#)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
             .unwrap();
         let size = client.read_u32().await.unwrap();
@@ -705,21 +718,31 @@ mod tests {
             "credential_unavailable"
         );
         assert_eq!(slots.available_permits(), 0);
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        release.send(()).unwrap();
+        // Wait for the actual retained permit, not a scheduler-dependent sleep.
+        let returned = tokio::time::timeout(Duration::from_secs(5), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(returned);
         assert_eq!(slots.available_permits(), 1);
     }
     #[tokio::test]
     async fn listener_owned_handlers_close_sockets_on_disable_without_late_secret_delivery() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        struct Slow(Arc<AtomicBool>);
+        struct Slow {
+            started: Arc<AtomicBool>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
         impl Resolver for Slow {
             fn resolve(&self, _: &Policy) -> io::Result<Zeroizing<String>> {
-                self.0.store(true, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(100));
+                self.started.store(true, Ordering::SeqCst);
+                let _ = self.release.lock().unwrap().recv();
                 Ok(Zeroizing::new("mk_synthetic".into()))
             }
         }
         let started = Arc::new(AtomicBool::new(false));
+        let (release, wait) = std::sync::mpsc::channel();
         let slots = Arc::new(Semaphore::new(1));
         let permit = Arc::new(slots.clone().acquire_owned().await.unwrap());
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -727,7 +750,10 @@ mod tests {
         handlers.spawn(handle_peer(
             server,
             policy(),
-            Arc::new(Slow(started.clone())),
+            Arc::new(Slow {
+                started: started.clone(),
+                release: std::sync::Mutex::new(wait),
+            }),
             permit,
             DEADLINE,
             Some(1234),
@@ -735,7 +761,7 @@ mod tests {
         send(&mut client, br#"{"operation":"get_percival_credential"}"#)
             .await
             .unwrap();
-        within(Instant::now() + Duration::from_millis(500), async {
+        within(Instant::now() + Duration::from_secs(5), async {
             while !started.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }
@@ -747,7 +773,7 @@ mod tests {
         let mut byte = [0];
         assert_eq!(
             within(
-                Instant::now() + Duration::from_millis(500),
+                Instant::now() + Duration::from_secs(5),
                 client.read(&mut byte)
             )
             .await
@@ -755,7 +781,12 @@ mod tests {
             0
         );
         assert_eq!(slots.available_permits(), 0);
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        release.send(()).unwrap();
+        let returned = tokio::time::timeout(Duration::from_secs(5), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(returned);
         assert_eq!(slots.available_permits(), 1);
     }
     #[cfg(not(target_os = "linux"))]
