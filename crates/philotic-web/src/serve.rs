@@ -101,6 +101,9 @@ mod surface_routes;
 // Awaiting the authenticated hotel/runtime cancellation adapter; see contract.
 #[allow(dead_code)]
 mod voice_turn_binding;
+// Configuration preparation only; no profile route or provider dispatch yet.
+#[allow(dead_code)]
+mod voice_profile_catalog;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};

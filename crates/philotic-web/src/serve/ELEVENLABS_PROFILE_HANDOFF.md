@@ -36,3 +36,10 @@ permits only configured endpoints; local failure never falls back externally;
 revocation or cancellation between sentences blocks the next attempt; preview
 and actual response use the same guarded registry. Use mock providers and verify
 zero invocations on denial before any separately authorized live experiment.
+
+Configuration-only source preparation now lives in voice_profile_catalog.rs:
+server-owned stable selections map to existing voice/model/voice_settings hints.
+It accepts no speech content, endpoint, credentials or eligibility flag and has
+no send method or installed route. Three synthetic tests prove metadata mapping,
+unknown/duplicate denial and malformed configuration rejection. Full task
+assembly/preview dispatch remains blocked on the owner guard described above.

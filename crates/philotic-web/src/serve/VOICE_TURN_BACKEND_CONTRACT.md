@@ -20,10 +20,30 @@ present mismatched or malformed IDs are dropped. These are correlation barriers,
 not authenticated agent provenance. Bytes already admitted to a socket send
 cannot be recalled; the client turn gate rejects stale playback independently.
 
-The bounded ledger currently rejects after 256 unique correlated requests per
-device in the process lifetime, including tombstones. It does not evict/reuse
-revoked IDs. Production authority installation must define session expiry and
-safe ledger cleanup before treating this checkpoint as an unrestricted release.
+Lifecycle follow-up preserves `ad13939b` and fixes its 256 lifetime-entry cliff.
+There are separate bounds of 256 active entries and 256 terminal metadata entries
+per device. Active pending/accepted and unconfirmed revoked jobs have no timer
+eviction. Completed relays, failed preparation and confirmed cancellation release
+active capacity; terminal metadata expires after 30 minutes of monotonic server
+time or is evicted at its bounded terminal capacity. Expiry is checked lazily on
+ledger access. Clock rollback is clamped and jumps remove only terminal entries.
+
+Managed canonical turns use the server-only `operator-chat-edge-turn-` namespace.
+An unknown/expired managed turn denies, rather than becoming permissive legacy
+traffic. Completed output is sealed at its last admitted sequence: existing
+queued/replayed frames within that cutoff remain valid; later output denies.
+Revocation denies even previously queued frames. Ledger admission and ring
+insertion now hold the same lock as cancellation, so frames are admitted before
+revocation or rejected; previously admitted retained frames may remain in the
+ring while delivery/replay suppress them.
+
+Compact keyed request fingerprints remain bounded at 4,096 per device for the
+process lifetime and reject ID reuse after terminal metadata expiry, eviction
+or reconnect. A hash collision rejects safely. They are not authority handles.
+That safe budget exhaustion deliberately fails closed; it is not silently reset
+on reconnect or wall-clock expiry. Removing even this bound safely requires an
+owner-provided verified epoch/durable request replay contract. This remains an
+in-memory source checkpoint; restart durability belongs to that authority work.
 
 Production installation requires these interfaces, coordinated by the parent:
 
@@ -57,14 +77,13 @@ privacy-integration worktree. Preferences/request IDs/cancellation grant no egre
 eligibility. Native-live paths remain denied. Source manifests and current policy
 must come from the trusted runtime issuer, which is still absent.
 
-Ownership: this patch adds `serve/voice_turn_binding.rs` and this note, plus only
-a module declaration in `serve.rs`. The active desktop-invite-login worktree owns
+Ownership: the initial ledger added its module and note; follow-ups add edge admission/lifecycle, an acceptance callback and canonical reply filtering in `serve.rs`, and configuration-only profile preparation. The active desktop-invite-login worktree owns
 dirty login fencing in `serve.rs`; no files in that worktree were edited. The
 privacy owner retains core/model-router/IPC authority work. Apple client code is
 in the preceding isolated commits c4c3ff4d and 46f871d2.
 
-Verification: 30 protocol tests (legacy fixtures unchanged), 29 edge unit tests,
-five ledger unit tests and all 11 fake-hotel loopback WebSocket tests pass. Mock
+Verification: 30 protocol tests (legacy fixtures unchanged), 30 edge unit tests,
+ten ledger unit tests, three mock profile tests and all 12 fake-hotel loopback WebSocket tests pass. The lifecycle regression sends 270 mixed completed/failed requests and reconnects; unit fixtures cover 600 transitions, repeated cancellation, clock/expiry, stale frames and fail-closed budget exhaustion. Mock
 adapter tests cover cancellation before acceptance, wrong device/target/agent/
 conversation/turn, adapter failure, queued/replayed stale output and a running
 synthetic job whose committed tool effect survives cancellation. These do not
@@ -75,3 +94,5 @@ verification remains unchanged. No external provider traffic or microphone use.
 ElevenLabs profile preparation is described in [the profile handoff](ELEVENLABS_PROFILE_HANDOFF.md).
 The guarded registry and verified dispatch context remain the only supported
 privacy seam; no second trust mechanism or client eligibility flag was added.
+
+Minimum owner interface request: [runtime authority/cancellation](VOICE_RUNTIME_AUTHORITY_REQUEST.md).
