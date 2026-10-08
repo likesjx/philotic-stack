@@ -6752,20 +6752,11 @@ impl IpcServer {
                 Self::handle_revoke_skill(agent_id, role_name, skill_name, graph, current_identity)
             }
             IpcRequest::RegisterProcedure { procedure, origin } => {
-                handle_register_procedure(current_identity.as_ref(), graph, procedure, origin)
+                Self::handle_register_procedure_request(procedure, origin, graph, current_identity)
             }
-            IpcRequest::GetProcedure { procedure_id } => match graph.get_procedure(&procedure_id) {
-                Ok(Some(p)) => IpcResponse::success(
-                    "get_procedure",
-                    Some(serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)),
-                ),
-                Ok(None) => IpcResponse::error(
-                    "get_procedure",
-                    "PROCEDURE_NOT_FOUND",
-                    format!("no procedure named {procedure_id}"),
-                ),
-                Err(e) => IpcResponse::error("get_procedure", "PROCEDURE_ERROR", e.to_string()),
-            },
+            IpcRequest::GetProcedure { procedure_id } => {
+                Self::handle_get_procedure(procedure_id, graph)
+            }
             IpcRequest::ApplySurfaceMessages {
                 surface_id,
                 messages,
@@ -6797,146 +6788,44 @@ impl IpcServer {
                 limit,
                 graph,
             ),
-            IpcRequest::ListProcedures {} => match graph.list_procedures() {
-                Ok(list) => IpcResponse::success(
-                    "list_procedures",
-                    Some(serde_json::json!({ "procedures": list })),
-                ),
-                Err(e) => IpcResponse::error("list_procedures", "PROCEDURE_ERROR", e.to_string()),
-            },
+            IpcRequest::ListProcedures {} => Self::handle_list_procedures(graph),
             IpcRequest::RecordProcedureRun { run } => {
-                // The ledger is the refiner's evidence and the trial gate's
-                // score source; an unregistered peer must not be able to
-                // write either.
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "record_procedure_run",
-                        "PROCEDURE_RUN_UNREGISTERED",
-                        "guest must register before recording procedure runs",
-                    );
-                };
-                let mut run: ProcedureRunRecord = match serde_json::from_value(run) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "record_procedure_run",
-                            "PROCEDURE_RUN_INVALID",
-                            format!("malformed run record: {e}"),
-                        );
-                    }
-                };
-                if run.run_id.trim().is_empty() || run.procedure_id.trim().is_empty() {
-                    return IpcResponse::error(
-                        "record_procedure_run",
-                        "PROCEDURE_RUN_INVALID",
-                        "run_id and procedure_id are required",
-                    );
-                }
-                if run.agent_id.trim().is_empty() {
-                    run.agent_id = identity.guest_id.clone();
-                }
-                if run.recorded_at == 0 {
-                    run.recorded_at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                }
-                // The score is derived, never trusted from the wire.
-                run.score = ProcedureRunRecord::score_for(&run.verdict, &run.basis);
-                match graph.record_procedure_run(&run) {
-                    Ok(()) => {
-                        // P4: every run may close a trial window.
-                        let trials = evaluate_procedure_trials(graph, &run.procedure_id);
-                        IpcResponse::success(
-                            "record_procedure_run",
-                            Some(serde_json::json!({
-                                "run_id": run.run_id,
-                                "procedure_id": run.procedure_id,
-                                "graph_version": run.graph_version,
-                                "score": run.score,
-                                "trials_decided": trials,
-                            })),
-                        )
-                    }
-                    Err(e) => IpcResponse::error(
-                        "record_procedure_run",
-                        "PROCEDURE_RUN_ERROR",
-                        e.to_string(),
-                    ),
-                }
+                Self::handle_record_procedure_run(run, graph, current_identity)
             }
             IpcRequest::ListProcedureRuns {
                 procedure_id,
                 graph_version,
                 limit,
-            } => match graph.list_procedure_runs(
-                &procedure_id,
-                graph_version,
-                limit.unwrap_or(20).clamp(1, 200),
-            ) {
-                Ok(runs) => IpcResponse::success(
-                    "list_procedure_runs",
-                    Some(serde_json::json!({ "procedure_id": procedure_id, "runs": runs })),
-                ),
-                Err(e) => {
-                    IpcResponse::error("list_procedure_runs", "PROCEDURE_RUN_ERROR", e.to_string())
-                }
-            },
+            } => Self::handle_list_procedure_runs(procedure_id, graph_version, limit, graph),
             IpcRequest::ProposeProcedurePatch {
                 procedure_id,
                 ops,
                 rationale,
                 evidence_run_ids,
                 origin,
-            } => handle_propose_procedure_patch(
-                current_identity.as_ref(),
-                graph,
+            } => Self::handle_propose_procedure_patch_request(
                 procedure_id,
                 ops,
                 rationale,
                 evidence_run_ids,
                 origin,
+                graph,
+                current_identity,
             ),
             IpcRequest::ListProcedurePatches {
                 procedure_id,
                 status,
-            } => {
-                let status = match status.as_deref() {
-                    None => None,
-                    Some("pending") => Some(ProcedurePatchStatus::Pending),
-                    Some("trial") => Some(ProcedurePatchStatus::Trial),
-                    Some("accepted") => Some(ProcedurePatchStatus::Accepted),
-                    Some("rejected") => Some(ProcedurePatchStatus::Rejected),
-                    Some(other) => {
-                        return IpcResponse::error(
-                            "list_procedure_patches",
-                            "PROCEDURE_PATCH_INVALID",
-                            format!("unknown status filter {other:?}"),
-                        );
-                    }
-                };
-                match graph.list_procedure_patches(procedure_id.as_deref(), status) {
-                    Ok(patches) => IpcResponse::success(
-                        "list_procedure_patches",
-                        Some(serde_json::json!({ "patches": patches })),
-                    ),
-                    Err(e) => IpcResponse::error(
-                        "list_procedure_patches",
-                        "PROCEDURE_PATCH_ERROR",
-                        e.to_string(),
-                    ),
-                }
-            }
+            } => Self::handle_list_procedure_patches(procedure_id, status, graph),
             IpcRequest::DecideProcedurePatch {
                 patch_id,
                 decision,
                 reason,
-            } => handle_decide_procedure_patch(
-                current_identity.as_ref(),
-                graph,
+            } => Self::handle_decide_procedure_patch_request(
                 patch_id,
                 decision,
                 reason,
+                graph,
+                current_identity,
             ),
             IpcRequest::ListSkills {} => Self::handle_list_skills(graph, current_identity),
             IpcRequest::AbortSubagentSpawn { subagent_guest_id } => {
