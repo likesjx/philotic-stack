@@ -983,7 +983,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                     .as_secs();
                                 let payload = ack_payload.into_bytes();
                                 let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key)
-                                    .sign(&msg_id, seq as u64, &payload, timestamp);
+                                    .sign(&msg_id, seq, &payload, timestamp);
                                 let ack = ansible_mesh_core::BeaconMessage {
                                     version: 1,
                                     msg_id,
@@ -1173,7 +1173,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
 
                     let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key).sign(
                         &msg_id,
-                        seq as u64,
+                        seq,
                         &payload_bytes,
                         timestamp,
                     );

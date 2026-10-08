@@ -48,7 +48,7 @@ else
   COGNITIVE_HOTEL="${HOTEL_NAME}"
 fi
 
-"${ROOT_DIR}/target/debug/aiua" \
+PHILOTIC_HOTEL_SOCKET="/tmp/philotic-${COGNITIVE_HOTEL}.sock" "${ROOT_DIR}/target/debug/aiua" \
   --hotel "${COGNITIVE_HOTEL}" \
   --test cognitive-roundtrip \
   --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-startup cognitive smoke ok}" \
