@@ -41,6 +41,7 @@ public final class VoiceController: NSObject {
     private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognitionGeneration = UUID()
 
     private var audioRecorder: AVAudioRecorder?
     private var recordingURL: URL?
@@ -78,6 +79,10 @@ public final class VoiceController: NSObject {
             voiceError = "Speech recognition is not available on this device right now."
             return
         }
+        guard speechRecognizer.supportsOnDeviceRecognition else {
+            voiceError = "On-device speech recognition is unavailable for this language. Voice capture cannot use an external recognizer."
+            return
+        }
 
         guard await Self.requestSpeechAuthorization() else {
             voiceError = "Speech recognition permission was denied. Enable it in Settings to send voice messages."
@@ -91,7 +96,7 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -102,12 +107,7 @@ public final class VoiceController: NSObject {
         let engine = AVAudioEngine()
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Prefer on-device recognition when the locale supports it (privacy
-        // + works offline); fall back to the default (server-assisted)
-        // recognizer otherwise rather than failing outright.
-        if speechRecognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        request.requiresOnDeviceRecognition = true
 
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
@@ -127,6 +127,8 @@ public final class VoiceController: NSObject {
         audioEngine = engine
         recognitionRequest = request
         isListening = true
+        let generation = UUID()
+        recognitionGeneration = generation
 
         recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
             // Extract Sendable primitives here, on whatever thread this
@@ -135,7 +137,8 @@ public final class VoiceController: NSObject {
             let isFinal = result?.isFinal ?? false
             let errorDescription = error?.localizedDescription
             Task { @MainActor [weak self] in
-                self?.handleRecognitionUpdate(text: text, isFinal: isFinal, errorDescription: errorDescription)
+                guard let self, self.recognitionGeneration == generation else { return }
+                self.handleRecognitionUpdate(text: text, isFinal: isFinal, errorDescription: errorDescription)
             }
         }
     }
@@ -168,6 +171,7 @@ public final class VoiceController: NSObject {
     }
 
     private func teardownAudioCapture() {
+        recognitionGeneration = UUID()
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
@@ -176,7 +180,7 @@ public final class VoiceController: NSObject {
         recognitionRequest = nil
         isListening = false
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        deactivateAudioSessionIfIdle()
         #endif
     }
 
@@ -214,7 +218,7 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .default, options: .duckOthers)
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -258,7 +262,7 @@ public final class VoiceController: NSObject {
         let url = recordingURL
         recordingURL = nil
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        deactivateAudioSessionIfIdle()
         #endif
         return url
     }
@@ -295,7 +299,7 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -409,7 +413,7 @@ public final class VoiceController: NSObject {
         isCapturingPCM = false
 
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        deactivateAudioSessionIfIdle()
         #endif
     }
 
@@ -429,11 +433,15 @@ public final class VoiceController: NSObject {
 
     /// Stops any in-flight voice-reply playback, discarding queued chunks.
     public func stopPlayback() {
+        cancelFallback()
         chunkQueue.removeAll()
         isChunkedPlayback = false
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false
+        #if os(iOS)
+        deactivateAudioSessionIfIdle()
+        #endif
     }
 
     // MARK: - Chunked voice-reply playback
@@ -441,7 +449,7 @@ public final class VoiceController: NSObject {
     /// True while agent reply audio is audible or queued — the barge-in
     /// condition for conversation mode (stricter VAD onset applies).
     public var hasPendingReplyAudio: Bool {
-        isPlaying || !chunkQueue.isEmpty
+        isPlaying || speechSynthesizer.isSpeaking || !chunkQueue.isEmpty
     }
 
     /// FIFO of decoded audio chunks awaiting playback (per-sentence TTS).
@@ -489,7 +497,7 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true)
         } catch {
             voiceError = "Could not configure audio playback: \(error.localizedDescription)"
@@ -514,7 +522,8 @@ public final class VoiceController: NSObject {
 
     /// Delegate-chained continuation: called on the main actor when the
     /// current player finishes (or fails to decode mid-flight).
-    fileprivate func handlePlaybackFinished(errorDescription: String? = nil) {
+    fileprivate func handlePlaybackFinished(playerID: ObjectIdentifier, errorDescription: String? = nil) {
+        guard let currentPlayer = audioPlayer, ObjectIdentifier(currentPlayer) == playerID else { return }
         audioPlayer = nil
         isPlaying = false
         if let errorDescription {
@@ -523,7 +532,18 @@ public final class VoiceController: NSObject {
         if isChunkedPlayback {
             playNextChunk()
         }
+        #if os(iOS)
+        deactivateAudioSessionIfIdle()
+        #endif
     }
+
+    #if os(iOS)
+    private func deactivateAudioSessionIfIdle() {
+        guard !isListening, !isRecording, !isCapturingPCM, !isPlaying,
+            !speechSynthesizer.isSpeaking else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+    #endif
 
     // MARK: - Fallback TTS
 
@@ -531,6 +551,16 @@ public final class VoiceController: NSObject {
     /// server-side audio reply hasn't arrived within the fallback window.
     public func speakFallback(text: String) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        #if os(iOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true)
+        } catch {
+            voiceError = "Could not configure speech playback: \(error.localizedDescription)"
+            return
+        }
+        #endif
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         speechSynthesizer.speak(utterance)
@@ -546,15 +576,17 @@ public final class VoiceController: NSObject {
 
 extension VoiceController: AVAudioPlayerDelegate {
     public nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        let playerID = ObjectIdentifier(player)
         Task { @MainActor [weak self] in
-            self?.handlePlaybackFinished()
+            self?.handlePlaybackFinished(playerID: playerID)
         }
     }
 
     public nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         let description = error?.localizedDescription ?? "Voice reply playback failed."
+        let playerID = ObjectIdentifier(player)
         Task { @MainActor [weak self] in
-            self?.handlePlaybackFinished(errorDescription: description)
+            self?.handlePlaybackFinished(playerID: playerID, errorDescription: description)
         }
     }
 }
