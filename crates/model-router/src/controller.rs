@@ -579,11 +579,13 @@ impl ControllerTask {
             ));
         }
 
+        // A structured active turn is the current message. The accompanying
+        // legacy flat prompt repeats its context layers and must not be appended.
         if let Some(prompt) = self
             .prompt
             .as_deref()
             .map(str::trim)
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && self.context.active_turn.is_none())
         {
             sections.push(format!("[Prompt]\n{prompt}"));
         }

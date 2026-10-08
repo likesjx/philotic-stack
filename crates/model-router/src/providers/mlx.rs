@@ -226,6 +226,18 @@ impl MlxProvider {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
 
+        let wire = mlx_runner::client::ChatRequest {
+            model: inst
+                .discovered_model_id
+                .clone()
+                .unwrap_or_else(|| inst.config.repo_id.clone()),
+            messages: messages.clone(),
+            tools: tools.clone(),
+            tool_choice: None,
+            temperature,
+            max_tokens,
+        };
+        crate::context_management::account_wire(&serde_json::to_value(&wire)?, task)?;
         let result = inst.chat(messages, tools, temperature, max_tokens).await;
 
         if let Err(ref e) = result {

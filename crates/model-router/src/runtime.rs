@@ -28,6 +28,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+/// The ordinary dispatch retry loop enters here for every batch/stream attempt,
+/// including rebuilt providers after credential rotation. Prepare a fresh clone:
+/// retries and fallback attempts cannot inflate or rewrite the source context.
+async fn invoke_ordinary_provider_attempt(
+    provider: &dyn ModelProvider,
+    task: &ControllerTask,
+    tokens: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<ProviderOutput> {
+    let prepared = if task.kind == TaskKind::TextGenerate {
+        let (prepared, accounting) = crate::context_management::prepare(task)?;
+        info!(accounting = %serde_json::to_string(&accounting)?,
+            "model context selection (conservative estimate; metadata only)");
+        prepared
+    } else {
+        task.clone()
+    };
+    match tokens {
+        Some(tokens) => provider.invoke_streaming(&prepared, tokens).await,
+        None => provider.invoke(&prepared).await,
+    }
+}
+
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
@@ -903,7 +925,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 });
                                 tokio::time::timeout(
                                     Duration::from_secs(attempt_secs),
-                                    provider.invoke_streaming(&controller_task, token_tx),
+                                    invoke_ordinary_provider_attempt(provider.as_ref(), &controller_task, Some(token_tx)),
                                 )
                                 .await
                                 .unwrap_or_else(|_| {
@@ -915,7 +937,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             } else {
                                 tokio::time::timeout(
                                     Duration::from_secs(attempt_secs),
-                                    provider.invoke(&controller_task),
+                                    invoke_ordinary_provider_attempt(provider.as_ref(), &controller_task, None),
                                 )
                                 .await
                                 .unwrap_or_else(|_| {
@@ -2855,5 +2877,169 @@ mod openrouter_default_tests {
         assert_eq!(DEFAULT_OPENROUTER_MODEL, "z-ai/glm-5.2");
         assert_ne!(DEFAULT_OPENROUTER_MODEL, "gpt-4.1-mini");
         assert_ne!(DEFAULT_OPENROUTER_MODEL, "openai/gpt-4.1-mini");
+    }
+}
+
+#[cfg(test)]
+mod context_dispatch_tests {
+    use super::*;
+    use crate::providers::OpenAIProvider;
+    use anyhow::bail;
+    use axum::{Json, Router, http::StatusCode, routing::post};
+    use tokio::sync::Mutex;
+
+    fn task() -> ControllerTask {
+        ControllerTask::from_value(&json!({
+            "kind":"text.generate", "model":"deepseek/deepseek-v4.1-flash",
+            "prompt":"LEGACY_DUPLICATE",
+            "context":{
+                "active_turn":{"role":"user","text":"CURRENT_USER"},
+                "instructions":[{"text":"REQUIRED_SYSTEM"}],
+                "recalled_memory":[{"text":"RECALL_ONCE"},{"text":"RECALL_ONCE"}],
+                "tool_history":[{"index":1,"tool_name":"synthetic",
+                    "arguments":{"marker":"CALL_ARGUMENT"},"result":"TOOL_RESULT"}]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ordinary_dispatch_openrouter_wire_default_cap_retry_and_fallback() {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let capture = captured.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let capture = capture.clone();
+                async move {
+                    let mut bodies = capture.lock().await;
+                    bodies.push(body);
+                    if bodies.len() <= 2 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error":{"message":"synthetic retry failure"}})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({"choices":[{"message":{"content":"synthetic success"}}]})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let primary = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            None,
+            Some(base.clone()),
+            None,
+            Some("deepseek/deepseek-v4.1-flash".into()),
+            None,
+            vec!["openai/gpt-4.1-mini".into()],
+            None,
+        );
+        let fallback = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            None,
+            Some(base),
+            None,
+            Some("openai/gpt-4.1-mini".into()),
+            None,
+            vec![],
+            None,
+        );
+        let mut original = task();
+        original.model = None; // exercise configured provider default, not a task pin
+        let snapshot = format!("{original:?}");
+        // Enter the same ordinary attempt boundary as the runtime retry loop;
+        // failures, repeated attempts, and the next resolved provider all pass
+        // through preparation before the real HTTP provider serializes them.
+        assert!(
+            invoke_ordinary_provider_attempt(&primary, &original, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            invoke_ordinary_provider_attempt(&primary, &original, None)
+                .await
+                .is_err()
+        );
+        let mut next = original.clone();
+        next.model = Some("openai/gpt-4.1-mini".into());
+        invoke_ordinary_provider_attempt(&fallback, &next, None)
+            .await
+            .unwrap();
+        let bodies = captured.lock().await;
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0], bodies[1], "retry wire must not inflate");
+        assert_eq!(bodies[0]["models"], json!(["openai/gpt-4.1-mini"]));
+        assert_eq!(bodies[2]["model"], "openai/gpt-4.1-mini");
+        for body in bodies.iter() {
+            assert_eq!(body["max_tokens"], 4096);
+            let content = body["messages"].to_string();
+            for marker in [
+                "CURRENT_USER",
+                "REQUIRED_SYSTEM",
+                "RECALL_ONCE",
+                "CALL_ARGUMENT",
+                "TOOL_RESULT",
+            ] {
+                assert_eq!(content.matches(marker).count(), 1, "{marker}");
+            }
+            assert!(!content.contains("LEGACY_DUPLICATE"));
+        }
+        assert_eq!(format!("{original:?}"), snapshot);
+        server.abort();
+    }
+
+    struct StreamingProbe;
+    #[async_trait::async_trait]
+    impl ModelProvider for StreamingProbe {
+        fn id(&self) -> &'static str {
+            "synthetic"
+        }
+        fn supports(&self, _: &ControllerTask) -> bool {
+            true
+        }
+        async fn invoke(&self, _: &ControllerTask) -> Result<ProviderOutput> {
+            bail!("batch path must not run")
+        }
+        async fn invoke_streaming(
+            &self,
+            task: &ControllerTask,
+            _: tokio::sync::mpsc::Sender<String>,
+        ) -> Result<ProviderOutput> {
+            assert_eq!(task.provider_options["max_tokens"], 4096);
+            let prompt = task.composed_prompt_text().unwrap();
+            assert_eq!(prompt.matches("RECALL_ONCE").count(), 1);
+            assert!(prompt.contains("REQUIRED_SYSTEM"));
+            assert!(prompt.contains("CURRENT_USER"));
+            bail!("synthetic streaming reached after preparation")
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_dispatch_streaming_and_mandatory_overflow_use_preparation() {
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let err = invoke_ordinary_provider_attempt(&StreamingProbe, &task(), Some(tx))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("streaming reached"));
+        let mut oversized = task();
+        oversized.context.active_turn.as_mut().unwrap().text = Some("x".repeat(20000));
+        let err = invoke_ordinary_provider_attempt(&StreamingProbe, &oversized, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("current user"),
+            "must fail before provider entry"
+        );
     }
 }

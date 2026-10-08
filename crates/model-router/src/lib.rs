@@ -1,3 +1,4 @@
+pub mod context_management;
 pub mod aux_model;
 pub mod controller;
 pub mod credential_pool;

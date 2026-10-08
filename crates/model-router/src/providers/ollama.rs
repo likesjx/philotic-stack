@@ -71,33 +71,27 @@ impl ModelProvider for OllamaProvider {
             .unwrap_or(&self.default_model)
             .to_string();
 
-        // Build messages array from composed prompt.
-        // System text goes into a system role message; the prompt is the user turn.
-        let mut messages: Vec<Value> = Vec::new();
-
-        // Inject composed context (identity, instructions, memory) as system message.
-        if let Some(system_text) = task.composed_prompt_text()
-            && !system_text.trim().is_empty()
-        {
-            messages.push(json!({ "role": "system", "content": system_text }));
-        }
-
-        // Active user prompt — required for text generation.
         let prompt = task
-            .prompt_text()
+            .composed_prompt_text()
             .context("OllamaProvider: TextGenerate task missing prompt text")?;
-        messages.push(json!({ "role": "user", "content": prompt }));
+        let messages = vec![json!({ "role": "user", "content": prompt })];
+        let output_limit = task
+            .provider_options
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(self.max_tokens);
 
         let body = json!({
             "model": model,
             "messages": messages,
             "stream": false,
-            "max_tokens": self.max_tokens,
+            "max_tokens": output_limit,
             "options": {
-                "num_predict": self.max_tokens
+                "num_predict": output_limit
             },
         });
 
+        crate::context_management::account_wire(&body, task)?;
         info!(
             model = %model,
             base_url = %self.base_url,

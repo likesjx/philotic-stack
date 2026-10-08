@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Default model for `text.generate` when the task names none.
 pub const DEFAULT_TEXT_MODEL: &str = "claude-sonnet-5";
@@ -27,7 +27,7 @@ pub const HEAVY_TIER_MODEL: &str = "claude-opus-4-8";
 pub const FAST_TIER_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Messages API requires an explicit output cap.
-const DEFAULT_MAX_TOKENS: u64 = 8192;
+const DEFAULT_MAX_TOKENS: u64 = 4096;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Cap tool descriptions defensively — the catalog occasionally carries long prose.
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 1024;
@@ -503,14 +503,6 @@ impl AnthropicProvider {
 
         Self::text_output(task, text_segments.join("\n"), model)
     }
-
-    fn debug_model_requests_enabled() -> bool {
-        std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
-            .ok()
-            .as_deref()
-            .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-    }
 }
 
 /// State accumulated while folding Messages SSE events into a final output.
@@ -660,15 +652,9 @@ impl ModelProvider for AnthropicProvider {
 
         let model = self.request_model(task).to_string();
         let body = self.request_body(task, false)?;
-        if Self::debug_model_requests_enabled() {
-            info!(
-                provider = ModelProvider::id(self),
-                model = %model,
-                request = %serde_json::to_string_pretty(&body).unwrap_or_default(),
-                "Anthropic request payload"
-            );
+        if task.kind == TaskKind::TextGenerate {
+            crate::context_management::account_wire(&body, task)?;
         }
-
         let request = self.http_client.post(self.messages_url()).json(&body);
         let response = self.apply_headers(request)?.send().await?;
         let status = response.status();
@@ -703,6 +689,9 @@ impl ModelProvider for AnthropicProvider {
 
         let model = self.request_model(task).to_string();
         let body = self.request_body(task, true)?;
+        if task.kind == TaskKind::TextGenerate {
+            crate::context_management::account_wire(&body, task)?;
+        }
         // Under the structured contract the text stream is JSON syntax — don't
         // forward raw fragments as display tokens; the final parse recovers
         // display_text. Plain-text turns stream tokens straight through.

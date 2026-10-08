@@ -21,7 +21,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 /// Seconds without a byte chunk from the SSE stream before we abort and escalate.
 const STREAMING_IDLE_SECS: u64 = 8;
@@ -107,15 +107,6 @@ struct GeminiLiveSession {
 }
 
 impl GeminiProvider {
-    fn debug_model_requests_enabled() -> bool {
-        matches!(
-            std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-        )
-    }
-
     pub fn new(
         http_client: reqwest::Client,
         auth: Option<GeminiAuth>,
@@ -1142,37 +1133,19 @@ impl GeminiProvider {
         rendered
     }
 
-    /// Cap (in bytes) on the request-payload dump attached to HTTP-failure
-    /// evidence logs. Payloads carry no secrets (auth rides headers/query),
-    /// so nothing is redacted — only truncated for log hygiene.
-    const HTTP_FAILURE_PAYLOAD_LOG_CAP: usize = 16 * 1024;
-
-    /// Definitive-evidence log for any non-2xx Gemini response.
-    ///
-    /// Emitted unconditionally at ERROR level from both `invoke` and
-    /// `invoke_streaming` so a live 400 can never again escape with only
-    /// "Request contains an invalid argument.": the FULL error body (no
-    /// detail cap, unlike `api_error_detail`'s 600-char user-facing render)
-    /// plus the exact request payload (capped at 16KB) land in the log.
+    /// Error status and sizes only; provider error bodies may echo private input.
     fn log_http_failure(site: &str, status: reqwest::StatusCode, body: &Value, payload: &Value) {
-        let body_text = body.to_string();
-        let mut payload_text = serde_json::to_string(payload)
-            .unwrap_or_else(|err| format!("<payload serialization failed: {err}>"));
-        let payload_bytes = payload_text.len();
-        if payload_text.len() > Self::HTTP_FAILURE_PAYLOAD_LOG_CAP {
-            let mut cut = Self::HTTP_FAILURE_PAYLOAD_LOG_CAP;
-            while !payload_text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            payload_text.truncate(cut);
-            payload_text.push_str("…<truncated>");
-        }
+        let payload_bytes = serde_json::to_vec(payload).map(|v| v.len()).unwrap_or(0);
+        let error_code = body
+            .get("error")
+            .and_then(|v| v.get("code"))
+            .and_then(Value::as_u64);
         error!(
-            "gemini {site} HTTP {} — full error body: {} — request payload ({}B): {}",
-            status.as_u16(),
-            body_text,
+            site,
+            status = status.as_u16(),
+            error_code,
             payload_bytes,
-            payload_text,
+            "Gemini HTTP failure (metadata only)"
         );
     }
 
@@ -1929,28 +1902,13 @@ impl ModelProvider for GeminiProvider {
         // doc). No-op for "standard"/unset — wire-identical to pre-feature.
         Self::apply_safety_settings(&mut payload, task.provider_option_str("content_policy"));
 
-        if Self::debug_model_requests_enabled() && task.kind == TaskKind::TextGenerate {
-            let prompt = task
-                .composed_prompt_text()
-                .unwrap_or_else(|| "<missing prompt>".into());
-            info!(
-                "PHILOTIC_DEBUG_MODEL_REQUESTS gemini composed prompt provider={} model={:?}:\n{}",
-                ModelProvider::id(self),
-                task.model,
-                prompt
-            );
-            match serde_json::to_string_pretty(&payload) {
-                Ok(json) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini provider payload provider={} model={:?}:\n{}",
-                    ModelProvider::id(self),
-                    task.model,
-                    json
-                ),
-                Err(err) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini payload serialization failed: {}",
-                    err
-                ),
-            }
+        if task.kind == TaskKind::TextGenerate {
+            payload["generationConfig"]["maxOutputTokens"] = task
+                .provider_options
+                .get("max_tokens")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(4096));
+            crate::context_management::account_wire(&payload, task)?;
         }
 
         let url = self.endpoint_url(Some(self.request_model(task)))?;
@@ -2081,29 +2039,13 @@ impl ModelProvider for GeminiProvider {
         // `invoke` — streaming builds its own payload above and must not be
         // skipped (see `apply_safety_settings` doc).
         Self::apply_safety_settings(&mut payload, task.provider_option_str("content_policy"));
-
-        if Self::debug_model_requests_enabled() {
-            let prompt = task
-                .composed_prompt_text()
-                .unwrap_or_else(|| "<missing prompt>".into());
-            info!(
-                "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming composed prompt provider={} model={:?}:\n{}",
-                ModelProvider::id(self),
-                task.model,
-                prompt
-            );
-            match serde_json::to_string_pretty(&payload) {
-                Ok(json) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming provider payload provider={} model={:?}:\n{}",
-                    ModelProvider::id(self),
-                    task.model,
-                    json
-                ),
-                Err(err) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming payload serialization failed: {}",
-                    err
-                ),
-            }
+        if task.kind == TaskKind::TextGenerate {
+            payload["generationConfig"]["maxOutputTokens"] = task
+                .provider_options
+                .get("max_tokens")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(4096));
+            crate::context_management::account_wire(&payload, task)?;
         }
 
         let payload_bytes = serde_json::to_vec(&payload).map(|v| v.len()).unwrap_or(0);
