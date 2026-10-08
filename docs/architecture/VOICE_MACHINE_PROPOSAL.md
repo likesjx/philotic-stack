@@ -3,7 +3,7 @@ title: "Philotic Voice Machine Proposal"
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-03-26
+last_updated: 2026-10-08
 tags:
   - voice
   - media
@@ -44,7 +44,21 @@ without turning `philote` into an audio pipeline with opinions.
 
 ## Disposition
 
-`in progress — policy-driven voice ingress/egress and watched-live Telegram audio delivery are working; philote now carries an explicit staged turn routing plan for voice turns, but the dedicated voice machine component is not yet materialised`
+`accepted for current slice` — existing staged philote voice routing remains the foundation. The October 8 Apple source slice is implemented and test-green in isolated commits; complete private voice and end-to-end cancellation remain blocked on trusted runtime authority. Historical Telegram live evidence below does not verify this Apple slice.
+
+## Current Slice — Apple voice (2026-10-08)
+
+Implemented locally in `c4c3ff4d` and `46f871d2`: mandatory on-device recognition, stale permission/recognition/playback rejection, iOS duplex session configuration, request/turn-correlated client gates, Apple voice selection/preview/stop, and an ElevenLabs preference that grants no dispatch eligibility. External audio/STT/TTS entry paths and handsfree remain unavailable pending trusted policy installation. Ordinary local transcripts use the normal philote text turn; server-side always-speak policy is not yet proven private.
+
+Backend commit `9da6ba37` supplies a tested bounded binding ledger only. It is not connected to edge dispatch, does not echo accepted request IDs, and cannot stop provider generation. `turn_cancel_v1` stays unadvertised. Caller-supplied hotel GuestIdentity registration does not establish an authenticated principal.
+
+Verification: 19 app source tests; 135 PhiloticKit tests with one live test skipped and zero failures; shared macOS app source typecheck; generic iOS simulator build for arm64/x86_64; five standalone Rust ledger tests. The ledger's committed-tool fixture is not proof of runtime tool cancellation semantics. No full backend build, simulator execution, physical-device audio, real microphone, live provider or deployed behavior was verified.
+
+Blocked next work: verified hotel launch/session authority and opaque task handles across direct/parked/reparked delivery and SDK decoding; guarded model-router privacy dispatch; correlated accepted events; authenticated runtime cancellation through retries and active streams. Cancellation must stop future generation/publication without undoing committed tools. Private or unknown provenance denies external processing, with no external fallback after local failure.
+
+Open after authority: eligible ElevenLabs expressive profiles and previews, fresh/reconnect/interruption integration tests, macOS shared duplex engine/AEC, real permission and route validation, and browser membrane parity. iPad received shared-source compilation only; broad iPad redesign is deferred. Dedicated voice-machine materialization remains deferred.
+
+See the [client contract](../../apps/philotic-apple/PhiloticApp/Tests/VOICE_CLIENT_CONTRACT.md), [backend contract](../../crates/philotic-web/src/serve/VOICE_TURN_BACKEND_CONTRACT.md), and [active tasks](../task.md#apple-voice-privacy-and-cancellation).
 
 Track active work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 

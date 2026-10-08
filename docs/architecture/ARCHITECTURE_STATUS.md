@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-10-03
+last_updated: 2026-10-08
 tags:
 - source-of-truth
 - current-state
@@ -60,6 +60,10 @@ Use it to answer three questions fast:
 3. What is actively being worked right now?
 
 This is not the place for full design arguments. For those, follow the linked proposal docs and the graph-backed domain/seam records.
+
+## Apple voice source checkpoint — 2026-10-08
+
+Isolated Apple client commits `c4c3ff4d`/`46f871d2` implement local recognition, playback lifecycle guards, iOS duplex configuration and correlated voice controls. Backend `9da6ba37` adds an uninstalled binding ledger. This is test-green source evidence, not deployed complete voice. Accepted request_id echo, provider cancellation, trusted privacy authority, ElevenLabs eligibility and macOS AEC remain open. Hotel registration identity is caller-supplied; verified authority must span IPC parked delivery and model dispatch before those capabilities activate. [Disposition and verification](VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08); [owner tasks](../task.md#apple-voice-privacy-and-cancellation).
 
 ## How To Read This
 

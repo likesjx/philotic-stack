@@ -22,6 +22,24 @@
 
 ## Current Work Item Split
 
+### Apple voice privacy and cancellation
+
+Disposition (2026-10-08): **client source slice complete; backend admission seam complete; full voice blocked**. Branches `codex/apple-voice-privacy` and `codex/voice-backend-contract`; commits `c4c3ff4d`, `46f871d2`, `9da6ba37`. [Proposal](architecture/VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08).
+
+- [x] Require available on-device STT; invalidate stale capture permissions, recognition callbacks and playback callbacks.
+- [x] Add iOS duplex session settings, correlated client interruption/stale-chunk gates, provider preference, installed Apple voice selection and local preview/stop.
+- [x] Disable external audio/transcription entry paths and handsfree until trusted privacy dispatch exists; preferences never grant eligibility.
+- [x] Add bounded backend binding ledger tests for pre-accept cancellation, scope denial and late-event rejection; keep it explicitly uninstalled.
+- [x] Record source verification: 19 app tests; 134 kit passes/one skipped; Mac source typecheck; generic iOS simulator build; five standalone Rust ledger tests. Test-green only, no live audio.
+- [ ] **Blocked — IPC owner:** establish verified server-owned launch/session principal, opaque authority handles and complete immutable source provenance through direct/parked/reparked delivery and SDK. Incoming GuestIdentity is registration metadata, not authentication.
+- [ ] **Blocked — privacy/model runtime owners:** install DispatchPrivacyAuthority/guarded_registry for STT/TTS and every retry/fallback; deny missing/stale/private external context and native-live bypasses. Privacy worker's 55 source tests are separate evidence, not runtime installation.
+- [ ] **Blocked — voice/backend owner:** accepted request_id echo ordered before output; authenticated turn_cancel_v1 runtime adapter revoking pending/active provider generation; per-event/chunk barriers. No committed-tool rollback. Do not advertise capability before installation.
+- [ ] Complete eligible ElevenLabs expressive voice profiles/preview and actual same-philote spoken replies after authority; default fail closed, no external fallback.
+- [ ] Implement macOS shared duplex audio engine/AEC; validate iOS/Mac permission denial, fresh session, reconnect, agent switch and audio routes with mocks first, then separately authorized device/live checks.
+- [ ] Coordinate browser membrane parity after core integration; assess iPad without broad redesign.
+
+No push, merge, deployment, restart, live credentials, security grants or real microphone/provider calls were authorized for this closeout. Shared integration belongs to the parent/owners; all edits remain isolated.
+
 ### Desktop hotel sessions
 
 Branch: `codex/desktop-hotel-session`; seam: `operator-session-auth`.
