@@ -1,0 +1,9 @@
+---
+# Dedicated play: does not import hotel/Muninn roles or vaulted credential files.
+- name: Install explicitly approved scoped Percival gateway
+  hosts: jane-vps
+  gather_facts: false
+  become: true
+  roles:
+    - role: percival_personal_mcp
+      tags: [percival]

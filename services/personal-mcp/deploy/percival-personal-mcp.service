@@ -1,0 +1,33 @@
+# TEMPLATE ONLY: review paths/config and create a verified-free identity first.
+[Unit]
+Description=Percival scoped personal recall gateway
+After=network-online.target philotic-hotel.service
+Wants=network-online.target
+Requires=philotic-hotel.service
+
+[Service]
+Type=simple
+User=percival-gateway
+Group=percival-gateway
+WorkingDirectory=/opt/percival-personal-mcp/current
+ExecStart=/usr/bin/node /opt/percival-personal-mcp/current/server.mjs /etc/percival-personal-mcp/gateway.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+InaccessiblePaths=/opt/philotic/data /opt/philotic/etc /run/philotic
+
+[Install]
+WantedBy=multi-user.target

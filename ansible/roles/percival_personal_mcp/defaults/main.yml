@@ -1,0 +1,13 @@
+---
+percival_enabled: false
+percival_gateway_user: percival-gateway
+percival_gateway_uid: null
+percival_hotel_uid: 999
+percival_hotel_binary: /opt/philotic/bin/aiua
+percival_hotel_sha256: ''
+percival_source_dir: ''
+percival_source_commit: ''
+percival_source_sha256: {}
+percival_secret_ref: ''
+percival_introspection_secret_ref: ''
+percival_gateway_config: {}

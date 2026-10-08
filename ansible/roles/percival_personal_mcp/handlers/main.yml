@@ -1,0 +1,6 @@
+---
+# Definition order is deliberate: shared rescue covers activation before gateway.
+- name: Activate scoped hotel
+  ansible.builtin.include_tasks: ../tasks/activate_hotel.yml
+- name: Restart scoped gateway
+  ansible.builtin.include_tasks: ../tasks/activate_gateway.yml
