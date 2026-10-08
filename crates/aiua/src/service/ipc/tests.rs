@@ -17743,3 +17743,89 @@ async fn register_component_marks_hotel_state_dirty() {
         let _ = std::fs::remove_file(&socket_path);
     }
 }
+
+/// Start a server with `policy`, then report (socket mode, whether a client
+/// could connect and get a reply).
+async fn connect_under_peer_policy(policy: PeerUidPolicy) -> (u32, bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let socket_path = test_socket_path();
+    let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+    let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+    let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+        .with_peer_uid_policy(policy);
+    let server_task = tokio::spawn(async move {
+        server.run().await.expect("ipc server should run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let mode = std::fs::metadata(&socket_path)
+        .expect("socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let answered = match PhiloticClient::connect_at(
+        &socket_path,
+        GuestIdentity {
+            guest_id: "philotic-web".into(),
+            role: "operator".into(),
+            supported_tools: Vec::new(),
+        },
+    )
+    .await
+    {
+        Ok(mut client) => tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            client.send_request(IpcRequest::ListCronJobs),
+        )
+        .await
+        .is_ok_and(|reply| reply.is_ok()),
+        Err(_) => false,
+    };
+    server_task.abort();
+    let _ = server_task.await;
+    let _ = std::fs::remove_file(&socket_path);
+    (mode, answered)
+}
+
+/// PERIMETER_ENFORCEMENT P1: the socket is owner-only, and a connection from
+/// another OS user is refused at accept. CI cannot switch users, so the
+/// foreign user is simulated through the injected uid policy.
+#[tokio::test]
+async fn hotel_socket_is_owner_only_and_refuses_a_foreign_uid() {
+    let _env_guard = ipc_env_guard();
+    let (mode, answered) = connect_under_peer_policy(same_uid_only).await;
+    assert_eq!(mode, 0o600, "hotel socket must be owner-only");
+    assert!(answered, "a same-uid client must be served");
+
+    let (_, answered) = connect_under_peer_policy(|_peer, _hotel| false).await;
+    assert!(!answered, "a foreign-uid connection must be refused");
+}
+
+#[test]
+fn mcp_owner_check_refuses_an_unregistered_connection() {
+    let id = |guest: &str, role: &str| {
+        Some(GuestIdentity {
+            guest_id: guest.into(),
+            role: role.into(),
+            supported_tools: Vec::new(),
+        })
+    };
+    assert!(
+        !IpcServer::mcp_owner_identity_ok(&None, "agent-bjork-01"),
+        "an unregistered caller is no longer admin-equivalent (PERIMETER_ENFORCEMENT P1)"
+    );
+    assert!(IpcServer::mcp_owner_identity_ok(
+        &id("agent-bjork-01:operator", "operator"),
+        "agent-bjork-01"
+    ));
+    assert!(IpcServer::mcp_owner_identity_ok(
+        &id(
+            "agent-bjork-01:orchestrator",
+            "role:agent-bjork-01:orchestrator"
+        ),
+        "agent-bjork-01"
+    ));
+    assert!(!IpcServer::mcp_owner_identity_ok(
+        &id("agent-beacon", "agent"),
+        "agent-bjork-01"
+    ));
+}

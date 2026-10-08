@@ -1029,6 +1029,24 @@ fn resolve_runtime_ports(hotel: &HotelRecord, mesh_enabled: bool) -> Result<(u16
     Ok((base, base + 1, base + 2))
 }
 
+/// PERIMETER_ENFORCEMENT P1: a hotel only binds its socket inside its profile
+/// directory or at an explicit `PHILOTIC_HOTEL_SOCKET`. The `/tmp` default
+/// below survives only in record defaults and tests; a hotel that would bind
+/// it refuses to start.
+fn ensure_socket_location_configured(
+    explicit_socket: Option<&str>,
+    profile_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let explicit = explicit_socket.is_some_and(|s| !s.trim().is_empty());
+    if !explicit && profile_dir.is_none() {
+        anyhow::bail!(
+            "refusing to start: no hotel profile (PHILOTIC_PROFILE) and no PHILOTIC_HOTEL_SOCKET. \
+             The /tmp socket fallback was removed (PERIMETER_ENFORCEMENT P1); set one of them."
+        );
+    }
+    Ok(())
+}
+
 fn hotel_ipc_socket_path(hotel_name: &str) -> String {
     if let Ok(explicit) = std::env::var("PHILOTIC_HOTEL_SOCKET") {
         let trimmed = explicit.trim();
@@ -7796,6 +7814,11 @@ async fn main() -> Result<()> {
         warn!(error = %e, "autonomy_sweep: failed to ensure daily timeout-to-neutral sweep cron job");
     }
 
+    ensure_socket_location_configured(
+        std::env::var("PHILOTIC_HOTEL_SOCKET").ok().as_deref(),
+        profile_dir().as_deref(),
+    )?;
+
     if smoke_mode {
         warn!(
             "PHILOTIC_SMOKE_MODE enabled: starting local-only IPC runtime without mesh or guest materialization."
@@ -8786,9 +8809,10 @@ mod tests {
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, enforce_graph_datasource_home,
-        execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
-        guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
-        hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
+        ensure_socket_location_configured, execution_reachability_for_hotel,
+        extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
+        guest_supervision_enabled_from, hotel_base_port, hotel_ipc_socket_path,
+        local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
         nearest_available_base_port, node_id_bound_to_other_hotel,
         preserve_runtime_guest_activation, read_string_config,
@@ -8875,6 +8899,17 @@ mod tests {
         assert!(!guest_supervision_enabled_from(None, Some("false")));
         // New disable var wins over legacy truthy.
         assert!(!guest_supervision_enabled_from(Some("1"), Some("1")));
+    }
+
+    #[test]
+    fn hotel_refuses_to_start_without_a_profile_or_explicit_socket() {
+        let dir = std::path::Path::new("/Users/someone/.philotic/bjork");
+        assert!(ensure_socket_location_configured(None, None).is_err());
+        assert!(ensure_socket_location_configured(Some("  "), None).is_err());
+        assert!(
+            ensure_socket_location_configured(Some("/run/philotic/vps-jane.sock"), None).is_ok()
+        );
+        assert!(ensure_socket_location_configured(None, Some(dir)).is_ok());
     }
 
     #[test]
