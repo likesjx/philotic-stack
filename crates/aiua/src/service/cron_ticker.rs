@@ -1826,6 +1826,7 @@ mod tests {
             },
             silent_ok: false,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
+            policy: None,
         };
         graph.upsert_cron_job(&job).expect("seed job");
 
@@ -1894,6 +1895,7 @@ mod tests {
             },
             silent_ok: false,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
+            policy: None,
         };
         graph.upsert_cron_job(&job).expect("seed job");
 
