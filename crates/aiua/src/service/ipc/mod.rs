@@ -372,6 +372,10 @@ pub(super) enum AgentRouteResolution {
     Park { guest_id: String },
 }
 
+/// Heal-queue id of the open MuninnDB-outage work item (see
+/// `IpcServer::record_muninn_heal_transition`).
+pub(crate) type MuninnOutageHealId = Arc<std::sync::Mutex<Option<String>>>;
+
 pub struct IpcServer {
     protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
     socket_path: String,
@@ -403,6 +407,10 @@ pub struct IpcServer {
     /// Tracks whether MuninnDB was reachable on the most recent probe. Shared with the
     /// probe loop and per-connection handlers for inline `RefreshMemoryConfig` probes.
     muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+    /// Heal-queue id of the open "MuninnDB unreachable" work item, if any. Shared
+    /// by the probe loop and the inline `RefreshMemoryConfig` probe so whichever
+    /// one sees the recovery resolves the row the other filed.
+    muninn_outage_heal_id: MuninnOutageHealId,
     /// Per-vault timestamp of the last `HealMemoryToken` mint attempt — the
     /// token self-heal mint budget. A misconfigured MuninnDB must produce one
     /// throttled escalation, not an unbounded mint loop.
@@ -1880,6 +1888,7 @@ impl IpcServer {
             webrtc_signal_tx: None,
             network_broadcast,
             muninn_reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            muninn_outage_heal_id: Arc::new(std::sync::Mutex::new(None)),
             muninn_heal_attempts: Arc::new(Mutex::new(HashMap::new())),
             operator_surface_tx: None,
             perimeter_svc: None,
@@ -2027,13 +2036,22 @@ impl IpcServer {
         }
 
         // MuninnDB reachability probe — checks every 60s and broadcasts MuninnStatus on flip.
-        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act.
+        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act,
+        // and resolves that row when it comes back.
         if let Some(cfg) = self.muninn_config.clone() {
             let reachable = self.muninn_reachable.clone();
             let broadcast_tx = self.network_broadcast.clone();
             let heal_queue = self.heal_queue.clone();
+            let outage_heal_id = self.muninn_outage_heal_id.clone();
             tokio::spawn(async move {
-                Self::run_muninn_probe_loop(cfg, reachable, broadcast_tx, heal_queue).await;
+                Self::run_muninn_probe_loop(
+                    cfg,
+                    reachable,
+                    broadcast_tx,
+                    heal_queue,
+                    outage_heal_id,
+                )
+                .await;
             });
         }
 
@@ -2058,6 +2076,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let muninn_reachable = self.muninn_reachable.clone();
+                    let muninn_outage_heal_id = self.muninn_outage_heal_id.clone();
                     let muninn_heal_attempts = self.muninn_heal_attempts.clone();
                     let training_storage = self.training_storage.clone();
                     let heal_queue = self.heal_queue.clone();
@@ -2092,6 +2111,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             muninn_reachable,
+                            muninn_outage_heal_id,
                             muninn_heal_attempts,
                             training_storage,
                             heal_queue,
@@ -2144,6 +2164,7 @@ impl IpcServer {
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+        muninn_outage_heal_id: MuninnOutageHealId,
         muninn_heal_attempts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
@@ -2330,14 +2351,12 @@ impl IpcServer {
                                 available,
                                 endpoint: endpoint.clone(),
                             });
-                            if !available {
-                                if let Some(hq) = heal_queue.as_deref() {
-                                    let msg = format!(
-                                        "MuninnDB unreachable: connection refused at {endpoint}"
-                                    );
-                                    let _ = hq.push_error("hotel", &msg);
-                                }
-                            }
+                            Self::record_muninn_heal_transition(
+                                heal_queue.as_deref(),
+                                &muninn_outage_heal_id,
+                                available,
+                                &endpoint,
+                            );
                         }
                         info!(available, "RefreshMemoryConfig probe complete");
                         let _ = outbound_tx.send(IpcResponse::MemoryConfigRefreshReply {
