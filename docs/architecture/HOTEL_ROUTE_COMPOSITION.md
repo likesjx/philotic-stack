@@ -105,3 +105,29 @@ Validation for this integration: rustfmt and git diff --check only. New wire
 correlation/injection and diagnostic round-trip tests are authored but not run;
 local builds were explicitly prohibited. The earlier 3251 passing tests cover
 phase-one code on develop 86e154c8, not this privacy-base integration.
+
+## Diagnostic SDK consumer
+
+`PhiloticClient::explain_local_model_route` uses the existing protected RPC and
+server-owned catalog. The launch owner supplies the trusted hotel kernel peer;
+the caller supplies expected catalog revision and candidate identities solely
+for reply comparison. These expectations cannot grant access or change policy.
+Replies must match the request ID, task, immutable payload digest, catalog
+revision and full candidate identities. Duplicate identities and expanded strict
+pins are rejected. Binding/type failures disconnect; an authenticated `Denied`
+returns an error without a legacy fallback. Whole-operation timeouts include
+backpressured writes and force reconnection before reuse.
+
+The returned `BoundRouteExplanation` contains diagnostics and revision metadata,
+not an authenticated processing context or dispatch receipt. No controller or
+provider invocation consumes it automatically. Catalog installation, catalog
+comparison metadata delivery, complete outgoing-payload authorization and guarded
+retry/fallback installation remain separate runtime dependencies. The merged
+context bridge is preserved without duplication. No management writes, grants or
+live activation are introduced.
+
+Synthetic SDK tests cover valid/empty-strict explanations, wrong request/task/
+digest/catalog revision, all endpoint identity dimensions, duplicates, reply-type
+confusion, replay and stale unsolicited replies, denied admission, wrong hotel
+peer, truncated/closed transport, read timeout and backpressured-write deadline.
+Local builds are prohibited; hosted exact-head CI supplies execution evidence.
