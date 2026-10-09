@@ -1548,6 +1548,50 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_override_serialization_does_not_bypass_context_dispatch_budget() {
+        let provider = output_budget_test_provider("openrouter");
+        for limit in [json!(1024), json!("1024"), json!(8192), json!("8192")] {
+            let task = ControllerTask::from_value(&json!({
+                "kind":"text.generate", "prompt":"Synthetic prompt",
+                "provider_options":{"max_tokens":limit}
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            // Keep PR #635's builder contract: explicit values serialize intact.
+            let actual = body["max_tokens"].as_f64().unwrap();
+            let permitted = actual <= 4096.0;
+            let prepared = crate::context_management::prepare(&task);
+            assert_eq!(prepared.is_ok(), permitted);
+            if let Ok((prepared, _)) = prepared {
+                // Normal dispatch canonicalizes a valid numeric-string option
+                // before the actual HTTP guard and send_json.
+                let wire = provider.chat_request_body(&prepared).unwrap();
+                assert_eq!(wire["max_tokens"].as_u64().unwrap() as f64, actual);
+                crate::context_management::account_wire(&wire, &prepared).unwrap();
+            } else {
+                assert!(crate::context_management::account_wire(&body, &task).is_err());
+            }
+        }
+        for limit in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("invalid"),
+        ] {
+            let task = ControllerTask::from_value(&json!({
+                "kind":"text.generate", "prompt":"Synthetic prompt",
+                "provider_options":{"max_tokens":limit}
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            assert_eq!(body["max_tokens"], 4096, "builder defaults are preserved");
+            assert!(crate::context_management::prepare(&task).is_err());
+            assert!(crate::context_management::account_wire(&body, &task).is_err());
+        }
+    }
+
+    #[test]
     fn openrouter_output_budget_excludes_other_providers_media_and_native_audio() {
         for (provider_id, task_json) in [
             (
