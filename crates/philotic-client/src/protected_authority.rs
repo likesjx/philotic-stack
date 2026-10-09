@@ -368,6 +368,11 @@ mod tests {
             },
         }
     }
+    fn second_explain_identity() -> CandidateIdentity {
+        let mut identity = explain_catalog().candidates.into_iter().next().unwrap();
+        identity.endpoint.push_str("-second");
+        identity
+    }
 
     #[tokio::test]
     async fn protected_explain_returns_bound_diagnostics_and_empty_strict_plan() {
@@ -453,9 +458,12 @@ mod tests {
                             8 => route.candidates[0].hotel.push('x'),
                             9 => route.candidates[0].incarnation.push('x'),
                             10 => route.candidates[0].policy_scope.push('x'),
-                            11 | 12 => {
+                            11 => {
                                 route.candidates.push(route.candidates[0].clone());
-                                route.strict_pin = kind == 12;
+                            }
+                            12 => {
+                                route.candidates.push(second_explain_identity());
+                                route.strict_pin = true;
                             }
                             _ => unreachable!(),
                         }
@@ -463,14 +471,15 @@ mod tests {
                 }
                 reply(&mut server, response).await;
             });
+            let mut catalog = explain_catalog();
+            if kind == 12 {
+                // Both endpoints belong to the expected catalog. This case
+                // isolates strict-pin expansion from identity/duplicate denial.
+                catalog.candidates.insert(second_explain_identity());
+            }
             assert!(
                 client
-                    .explain_local_model_route(
-                        peer,
-                        &envelope,
-                        &explain_catalog(),
-                        Duration::from_secs(1)
-                    )
+                    .explain_local_model_route(peer, &envelope, &catalog, Duration::from_secs(1))
                     .await
                     .is_err(),
                 "case {kind}"
