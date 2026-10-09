@@ -22,6 +22,181 @@ fn supervised_fixture_child() {
     let _ = stream.read(&mut byte);
 }
 struct Owner;
+struct SyntheticRouteProjection;
+impl ansible_mesh_core::privacy_rpc::BoundRouteProjection for SyntheticRouteProjection {
+    fn project(
+        &self,
+        payload: &str,
+    ) -> anyhow::Result<(
+        ansible_mesh_core::model_oracle::RouteNeed,
+        ProcessingOperation,
+    )> {
+        anyhow::ensure!(
+            payload == "synthetic complete payload",
+            "unsupported payload"
+        );
+        Ok((
+            ansible_mesh_core::model_oracle::RouteNeed {
+                request_class: "cognitive".into(),
+                needs_tools: false,
+                needs_structured: false,
+                approx_context_tokens: 100,
+                latency_class: ansible_mesh_core::model_oracle::LatencyClass::Interactive,
+                trust_ceiling: "remote_cloud".into(),
+            },
+            ProcessingOperation::Inference,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn protected_route_explain_denies_private_external_stale_catalog_and_strict_pin() {
+    use ansible_mesh_core::graph::ModelProfileRecord;
+    use ansible_mesh_core::privacy_rpc::*;
+    use ansible_mesh_core::route_composition::*;
+    use std::collections::BTreeMap;
+    let mut f = Fixture::new();
+    let origin = f.child("origin-route", "agent:synthetic").await;
+    let consumer = f.child("consumer-route", "model:synthetic").await;
+    let authority = Arc::new(f.authority(32));
+    let envelope = authority
+        .issue(
+            origin,
+            consumer.consumer(),
+            Uuid::new_v4(),
+            "synthetic complete payload".into(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    let candidate = |endpoint: &str| ResolvedCandidate {
+        identity: CandidateIdentity {
+            provider: "synthetic".into(),
+            model: "synthetic".into(),
+            endpoint: endpoint.into(),
+            credential_scope: "opaque".into(),
+            hotel: "synthetic-hotel".into(),
+            incarnation: "synthetic".into(),
+            policy_scope: "synthetic".into(),
+        },
+        profile: ModelProfileRecord {
+            provider: "synthetic".into(),
+            model_ref: "synthetic".into(),
+            node_id: "synthetic-hotel".into(),
+            trust_tier: "remote_cloud".into(),
+            task_kinds: vec!["text.generate".into()],
+            ..Default::default()
+        },
+        admission: Admission::Allowed,
+    };
+    let catalog = |strict: bool| HotelRouteCatalog {
+        revision: 7,
+        policies: BTreeMap::from([(
+            "agent:synthetic".into(),
+            RoutePolicy {
+                version: CompositionVersion::PreferencesThenHotelV2,
+                agent_preferences: vec![
+                    "cloud".into(),
+                    "local-denied".into(),
+                    "local".into(),
+                    "alias".into(),
+                ],
+                direct_override: strict.then(|| RouteOverride {
+                    candidate: "cloud".into(),
+                    mode: OverrideMode::StrictPin,
+                }),
+            },
+        )]),
+        waterfall: vec!["local".into()],
+        candidates: BTreeMap::from([
+            ("cloud".into(), candidate("cloud")),
+            ("local".into(), candidate("local")),
+            ("alias".into(), candidate("local")),
+            (
+                "local-denied".into(),
+                ResolvedCandidate {
+                    admission: Admission::AccessDenied,
+                    ..candidate("local")
+                },
+            ),
+        ]),
+        projection: Arc::new(SyntheticRouteProjection),
+        cooloff_secs: 300,
+    };
+    let rpc = |strict| {
+        LocalAuthorityRpc::new(
+            "synthetic-hotel".into(),
+            f.registry.clone(),
+            authority.clone(),
+            BTreeMap::from([
+                ("local".into(), ProviderBoundary::LocalTrusted),
+                ("cloud".into(), ProviderBoundary::External),
+            ]),
+        )
+        .unwrap()
+        .with_route_catalog(catalog(strict))
+    };
+    let request = ProtectedAuthorityRequest::ExplainModelRoute {
+        request_id: Uuid::new_v4(),
+        guest: "consumer-route".into(),
+        envelope: envelope.clone(),
+        catalog_revision: 7,
+    };
+    let normal = rpc(false);
+    let proof = normal.authenticate(&f.streams[1], &request).unwrap();
+    let reply = normal.handle(&proof, &request);
+    let ProtectedAuthorityOutcome::ModelRoute {
+        route,
+        policy_revision,
+        payload_digest,
+        ..
+    } = reply.outcome
+    else {
+        panic!("expected admitted local route")
+    };
+    assert_eq!(policy_revision, f.store.snapshot().unwrap().revision());
+    assert_eq!(payload_digest, capture_payload_digest(&envelope.payload));
+    assert_eq!(route.candidates.len(), 1);
+    assert_eq!(route.candidates[0].endpoint, "local");
+    assert_eq!(
+        route.diagnostics[0].disposition,
+        CandidateDisposition::AdmissionDenied(Admission::PrivacyDenied)
+    );
+    assert_eq!(
+        route.diagnostics[1].disposition,
+        CandidateDisposition::AdmissionDenied(Admission::AccessDenied)
+    );
+    assert_eq!(
+        route.diagnostics[3].disposition,
+        CandidateDisposition::Duplicate {
+            first_candidate: "local".into()
+        }
+    );
+    let mut stale = request.clone();
+    if let ProtectedAuthorityRequest::ExplainModelRoute {
+        catalog_revision, ..
+    } = &mut stale
+    {
+        *catalog_revision = 6;
+    }
+    assert!(matches!(
+        normal.handle(&proof, &stale).outcome,
+        ProtectedAuthorityOutcome::Denied
+    ));
+    let strict = rpc(true);
+    let ProtectedAuthorityOutcome::ModelRoute { route, .. } =
+        strict.handle(&proof, &request).outcome
+    else {
+        panic!("expected denied strict plan")
+    };
+    assert!(route.strict_pin);
+    assert!(route.candidates.is_empty());
+    assert_eq!(route.diagnostics.len(), 1);
+    assert_eq!(
+        route.diagnostics[0].disposition,
+        CandidateDisposition::AdmissionDenied(Admission::PrivacyDenied)
+    );
+}
+
 impl ServerAuthenticatedIdentity for Owner {
     fn stable_agent_id(&self) -> &str {
         "owner"
