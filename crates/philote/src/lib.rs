@@ -1,4 +1,5 @@
 pub mod recall_selection;
+pub mod recall_authority;
 pub mod approval_ref;
 pub mod catalog;
 pub mod commands;
