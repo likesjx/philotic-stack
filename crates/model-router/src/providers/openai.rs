@@ -1106,6 +1106,20 @@ impl ModelProvider for OpenAIProvider {
         self.provider_id
     }
 
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        let mut models = vec![self.default_model(task).to_owned()];
+        if self.provider_id == "openrouter" {
+            if let Some(configured) = task.provider_options.get("models") {
+                if let Some(array) = configured.as_array() {
+                    models.extend(array.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            } else {
+                models.extend(self.fallback_models.clone());
+            }
+        }
+        models
+    }
+
     fn supports(&self, task: &ControllerTask) -> bool {
         matches!(
             task.kind,
@@ -1138,20 +1152,9 @@ impl ModelProvider for OpenAIProvider {
                     );
                     Self::strip_tools(&mut body);
                 }
-                if std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
-                    .ok()
-                    .as_deref()
-                    .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
-                    .unwrap_or(false)
-                {
-                    info!(
-                        provider = self.id(),
-                        model = ?task.model,
-                        request = %serde_json::to_string_pretty(&body).unwrap_or_default(),
-                        "OpenAI request payload"
-                    );
+                if task.kind == TaskKind::TextGenerate {
+                    crate::context_management::account_wire(&body, task)?;
                 }
-
                 let response = self.send_json("/v1/chat/completions", &body).await?;
                 let status = response.status();
                 let response_body = response.json::<Value>().await?;
@@ -1545,6 +1548,50 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_override_serialization_does_not_bypass_context_dispatch_budget() {
+        let provider = output_budget_test_provider("openrouter");
+        for limit in [json!(1024), json!("1024"), json!(8192), json!("8192")] {
+            let task = ControllerTask::from_value(&json!({
+                "kind":"text.generate", "prompt":"Synthetic prompt",
+                "provider_options":{"max_tokens":limit}
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            // Keep PR #635's builder contract: explicit values serialize intact.
+            let actual = body["max_tokens"].as_f64().unwrap();
+            let permitted = actual <= 4096.0;
+            let prepared = crate::context_management::prepare(&task);
+            assert_eq!(prepared.is_ok(), permitted);
+            if let Ok((prepared, _)) = prepared {
+                // Normal dispatch canonicalizes a valid numeric-string option
+                // before the actual HTTP guard and send_json.
+                let wire = provider.chat_request_body(&prepared).unwrap();
+                assert_eq!(wire["max_tokens"].as_u64().unwrap() as f64, actual);
+                crate::context_management::account_wire(&wire, &prepared).unwrap();
+            } else {
+                assert!(crate::context_management::account_wire(&body, &task).is_err());
+            }
+        }
+        for limit in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("invalid"),
+        ] {
+            let task = ControllerTask::from_value(&json!({
+                "kind":"text.generate", "prompt":"Synthetic prompt",
+                "provider_options":{"max_tokens":limit}
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            assert_eq!(body["max_tokens"], 4096, "builder defaults are preserved");
+            assert!(crate::context_management::prepare(&task).is_err());
+            assert!(crate::context_management::account_wire(&body, &task).is_err());
+        }
+    }
+
+    #[test]
     fn openrouter_output_budget_excludes_other_providers_media_and_native_audio() {
         for (provider_id, task_json) in [
             (
@@ -1811,6 +1858,121 @@ mod tests {
         assert_eq!(body["verbosity"], "low");
         assert_eq!(body["background"], true);
         assert_eq!(body["tools"][0]["type"], "web_search_preview");
+    }
+
+    #[test]
+    fn context_models_match_actual_default_pin_and_fallback_override() {
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            None,
+            None,
+            None,
+            Some("configured/default".into()),
+            None,
+            vec!["configured/fallback".into()],
+            None,
+        );
+        let mut task =
+            ControllerTask::from_value(&json!({"kind":"text.generate","prompt":"current"}))
+                .unwrap();
+        assert_eq!(
+            provider.context_models(&task),
+            vec!["configured/default", "configured/fallback"]
+        );
+        task.model = Some("explicit/pin".into());
+        task.provider_options
+            .insert("models".into(), json!(["explicit/fallback"]));
+        assert_eq!(
+            provider.context_models(&task),
+            vec!["explicit/pin", "explicit/fallback"]
+        );
+        let body = provider.chat_request_body(&task).unwrap();
+        assert_eq!(body["model"], "explicit/pin");
+        assert_eq!(body["models"], json!(["explicit/fallback"]));
+    }
+
+    #[test]
+    fn context_management_philote_to_openrouter_wire_has_one_context_copy() {
+        let mut state = agent_core::session::SessionState::new(
+            "synthetic-session".into(),
+            "synthetic-agent".into(),
+            "telegram".into(),
+        );
+        state.agent_profile.identity_text = Some("UNIQUE_PERSONA".into());
+        let (prompt, context, projection) = state.model_request_payloads("UNIQUE_USER", &[]);
+        let task = ControllerTask::from_value(&json!({"kind":"text.generate",
+            "model":"deepseek/deepseek-v4.1-flash", "prompt":prompt,
+            "context":context,"context_projection":projection}))
+        .unwrap();
+        let (task, counts) = crate::context_management::prepare(&task).unwrap();
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            None,
+            None,
+            None,
+            Some("deepseek/deepseek-v4.1-flash".into()),
+            None,
+            vec![],
+            None,
+        );
+        let body = provider.chat_request_body(&task).unwrap();
+        let wire = body.to_string();
+        assert_eq!(wire.matches("UNIQUE_PERSONA").count(), 1);
+        assert_eq!(wire.matches("UNIQUE_USER").count(), 1);
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["stream"], false);
+        assert!(counts.rendered_estimate <= counts.input_limit);
+        crate::context_management::account_wire(&body, &task).unwrap();
+    }
+
+    #[test]
+    fn context_management_philote_required_rules_policy_and_clock_survive_memory_trim() {
+        let mut state = agent_core::session::SessionState::new(
+            "required-context".into(),
+            "synthetic-agent".into(),
+            "telegram".into(),
+        );
+        state.agent_profile.agent_role_names = vec!["EXACT_ROLE_MARKER".into()];
+        state.agent_profile.user_timezone = Some("America/New_York".into());
+        state.agent_profile.memory_summary = Some("OPTIONAL_SEED".repeat(200));
+        state.agent_profile.user_context_text = Some("OPTIONAL_RELATIONSHIP".repeat(150));
+        for preapproved in [false, true] {
+            state.approval_policy.auto_approve_all = preapproved;
+            let (prompt, context, projection) =
+                state.model_request_payloads("CURRENT_REQUIRED_USER", &[]);
+            let task = ControllerTask::from_value(
+                &json!({"kind":"text.generate", "model":"deepseek/deepseek-v4.1-flash",
+                "prompt":prompt,"context":context,"context_projection":projection,
+                "provider_options":{"context_limits":{"memory_tokens":1}}}),
+            )
+            .unwrap();
+            let (prepared, counts) = crate::context_management::prepare(&task).unwrap();
+            let text = prepared.composed_prompt_text().unwrap();
+            assert!(counts.memory_dropped > 0);
+            assert!(!text.contains("OPTIONAL_SEED"));
+            assert!(!text.contains("OPTIONAL_RELATIONSHIP"));
+            assert!(text.contains("EXACT_ROLE_MARKER"));
+            assert!(text.contains("CURRENT_REQUIRED_USER"));
+            assert_eq!(text.matches("Current date and time (UTC):").count(), 1);
+            assert_eq!(text.matches("Operator local time:").count(), 1);
+            assert!(text.contains("America/New_York"));
+            let policy = if preapproved {
+                "This session is pre-approved."
+            } else {
+                "Request approval before side-effecting actions."
+            };
+            assert_eq!(text.matches(policy).count(), 1);
+            let mut too_small = task.clone();
+            too_small
+                .provider_options
+                .insert("context_limits".into(), json!({"mandatory_tokens":1}));
+            assert!(
+                crate::context_management::prepare(&too_small).is_err(),
+                "required context must fail rather than vanish"
+            );
+        }
     }
 
     #[tokio::test]

@@ -63,6 +63,23 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
     content.to_string()
 }
 
+// Mandatory identity and rules are never sliced at source. The provider
+// budget layer rejects an impossible request with a count-only error.
+fn record_required_budget(
+    ledger: &mut BudgetLedger,
+    source: &str,
+    content: String,
+    cap_chars: usize,
+) -> String {
+    ledger.entries.push(BudgetEntry {
+        source: source.into(),
+        used_chars: content.chars().count(),
+        cap_chars,
+        truncated: false,
+    });
+    content
+}
+
 /// Cap on tidy steps seeded from one audit: the continuation budget scales
 /// with outstanding steps, and the next audit re-lists what is left.
 const GARDENING_STEPS_PER_PASS: usize = 12;
@@ -1083,7 +1100,7 @@ impl SessionState {
         };
 
         let tools_for_model = self.project_tools_for_turn(&user_content);
-        let prompt = self.build_prompt_with_tools(&user_content, &tools_for_model);
+        let prompt = user_content.clone();
         Some(ModelReentryPlan {
             task_id,
             user_content,
@@ -1463,6 +1480,34 @@ impl SessionState {
                     .map(|_| format!("{operation} '{item}' in bindings.effective_skillset."))
             }
             // ── Settings tree ─────────────────────────────────────────────────
+            "settings.context_request_limits" => {
+                if value.is_null() {
+                    self.settings.context_request_limits = None;
+                    return Ok("Reset request budgets to router defaults.".into());
+                }
+                let limits = value
+                    .as_object()
+                    .ok_or("request budgets require an object")?;
+                let allowed = [
+                    "input_tokens",
+                    "output_tokens",
+                    "mandatory_tokens",
+                    "history_tokens",
+                    "memory_tokens",
+                    "tool_result_tokens",
+                    "tool_schema_tokens",
+                    "user_tokens",
+                ];
+                for (key, v) in limits {
+                    if !allowed.contains(&key.as_str()) || v.as_u64().is_none_or(|n| n == 0) {
+                        return Err(
+                            "request budgets require known keys and positive integers".into()
+                        );
+                    }
+                }
+                self.settings.context_request_limits = Some(value.clone());
+                Ok("Set explicit request budgets; router model ceilings still apply.".into())
+            }
             "settings.context_window.dialogue_window_minutes" => {
                 let v = value
                     .as_u64()
@@ -1972,12 +2017,13 @@ impl SessionState {
     /// Non-blocking by construction: only the cache is consulted — never the
     /// runner. Entries older than `max_age_secs` are skipped (stale), records are
     /// deduplicated by node id (against both the cache lanes and any memories the
-    /// Muninn lane already recalled), and total injected content is capped at
-    /// `char_budget` chars with a truncation marker. Returns the number of
-    /// records injected.
+    /// Muninn lane already recalled). Whole records fit the legacy `char_budget`
+    /// setting using serialized UTF-8 bytes including metadata, escaping, array
+    /// brackets and separators. Oversized records are omitted, never sliced or
+    /// marked; cached originals remain unchanged. Returns complete records injected.
     ///
     /// Fairness: candidates are round-robin interleaved across strategies
-    /// (one record per strategy per round) before the char budget is applied,
+    /// (one record per strategy per round) before the serialized-byte budget is applied,
     /// so a strategy added later to the auto-recall lane's strategy list —
     /// e.g. `current_prompt_semantic` — isn't starved by two strategies'
     /// worth of records filling the budget first. Dedup precedence (first
@@ -3019,7 +3065,7 @@ impl SessionState {
         // projection's role_activation metadata below.
         let projected_skill_names =
             self.projected_skill_names_for_turn(user_content, projected_tools);
-        let identity = apply_injection_budget(
+        let identity = record_required_budget(
             &mut budget_ledger,
             "identity",
             self.project_agent_self_core(),
@@ -3041,15 +3087,20 @@ impl SessionState {
         };
         let relationship = self.project_user(user_content);
         let knowledge = self.project_knowledge(user_content, projected_tools);
-        let recalled_memory = apply_injection_budget(
+        // The renderer budgets whole optional records; record usage without a second text cut.
+        let recalled_memory = record_required_budget(
             &mut budget_ledger,
             "recalled_memory",
             self.project_recalled_memory(),
             injection_budget.recalled_memory_chars,
         );
         let working = self.project_working_state();
-        let session = self.project_session_context(projected_tools);
-        let rules = apply_injection_budget(
+        let session = format!(
+            "{}\n{}",
+            self.project_session_context(projected_tools),
+            self.project_approval_policy()
+        );
+        let rules = record_required_budget(
             &mut budget_ledger,
             "rules",
             self.project_rules(),
@@ -3236,8 +3287,7 @@ impl SessionState {
         }
     }
 
-    fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
-        let mut prompt = String::new();
+    fn project_clock(&self) -> String {
         // Show the operator's LIVE local clock, not just the zone name: with
         // only a UTC timestamp in view, models hand-convert local times and
         // get scheduling wrong while sounding confident (live 2026-08-26:
@@ -3260,7 +3310,7 @@ impl SessionState {
                 Err(_) => format!(" (user timezone: {tz})"),
             })
             .unwrap_or_default();
-        let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
+        if let Some(ref name) = self.agent_profile.persona_name {
             format!(
                 "Name: {name}\nCurrent date and time (UTC): {}{tz_suffix}\n",
                 utc_datetime_string()
@@ -3270,7 +3320,12 @@ impl SessionState {
                 "Current date and time (UTC): {}{tz_suffix}\n",
                 utc_datetime_string()
             )
-        };
+        }
+    }
+
+    fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
+        let mut prompt = String::new();
+        let persona_line = self.project_clock();
         prompt.push_str(&format!("[System]\n{persona_line}"));
         for layer in &projection.layers {
             let title = match layer.layer_id {
@@ -3299,24 +3354,30 @@ impl SessionState {
             .filter(|layer| layer.layer_id == ContextLayerId::Identity)
             .map(|layer| projection_item(&layer.rendered_content, &layer.owner, "identity"))
             .collect::<Vec<_>>();
-        let instructions = projection
+        let mut instructions = projection
             .layers
             .iter()
             .filter(|layer| {
                 matches!(
                     layer.layer_id,
-                    ContextLayerId::Session | ContextLayerId::Working
+                    ContextLayerId::Session | ContextLayerId::Working | ContextLayerId::Rules
                 )
             })
             .map(|layer| {
                 let kind = match layer.layer_id {
                     ContextLayerId::Session => "session",
                     ContextLayerId::Working => "working",
+                    ContextLayerId::Rules => "rules",
                     _ => "instruction",
                 };
                 projection_item(&layer.rendered_content, &layer.owner, kind)
             })
             .collect::<Vec<_>>();
+        instructions.push(projection_item(
+            &self.project_clock(),
+            "runtime:clock",
+            "clock",
+        ));
         let memory = projection
             .layers
             .iter()
@@ -3370,7 +3431,7 @@ impl SessionState {
             .iter()
             .rev()
             .take_while(|turn| {
-                let cost = turn.user_content.len()
+                let cost = sanitize_turn_content_for_history(&turn.user_content).len()
                     + turn.assistant_content.as_deref().map(str::len).unwrap_or(0);
                 if budget_used + cost <= char_budget {
                     budget_used += cost;
@@ -3392,7 +3453,7 @@ impl SessionState {
             let at = self.turn_stamp(turn.created_at);
             dialogue_window.push(json!({
                 "role": "user",
-                "text": collapse_internal_turn_content(&turn.user_content),
+                "text": collapse_internal_turn_content(&sanitize_turn_content_for_history(&turn.user_content)),
                 "at": at,
             }));
             if let Some(reply) = turn.assistant_content.as_deref() {
@@ -3406,13 +3467,9 @@ impl SessionState {
 
         // tool_history: accumulated (call, result) pairs from the active turn.
         // Always present in the envelope — empty on initial turn, populated on re-entry.
-        // Results are truncated to max_tool_result_chars to prevent context overflow.
+        // Complete results are bounded by provider-side pair selection; never
+        // truncate a result before that selector can identify an oversized pair.
         // Oldest entries are dropped first when working_tool_history exceeds max_tool_history_entries.
-        let max_result_chars = self
-            .settings
-            .context_window
-            .max_tool_result_chars
-            .max(1_000);
         let max_history_entries = self.settings.context_window.max_tool_history_entries.max(3);
         let tool_history: Vec<Value> = self
             .active_turn
@@ -3436,15 +3493,9 @@ impl SessionState {
                     }));
                 }
                 for (i, (call, result)) in windowed.iter().enumerate() {
-                    let result_text = if result.content.len() > max_result_chars {
-                        format!(
-                            "{}… [truncated: {} chars total]",
-                            &result.content[..max_result_chars],
-                            result.content.len()
-                        )
-                    } else {
-                        result.content.clone()
-                    };
+                    // Keep complete results here; request-local provider selection
+                    // drops whole old pairs or rejects an oversized newest pair.
+                    let result_text = result.content.clone();
                     entries.push(json!({
                         "index": dropped + i + 1,
                         "tool_name": call.tool_name,
@@ -3987,18 +4038,7 @@ impl SessionState {
         lines.join("\n")
     }
 
-    pub fn project_knowledge(
-        &self,
-        user_content: &str,
-        projected_tools: &[ToolDefinition],
-    ) -> String {
-        let mut sections = Vec::new();
-
-        let dialogue = self.render_dialogue_window(self.settings.injection_budget.dialogue_chars);
-        if !dialogue.is_empty() {
-            sections.push(dialogue);
-        }
-
+    fn project_approval_policy(&self) -> String {
         let mut policy = String::from("[Approval policy]\n");
         if self.approval_policy.auto_approve_all {
             policy.push_str(
@@ -4025,7 +4065,16 @@ impl SessionState {
                 "No pre-approvals are configured. Request approval before side-effecting actions.\n",
             );
         }
-        sections.push(policy.trim_end().to_string());
+        policy.trim_end().to_string()
+    }
+
+    pub fn project_knowledge(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> String {
+        let mut sections = Vec::new();
+
         // [Recent summary] used to be emitted here as well. It is the last three
         // turns, which `[Recent session context]` above already carries in full — in
         // this same layer — so it was a verbatim second copy in every request. The
@@ -4085,21 +4134,9 @@ impl SessionState {
         )
     }
 
-    /// Render the turn's recalled memories for the model.
-    ///
-    /// Phase 2 M2 (2026-09-16 audit): the previous renderer spent ~965 chars on
-    /// a fixed preamble and ~650 chars per item on ids, tags, vault, a constant
-    /// `confidence=1.00` and inferred frame lines, for ~150 chars of content —
-    /// the 3,000-char cap then truncated 97–99.5% of blocks mid-item and cut
-    /// LifeGraph records (appended last) first. This renderer:
-    /// - keeps a short precedence preamble;
-    /// - renders one compact line per memory: concept, content (capped), date
-    ///   + age, origin, and an id only where a tool can act on it
-    ///   (LifeGraph items, which life.commit/life.resolve close);
-    /// - shows stored (not inferred) spacetime frame facts compactly;
-    /// - maps contradiction ids onto item numbers and renders each ⚠ once;
-    /// - budgets whole items per origin lane so the outer cap never cuts an
-    ///   item and neither lane starves the other.
+    /// Render complete admitted memories with stored qualifications/provenance.
+    /// UTF-8 byte budgets include the preamble, numbering, metadata and warnings.
+    /// An item that does not fit is omitted whole; no outer cap slices it.
     fn project_recalled_memory(&self) -> String {
         let Some(turn) = self.active_turn.as_ref() else {
             return String::new();
@@ -4126,7 +4163,6 @@ impl SessionState {
              contradicts an item, trust the turn and update the store: life.commit with \
              loop_status=\"resolved\" for a life-graph item, memory.remember for a muninn item. \
              Memories you write about events must include an ISO 8601 date.\n";
-        const ITEM_CONTENT_MAX_CHARS: usize = 500;
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4136,7 +4172,7 @@ impl SessionState {
             .settings
             .injection_budget
             .recalled_memory_chars
-            .saturating_sub(PREAMBLE.chars().count());
+            .saturating_sub(PREAMBLE.len());
         // Split the budget between lanes; a lane with nothing to show donates
         // its share to the other.
         let has_life = turn
@@ -4169,9 +4205,8 @@ impl SessionState {
         let mut omitted = 0usize;
         for (idx, memory) in turn.recalled_memories.iter().enumerate() {
             let origin = recalled_memory_origin(memory);
-            let line =
-                self.render_recalled_memory_line(memory, origin, now_secs, ITEM_CONTENT_MAX_CHARS);
-            let cost = line.chars().count() + 4; // "NN. " prefix
+            let line = self.render_recalled_memory_line(memory, origin, now_secs);
+            let cost = line.len() + 4; // "NN. " prefix
             let lane_used = used.entry(origin).or_default();
             if *lane_used + cost > lane_budget(origin) {
                 omitted += 1;
@@ -4180,19 +4215,6 @@ impl SessionState {
             *lane_used += cost;
             lines.push((idx, line));
         }
-        if lines.is_empty() {
-            // Nothing fits the configured budget: render the best item anyway
-            // so the outer injection cap truncates it visibly and records the
-            // overflow in the budget ledger, instead of silently showing nothing.
-            let first = &turn.recalled_memories[0];
-            let origin = recalled_memory_origin(first);
-            lines.push((
-                0,
-                self.render_recalled_memory_line(first, origin, now_secs, ITEM_CONTENT_MAX_CHARS),
-            ));
-            omitted = omitted.saturating_sub(1);
-        }
-
         let number_of = |id: &str| -> Option<usize> {
             lines
                 .iter()
@@ -4202,21 +4224,24 @@ impl SessionState {
 
         let mut out = degraded_marker.unwrap_or_default();
         out.push_str(PREAMBLE);
+        if out.len() > self.settings.injection_budget.recalled_memory_chars {
+            return String::new();
+        }
         for (pos, (idx, line)) in lines.iter().enumerate() {
             let memory = &turn.recalled_memories[*idx];
-            out.push_str(&format!("{}. {}", pos + 1, line));
+            let mut item = format!("{}. {}", pos + 1, line);
             if let Some(ann) = memory.annotations.as_ref().filter(|v| v.is_object()) {
                 if let Some(ids) = ann.get("contradicts_ids").and_then(|v| v.as_array()) {
                     let refs: Vec<String> = ids
                         .iter()
                         .filter_map(|v| v.as_str())
                         .map(|id| match number_of(id) {
-                            Some(n) => format!("item {n}"),
+                            Some(_) => format!("record {id}"),
                             None => "an unshown memory".to_string(),
                         })
                         .collect();
                     if !refs.is_empty() {
-                        out.push_str(&format!(
+                        item.push_str(&format!(
                             "\n   ⚠ CONTRADICTS {}: do not present either as settled; prefer the newer/verified one or resolve via memory.remember.",
                             refs.join(", ")
                         ));
@@ -4227,7 +4252,7 @@ impl SessionState {
                     .and_then(|v| v.as_str())
                     .is_some_and(|v| !v.is_empty())
                 {
-                    out.push_str(
+                    item.push_str(
                         "\n   ⚠ STALE — superseded by a newer version: treat this as history, not current fact.",
                     );
                 } else if ann
@@ -4235,15 +4260,35 @@ impl SessionState {
                     .and_then(|v| v.as_str())
                     .is_some_and(|v| !v.is_empty())
                 {
-                    out.push_str("\n   possibly stale — a newer, similar memory exists.");
+                    item.push_str("\n   possibly stale — a newer, similar memory exists.");
                 }
             }
-            out.push('\n');
+            item.push('\n');
+            if item.len()
+                <= self
+                    .settings
+                    .injection_budget
+                    .recalled_memory_chars
+                    .saturating_sub(out.len())
+            {
+                out.push_str(&item);
+            } else {
+                omitted += 1;
+            }
         }
         if omitted > 0 {
-            out.push_str(&format!(
+            let marker = format!(
                 "({omitted} more recalled item(s) omitted for space; use memory.recall or life.recall for more.)\n"
-            ));
+            );
+            if marker.len()
+                <= self
+                    .settings
+                    .injection_budget
+                    .recalled_memory_chars
+                    .saturating_sub(out.len())
+            {
+                out.push_str(&marker);
+            }
         }
         out.trim_end().to_string()
     }
@@ -4254,17 +4299,8 @@ impl SessionState {
         memory: &RecalledMemoryRecord,
         origin: &str,
         now_secs: u64,
-        content_max_chars: usize,
     ) -> String {
-        let content = normalize_projection_whitespace(&memory.content);
-        let content = if content.chars().count() > content_max_chars {
-            let mut cut: String = content.chars().take(content_max_chars).collect();
-            cut.push('…');
-            cut
-        } else {
-            content
-        };
-
+        let content = &memory.content;
         let mut facts: Vec<String> = Vec::new();
         let frame = memory.spacetime_frame.clone().unwrap_or_default();
         let when = frame
@@ -4301,7 +4337,20 @@ impl SessionState {
             }
         }
 
-        format!("[{}] {} ({})", memory.concept, content, facts.join("; "))
+        // Keep all stored qualifications/provenance, not just the display facts.
+        // Content/concept have already rendered once; metadata remains complete.
+        let mut metadata = serde_json::to_value(memory).expect("memory serializes");
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove("content");
+            object.remove("concept");
+        }
+        format!(
+            "[{}] {} ({})\n   Stored metadata: {}",
+            memory.concept,
+            content,
+            facts.join("; "),
+            metadata
+        )
     }
 
     fn project_agent_graph_with_memory_overlay(&self) -> String {
@@ -4618,35 +4667,12 @@ impl SessionState {
         }
 
         if !turn.working_tool_history.is_empty() {
-            let max_result_chars = self
-                .settings
-                .context_window
-                .max_tool_result_chars
-                .max(1_000);
+            // Tool payloads have one owner: context.tool_history. This layer
+            // carries instructions only, never a second copy of every result.
             lines.push(format!(
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
             ));
-            lines.push("\n[Tool call history]".into());
-            for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
-                let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-                let content = if result.content.len() > max_result_chars {
-                    format!(
-                        "{}… [truncated: {} chars total]",
-                        &result.content[..max_result_chars],
-                        result.content.len()
-                    )
-                } else {
-                    result.content.clone()
-                };
-                lines.push(format!(
-                    "Call {n}: {name}({args})\nResult {n}: {content}",
-                    n = i + 1,
-                    name = call.tool_name,
-                    content = content,
-                ));
-            }
-
             // Structured re-entry footer: grounded in verification against the
             // tool results above, not the model's own step statuses.
             lines.push(crate::plan_eval::reentry_hint(turn));
@@ -4855,12 +4881,63 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> (String, Value, Value) {
-        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
-        let prompt = self.render_prompt_from_projection(&projection);
-        let context = self.model_context_from_projection(&projection);
+        self.model_request_payloads_with_recall_authority(user_content, projected_tools, None)
+    }
+
+    /// Privacy adapter seam. No source-side assumptions about shared vaults,
+    /// memory tags, or ownership; missing authority is a fail-closed omission.
+    pub fn model_request_payloads_with_recall_authority(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+        authority: Option<&dyn crate::recall_selection::RecallAuthority>,
+    ) -> (String, Value, Value) {
+        let principal = self.agent_profile.user_principal_id.as_deref();
+        let mut selected = self.clone();
+        if let Some(turn) = selected.active_turn.as_mut() {
+            let (admitted, counts) = crate::recall_selection::select(
+                principal,
+                &self.agent_id,
+                &self.session_id,
+                authority,
+                &turn.recalled_memories,
+                12,
+                self.settings.injection_budget.recalled_memory_chars,
+            );
+            let admitted = admitted.into_iter().cloned().collect();
+            tracing::info!(
+                considered = counts.considered,
+                admitted = counts.admitted,
+                denied = counts.denied,
+                duplicates = counts.duplicates,
+                over_budget = counts.over_budget,
+                "context recall admission (counts only)"
+            );
+            turn.recalled_memories = admitted;
+        }
+        let mut projection =
+            selected.build_context_projection_with_tools(user_content, projected_tools);
+        let graph_allowed = principal
+            .filter(|p| !p.trim().is_empty())
+            .zip(authority)
+            .is_some_and(|(p, a)| a.permits_agent_graph(p, &self.agent_id, &self.session_id));
+        if !graph_allowed {
+            projection
+                .layers
+                .retain(|l| l.layer_id != ContextLayerId::AgentGraph);
+        }
+        let mut context = selected.model_context_from_projection(&projection);
+        // Recall has a dedicated lane; never duplicate it into generic memory.
+        if let Some(memory) = context.get_mut("memory").and_then(Value::as_array_mut) {
+            memory.retain(|m| {
+                m.get("projection_kind").and_then(Value::as_str) != Some("recalled_memory")
+            });
+        }
         let context_projection =
             serde_json::to_value(&projection).expect("context projection should serialize");
-        (prompt, context, context_projection)
+        // The legacy prompt now contains only the actual current message.
+        // Providers render the structured envelope freshly once per call.
+        (user_content.to_string(), context, context_projection)
     }
 
     pub fn checkpoint_json(&self) -> serde_json::Value {
@@ -4955,6 +5032,7 @@ impl SessionState {
             "active_user_task_id": self.active_user_task_id,
             "pinned_tier_role": self.pinned_tier_role,
             "fallback_override": self.fallback_override,
+            "context_request_limits": self.settings.context_request_limits,
             "life_recall_cache": self.life_recall_cache,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
@@ -4997,6 +5075,7 @@ impl SessionState {
     /// Dropped turns are named rather than silently vanished: the full text is
     /// still in the hotel's `session_turn` ledger, and anything that must outlive
     /// the window belongs in Muninn, which is the memory of record.
+    #[cfg(test)]
     fn render_dialogue_window(&self, budget_chars: usize) -> String {
         if self.recent_turns.is_empty() {
             return String::new();
@@ -5524,7 +5603,13 @@ impl SessionState {
             active_incarnation_id,
             role_activation,
             agent_profile,
-            settings: AgentSettings::default(),
+            settings: AgentSettings {
+                context_request_limits: checkpoint
+                    .get("context_request_limits")
+                    .filter(|value| value.is_object())
+                    .cloned(),
+                ..AgentSettings::default()
+            },
             status,
             approval_policy,
             cron_fire_policy,
@@ -5604,45 +5689,31 @@ fn recalled_content_fingerprint(content: &str) -> Option<u64> {
     (tokens > 0).then(|| hasher.finish())
 }
 
-/// Truncation marker appended when the LifeGraph char budget cuts content.
+/// Legacy marker retained for recognizing older cached records. New selections
+/// never append it or modify record content.
 pub const LIFE_RECALL_TRUNCATION_MARKER: &str = "… [LifeGraph context truncated at char budget]";
 
-/// Enforce the total char budget over LifeGraph records (concept + content).
-///
-/// Records are kept in ranked order until the budget is exhausted. The record
-/// that crosses the budget is content-truncated (when meaningful room remains)
-/// and tagged with [`LIFE_RECALL_TRUNCATION_MARKER`]; everything after it is
-/// dropped so the injected context stays lean.
+/// Select whole upstream cache records within a conservative UTF-8 byte budget.
+/// Account the complete JSON array (including metadata, quotes/escaping,
+/// separators and brackets), not concept/content alone. An oversized ranked
+/// record is skipped so a later complete record can still fit. Inputs remain
+/// unchanged; this request-local view never rewrites the cached originals.
+/// The legacy function/setting name is retained for compatibility.
 pub fn apply_life_recall_char_budget(
     records: Vec<RecalledMemoryRecord>,
     char_budget: usize,
 ) -> Vec<RecalledMemoryRecord> {
-    let mut out: Vec<RecalledMemoryRecord> = Vec::new();
-    let mut used = 0usize;
-    for mut record in records {
-        let record_chars = record.concept.chars().count() + record.content.chars().count();
-        if used + record_chars <= char_budget {
-            used += record_chars;
-            out.push(record);
+    let mut out = Vec::new();
+    let mut used = 2usize; // JSON array brackets
+    for record in records {
+        let Ok(bytes) = serde_json::to_vec(&record) else {
             continue;
-        }
-        // Budget crossed: truncate this record into the remaining room when it
-        // is still meaningful, otherwise just mark the previous record.
-        let remaining = char_budget.saturating_sub(used + record.concept.chars().count());
-        if remaining >= 40 {
-            record.content = record
-                .content
-                .chars()
-                .take(remaining)
-                .collect::<String>()
-                .trim_end()
-                .to_string();
-            record.content.push_str(LIFE_RECALL_TRUNCATION_MARKER);
+        };
+        let cost = bytes.len().saturating_add(usize::from(!out.is_empty()));
+        if cost <= char_budget.saturating_sub(used) && char_budget >= 2 {
+            used += cost;
             out.push(record);
-        } else if let Some(last) = out.last_mut() {
-            last.content.push_str(LIFE_RECALL_TRUNCATION_MARKER);
         }
-        break;
     }
     out
 }
@@ -6761,10 +6832,6 @@ fn recalled_memory_origin(memory: &RecalledMemoryRecord) -> &'static str {
     }
 }
 
-fn normalize_projection_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Render a memory timestamp (seconds or milliseconds) as a UTC date plus a
 /// coarse age, e.g. `2026-05-12, 4mo ago`. Returns `None` for zero/invalid.
 fn memory_date_and_age(value: u64, now_secs: u64) -> Option<String> {
@@ -6988,6 +7055,194 @@ mod tests {
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::reflex::ReflexEvent;
     use uuid::Uuid;
+
+    #[test]
+    fn context_management_durable_messages_are_not_rendered_envelopes() {
+        let mut state = SessionState::new(
+            "context-test".into(),
+            "agent-test".into(),
+            "telegram".into(),
+        );
+        for (n, user, reply) in [(1, "USER_ONE", "REPLY_ONE"), (2, "USER_TWO", "REPLY_TWO")] {
+            let mut turn = test_working_turn(None);
+            turn.turn_id = format!("turn-{n}");
+            turn.user_content = user.into();
+            state.active_turn = Some(turn);
+            let (prompt, context, _) = state.model_request_payloads(user, &[]);
+            assert_eq!(prompt, user);
+            assert_eq!(context["active_turn"]["text"], user);
+            let before = state.checkpoint_json();
+            for _ in 0..3 {
+                let _ = state.model_request_payloads(user, &[]);
+            }
+            assert_eq!(
+                before,
+                state.checkpoint_json(),
+                "retries cannot rewrite history"
+            );
+            state.complete_active_turn(reply.into());
+            let record = state.recent_turns.last().unwrap();
+            assert_eq!(record.user_content, user);
+            assert_eq!(record.assistant_content.as_deref(), Some(reply));
+        }
+        assert_eq!(state.recent_turns.len(), 2);
+        assert!(
+            state
+                .recent_turns
+                .iter()
+                .all(|t| !t.user_content.contains("projection"))
+        );
+    }
+
+    #[test]
+    fn context_management_tool_results_have_one_structured_owner() {
+        let mut state = SessionState::new(
+            "context-test".into(),
+            "agent-test".into(),
+            "telegram".into(),
+        );
+        state.active_turn = Some(test_working_turn(None));
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "synthetic".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "synthetic".into(),
+                content: "UNIQUE_TOOL_RESULT".into(),
+            },
+        );
+        let (prompt, context, _) = state.model_request_payloads("CURRENT", &[]);
+        assert_eq!(prompt, "CURRENT");
+        assert_eq!(context.to_string().matches("UNIQUE_TOOL_RESULT").count(), 1);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .working_tool_history
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn context_management_budget_override_is_explicit_and_checkpointed() {
+        let mut state = SessionState::new(
+            "context-test".into(),
+            "agent-test".into(),
+            "telegram".into(),
+        );
+        let limits = serde_json::json!({"input_tokens":65536,"output_tokens":8192});
+        state
+            .apply_configure("settings.context_request_limits", &limits, "set")
+            .unwrap();
+        assert_eq!(state.settings.context_request_limits, Some(limits.clone()));
+        let restored = SessionState::from_checkpoint(&state.checkpoint_json()).unwrap();
+        assert_eq!(restored.settings.context_request_limits, Some(limits));
+        for value in [
+            serde_json::json!({"output_tokens":0}),
+            serde_json::json!({"unknown":10}),
+            serde_json::json!({"output_tokens":1.5}),
+        ] {
+            assert!(
+                state
+                    .apply_configure("settings.context_request_limits", &value, "set")
+                    .is_err()
+            );
+        }
+        state
+            .apply_configure(
+                "settings.context_request_limits",
+                &serde_json::Value::Null,
+                "set",
+            )
+            .unwrap();
+        assert!(state.settings.context_request_limits.is_none());
+    }
+
+    #[test]
+    fn context_management_authorized_memory_is_whole_or_omitted_with_framing() {
+        struct Allow;
+        impl crate::recall_selection::RecallAuthority for Allow {
+            fn permits(&self, _: &str, _: &str, _: &str, _: &RecalledMemoryRecord) -> bool {
+                true
+            }
+        }
+        let mut state = SessionState::new(
+            "whole-recall".into(),
+            "agent-test".into(),
+            "telegram".into(),
+        );
+        state.agent_profile.user_principal_id = Some("synthetic-principal".into());
+        let mut turn = test_working_turn(None);
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            id: Some("synthetic-whole".into()),
+            concept: "synthetic".into(),
+            content: format!("{}\nTAIL_QUALIFICATION", "é".repeat(350)),
+            annotations: Some(
+                serde_json::json!({"qualification":"STORED_QUALIFIER","superseded_by":"newer"}),
+            ),
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+        state.settings.injection_budget.recalled_memory_chars = 3000;
+        let (_, context, _) =
+            state.model_request_payloads_with_recall_authority("CURRENT", &[], Some(&Allow));
+        let text = context["recalled_memory"][0]["text"].as_str().unwrap();
+        assert!(text.contains("TAIL_QUALIFICATION"));
+        assert!(text.contains("STORED_QUALIFIER"));
+        assert!(text.contains("⚠ STALE"));
+        assert_eq!(text.matches("TAIL_QUALIFICATION").count(), 1);
+        assert!(text.len() <= 3000);
+        // The raw record fits this smaller admission budget; the complete
+        // rendered item plus its preamble/warning does not. Never slice it.
+        let raw = serde_json::to_vec(&state.active_turn.as_ref().unwrap().recalled_memories[0])
+            .unwrap()
+            .len();
+        state.settings.injection_budget.recalled_memory_chars = raw;
+        let (_, small, _) =
+            state.model_request_payloads_with_recall_authority("CURRENT", &[], Some(&Allow));
+        assert!(
+            !small["recalled_memory"]
+                .to_string()
+                .contains("synthetic-whole")
+        );
+        assert!(
+            !small["recalled_memory"]
+                .to_string()
+                .contains("TAIL_QUALIFICATION")
+        );
+        assert!(
+            state.active_turn.as_ref().unwrap().recalled_memories[0]
+                .content
+                .contains("TAIL_QUALIFICATION")
+        );
+    }
+
+    #[test]
+    fn context_management_unattested_recall_is_omitted_without_deleting_it() {
+        let mut state = SessionState::new(
+            "context-test".into(),
+            "agent-test".into(),
+            "telegram".into(),
+        );
+        let mut turn = test_working_turn(None);
+        turn.recalled_memories = vec![
+            serde_json::from_value(serde_json::json!({
+                "id":"synthetic-1","concept":"synthetic","content":"PRIVATE_MARKER"
+            }))
+            .unwrap(),
+        ];
+        state.active_turn = Some(turn);
+        let (_, context, projection) = state.model_request_payloads("user", &[]);
+        assert!(!context.to_string().contains("PRIVATE_MARKER"));
+        assert!(!projection.to_string().contains("PRIVATE_MARKER"));
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories.len(),
+            1
+        );
+    }
 
     fn test_working_turn(active_plan: Option<ActivePlan>) -> WorkingTurn {
         WorkingTurn {
@@ -7884,7 +8139,8 @@ mod tests {
         });
         let state =
             SessionState::from_checkpoint(&checkpoint).expect("from_checkpoint must succeed");
-        let knowledge = state.project_knowledge("", &[]);
+        let (_, context, _) = state.model_request_payloads("current", &[]);
+        let knowledge = context["dialogue_window"].to_string();
         assert!(
             !knowledge.contains("audio_base64"),
             "audio base64 must not appear in context"
@@ -7920,47 +8176,32 @@ mod tests {
     /// coach was sending 236KB requests and OpenRouter timed out at 55s.
     #[test]
     fn dialogue_window_is_bounded_by_the_injection_budget() {
-        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(5, 4_000))
-            .expect("from_checkpoint must succeed");
-        let budget = state.settings.injection_budget.dialogue_chars;
-        let knowledge = state.project_knowledge("", &[]);
-
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(5, 4000)).unwrap();
+        let (_, context, _) = state.model_request_payloads("CURRENT", &[]);
+        let history = &context["dialogue_window"];
         assert!(
-            knowledge.chars().count() < budget * 2,
-            "dialogue window must stay near its {budget}-char budget, got {}",
-            knowledge.chars().count()
+            history.to_string().len() < state.settings.context_window.dialogue_window_chars + 1000
         );
-        assert!(
-            knowledge.contains("elided to stay inside"),
-            "elided turns must be announced, not silently dropped"
-        );
-        // Newest turn survives; the oldest is the one dropped.
-        assert!(
-            knowledge.contains("TURN4"),
-            "the most recent turn must always be kept"
-        );
-        assert!(
-            !knowledge.contains("TURN0"),
-            "the oldest turn must be the first evicted under budget pressure"
+        assert!(history.to_string().contains("TURN4"));
+        assert!(!history.to_string().contains("TURN0"));
+        assert_eq!(
+            state.recent_turns.len(),
+            5,
+            "selection cannot delete source history"
         );
     }
 
     /// Dropping the turn currently being replied to would be worse than
     /// overrunning the budget, so the newest turn is admitted unconditionally.
     #[test]
-    fn dialogue_window_keeps_the_newest_turn_even_if_it_alone_exceeds_budget() {
-        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(1, 40_000))
-            .expect("from_checkpoint must succeed");
-        let knowledge = state.project_knowledge("", &[]);
-        assert!(
-            knowledge.contains("TURN0"),
-            "a single oversized turn must still be projected — it is the one being answered"
-        );
+    fn oversized_old_dialogue_does_not_displace_the_current_request() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(1, 20000)).unwrap();
+        let (prompt, context, _) = state.model_request_payloads("CURRENT", &[]);
+        assert_eq!(prompt, "CURRENT");
+        assert!(context["dialogue_window"].as_array().unwrap().is_empty());
+        assert_eq!(state.recent_turns.len(), 1);
     }
 
-    /// `project_knowledge` used to emit `[Recent session context]` (the whole
-    /// window) AND `[Recent summary]` (its last three turns) into the same layer,
-    /// so those turns were sent twice in every request.
     #[test]
     fn knowledge_layer_does_not_duplicate_recent_turns() {
         let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(2, 10))
@@ -7973,8 +8214,8 @@ mod tests {
         );
         assert_eq!(
             knowledge.matches("TURN1").count(),
-            1,
-            "the newest turn must appear exactly once in the knowledge layer"
+            0,
+            "dialogue must be owned by the structured dialogue window"
         );
     }
 
@@ -12341,7 +12582,8 @@ mod tests {
         let text = state.project_recalled_memory();
         // LifeGraph records are no longer starved by Muninn items rendered first.
         assert!(text.contains("[life-1]"), "{text}");
-        assert!(text.contains("[life-2]"), "{text}");
+        assert!(text.contains("[muninn-1]"), "{text}");
+        assert!(text.contains("Stored metadata:"), "{text}");
         assert!(text.contains("omitted for space"), "{text}");
         // Whole items only: nothing is cut mid-content by the outer cap.
         assert!(!text.contains("truncated at"), "{text}");
@@ -12933,7 +13175,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_life_recall_char_budget_truncates_with_marker() {
+    fn apply_life_recall_char_budget_selects_complete_records_with_framing() {
         let records = vec![
             life_record("life:1", &"a".repeat(2_000)),
             life_record("life:2", &"b".repeat(2_000)),
@@ -12942,19 +13184,65 @@ mod tests {
 
         let budgeted = apply_life_recall_char_budget(records, 2_500);
 
-        assert_eq!(budgeted.len(), 2, "third record must be dropped");
-        assert_eq!(budgeted[0].content.chars().count(), 2_000);
-        assert!(
-            budgeted[1].content.ends_with(LIFE_RECALL_TRUNCATION_MARKER),
-            "crossing record must carry the truncation marker"
+        assert_eq!(budgeted.len(), 1);
+        assert_eq!(budgeted[0].content, "a".repeat(2_000));
+        assert!(!budgeted[0].content.contains(LIFE_RECALL_TRUNCATION_MARKER));
+        assert!(serde_json::to_vec(&budgeted).unwrap().len() <= 2500);
+    }
+
+    #[test]
+    fn upstream_life_selection_preserves_originals_and_complete_provenance() {
+        let mut oversized = life_record("life:large", &"é".repeat(2000));
+        oversized.annotations = Some(serde_json::json!({"qualification":"TAIL_QUALIFIER"}));
+        let mut small = life_record("life:small", "complete\nqualified");
+        small.annotations = Some(serde_json::json!({"provenance":"SOURCE_VERSION_1"}));
+        let records = vec![oversized, small.clone()];
+        let snapshot = serde_json::to_value(&records).unwrap();
+        let boundary = serde_json::to_vec(&vec![small.clone()]).unwrap().len();
+        let selected = apply_life_recall_char_budget(records.clone(), boundary);
+        assert_eq!(
+            serde_json::to_value(&selected).unwrap(),
+            serde_json::json!([small])
         );
-        let total: usize = budgeted
-            .iter()
-            .map(|record| record.concept.chars().count() + record.content.chars().count())
-            .sum();
-        assert!(
-            total <= 2_500 + LIFE_RECALL_TRUNCATION_MARKER.chars().count(),
-            "total injected chars must respect the budget (marker exempt), got {total}"
+        assert!(apply_life_recall_char_budget(records.clone(), boundary - 1).is_empty());
+        assert_eq!(serde_json::to_value(&records).unwrap(), snapshot);
+        assert!(records[0].content.ends_with(&"é".repeat(2000)));
+    }
+
+    #[test]
+    fn upstream_cache_selection_does_not_rewrite_cached_originals() {
+        let mut state =
+            SessionState::new("cache-whole".into(), "agent-test".into(), "telegram".into());
+        state.start_turn(test_working_turn(None));
+        let large = life_record(
+            "life:oversized",
+            &format!("{} TAIL_QUALIFIER", "é".repeat(2000)),
+        );
+        let small = life_record("life:complete", "complete qualifier");
+        let budget = serde_json::to_vec(&vec![small.clone()]).unwrap().len();
+        let now = 1_800_000_000;
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "synthetic".into(),
+            fetched_at: now,
+            query_text: "synthetic".into(),
+            records: vec![large, small],
+        });
+        let original = serde_json::to_value(&state.life_recall_cache).unwrap();
+        assert_eq!(state.inject_cached_life_context(1800, now, budget), 1);
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories[0]
+                .id
+                .as_deref(),
+            Some("life:complete")
+        );
+        assert_eq!(
+            serde_json::to_value(&state.life_recall_cache).unwrap(),
+            original
+        );
+        assert_eq!(state.inject_cached_life_context(1800, now, budget), 0);
+        assert_eq!(
+            serde_json::to_value(&state.life_recall_cache).unwrap(),
+            original
         );
     }
 
@@ -13245,10 +13533,8 @@ mod tests {
             .find(|l| l.layer_id == ContextLayerId::Identity)
             .expect("identity layer present");
         assert!(
-            identity
-                .rendered_content
-                .contains("truncated at 6000 chars"),
-            "persona overflow should still be reported"
+            identity.rendered_content.contains(&"x".repeat(9000)),
+            "required persona must be preserved for the provider budget check"
         );
         assert!(
             identity
@@ -13268,7 +13554,7 @@ mod tests {
     }
 
     #[test]
-    fn injection_budget_truncates_persona_and_records_ledger_entry() {
+    fn injection_budget_preserves_required_persona_and_records_usage() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.agent_profile.identity_text = Some("x".repeat(50));
@@ -13282,7 +13568,7 @@ mod tests {
             .iter()
             .find(|e| e.source == "identity")
             .expect("identity ledger entry present");
-        assert!(entry.truncated);
+        assert!(!entry.truncated);
         assert_eq!(entry.cap_chars, 10);
         assert_eq!(entry.used_chars, 50);
 
@@ -13294,7 +13580,7 @@ mod tests {
         // Usage header is operator-facing (/context) only — it must never
         // leak into the literal model prompt content.
         assert!(!layer.rendered_content.contains("[IDENTITY"));
-        assert!(layer.rendered_content.contains("truncated at 10 chars"));
+        assert!(layer.rendered_content.contains(&"x".repeat(50)));
 
         // The same numbers are visible to the operator via /context instead.
         let breakdown = state.context_breakdown_text();
@@ -13304,7 +13590,7 @@ mod tests {
     }
 
     #[test]
-    fn injection_budget_truncates_recalled_memory_and_records_ledger_entry() {
+    fn injection_budget_omits_whole_recalled_memory_and_records_ledger_entry() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.settings.injection_budget.recalled_memory_chars = 20;
@@ -13324,20 +13610,24 @@ mod tests {
             .iter()
             .find(|e| e.source == "recalled_memory")
             .expect("recalled_memory ledger entry present");
-        assert!(entry.truncated);
+        assert!(!entry.truncated);
+        assert_eq!(entry.used_chars, 0);
         assert_eq!(entry.cap_chars, 20);
 
-        let layer = projection
-            .layers
-            .iter()
-            .find(|l| l.layer_id == ContextLayerId::RecalledMemory)
-            .expect("recalled_memory layer present");
-        assert!(!layer.rendered_content.contains("[RECALLED MEMORY"));
-        assert!(layer.rendered_content.contains("truncated at 20 chars"));
+        assert!(
+            !projection
+                .layers
+                .iter()
+                .any(|layer| layer.layer_id == ContextLayerId::RecalledMemory)
+        );
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories[0].content,
+            "x".repeat(200)
+        );
     }
 
     #[test]
-    fn injection_budget_truncates_rules_and_records_ledger_entry() {
+    fn injection_budget_preserves_required_rules_and_records_usage() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.settings.injection_budget.rules_chars = 15;
@@ -13352,7 +13642,7 @@ mod tests {
             .iter()
             .find(|e| e.source == "rules")
             .expect("rules ledger entry present");
-        assert!(entry.truncated);
+        assert!(!entry.truncated);
         assert_eq!(entry.cap_chars, 15);
 
         let layer = projection
@@ -13361,7 +13651,7 @@ mod tests {
             .find(|l| l.layer_id == ContextLayerId::Rules)
             .expect("rules layer present");
         assert!(!layer.rendered_content.contains("[RULES"));
-        assert!(layer.rendered_content.contains("truncated at 15 chars"));
+        assert!(!layer.rendered_content.contains("truncated"));
     }
 
     #[test]
@@ -13436,8 +13726,8 @@ mod tests {
             "usage-header bracket syntax leaked into the literal model prompt: {prompt}"
         );
         assert!(
-            prompt.contains("…truncated at 10 chars"),
-            "truncation marker must still reach the model prompt even without the header"
+            prompt.contains(&"x".repeat(50)),
+            "mandatory content is preserved until the provider budget check"
         );
 
         let model_context = state.model_context_from_projection(&projection);

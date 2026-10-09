@@ -1430,10 +1430,15 @@ mod tests {
         assert!(
             emitted.iter().any(|e| {
                 e["task"]["action"] == "generate_text"
-                    && e["task"]["prompt"]
-                        .as_str()
-                        .map(|p| p.contains("unavailable"))
-                        .unwrap_or(false)
+                    && e["task"]["context"]["tool_history"]
+                        .as_array()
+                        .is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry["result"]
+                                    .as_str()
+                                    .is_some_and(|result| result.contains("unavailable"))
+                            })
+                        })
             }),
             "refusal must re-enter the model as a visible tool failure: {:#?}",
             *emitted

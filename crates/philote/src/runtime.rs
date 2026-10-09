@@ -160,15 +160,6 @@ fn life_graph_runner_node_id() -> String {
         .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
 }
 
-fn debug_model_requests_enabled() -> bool {
-    matches!(
-        std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
-}
-
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
@@ -702,6 +693,23 @@ fn content_policy_provider_options(effective_content_policy: &str) -> Map<String
     options
 }
 
+/// Every runtime re-entry uses the same authority-aware assembly as the initial
+/// dispatch, with the actual projected tools. Missing runtime authority remains
+/// fail-closed; no diagnostic projection can become a provider request directly.
+fn assemble_model_reentry(
+    state: Option<&SessionState>,
+    user_content: &str,
+    tools: &[crate::session::ToolDefinition],
+) -> (String, Option<Value>, Option<Value>) {
+    match state {
+        Some(state) => {
+            let (prompt, context, projection) = state.model_request_payloads(user_content, tools);
+            (prompt, Some(context), Some(projection))
+        }
+        None => (user_content.to_string(), None, None),
+    }
+}
+
 /// Session-lookup wrapper matching the `Option<&SessionState>` convention used
 /// by `model_response_route` / `planning_ligand` / `model_affordances` below —
 /// call sites already have `self.sessions.get(&session_id)` in scope for those,
@@ -712,11 +720,15 @@ fn content_policy_provider_options(effective_content_policy: &str) -> Map<String
 pub(crate) fn resolve_content_policy_provider_options(
     state: Option<&SessionState>,
 ) -> Map<String, Value> {
-    content_policy_provider_options(
+    let mut options = content_policy_provider_options(
         state
             .map(|s| s.effective_content_policy())
             .unwrap_or("standard"),
-    )
+    );
+    if let Some(limits) = state.and_then(|s| s.settings.context_request_limits.as_ref()) {
+        options.insert("context_limits".into(), limits.clone());
+    }
+    options
 }
 
 fn voice_response_contract(policy: &VoiceResponsePolicy) -> Value {
@@ -3941,20 +3953,11 @@ impl AgentRuntime {
             model_req.oracle_agreement = shadow_agreement;
         }
 
-        if debug_model_requests_enabled()
-            && matches!(capability.as_str(), "text.generate" | "response.generate")
-        {
-            match serde_json::to_string_pretty(&model_req) {
-                Ok(json) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
-                    session_id, model_req.turn_id, json
-                ),
-                Err(err) => warn!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS could not serialize outbound model request: {}",
-                    err
-                ),
-            }
-        }
+        info!(
+            user_bytes = model_req.user_content.len(),
+            projected_tools = model_req.tools_for_model.len(),
+            "Philote model request assembly (metadata only)"
+        );
 
         info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
@@ -4346,20 +4349,11 @@ impl AgentRuntime {
             })
             .await?;
 
-        let (context, context_projection) = self
-            .sessions
-            .get(&session_id)
-            .map(|state| {
-                let projection = state.build_context_projection(&reentry.user_content);
-                (
-                    Some(state.model_context_from_projection(&projection)),
-                    Some(
-                        serde_json::to_value(&projection)
-                            .expect("context projection should serialize"),
-                    ),
-                )
-            })
-            .unwrap_or((None, None));
+        let (model_prompt, context, context_projection) = assemble_model_reentry(
+            self.sessions.get(&session_id),
+            &reentry.user_content,
+            &reentry.tools_for_model,
+        );
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.clear_handoff_summary();
         }
@@ -4399,7 +4393,7 @@ impl AgentRuntime {
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
             turn_id,
-            prompt: reentry.prompt,
+            prompt: model_prompt,
             user_content: reentry.user_content.clone(),
             context,
             context_projection,
@@ -5654,7 +5648,6 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
-            prompt,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -5683,7 +5676,6 @@ impl AgentRuntime {
                 active_turn.phase = TurnPhase::WaitingModel;
                 active_turn.user_content.clone()
             };
-            let prompt = state.build_prompt(&user_content);
             let active_turn = state
                 .active_turn
                 .as_ref()
@@ -5693,7 +5685,6 @@ impl AgentRuntime {
                 active_turn.final_reply_to.clone(),
                 active_turn.final_reply_role.clone(),
                 active_turn.final_reply_guest_id.clone(),
-                prompt,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -5730,25 +5721,16 @@ impl AgentRuntime {
                 if state.plan_fully_verified() {
                     Vec::new()
                 } else {
-                    state.tool_assembly.tools_for_model.clone()
+                    state.project_tools_for_turn(&user_content)
                 }
             })
             .unwrap_or_default();
 
-        let (context, context_projection) = self
-            .sessions
-            .get(&session_id)
-            .map(|state| {
-                let projection = state.build_context_projection(&user_content);
-                (
-                    Some(state.model_context_from_projection(&projection)),
-                    Some(
-                        serde_json::to_value(&projection)
-                            .expect("context projection should serialize"),
-                    ),
-                )
-            })
-            .unwrap_or((None, None));
+        let (prompt, context, context_projection) = assemble_model_reentry(
+            self.sessions.get(&session_id),
+            &user_content,
+            &tools_for_model,
+        );
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.clear_handoff_summary();
         }
@@ -7970,6 +7952,55 @@ mod tests {
         assert!(policy.contains("durable future-useful context"));
         assert!(policy.contains("readiness/status chatter"));
         assert!(policy.contains("24-700 characters"));
+    }
+
+    #[test]
+    fn context_management_initial_transcription_and_steering_share_authority_assembly() {
+        let mut state = SessionState::new(
+            "context-routes".into(),
+            "agent-test".into(),
+            "telegram".into(),
+        );
+        state.agent_profile.user_principal_id = Some("synthetic-principal".into());
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.recalled_memories = vec![crate::session::RecalledMemoryRecord {
+            content: "PRIVATE_ROUTE_MARKER".into(),
+            concept: "synthetic".into(),
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+        let tools = vec![crate::session::ToolDefinition {
+            tool_name: "synthetic.projected".into(),
+            description: "synthetic".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            class: None,
+        }];
+        for label in ["initial", "transcription", "approval", "denial"] {
+            let message = format!("CURRENT_{label}");
+            if label == "transcription" {
+                state.prepare_transcription_reentry(&message).unwrap();
+            }
+            let (prompt, context, projection) =
+                super::assemble_model_reentry(Some(&state), &message, &tools);
+            assert_eq!(prompt, message);
+            let context = context.unwrap();
+            let projection = projection.unwrap();
+            assert!(!context.to_string().contains("PRIVATE_ROUTE_MARKER"));
+            assert!(!projection.to_string().contains("PRIVATE_ROUTE_MARKER"));
+            assert!(
+                projection.to_string().contains("synthetic.projected"),
+                "actual projected tools must inform assembly"
+            );
+            assert!(
+                context["instructions"]
+                    .to_string()
+                    .contains("Request approval before side-effecting")
+            );
+            assert_eq!(
+                state.active_turn.as_ref().unwrap().recalled_memories[0].content,
+                "PRIVATE_ROUTE_MARKER"
+            );
+        }
     }
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
@@ -11482,10 +11513,15 @@ mod tests {
         assert!(
             emitted.iter().any(|e| {
                 e["task"]["action"] == "generate_text"
-                    && e["task"]["prompt"]
-                        .as_str()
-                        .map(|p| p.contains("did not respond"))
-                        .unwrap_or(false)
+                    && e["task"]["context"]["tool_history"]
+                        .as_array()
+                        .is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry["result"]
+                                    .as_str()
+                                    .is_some_and(|result| result.contains("did not respond"))
+                            })
+                        })
             }),
             "specialist silence must re-enter the model as a visible tool failure: {:#?}",
             *emitted

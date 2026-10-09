@@ -2873,18 +2873,11 @@ impl AgentRuntime {
             oracle_agreement: None,
         };
 
-        if debug_model_requests_enabled() {
-            match serde_json::to_string_pretty(&model_req) {
-                Ok(json) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS philote retry model request session={} turn={}:\n{}",
-                    session_id, model_req.turn_id, json
-                ),
-                Err(err) => warn!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS could not serialize retry model request: {}",
-                    err
-                ),
-            }
-        }
+        info!(
+            user_bytes = model_req.user_content.len(),
+            projected_tools = model_req.tools_for_model.len(),
+            "Philote model request assembly (metadata only)"
+        );
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
