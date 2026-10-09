@@ -5,6 +5,7 @@ struct RootView: View {
     @Bindable var router: CompanionRouter
     @State private var health = HealthKitCaptureService()
     @State private var location = LocationCaptureService()
+    @State private var agentColumn: NavigationSplitViewColumn = .sidebar
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,8 +17,12 @@ struct RootView: View {
                 CompanionDashboard(session: session, router: router).toolbar { settingsButton }
             }
             .tabItem { Label("Today", systemImage: "sparkles.rectangle.stack") }.tag(CompanionTab.today)
-            NavigationSplitView {
-                AgentPickerView(session: session) { _ in }.toolbar { settingsButton }
+            NavigationSplitView(preferredCompactColumn: $agentColumn) {
+                AgentPickerView(session: session) { _ in
+                    agentColumn = .detail
+                }
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
+                .toolbar { settingsButton }
             } detail: {
                 if session.currentAgent != nil {
                     ChatView(session: session)
@@ -26,6 +31,7 @@ struct RootView: View {
                         description: Text("Choose an agent to start a conversation."))
                 }
             }
+            .navigationSplitViewStyle(.balanced)
             .tabItem { Label("Agents", systemImage: "bubble.left.and.bubble.right") }.tag(CompanionTab.agents)
             NavigationStack {
                 LifeView(session: session).toolbar { settingsButton }
