@@ -9962,6 +9962,16 @@ mod tests {
             let req: philotic_client::IpcRequest =
                 serde_json::from_slice(&buf).expect("decode request");
             let reply = match &req {
+                philotic_client::IpcRequest::RefreshMemoryConfigCorrelated { request_id } => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::MemoryConfigRefreshReply {
+                        memory_config_refresh: philotic_client::MemoryConfigRefresh {
+                            request_id: *request_id,
+                            available: false,
+                            endpoint: "http://synthetic.invalid".into(),
+                        },
+                    })
+                    .unwrap()
+                }
                 philotic_client::IpcRequest::GetConfig { key } => {
                     serde_json::to_vec(&philotic_client::IpcResponse::ConfigData {
                         key: key.clone(),

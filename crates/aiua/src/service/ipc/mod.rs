@@ -2300,6 +2300,16 @@ impl IpcServer {
                         let _ = outbound_tx.send(response);
                     }
                     Ok(IpcRequest::RefreshMemoryConfig) => {
+                        // Old guests cannot distinguish the solicited status from a
+                        // broadcast. Refuse explicitly instead of returning that
+                        // ambiguous frame and leaving them waiting indefinitely.
+                        let _ = outbound_tx.send(IpcResponse::error(
+                            "refresh_memory_config",
+                            "MEMORY_REFRESH_PROTOCOL_REQUIRED",
+                            "Upgrade the guest to correlated memory refresh",
+                        ));
+                    }
+                    Ok(IpcRequest::RefreshMemoryConfigCorrelated { request_id }) => {
                         let endpoint = muninn_config
                             .as_deref()
                             .map(|c| c.base_url.clone())
@@ -2330,9 +2340,12 @@ impl IpcServer {
                             }
                         }
                         info!(available, "RefreshMemoryConfig probe complete");
-                        let _ = outbound_tx.send(IpcResponse::MuninnStatus {
-                            available,
-                            endpoint,
+                        let _ = outbound_tx.send(IpcResponse::MemoryConfigRefreshReply {
+                            memory_config_refresh: philotic_client::MemoryConfigRefresh {
+                                request_id,
+                                available,
+                                endpoint,
+                            },
                         });
                     }
                     Ok(IpcRequest::GetPerimeterStatus) => {
@@ -7300,6 +7313,7 @@ impl IpcServer {
             // Handled before process_request is called (in handle_client).
             IpcRequest::FetchMemoryConfig
             | IpcRequest::RefreshMemoryConfig
+            | IpcRequest::RefreshMemoryConfigCorrelated { .. }
             | IpcRequest::HealMemoryToken { .. } => IpcResponse::error(
                 "memory",
                 "UNREACHABLE",
