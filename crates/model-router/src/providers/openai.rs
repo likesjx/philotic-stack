@@ -35,6 +35,9 @@ struct ToolsCatalog {
 /// Refresh cadence for the tools-capability catalog.
 const TOOLS_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+// Bound OpenRouter's credit preflight when text callers omit an output budget.
+const OPENROUTER_DEFAULT_MAX_TOKENS: u64 = 4096;
+
 pub struct OpenAIProvider {
     http_client: reqwest::Client,
     auth: Option<OpenAIAuth>,
@@ -426,6 +429,17 @@ impl OpenAIProvider {
             if let Some(value) = Self::numeric_provider_option(task, key) {
                 body[key] = value;
             }
+        }
+
+        if self.provider_id == "openrouter"
+            && matches!(task.kind, TaskKind::TextGenerate)
+            && !Self::native_audio_requested(task)
+            && !body
+                .get("max_tokens")
+                .and_then(Value::as_f64)
+                .is_some_and(|limit| limit > 0.0 && limit.fract() == 0.0)
+        {
+            body["max_tokens"] = json!(OPENROUTER_DEFAULT_MAX_TOKENS);
         }
 
         if let Some(stop) = task.provider_options.get("stop") {
@@ -1436,6 +1450,141 @@ mod tests {
         let body = provider.chat_request_body(&plain).unwrap();
         assert_eq!(body["messages"][0]["role"], "user");
         assert!(body.get("response_format").is_none());
+    }
+
+    fn output_budget_test_provider(provider_id: &'static str) -> OpenAIProvider {
+        OpenAIProvider::new_compatible(
+            provider_id,
+            reqwest::Client::new(),
+            None,
+            Some("http://127.0.0.1:9".into()),
+            None,
+            Some("synthetic-model".into()),
+            None,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn openrouter_output_budget_defaults_for_text_and_preserves_streaming_tools_contract() {
+        let provider = output_budget_test_provider("openrouter");
+        let plain = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "Synthetic prompt"
+        }))
+        .unwrap();
+        let body = provider.chat_request_body(&plain).unwrap();
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["stream"], false);
+        assert!(body.get("tools").is_none());
+
+        for stream in [false, true] {
+            let task = ControllerTask::from_value(&json!({
+                "kind": "text.generate",
+                "prompt": "Synthetic prompt",
+                "provider_options": { "stream": stream },
+                "response_contract": { "channels": ["spoken_text", "active_plan"] },
+                "tools_for_model": [{
+                    "tool_name": "workspace.read",
+                    "input_schema": { "type": "object", "properties": {} }
+                }]
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["stream"], stream);
+            assert_eq!(body["model"], "synthetic-model");
+            assert_eq!(body["tools"][0]["function"]["name"], "workspace.read");
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["messages"][0]["role"], "system");
+            assert!(body.get("response_format").is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_output_budget_preserves_explicit_positive_integer_overrides() {
+        let provider = output_budget_test_provider("openrouter");
+        for limit in [json!(1024), json!(8192), json!("8192")] {
+            let task = ControllerTask::from_value(&json!({
+                "kind": "text.generate",
+                "prompt": "Synthetic prompt",
+                "provider_options": { "max_tokens": limit }
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            assert_eq!(
+                body["max_tokens"],
+                OpenAIProvider::numeric_provider_option(&task, "max_tokens").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_output_budget_defaults_for_unusable_overrides() {
+        let provider = output_budget_test_provider("openrouter");
+        for limit in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(false),
+            json!("invalid"),
+            json!("NaN"),
+            json!("inf"),
+        ] {
+            let task = ControllerTask::from_value(&json!({
+                "kind": "text.generate",
+                "prompt": "Synthetic prompt",
+                "provider_options": { "max_tokens": limit }
+            }))
+            .unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            assert_eq!(body["max_tokens"], 4096, "override: {limit}");
+        }
+    }
+
+    #[test]
+    fn openrouter_output_budget_excludes_other_providers_media_and_native_audio() {
+        for (provider_id, task_json) in [
+            (
+                "openai",
+                json!({ "kind": "text.generate", "prompt": "Synthetic" }),
+            ),
+            (
+                "ollama",
+                json!({ "kind": "text.generate", "prompt": "Synthetic" }),
+            ),
+            (
+                "openrouter",
+                json!({
+                    "kind": "media.analyze",
+                    "prompt": "Synthetic",
+                    "attachments": [{
+                        "kind": "image",
+                        "mime_type": "image/png",
+                        "url": "https://example.com/test.png"
+                    }]
+                }),
+            ),
+            (
+                "openrouter",
+                json!({
+                    "kind": "text.generate",
+                    "prompt": "Synthetic",
+                    "response_contract": { "modalities": ["text", "audio"] },
+                    "provider_options": { "response_mode": "native_audio" }
+                }),
+            ),
+        ] {
+            let provider = output_budget_test_provider(provider_id);
+            let task = ControllerTask::from_value(&task_json).unwrap();
+            let body = provider.chat_request_body(&task).unwrap();
+            assert!(
+                body.get("max_tokens").is_none(),
+                "{provider_id}: {task_json}"
+            );
+        }
     }
 
     #[test]
