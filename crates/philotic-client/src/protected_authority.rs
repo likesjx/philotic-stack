@@ -11,6 +11,7 @@ use ansible_mesh_core::privacy_rpc::{
 use ansible_mesh_core::privacy_storage::{
     PolicySnapshot, ServerPolicySnapshotAuthority, capture_payload_digest,
 };
+use ansible_mesh_core::route_composition::{CandidateIdentity, EffectiveRoute};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -21,6 +22,24 @@ use uuid::Uuid;
 pub struct TrustedHotelPeer {
     pub pid: u32,
     pub uid: u32,
+}
+/// Expected catalog metadata used only to compare diagnostic replies. This
+/// carries no admission, credentials or dispatch authority. The caller must
+/// refresh it when the hotel's catalog changes; a mismatch fails closed.
+pub struct RouteExplainCatalog {
+    pub revision: u64,
+    pub candidates: BTreeSet<CandidateIdentity>,
+}
+
+/// A correlated explanation for one bound payload, never a dispatch grant.
+/// Every actual provider attempt still requires fresh canonical admission.
+#[derive(Debug)]
+pub struct BoundRouteExplanation {
+    pub task_id: Uuid,
+    pub payload_digest: String,
+    pub catalog_revision: u64,
+    pub policy_revision: u64,
+    pub route: EffectiveRoute,
 }
 /// A snapshot for ONE immediate dispatch attempt. Never cache across retries,
 /// sentences, reconnects or publication. Runtime cancellation still needs fences.
@@ -58,6 +77,62 @@ pub enum LocalCancellation {
     RevokedPendingQuiescence,
 }
 impl PhiloticClient {
+    /// Read-only route diagnostics through the kernel-peer-verified protected
+    /// RPC. No legacy query fallback, provider invocation or policy write.
+    pub async fn explain_local_model_route(
+        &mut self,
+        peer: TrustedHotelPeer,
+        envelope: &LocalTaskEnvelope,
+        catalog: &RouteExplainCatalog,
+        timeout: Duration,
+    ) -> Result<BoundRouteExplanation> {
+        let request_id = Uuid::new_v4();
+        let request = ProtectedAuthorityRequest::ExplainModelRoute {
+            request_id,
+            guest: self._identity.guest_id.clone(),
+            envelope: envelope.clone(),
+            catalog_revision: catalog.revision,
+        };
+        let reply = self.protected_rpc(peer, request, timeout).await?;
+        if reply.request_id != request_id {
+            self.disconnect();
+            bail!("protected route request binding mismatch");
+        }
+        match reply.outcome {
+            ProtectedAuthorityOutcome::ModelRoute {
+                task_id,
+                catalog_revision,
+                policy_revision,
+                payload_digest,
+                route,
+            } => {
+                let identities: BTreeSet<_> = route.candidates.iter().cloned().collect();
+                if task_id != envelope.task_id
+                    || payload_digest != capture_payload_digest(&envelope.payload)
+                    || catalog_revision != catalog.revision
+                    || identities.len() != route.candidates.len()
+                    || !identities.is_subset(&catalog.candidates)
+                    || (route.strict_pin && route.candidates.len() > 1)
+                {
+                    self.disconnect();
+                    bail!("protected route response binding mismatch");
+                }
+                Ok(BoundRouteExplanation {
+                    task_id,
+                    payload_digest,
+                    catalog_revision,
+                    policy_revision,
+                    route,
+                })
+            }
+            ProtectedAuthorityOutcome::Denied => bail!("protected route explanation denied"),
+            _ => {
+                self.disconnect();
+                bail!("protected route response type mismatch");
+            }
+        }
+    }
+
     fn verify_hotel_peer(&mut self, expected: TrustedHotelPeer) -> Result<()> {
         self.ensure_connected()?;
         let actual = self
@@ -257,6 +332,319 @@ mod tests {
             },
         }
     }
+    fn explain_catalog() -> RouteExplainCatalog {
+        RouteExplainCatalog {
+            revision: 7,
+            candidates: BTreeSet::from([CandidateIdentity {
+                provider: "synthetic".into(),
+                model: "synthetic".into(),
+                endpoint: "opaque-endpoint".into(),
+                credential_scope: "opaque-credential".into(),
+                hotel: "synthetic-hotel".into(),
+                incarnation: "synthetic-incarnation".into(),
+                policy_scope: "synthetic-policy".into(),
+            }]),
+        }
+    }
+    fn explained(request: &ProtectedAuthorityRequest) -> IpcResponse {
+        assert!(
+            matches!(request, ProtectedAuthorityRequest::ExplainModelRoute { catalog_revision: 7, guest, .. } if guest == "synthetic-guest")
+        );
+        let catalog = explain_catalog();
+        IpcResponse::ProtectedAuthorityReply {
+            protected_authority: ProtectedAuthorityReply {
+                request_id: request.request_id(),
+                outcome: ProtectedAuthorityOutcome::ModelRoute {
+                    task_id: request.envelope().task_id,
+                    payload_digest: capture_payload_digest(&request.envelope().payload),
+                    catalog_revision: 7,
+                    policy_revision: 9,
+                    route: EffectiveRoute {
+                        candidates: catalog.candidates.into_iter().collect(),
+                        diagnostics: vec![],
+                        strict_pin: false,
+                    },
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_explain_returns_bound_diagnostics_and_empty_strict_plan() {
+        for empty_strict in [false, true] {
+            let (mut client, mut server, peer, envelope) = fixture();
+            let hotel = tokio::spawn(async move {
+                let request = request(&mut server).await;
+                let mut response = explained(&request);
+                if empty_strict
+                    && let IpcResponse::ProtectedAuthorityReply {
+                        protected_authority,
+                    } = &mut response
+                    && let ProtectedAuthorityOutcome::ModelRoute { route, .. } =
+                        &mut protected_authority.outcome
+                {
+                    route.candidates.clear();
+                    route.strict_pin = true;
+                }
+                reply(&mut server, response).await;
+            });
+            let explanation = client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(explanation.task_id, envelope.task_id);
+            assert_eq!(
+                explanation.payload_digest,
+                capture_payload_digest(&envelope.payload)
+            );
+            assert_eq!(explanation.catalog_revision, 7);
+            assert_eq!(explanation.policy_revision, 9);
+            assert_eq!(explanation.route.strict_pin, empty_strict);
+            assert_eq!(
+                explanation.route.candidates.len(),
+                usize::from(!empty_strict)
+            );
+            hotel.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_explain_rejects_wrong_binding_identity_and_response_type() {
+        // Request/task/digest/catalog, all seven identity dimensions, duplicate,
+        // expanded strict pin, generic ACK, and a resolution-as-explanation.
+        for kind in 0..15 {
+            let (mut client, mut server, peer, envelope) = fixture();
+            let hotel = tokio::spawn(async move {
+                let request = request(&mut server).await;
+                let mut response = explained(&request);
+                if kind == 13 {
+                    response = IpcResponse::Ack {
+                        req_id: request.request_id().to_string(),
+                    };
+                } else if kind == 14 {
+                    response = resolved(&request);
+                } else if let IpcResponse::ProtectedAuthorityReply {
+                    protected_authority,
+                } = &mut response
+                {
+                    if kind == 0 {
+                        protected_authority.request_id = Uuid::new_v4();
+                    } else if let ProtectedAuthorityOutcome::ModelRoute {
+                        task_id,
+                        payload_digest,
+                        catalog_revision,
+                        route,
+                        ..
+                    } = &mut protected_authority.outcome
+                    {
+                        match kind {
+                            1 => *task_id = Uuid::new_v4(),
+                            2 => payload_digest.push('x'),
+                            3 => *catalog_revision = 6,
+                            4 => route.candidates[0].provider.push('x'),
+                            5 => route.candidates[0].model.push('x'),
+                            6 => route.candidates[0].endpoint.push('x'),
+                            7 => route.candidates[0].credential_scope.push('x'),
+                            8 => route.candidates[0].hotel.push('x'),
+                            9 => route.candidates[0].incarnation.push('x'),
+                            10 => route.candidates[0].policy_scope.push('x'),
+                            11 | 12 => {
+                                route.candidates.push(route.candidates[0].clone());
+                                route.strict_pin = kind == 12;
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                reply(&mut server, response).await;
+            });
+            assert!(
+                client
+                    .explain_local_model_route(
+                        peer,
+                        &envelope,
+                        &explain_catalog(),
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err(),
+                "case {kind}"
+            );
+            assert!(client.stream.is_none(), "case {kind}");
+            hotel.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_explain_denial_does_not_fallback_or_disconnect() {
+        let (mut client, mut server, peer, envelope) = fixture();
+        let hotel = tokio::spawn(async move {
+            let first = request(&mut server).await;
+            reply(
+                &mut server,
+                IpcResponse::ProtectedAuthorityReply {
+                    protected_authority: ProtectedAuthorityReply::denied(first.request_id()),
+                },
+            )
+            .await;
+            let second = request(&mut server).await;
+            assert_ne!(first.request_id(), second.request_id());
+            reply(&mut server, explained(&second)).await;
+        });
+        assert!(
+            client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("denied")
+        );
+        assert!(client.stream.is_some());
+        assert!(
+            client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .is_ok()
+        );
+        hotel.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_explain_replayed_reply_cannot_answer_next_request() {
+        let (mut client, mut server, peer, envelope) = fixture();
+        let hotel = tokio::spawn(async move {
+            let first = request(&mut server).await;
+            reply(&mut server, explained(&first)).await;
+            let second = request(&mut server).await;
+            assert_ne!(first.request_id(), second.request_id());
+            reply(&mut server, explained(&first)).await;
+        });
+        assert!(
+            client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.stream.is_none());
+        hotel.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_explain_transport_failure_and_timeout_close_connection() {
+        for truncated in [false, true] {
+            let (mut client, mut server, peer, envelope) = fixture();
+            let hotel = tokio::spawn(async move {
+                let _ = request(&mut server).await;
+                if truncated {
+                    server.write_u32(32).await.unwrap();
+                    server.write_all(b"incomplete").await.unwrap();
+                }
+            });
+            assert!(
+                client
+                    .explain_local_model_route(
+                        peer,
+                        &envelope,
+                        &explain_catalog(),
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(client.stream.is_none());
+            hotel.await.unwrap();
+        }
+        let (mut client, mut server, peer, mut envelope) = fixture();
+        envelope.payload = "s".repeat(1_048_576);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.explain_local_model_route(
+                peer,
+                &envelope,
+                &explain_catalog(),
+                Duration::from_millis(10),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "SDK deadline must include backpressured write"
+        );
+        assert!(result.unwrap().is_err());
+        assert!(client.stream.is_none());
+        let mut bytes = vec![];
+        server.read_to_end(&mut bytes).await.unwrap();
+        assert!(!bytes.is_empty());
+        let (mut client, mut server, peer, envelope) = fixture();
+        assert!(
+            client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_millis(10)
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.stream.is_none());
+        let old = request(&mut server).await;
+        let (mut client, mut server, _, _) = fixture();
+        reply(&mut server, explained(&old)).await;
+        assert!(client.recv_task().await.is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn protected_explain_wrong_hotel_peer_denies_before_write() {
+        let (mut client, mut server, mut peer, envelope) = fixture();
+        peer.pid = 0;
+        assert!(
+            client
+                .explain_local_model_route(
+                    peer,
+                    &envelope,
+                    &explain_catalog(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.stream.is_none());
+        assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn protected_rpc_resolution_and_cancel_use_distinct_correlated_replies() {
         let (mut client, mut server, peer, envelope) = fixture();
