@@ -109,6 +109,9 @@ impl ModelProvider for PrivacyBoundProvider {
     fn supports_streaming(&self, task: &ControllerTask) -> bool {
         !task.kind.is_native_live() && self.inner.supports_streaming(task)
     }
+    fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+        self.inner.context_models(task)
+    }
     fn attempt_policy(&self) -> AttemptPolicy {
         self.inner.attempt_policy()
     }
@@ -126,5 +129,77 @@ impl ModelProvider for PrivacyBoundProvider {
     ) -> Result<ProviderOutput> {
         self.check(task)?;
         self.inner.invoke_streaming(task, tokens).await
+    }
+}
+
+#[cfg(test)]
+mod context_candidate_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Candidates;
+    #[async_trait]
+    impl ModelProvider for Candidates {
+        fn id(&self) -> &'static str {
+            "openrouter"
+        }
+        fn supports(&self, _: &ControllerTask) -> bool {
+            true
+        }
+        fn context_models(&self, task: &ControllerTask) -> Vec<String> {
+            task.model
+                .clone()
+                .map(|model| vec![model])
+                .unwrap_or_else(|| vec!["synthetic/default".into(), "synthetic/fallback".into()])
+        }
+        async fn invoke(&self, _: &ControllerTask) -> Result<ProviderOutput> {
+            bail!("synthetic provider must not be called")
+        }
+    }
+    struct Deny;
+    impl DispatchPrivacyAuthority for Deny {
+        fn context_for(&self, _: &ControllerTask) -> Option<VerifiedDispatchContext> {
+            None
+        }
+    }
+
+    #[test]
+    fn guarded_provider_preserves_default_fallback_and_unknown_pinned_candidates() {
+        let guarded = PrivacyBoundProvider::new(
+            Arc::new(Candidates),
+            Arc::new(Deny),
+            ProviderBoundary::Unknown,
+        );
+        let catalog = crate::context_management::parse_openrouter_capabilities(
+            r#"[{"id":"synthetic/default","ctx":100000},{"id":"synthetic/fallback","ctx":8000}]"#,
+        );
+        let mut task =
+            ControllerTask::from_value(&json!({"kind":"text.generate", "prompt":"synthetic"}))
+                .unwrap();
+        assert_eq!(
+            guarded.context_models(&task),
+            vec!["synthetic/default", "synthetic/fallback"]
+        );
+        task.resolved_context_capabilities = crate::context_management::resolve_capabilities(
+            guarded.id(),
+            guarded.context_models(&task),
+            &catalog,
+        );
+        assert_eq!(crate::context_management::limits(&task).unwrap().1, 8000);
+        task.model = Some("synthetic/unknown-pinned".into());
+        assert_eq!(
+            guarded.context_models(&task),
+            vec!["synthetic/unknown-pinned"]
+        );
+        task.resolved_context_capabilities = crate::context_management::resolve_capabilities(
+            guarded.id(),
+            guarded.context_models(&task),
+            &catalog,
+        );
+        assert_eq!(crate::context_management::limits(&task).unwrap().1, 16_384);
+        assert!(
+            guarded.check(&task).is_err(),
+            "candidate metadata grants no authority"
+        );
     }
 }
