@@ -19,6 +19,7 @@ How-to documentation, policy authoring guides, and operational runbooks.
 |---|---|
 | [DESKTOP_COMPONENT_AUTHORING_WATCHED_UAT.md](DESKTOP_COMPONENT_AUTHORING_WATCHED_UAT.md) | Operator runbook for watched-live desktop component create/edit validation |
 | [DISCORD_WATCHED_UAT.md](DISCORD_WATCHED_UAT.md) | Operator runbook for watched-live Discord provider validation on `develop` |
+| [CARGO_BUILD_ARTIFACT_BUDGET.md](CARGO_BUILD_ARTIFACT_BUDGET.md) | Why worktrees must NOT share one `target/`, and how to cut build disk instead |
 | [SANDBOX_POLICIES.md](SANDBOX_POLICIES.md) | How to write custom sandbox policies for `philotic-sandbox` |
 
 ## Templates

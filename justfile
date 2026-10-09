@@ -357,6 +357,33 @@ worktree-gc-apply:
 worktree-gc-schedule:
     ./scripts/install-worktree-gc-schedule.sh
 
+# NOTE: worktrees keep separate target/ dirs on purpose — one shared CARGO_TARGET_DIR
+# makes cargo report "Finished" while leaving another branch's binary in place.
+# See docs/guides/CARGO_BUILD_ARTIFACT_BUDGET.md.
+#
+# Install+enable sccache so the 605 deps compile ONCE per machine, not per worktree.
+build-cache-setup:
+    ./scripts/setup-build-cache.sh --setup
+
+# Show sccache hit rate and the disk each worktree's target/ is holding.
+build-cache-status:
+    ./scripts/setup-build-cache.sh --status
+
+# Turn sccache back off (leaves it installed).
+build-cache-disable:
+    ./scripts/setup-build-cache.sh --disable
+
+# worktree-gc only removes MERGED worktrees, which in practice reclaims ~0 GB; the
+# disk is held by LIVE worktrees. This sweeps their build artifacts instead.
+#
+# Report cargo target/ dirs reclaimable from live-but-idle worktrees (dry run).
+target-sweep:
+    ./scripts/target-sweep.sh
+
+# Delete target/ from worktrees not built in 14 days (source and worktrees untouched).
+target-sweep-apply:
+    ./scripts/target-sweep.sh --apply
+
 # Run tests, then record pass/fail totals to the intel graph by default
 # (graceful no-op notice if the graph server at :8900 isn't running).
 test:
