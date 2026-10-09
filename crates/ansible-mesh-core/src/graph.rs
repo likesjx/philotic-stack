@@ -615,7 +615,8 @@ pub struct TurnLoopConfig {
     /// Ordered list of model roles for tiered provider fallback.
     /// Tier 0 is attempted first; on retriable failure the loop advances to the
     /// next tier. Defaults to `model_routing::DEFAULT_FALLBACK_TIERS`
-    /// (`["model", "model.openrouter", "model.ollama"]`) when empty.
+    /// (`["model.openrouter", "model.ollama"]`) when empty. Nonempty persisted
+    /// ladders retain their exclusive semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_tiers: Vec<String>,
     /// Per-role override for the maximum number of paracrine delegation hops

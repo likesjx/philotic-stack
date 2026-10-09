@@ -21,18 +21,17 @@ use std::collections::BTreeSet;
 /// `fallback_tiers`. Tier 0 is attempted first; on retriable failure the loop
 /// advances to the next tier.
 ///
-/// Ordering rationale (operator directive, 2026-07): gemini (`model`) is the
-/// primary; `model.openrouter` is the first fallback because OpenRouter
-/// controllers are live on all hotels and cloud reliability beats local;
-/// `model.ollama` is the local last resort — ollama is unstable and must never
-/// be the first fallback.
+/// Source defaults omit Gemini (operator directive, 2026-10). Explicit role
+/// ladders, pins, and hotel overrides may still select `model`/`model.gemini`.
+/// OpenRouter precedes Ollama; persisted nonempty ladders remain exclusive
+/// unless explicitly migrated to the versioned composition policy.
 ///
 /// NOTE: `model.ollama` is intentionally listed even though the hotel does not
 /// auto-seed an ollama controller — validation surfaces the gap loudly rather
 /// than silently escalating into a void. Both philote and the hotel's config
 /// validation read this constant so their notion of "the default ladder" cannot
 /// diverge.
-pub const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.openrouter", "model.ollama"];
+pub const DEFAULT_FALLBACK_TIERS: &[&str] = &["model.openrouter", "model.ollama"];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // (a) Fallback-ladder validation
@@ -185,7 +184,7 @@ mod tests {
         // ollama demoted to local last resort.
         assert_eq!(
             DEFAULT_FALLBACK_TIERS,
-            &["model", "model.openrouter", "model.ollama"]
+            &["model.openrouter", "model.ollama"]
         );
         let openrouter_idx = DEFAULT_FALLBACK_TIERS
             .iter()
@@ -196,7 +195,7 @@ mod tests {
             .position(|t| *t == "model.ollama")
             .expect("default ladder must include model.ollama");
         assert!(openrouter_idx < ollama_idx);
-        assert_eq!(DEFAULT_FALLBACK_TIERS[0], "model");
+        assert_eq!(DEFAULT_FALLBACK_TIERS[0], "model.openrouter");
     }
 
     #[test]

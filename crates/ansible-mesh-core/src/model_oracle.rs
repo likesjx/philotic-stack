@@ -279,57 +279,74 @@ pub fn rank_models(
     rank_models_with(candidates, need, now_secs, DEFAULT_DEGRADE_COOLOFF_SECS)
 }
 
-/// Rank `candidates` for `need`. Pure and deterministic: same inputs, same
-/// output. Hard filters first, then a weighted score; ties break on
-/// (provider, model_ref) so ordering is stable.
+/// First hard restriction preventing a model from serving a route need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRestriction {
+    Unavailable,
+    CoolingDown,
+    Capability,
+    Trust,
+    Context,
+    Tools,
+    StructuredResponse,
+}
+
+/// Shared hard gates for ordered routes and oracle-ranked candidates. This
+/// does not check access/privacy authority; callers must check that separately.
+pub fn model_restriction(
+    profile: &ModelProfileRecord,
+    need: &RouteNeed,
+    now_secs: u64,
+    degrade_cooloff_secs: u64,
+) -> Option<ModelRestriction> {
+    if matches!(profile.status.as_str(), "retired" | "unavailable") {
+        return Some(ModelRestriction::Unavailable);
+    }
+    if profile.status == "degraded"
+        && now_secs.saturating_sub(profile.updated_secs) < degrade_cooloff_secs
+    {
+        return Some(ModelRestriction::CoolingDown);
+    }
+    let task_kind = task_kind_for_request_class(&need.request_class);
+    if !profile.task_kinds.is_empty() && !profile.task_kinds.iter().any(|t| t == task_kind) {
+        return Some(ModelRestriction::Capability);
+    }
+    if trust_tier_rank(&profile.trust_tier) > trust_tier_rank(&need.trust_ceiling) {
+        return Some(ModelRestriction::Trust);
+    }
+    if need.approx_context_tokens > 0
+        && profile.max_context_tokens > 0
+        && need.approx_context_tokens > profile.max_context_tokens
+    {
+        return Some(ModelRestriction::Context);
+    }
+    if need.needs_tools && !profile.supports_tools {
+        return Some(ModelRestriction::Tools);
+    }
+    if need.needs_structured && !profile.supports_structured {
+        return Some(ModelRestriction::StructuredResponse);
+    }
+    None
+}
+
+/// Rank eligible models, preserving the oracle's existing scoring behavior.
 pub fn rank_models_with(
     candidates: &[ModelProfileRecord],
     need: &RouteNeed,
     now_secs: u64,
     degrade_cooloff_secs: u64,
 ) -> Vec<RankedModel> {
-    let task_kind = task_kind_for_request_class(&need.request_class);
-    let ceiling_rank = trust_tier_rank(&need.trust_ceiling);
-
     let mut ranked: Vec<RankedModel> = candidates
         .iter()
         .filter_map(|profile| {
             let mut reasons: Vec<String> = Vec::new();
 
             // ── Hard filters ────────────────────────────────────────────
-            match profile.status.as_str() {
-                "retired" | "unavailable" => return None,
-                "degraded" => {
-                    // Cool-off recovery: a degraded record that has not been
-                    // updated within the cool-off window becomes a probe
-                    // candidate again; a freshly degraded one stays frozen.
-                    let age = now_secs.saturating_sub(profile.updated_secs);
-                    if age < degrade_cooloff_secs {
-                        return None;
-                    }
-                    reasons.push("degraded_probe".to_string());
-                }
-                _ => {}
-            }
-
-            if !profile.task_kinds.is_empty() && !profile.task_kinds.iter().any(|t| t == task_kind)
-            {
+            if model_restriction(profile, need, now_secs, degrade_cooloff_secs).is_some() {
                 return None;
             }
-            if trust_tier_rank(&profile.trust_tier) > ceiling_rank {
-                return None;
-            }
-            if need.approx_context_tokens > 0
-                && profile.max_context_tokens > 0
-                && need.approx_context_tokens > profile.max_context_tokens
-            {
-                return None;
-            }
-            if need.needs_tools && !profile.supports_tools {
-                return None;
-            }
-            if need.needs_structured && !profile.supports_structured {
-                return None;
+            if profile.status == "degraded" {
+                reasons.push("degraded_probe".to_string());
             }
 
             // ── Weighted score ──────────────────────────────────────────

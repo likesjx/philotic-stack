@@ -37,6 +37,7 @@ pub mod model_catalog_discovery;
 pub mod model_manager;
 pub mod model_oracle;
 pub mod model_routing;
+pub mod route_composition;
 pub mod placement_sync;
 pub mod privacy;
 pub mod privacy_local;
