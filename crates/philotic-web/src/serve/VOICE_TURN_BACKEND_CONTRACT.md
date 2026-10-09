@@ -20,6 +20,13 @@ present mismatched or malformed IDs are dropped. These are correlation barriers,
 not authenticated agent provenance. Bytes already admitted to a socket send
 cannot be recalled; the client turn gate rejects stale playback independently.
 
+Reliable completion follow-up removes the lossy broadcast bus from managed-turn
+publication and lifecycle ownership. A synchronous per-turn sink admits every
+canonical event in order, seals the terminal sequence, and releases active capacity
+when the relay completes even if terminal observation is lost or malformed. The
+legacy retainer ignores managed observation copies, preventing duplicate delivery.
+This does not implement provider cancellation or authenticate agent provenance.
+
 Lifecycle follow-up preserves `ad13939b` and fixes its 256 lifetime-entry cliff.
 There are separate bounds of 256 active entries and 256 terminal metadata entries
 per device. Active pending/accepted and unconfirmed revoked jobs have no timer
@@ -75,15 +82,15 @@ and `guarded_registry`, with SpeechToText/TextToSpeech operation checks. Its exa
 contract lives in `crates/model-router/VOICE_PRIVACY_DISPATCH_CONTRACT.md` in the
 privacy-integration worktree. Preferences/request IDs/cancellation grant no egress
 eligibility. Native-live paths remain denied. Source manifests and current policy
-must come from the trusted runtime issuer, which is still absent.
+must come from the trusted runtime issuer, which is not yet installed in the production dispatch path.
 
 Ownership: the initial ledger added its module and note; follow-ups add edge admission/lifecycle, an acceptance callback and canonical reply filtering in `serve.rs`, and configuration-only profile preparation. The active desktop-invite-login worktree owns
 dirty login fencing in `serve.rs`; no files in that worktree were edited. The
 privacy owner retains core/model-router/IPC authority work. Apple client code is
 in the preceding isolated commits c4c3ff4d and 46f871d2.
 
-Verification: 30 protocol tests (legacy fixtures unchanged), 30 edge unit tests,
-ten ledger unit tests, three mock profile tests and all 12 fake-hotel loopback WebSocket tests pass. The lifecycle regression sends 270 mixed completed/failed requests and reconnects; unit fixtures cover 600 transitions, repeated cancellation, clock/expiry, stale frames and fail-closed budget exhaustion. Mock
+Verification: 30 protocol tests (legacy fixtures unchanged), 35 edge aggregate unit tests,
+ten ledger unit tests, three mock profile tests and all 12 fake-hotel loopback WebSocket tests pass. A deliberate one-slot broadcast regression completes 300 turns with one active slot, proves observer loss, preserves sealed replay and rejects late audio. Relay completion without a valid terminal also releases capacity without inventing replay. The lifecycle regression sends 270 mixed completed/failed requests and reconnects; unit fixtures cover 600 transitions, repeated cancellation, clock/expiry, stale frames and fail-closed budget exhaustion. Mock
 adapter tests cover cancellation before acceptance, wrong device/target/agent/
 conversation/turn, adapter failure, queued/replayed stale output and a running
 synthetic job whose committed tool effect survives cancellation. These do not

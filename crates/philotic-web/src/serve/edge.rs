@@ -161,6 +161,79 @@ impl Default for EdgeRing {
     }
 }
 
+/// Reliable per-relay publication/completion path for correlated turns. The
+/// best-effort UI broadcast is an observation copy, not lifecycle authority.
+#[derive(Clone)]
+pub(super) struct EdgeTurnSink {
+    edge: EdgeState,
+    binding: TurnBinding,
+}
+
+impl EdgeTurnSink {
+    fn new(edge: EdgeState, binding: TurnBinding) -> Self {
+        Self { edge, binding }
+    }
+
+    pub(super) fn publish(&self, raw: &str) {
+        let Some((node, batch)) = translate_edge_broadcast(raw) else {
+            return;
+        };
+        if node != self.binding.device {
+            return;
+        }
+        let terminal = batch.iter().any(|(msg, _)| {
+            matches!(
+                msg,
+                EdgeMessage::TurnEvent {
+                    event_kind: TurnEventKind::Final | TurnEventKind::Error,
+                    ..
+                }
+            )
+        });
+        // Validate the whole batch before admission; metadata never rebinds it.
+        if batch.iter().any(|(msg, _)| match msg {
+            EdgeMessage::TurnEvent {
+                conversation_id,
+                turn_id,
+                ..
+            }
+            | EdgeMessage::VoiceReply {
+                conversation_id,
+                turn_id,
+                ..
+            } => {
+                conversation_id != &self.binding.conversation
+                    || turn_id.as_deref() != Some(self.binding.turn.as_str())
+            }
+            _ => true,
+        }) {
+            return;
+        }
+        let mut ledger = self.edge.turn_ledger();
+        let mut cutoff = 0;
+        if ledger.may_publish(&self.binding) {
+            for (msg, retain) in batch {
+                let seq = if retain {
+                    self.edge.outbound_envelope(&node, None, msg, true).0
+                } else {
+                    self.edge.outbound_delivery_only(&node, msg)
+                };
+                cutoff = cutoff.max(seq);
+            }
+        }
+        if terminal {
+            ledger.seal(&node, &self.binding.turn, cutoff);
+        }
+    }
+
+    /// Called directly by the relay owner after success/error, irrespective of
+    /// broadcast delivery. A lost/malformed terminal denies future publication
+    /// and releases capacity without inventing a replay cutoff.
+    pub(super) fn finish_relay(&self) {
+        let _ = self.edge.turn_ledger().finish(&self.binding);
+    }
+}
+
 /// Shared edge-tier state hanging off [`AppState`]: the enrolled-device
 /// registry (JSON-file backed) and the per-node in-memory outbound rings.
 ///
@@ -1573,6 +1646,22 @@ pub(crate) fn spawn_edge_retainer(
                 Ok(raw) => {
                     if let Some((node_id, msgs)) = translate_edge_broadcast(&raw) {
                         if edge.is_enrolled(&node_id) {
+                            // Managed turns publish through their reliable sink.
+                            // These bus frames are observation copies; retaining
+                            // them would duplicate output or race terminal seal.
+                            if msgs.iter().any(|(msg, _)| match msg {
+                                EdgeMessage::TurnEvent { turn_id, .. }
+                                | EdgeMessage::VoiceReply { turn_id, .. } => {
+                                    turn_id.as_deref().is_some_and(|turn| {
+                                        turn.starts_with(
+                                            super::voice_turn_binding::MANAGED_TURN_PREFIX,
+                                        )
+                                    })
+                                }
+                                _ => false,
+                            }) {
+                                continue;
+                            }
                             // Ledger admission and ring insertion share this
                             // lock with revocation: a frame is admitted before
                             // cancellation or rejected, never checked then
@@ -1805,6 +1894,7 @@ async fn submit_correlated_edge_turn(
         message_kind,
         attachments,
         Some(binding.turn.clone()),
+        Some(EdgeTurnSink::new(state.edge.clone(), binding.clone())),
         |accepted| {
             if !state
                 .edge
@@ -2007,6 +2097,7 @@ async fn handle_edge_frame(
                 content,
                 message_kind,
                 attachments,
+                None,
                 None,
                 |accepted| {
                     // The same ring lock serializes acceptance and subsequent
@@ -3475,7 +3566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn voice_retainer_seals_completed_replay_and_rejects_late_audio() {
+    async fn voice_reliable_sink_seals_completed_replay_and_rejects_late_audio() {
         let path = temp_registry_path("voice-terminal-retainer");
         let edge = edge_state(&path, Some("INV-1"));
         let enrolled = edge
@@ -3492,17 +3583,23 @@ mod tests {
         let mut delivered = edge.subscribe_delivery(&enrolled.node_id);
         let (tx, _) = broadcast::channel::<String>(16);
         let retainer = spawn_edge_retainer(edge.clone(), tx.clone());
+        let sink = EdgeTurnSink::new(edge.clone(), binding.clone());
         let artifact = json!({"audio_base64":"bW9jaw==", "mime_type":"audio/pcm"}).to_string();
-        tx.send(broadcast_event(
-            "operator_chat:reply",
-            &marker,
-            &[
-                ("turn_id", &binding.turn),
-                ("content", "synthetic final"),
-                ("audio_artifact", &artifact),
-            ],
-        ))
-        .unwrap();
+        super::super::publish_operator_chat_event(
+            &tx,
+            Some(&sink),
+            broadcast_event(
+                "operator_chat:reply",
+                &marker,
+                &[
+                    ("turn_id", &binding.turn),
+                    ("conversation_id", &binding.conversation),
+                    ("content", "synthetic final"),
+                    ("audio_artifact", &artifact),
+                ],
+            ),
+        );
+        sink.finish_relay();
         let (_, final_frame) = tokio::time::timeout(Duration::from_secs(1), delivered.recv())
             .await
             .unwrap()
@@ -3515,12 +3612,19 @@ mod tests {
         assert!(edge.may_deliver_frame(&binding.device, &audio_frame));
         // Barrier is queued after the stale chunk on the same bus. Its arrival
         // proves the stale audio was processed without a sleep/race assumption.
-        tx.send(broadcast_event(
-            "operator_chat:voice_chunk",
-            &marker,
-            &[("turn_id", &binding.turn), ("audio_artifact", &artifact)],
-        ))
-        .unwrap();
+        super::super::publish_operator_chat_event(
+            &tx,
+            Some(&sink),
+            broadcast_event(
+                "operator_chat:voice_chunk",
+                &marker,
+                &[
+                    ("turn_id", &binding.turn),
+                    ("conversation_id", &binding.conversation),
+                    ("audio_artifact", &artifact),
+                ],
+            ),
+        );
         tx.send(broadcast_event(
             "operator_chat:partial_reply",
             &marker,
@@ -3557,6 +3661,147 @@ mod tests {
         retainer.abort();
         let _ = retainer.await;
         let _ = std::fs::remove_file(path);
+    }
+
+    /// No await until the bus overflows: the current-thread retainer is
+    /// guaranteed to miss terminal observation copies when it first polls.
+    #[tokio::test]
+    async fn voice_lost_terminal_broadcasts_do_not_consume_active_capacity() {
+        let path = temp_registry_path("voice-lost-terminal");
+        let mut edge = edge_state(&path, Some("INV-1"));
+        edge.turn_bindings = Arc::new(Mutex::new(TurnBindings::with_limits(
+            1,
+            2,
+            512,
+            30 * 60 * 1000,
+        )));
+        let enrolled = edge
+            .enroll(&enroll_request("c3ludGhldGljLWJ1cy1sb3Nz"))
+            .unwrap();
+        let marker = edge_session_marker(&enrolled.node_id);
+        let (tx, _) = broadcast::channel::<String>(1);
+        let mut deliberately_lagged = tx.subscribe();
+        let retainer = spawn_edge_retainer(edge.clone(), tx.clone());
+        let mut last = None;
+        for i in 0..300 {
+            let mut binding = voice_binding(&format!("lost-final-{i}"));
+            binding.device = enrolled.node_id.clone();
+            {
+                let mut ledger = edge.turn_ledger();
+                ledger.reserve(binding.clone()).unwrap();
+                ledger.accept(&binding).unwrap();
+            }
+            let sink = EdgeTurnSink::new(edge.clone(), binding.clone());
+            super::super::publish_operator_chat_event(
+                &tx,
+                Some(&sink),
+                broadcast_event(
+                    "operator_chat:reply",
+                    &marker,
+                    &[
+                        ("turn_id", &binding.turn),
+                        ("conversation_id", &binding.conversation),
+                        ("content", "synthetic final"),
+                    ],
+                ),
+            );
+            sink.finish_relay();
+            last = Some((binding, sink));
+        }
+        let mut delivered = edge.subscribe_delivery(&enrolled.node_id);
+        tx.send(broadcast_event(
+            "operator_chat:partial_reply",
+            &marker,
+            &[("turn_id", "loss-barrier"), ("content", "barrier")],
+        ))
+        .unwrap();
+        assert!(matches!(
+            deliberately_lagged.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        let (_, barrier) = tokio::time::timeout(Duration::from_secs(1), delivered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(serde_json::from_str::<EdgeEnvelope>(&barrier).unwrap().msg,
+            EdgeMessage::TurnEvent { ref content, .. } if content == "barrier")
+        );
+        let (binding, sink) = last.unwrap();
+        let retained = edge.replay_after(&binding.device, 0);
+        let (_, final_frame) = retained
+            .iter()
+            .rev()
+            .find(|(_, raw)| {
+                matches!(
+                    serde_json::from_str::<EdgeEnvelope>(raw).unwrap().msg,
+                    EdgeMessage::TurnEvent {
+                        event_kind: TurnEventKind::Final,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(edge.may_deliver_frame(&binding.device, final_frame));
+        let before_seq = retained.last().unwrap().0;
+        let artifact = json!({"audio_base64":"bW9jaw==", "mime_type":"audio/pcm"}).to_string();
+        super::super::publish_operator_chat_event(
+            &tx,
+            Some(&sink),
+            broadcast_event(
+                "operator_chat:voice_chunk",
+                &marker,
+                &[
+                    ("turn_id", &binding.turn),
+                    ("conversation_id", &binding.conversation),
+                    ("audio_artifact", &artifact),
+                ],
+            ),
+        );
+        tx.send(broadcast_event(
+            "operator_chat:partial_reply",
+            &marker,
+            &[
+                ("turn_id", "late-barrier"),
+                ("content", "after stale audio"),
+            ],
+        ))
+        .unwrap();
+        let (seq, next) = tokio::time::timeout(Duration::from_secs(1), delivered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, before_seq + 1); // late audio minted no frame
+        assert!(
+            matches!(serde_json::from_str::<EdgeEnvelope>(&next).unwrap().msg,
+            EdgeMessage::TurnEvent { ref content, .. } if content == "after stale audio")
+        );
+        let mut next_binding = voice_binding("capacity-released");
+        next_binding.device = binding.device.clone();
+        edge.turn_ledger().reserve(next_binding).unwrap();
+        retainer.abort();
+        let _ = retainer.await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn voice_relay_completion_without_terminal_releases_capacity_and_denies_stale_output() {
+        let mut edge = edge_state(&temp_registry_path("voice-missing-terminal"), None);
+        edge.turn_bindings = Arc::new(Mutex::new(TurnBindings::with_limits(1, 2, 8, 1000)));
+        let binding = voice_binding("missing-terminal");
+        {
+            let mut ledger = edge.turn_ledger();
+            ledger.reserve(binding.clone()).unwrap();
+            ledger.accept(&binding).unwrap();
+        }
+        let sink = EdgeTurnSink::new(edge.clone(), binding.clone());
+        sink.publish("malformed terminal");
+        sink.finish_relay();
+        sink.finish_relay();
+        assert!(!edge.may_deliver_message(&binding.device, &voice_event(&binding)));
+        edge.turn_ledger()
+            .reserve(voice_binding("next-after-missing"))
+            .unwrap();
     }
 
     /// The core store-and-forward guarantee: an operator-chat broadcast for an

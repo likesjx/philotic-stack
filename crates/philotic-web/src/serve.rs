@@ -3248,6 +3248,7 @@ async fn submit_operator_chat_turn(
         message_kind,
         attachments,
         None,
+        None,
         |_| Ok(()),
     )
     .await
@@ -3265,6 +3266,7 @@ async fn submit_operator_chat_turn_with_accept<F>(
     message_kind: Option<String>,
     attachments: Vec<Value>,
     reserved_turn_id: Option<String>,
+    edge_sink: Option<edge::EdgeTurnSink>,
     on_accepted: F,
 ) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError>
 where
@@ -3334,10 +3336,13 @@ where
             content,
             message_kind,
             attachments,
+            edge_sink.clone(),
         )
         .await
         {
-            let _ = tx.send(
+            publish_operator_chat_event(
+                &tx,
+                edge_sink.as_ref(),
                 json!({
                     "type": "operator_chat:error",
                     "payload": {
@@ -3352,6 +3357,9 @@ where
                 })
                 .to_string(),
             );
+        }
+        if let Some(sink) = edge_sink {
+            sink.finish_relay();
         }
     });
 
@@ -3402,6 +3410,17 @@ fn operator_reply_matches_turn(
     })
 }
 
+fn publish_operator_chat_event(
+    tx: &broadcast::Sender<String>,
+    sink: Option<&edge::EdgeTurnSink>,
+    raw: String,
+) {
+    if let Some(sink) = sink {
+        sink.publish(&raw);
+    }
+    let _ = tx.send(raw);
+}
+
 async fn stream_operator_chat_turn(
     socket: String,
     tx: broadcast::Sender<String>,
@@ -3415,6 +3434,7 @@ async fn stream_operator_chat_turn(
     content: String,
     message_kind: Option<String>,
     attachments: Vec<Value>,
+    edge_sink: Option<edge::EdgeTurnSink>,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
     let mut client = connect_client_with_identity(
@@ -3496,7 +3516,7 @@ async fn stream_operator_chat_turn(
             .unwrap_or("send_reply");
         match action {
             "turn_event" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:turn_event",
                         "payload": {
@@ -3513,7 +3533,7 @@ async fn stream_operator_chat_turn(
                 );
             }
             "partial_reply" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:partial_reply",
                         "payload": {
@@ -3530,7 +3550,7 @@ async fn stream_operator_chat_turn(
                 );
             }
             "voice_chunk" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:voice_chunk",
                         "payload": {
@@ -3550,7 +3570,7 @@ async fn stream_operator_chat_turn(
                 );
             }
             "send_reply" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:reply",
                         "payload": {
@@ -3574,7 +3594,9 @@ async fn stream_operator_chat_turn(
                 return Ok(());
             }
             other => {
-                let _ = tx.send(
+                publish_operator_chat_event(
+                    &tx,
+                    edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:event",
                         "payload": {

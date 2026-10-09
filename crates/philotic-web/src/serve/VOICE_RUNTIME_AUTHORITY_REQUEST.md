@@ -50,3 +50,16 @@ agent/incarnation/target/turn/generation; modified task or source manifest;
 park/repark/reconnect; cancel before acceptance; revocation between sentences,
 retries and fallback; active stream quiescence; committed tool remains; absent
 adapter advertises no capability and denial invokes zero external providers.
+
+## Owner source disposition
+
+The privacy owner's `LOCAL_AUTHORITY_INTEGRATION.md` now documents source APIs:
+`LocalLaunchRegistry`, `LocalTaskEnvelope`, and `LocalTaskAuthority` issue/resolve
+opaque handles against verified launch principals, payload digests, source manifests
+and current policy. Reuse this issuer; do not create a parallel voice authority.
+The owner still lists hotel/SDK/startup and guarded dispatch installation as pending.
+Its cancellation tombstone denies future resolution but does not abort an active
+provider stream. The voice adapter must compose that revocation with confirmed
+stream/publication quiescence before advertising `turn_cancel_v1`. SQLite authority
+work belongs on blocking workers. Restart-unknown handles deny and require new
+trusted admission.
