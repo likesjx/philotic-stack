@@ -392,7 +392,9 @@ async fn reply(stream: &mut UnixStream, response: IpcResponse) {
     stream.write_all(&bytes).await.unwrap();
 }
 async fn run_case(case: &str) {
-    let dir = std::env::temp_dir().join(format!("context-accept-{}", Uuid::new_v4().simple()));
+    // macOS's per-user temp directory can exceed sockaddr_un's path limit.
+    // This unique, exclusively-created directory is owned by the fixture.
+    let dir = PathBuf::from("/tmp").join(format!("context-accept-{}", Uuid::new_v4().simple()));
     std::fs::create_dir(&dir).unwrap();
     let listener = UnixListener::bind(dir.join("hotel.sock")).unwrap();
     // UID comes from an actual local socket peer, not a task identity claim.
