@@ -407,8 +407,10 @@ async fn run_case(case: &str) {
     std::fs::create_dir(&dir).unwrap();
     let listener = UnixListener::bind(dir.join("hotel.sock")).unwrap();
     // UID comes from an actual local socket peer, not a task identity claim.
-    let (uid_probe, _) = UnixStream::pair().unwrap();
+    let (uid_probe, uid_probe_peer) = UnixStream::pair().unwrap();
     let uid = uid_probe.peer_cred().unwrap().uid();
+    // macOS requires the probe's peer to remain connected for getpeereid.
+    drop((uid_probe, uid_probe_peer));
     let log = std::fs::File::create(dir.join("child.log")).unwrap();
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
