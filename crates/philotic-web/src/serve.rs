@@ -98,6 +98,12 @@
 mod cortex;
 pub(crate) mod edge;
 mod surface_routes;
+// Awaiting the authenticated hotel/runtime cancellation adapter; see contract.
+#[allow(dead_code)]
+mod voice_turn_binding;
+// Configuration preparation only; no profile route or provider dispatch yet.
+#[allow(dead_code)]
+mod voice_profile_catalog;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
@@ -3232,6 +3238,40 @@ async fn submit_operator_chat_turn(
     message_kind: Option<String>,
     attachments: Vec<Value>,
 ) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError> {
+    submit_operator_chat_turn_with_accept(
+        state,
+        target_node_id,
+        agent_id,
+        operator_session_id,
+        conversation_id,
+        content,
+        message_kind,
+        attachments,
+        None,
+        None,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Acceptance callback runs before generation starts. Edge uses it to retain
+/// the correlated accepted event, eliminating accepted/output ordering races.
+async fn submit_operator_chat_turn_with_accept<F>(
+    state: &AppState,
+    target_node_id: &str,
+    agent_id: &str,
+    operator_session_id: &str,
+    conversation_id: String,
+    content: String,
+    message_kind: Option<String>,
+    attachments: Vec<Value>,
+    reserved_turn_id: Option<String>,
+    edge_sink: Option<edge::EdgeTurnSink>,
+    on_accepted: F,
+) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError>
+where
+    F: FnOnce(&OperatorChatAcceptedView) -> Result<(), OperatorChatSubmitError>,
+{
     let targets = ipc_desktop_membrane_targets(&state.socket)
         .await
         .map_err(|err| OperatorChatSubmitError {
@@ -3258,7 +3298,7 @@ async fn submit_operator_chat_turn(
     let local_node_id = local_target.target_node_id.clone();
 
     let session_id = scoped_operator_session_id(operator_session_id, &conversation_id);
-    let turn_id = new_operator_chat_id("operator-chat-turn");
+    let turn_id = reserved_turn_id.unwrap_or_else(|| new_operator_chat_id("operator-chat-turn"));
     let accepted = OperatorChatAcceptedView {
         accepted: true,
         target_node_id: target_node_id.to_string(),
@@ -3273,6 +3313,8 @@ async fn submit_operator_chat_turn(
             "router-routed".into()
         },
     };
+
+    on_accepted(&accepted)?;
 
     let tx = state.tx.clone();
     let socket = state.socket.as_ref().clone();
@@ -3294,10 +3336,13 @@ async fn submit_operator_chat_turn(
             content,
             message_kind,
             attachments,
+            edge_sink.clone(),
         )
         .await
         {
-            let _ = tx.send(
+            publish_operator_chat_event(
+                &tx,
+                edge_sink.as_ref(),
                 json!({
                     "type": "operator_chat:error",
                     "payload": {
@@ -3312,6 +3357,9 @@ async fn submit_operator_chat_turn(
                 })
                 .to_string(),
             );
+        }
+        if let Some(sink) = edge_sink {
+            sink.finish_relay();
         }
     });
 
@@ -3340,6 +3388,39 @@ async fn handle_event_log(
     }
 }
 
+/// Reply metadata can confirm this relay's canonical binding, never replace it.
+/// Missing fields preserve legacy replies; present malformed/mismatched IDs deny.
+/// This is correlation filtering, not authenticated IPC provenance.
+fn operator_reply_matches_turn(
+    payload: &Value,
+    conversation: &str,
+    session: &str,
+    turn: &str,
+) -> bool {
+    [
+        ("chat_id", conversation),
+        ("session_id", session),
+        ("turn_id", turn),
+    ]
+    .iter()
+    .all(|(key, expected)| {
+        payload
+            .get(*key)
+            .is_none_or(|value| value.as_str() == Some(*expected))
+    })
+}
+
+fn publish_operator_chat_event(
+    tx: &broadcast::Sender<String>,
+    sink: Option<&edge::EdgeTurnSink>,
+    raw: String,
+) {
+    if let Some(sink) = sink {
+        sink.publish(&raw);
+    }
+    let _ = tx.send(raw);
+}
+
 async fn stream_operator_chat_turn(
     socket: String,
     tx: broadcast::Sender<String>,
@@ -3353,6 +3434,7 @@ async fn stream_operator_chat_turn(
     content: String,
     message_kind: Option<String>,
     attachments: Vec<Value>,
+    edge_sink: Option<edge::EdgeTurnSink>,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
     let mut client = connect_client_with_identity(
@@ -3425,22 +3507,25 @@ async fn stream_operator_chat_turn(
             continue;
         };
         let payload: Value = serde_json::from_str(&task_json)?;
+        if !operator_reply_matches_turn(&payload, &conversation_id, &session_id, &turn_id) {
+            continue;
+        }
         let action = payload
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or("send_reply");
         match action {
             "turn_event" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:turn_event",
                         "payload": {
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "event": payload.get("event").and_then(Value::as_str).unwrap_or("unknown")
                         }
                     })
@@ -3448,16 +3533,16 @@ async fn stream_operator_chat_turn(
                 );
             }
             "partial_reply" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:partial_reply",
                         "payload": {
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
                         }
                     })
@@ -3465,16 +3550,16 @@ async fn stream_operator_chat_turn(
                 );
             }
             "voice_chunk" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:voice_chunk",
                         "payload": {
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
                             "audio_artifact": payload.get("audio_artifact").cloned().unwrap_or(Value::Null),
                             "chunk_seq": payload.get("chunk_seq").cloned().unwrap_or(Value::Null),
@@ -3485,16 +3570,16 @@ async fn stream_operator_chat_turn(
                 );
             }
             "send_reply" => {
-                let _ = tx.send(
+                publish_operator_chat_event(&tx, edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:reply",
                         "payload": {
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "reply_action": action,
                             "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
                             // Synthesized persona-voice replies ride the same
@@ -3509,16 +3594,18 @@ async fn stream_operator_chat_turn(
                 return Ok(());
             }
             other => {
-                let _ = tx.send(
+                publish_operator_chat_event(
+                    &tx,
+                    edge_sink.as_ref(),
                     json!({
                         "type": "operator_chat:event",
                         "payload": {
                             "target_node_id": target_node_id,
                             "target_agent_id": agent_id,
                             "operator_session_id": operator_session_id,
-                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
-                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
-                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
                             "action": other,
                             "payload": payload
                         }

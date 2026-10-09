@@ -3,6 +3,7 @@
 // flow (POST /api/edge/enroll via EnrollmentClient).
 
 import SwiftUI
+import PhiloticKit
 
 struct ConnectionSettingsView: View {
     @Bindable var session: ChatSessionManager
@@ -30,7 +31,28 @@ struct ConnectionSettingsView: View {
 
             Section("Voice") {
                 Toggle("Speak replies", isOn: $session.speakAllReplies)
-                Toggle("Transcribe on device", isOn: $session.transcribeOnDevice)
+                Picker("Speaking provider", selection: $session.speakingProvider) {
+                    ForEach(VoiceProviderPreference.allCases, id: \.self) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                if let explanation = session.voiceProviderExplanation {
+                    Text(explanation).font(.caption).foregroundStyle(.secondary)
+                }
+                Picker("Apple voice", selection: $session.appleVoiceIdentifier) {
+                    Text("System voice").tag("")
+                    ForEach(session.voiceController.appleSpeechProfiles) { profile in
+                        Text("\(profile.name) (\(profile.language))").tag(profile.id)
+                    }
+                }
+                Button("Preview Apple voice") { session.previewAppleVoice() }
+                Button("Stop speech") { session.interruptVoiceReply() }
+                    .disabled(!session.voiceController.hasPendingReplyAudio)
+                Text("Dictation stays on this device. Hands-free transcription and external voice profiles are unavailable until their privacy policy can be verified.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let status = session.voiceStatus {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             Section("Enroll a new device") {

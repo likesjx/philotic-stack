@@ -56,6 +56,19 @@ final class EdgeClientCursorTests: XCTestCase {
 
     // MARK: - Watermark arithmetic
 
+    func testEphemeralVoiceRepliesCannotPruneOlderRetainedTurnEvents() {
+        for sequence in [nil, 0, 1] as [UInt64?] {
+            let voice = EdgeMessage.voiceReply(conversationId: "c", turnId: "voice-turn",
+                audioBase64: "c3ludGhldGlj", mimeType: "audio/mpeg", transcript: nil,
+                chunkSeq: sequence, isFinal: sequence == 1)
+            XCTAssertFalse(EdgeClient.advancesResumeCursor(voice))
+            XCTAssertEqual(EdgeClient.advanceWatermark(10, envelopeSeq: 100, message: voice), 10)
+            XCTAssertNil(EdgeClient.advanceWatermark(nil, envelopeSeq: 100, message: voice))
+        }
+        XCTAssertEqual(EdgeClient.advanceWatermark(10, envelopeSeq: 11,
+            message: .turnEvent(conversationId: "c", eventKind: .final, content: "retained", turnId: "turn")), 11)
+    }
+
     private func turnEvent(_ seq: UInt64) -> (UInt64, EdgeMessage) {
         (seq, .turnEvent(conversationId: "c", eventKind: .token, content: "t\(seq)", turnId: nil))
     }
