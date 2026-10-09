@@ -1,0 +1,59 @@
+name: Protected context text acceptance
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'crates/philote/**'
+      - 'crates/philotic-client/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/context-protected-text-acceptance.yml'
+  push:
+    branches: [develop]
+    paths:
+      - 'crates/philote/**'
+      - 'crates/philotic-client/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/context-protected-text-acceptance.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: protected-context-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protected-text:
+    name: protected text acceptance (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libssl-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: protected-context-linux-${{ hashFiles('Cargo.lock') }}
+      - name: Real Unix RPC, owned-child and canonical binding acceptance
+        # Disposable synthetic SQLite/Unix sockets and fake provider only.
+        # No vault, external inference, production service or credential setup.
+        run: cargo test --locked -p philote --test protected_text_acceptance -- --test-threads=1
