@@ -1,3 +1,4 @@
+pub mod protected_authority;
 pub use ansible_mesh_core::cron::{
     CronApprovalMode, CronJob, CronJobId, CronJobSource, CronTurnPolicy,
 };
@@ -956,6 +957,7 @@ pub enum RestartReason {
 #[serde(tag = "operation", content = "payload")]
 #[serde(rename_all = "snake_case")]
 pub enum IpcRequest {
+    ProtectedAuthority(ansible_mesh_core::privacy_rpc::ProtectedAuthorityRequest),
     /// Connect and register as an active materialized guest
     Register(GuestIdentity),
     /// Ask the Hotel for configuration data from the local Context Graph
@@ -2683,6 +2685,9 @@ pub struct MeshRosterEntryView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum IpcResponse {
+    ProtectedAuthorityReply {
+        protected_authority: ansible_mesh_core::privacy_rpc::ProtectedAuthorityReply,
+    },
     Ack {
         req_id: String,
     },
@@ -3286,7 +3291,7 @@ pub struct IpcPushEvent {
 
 /// The concrete Universal Hotel Client SDK
 pub struct PhiloticClient {
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     _identity: GuestIdentity,
     pending_push: VecDeque<IpcResponse>,
     read_buf: Vec<u8>,
@@ -3338,20 +3343,55 @@ pub fn is_ipc_timeout(err: &anyhow::Error) -> bool {
 }
 
 impl PhiloticClient {
-    async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
-        let len = u32::try_from(payload.len()).context("IPC payload too large")?;
-        self.stream
-            .write_all(&len.to_be_bytes())
-            .await
-            .context("Failed to send IPC frame header to Ansible")?;
-        self.stream
-            .write_all(payload)
-            .await
-            .context("Failed to send IPC frame payload to Ansible")?;
+    fn ensure_connected(&self) -> Result<()> {
+        if self.stream.is_none() {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "IPC connection closed; reconnect before reuse",
+            )
+            .into());
+        }
         Ok(())
+    }
+    fn disconnect(&mut self) {
+        self.stream.take();
+        self.pending_push.clear();
+        self.read_buf.clear();
+        self.pending_stale_responses = 0;
+    }
+    fn correlation_error(&mut self) -> anyhow::Error {
+        self.disconnect();
+        std::io::Error::new(
+            ErrorKind::ConnectionAborted,
+            "Unexpected correlated IPC reply; reconnect before reuse",
+        )
+        .into()
+    }
+
+    async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
+        self.ensure_connected()?;
+        let len = u32::try_from(payload.len()).context("IPC payload too large")?;
+        let result = async {
+            let stream = self.stream.as_mut().expect("checked connected");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .context("Failed to send IPC frame header to Ansible")?;
+            stream
+                .write_all(payload)
+                .await
+                .context("Failed to send IPC frame payload to Ansible")?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.disconnect();
+        }
+        result
     }
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
+        self.ensure_connected()?;
         loop {
             if self.read_buf.len() >= 4 {
                 let len = u32::from_be_bytes([
@@ -3369,12 +3409,19 @@ impl PhiloticClient {
             }
 
             self.stream
+                .as_ref()
+                .expect("checked connected")
                 .readable()
                 .await
                 .context("Failed to wait for IPC frame bytes")?;
 
             let mut chunk = [0u8; 8192];
-            match self.stream.try_read(&mut chunk) {
+            match self
+                .stream
+                .as_ref()
+                .expect("checked connected")
+                .try_read(&mut chunk)
+            {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -3408,7 +3455,7 @@ impl PhiloticClient {
         );
 
         let mut client = Self {
-            stream,
+            stream: Some(stream),
             _identity: identity.clone(),
             pending_push: VecDeque::new(),
             read_buf: Vec::new(),
@@ -3466,6 +3513,22 @@ impl PhiloticClient {
         req: IpcRequest,
         timeout: Duration,
     ) -> Result<IpcResponse> {
+        if matches!(&req, IpcRequest::ProtectedAuthority(_)) {
+            // Whole operation deadline, including partial/backpressured writes.
+            let result = tokio::time::timeout(timeout, self.send_request(req)).await;
+            return match result {
+                Ok(Ok(reply)) => Ok(reply),
+                Ok(Err(error)) => {
+                    self.disconnect();
+                    Err(error)
+                }
+                Err(elapsed) => {
+                    self.disconnect();
+                    Err(anyhow::Error::new(elapsed)
+                        .context("Protected IPC operation timed out; reconnect before reuse"))
+                }
+            };
+        }
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
         self.write_frame(&payload).await?;
 
@@ -3495,6 +3558,16 @@ impl PhiloticClient {
     async fn read_matching_response(&mut self, req: &IpcRequest) -> Result<IpcResponse> {
         loop {
             let resp = self.read_response().await?;
+            if let IpcResponse::ProtectedAuthorityReply {
+                protected_authority,
+            } = &resp
+            {
+                if matches!(req, IpcRequest::ProtectedAuthority(request) if request.request_id() == protected_authority.request_id)
+                {
+                    return Ok(resp);
+                }
+                return Err(self.correlation_error());
+            }
 
             // Pushes are never stale-request fallout and must never be lost —
             // classify and buffer them before any stale-discard logic runs.
@@ -3537,6 +3610,9 @@ impl PhiloticClient {
             // response read. Skip them here so they don't masquerade as request responses.
             if Self::is_ignorable_push(&resp) {
                 continue;
+            }
+            if matches!(req, IpcRequest::ProtectedAuthority(_)) {
+                return Err(self.correlation_error());
             }
             return Ok(resp);
         }
@@ -3643,12 +3719,16 @@ impl PhiloticClient {
 
     /// Poll for inbound tasks routed from the Philotic Web
     pub async fn recv_task(&mut self) -> Result<IpcResponse> {
+        self.ensure_connected()?;
         if let Some(pending) = self.pending_push.pop_front() {
             return Ok(pending);
         }
 
         loop {
             let resp = self.read_response().await?;
+            if matches!(&resp, IpcResponse::ProtectedAuthorityReply { .. }) {
+                return Err(self.correlation_error());
+            }
             if Self::is_push_message(&resp) {
                 return Ok(resp);
             }

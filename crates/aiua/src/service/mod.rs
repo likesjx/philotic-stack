@@ -17,6 +17,7 @@ pub mod mesh_runtime;
 pub mod model_catalog_sync;
 pub mod operator_surface;
 pub mod perimeter;
+pub mod protected_local_guest;
 pub mod resource_registry;
 pub mod role_materialization;
 pub mod scoped_vault;

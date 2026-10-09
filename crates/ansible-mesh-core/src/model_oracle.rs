@@ -26,6 +26,45 @@
 //! configured `fallback_tiers` ladder, when that ladder is exhausted.
 
 use crate::graph::ModelProfileRecord;
+use crate::privacy::{
+    authorize_processing, AuthenticatedAgent, PolicyAuthority, ProcessingOperation,
+    ProviderBoundary,
+};
+
+pub struct PrivacyRouteContext<'a, A> {
+    pub authority: &'a A,
+    pub actor: Option<&'a AuthenticatedAgent>,
+    pub resources: &'a [String],
+    pub operation: ProcessingOperation,
+}
+
+/// Privacy-constrained entry point for the existing deterministic routing reflex.
+/// Classification must describe the server-resolved endpoint. Missing facts
+/// deny a candidate. Health ranking cannot reintroduce a denied cloud fallback.
+/// This is selection only: dispatch must reauthorize against current policies.
+pub fn rank_models_with_privacy(
+    candidates: &[ModelProfileRecord],
+    need: &RouteNeed,
+    now_secs: u64,
+    privacy: &PrivacyRouteContext<'_, impl PolicyAuthority>,
+    classify: impl Fn(&ModelProfileRecord) -> ProviderBoundary,
+) -> Vec<RankedModel> {
+    let permitted: Vec<_> = candidates
+        .iter()
+        .filter(|profile| {
+            authorize_processing(
+                privacy.authority,
+                privacy.actor,
+                privacy.resources,
+                privacy.operation,
+                classify(profile),
+            )
+            .is_ok()
+        })
+        .cloned()
+        .collect();
+    rank_models(&permitted, need, now_secs)
+}
 
 /// Consecutive failures before a profile is stamped `degraded`.
 /// Override with `PHILOTIC_MODEL_DEGRADE_THRESHOLD`.

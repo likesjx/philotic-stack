@@ -38,6 +38,9 @@ pub mod model_manager;
 pub mod model_oracle;
 pub mod model_routing;
 pub mod placement_sync;
+pub mod privacy;
+pub mod privacy_local;
+pub mod privacy_storage;
 pub mod procedure;
 pub mod provenance;
 pub mod provider_keys;
@@ -178,3 +181,5 @@ pub struct NodeHealthSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perimeter: Option<PerimeterSnapshot>,
 }
+
+pub mod privacy_rpc;
