@@ -48,6 +48,8 @@ without turning `philote` into an audio pipeline with opinions.
 
 ## Current Slice — Apple voice (2026-10-08)
 
+The seven-commit checkpoint now also has a separate source integration on verified remote develop `689bfc7d`; original worktrees are preserved. Current IPC/mesh/dependency compilation and broader source/mock evidence are recorded in the [integration checkpoint](../../crates/philotic-web/src/serve/VOICE_INTEGRATION_CHECKPOINT.md). This does not install the trusted runtime or establish live audio behavior.
+
 Implemented locally in `c4c3ff4d` and `46f871d2`: mandatory on-device recognition, stale permission/recognition/playback rejection, iOS duplex session configuration, request/turn-correlated client gates, Apple voice selection/preview/stop, and an ElevenLabs preference that grants no dispatch eligibility. External audio/STT/TTS entry paths and handsfree remain unavailable pending trusted policy installation. Ordinary local transcripts use the normal philote text turn; server-side always-speak policy is not yet proven private.
 
 Backend checkpoint `9da6ba37` supplied the ledger; the source follow-up now reserves correlated submissions before IPC validation and echoes acceptance before generation. Verified-device cancellation admission and delivery/replay filtering are wired to a mock-tested runtime adapter seam. No production adapter is installed, so `turn_cancel_v1` stays unadvertised and real provider cancellation remains unavailable. Caller-supplied hotel GuestIdentity registration does not establish an authenticated principal.

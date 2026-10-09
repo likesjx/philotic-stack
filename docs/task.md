@@ -24,6 +24,8 @@
 
 ### Apple voice privacy and cancellation
 
+Current remote source integration: `codex/voice-integrated-689bfc7d` is based on verified develop `689bfc7ddce26341cac994bb77d0027bea2ac98a`, preserving the original seven-commit checkpoint. See [integrated source evidence](../crates/philotic-web/src/serve/VOICE_INTEGRATION_CHECKPOINT.md). This integrates voice only; other owners' iPad/privacy/notch deltas remain separate.
+
 Disposition (2026-10-08): **client source slice complete; correlated edge acceptance and mocked cancellation seam complete; full voice blocked**. Branches `codex/apple-voice-privacy` and `codex/voice-backend-contract`; commits `c4c3ff4d`, `46f871d2`, `9da6ba37`. [Proposal](architecture/VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08).
 
 - [x] Require available on-device STT; invalidate stale capture permissions, recognition callbacks and playback callbacks.
