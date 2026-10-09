@@ -1557,7 +1557,15 @@ mod tests {
             ),
             (
                 "openrouter",
-                json!({ "kind": "media.analyze", "prompt": "Synthetic" }),
+                json!({
+                    "kind": "media.analyze",
+                    "prompt": "Synthetic",
+                    "attachments": [{
+                        "kind": "image",
+                        "mime_type": "image/png",
+                        "url": "https://example.com/test.png"
+                    }]
+                }),
             ),
             (
                 "openrouter",
