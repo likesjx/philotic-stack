@@ -47,6 +47,7 @@ pub mod provider_keys;
 pub mod registry;
 pub mod relocation_ceremony;
 pub mod resources;
+pub mod route_composition;
 pub mod router_trace;
 pub mod runtime;
 pub mod sealed_secret;
