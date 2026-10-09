@@ -12455,7 +12455,7 @@ mod tests {
     /// The forensic gap end-to-end: a Gemini 400 arriving as an old-controller
     /// envelope (kind=provider_failure, no sub_kind, no error_class) must NOT
     /// fail the turn — the SAME turn must be re-dispatched to the next ladder
-    /// tier (model.openrouter under the post-#175 default ladder), a
+    /// tier (model.openrouter in an explicitly configured legacy ladder), a
     /// `provider_switch` turn event must surface, and the fallback reply must
     /// be delivered to the user.
     #[tokio::test]
@@ -12481,6 +12481,18 @@ mod tests {
             .ensure_session_loaded(session_id, "telegram")
             .await
             .expect("session load");
+
+        // Explicit Gemini preference preserves this legacy regression scenario
+        // now that the source default ladder omits Gemini.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .role_activation = Some(role_activation_with_ladder(&[
+            "model",
+            "model.openrouter",
+            "model.ollama",
+        ]));
 
         // Seed an in-flight turn waiting on the tier-0 (gemini) model, bound
         // to a membrane transport target.
