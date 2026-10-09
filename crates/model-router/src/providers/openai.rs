@@ -1580,7 +1580,10 @@ mod tests {
             let provider = output_budget_test_provider(provider_id);
             let task = ControllerTask::from_value(&task_json).unwrap();
             let body = provider.chat_request_body(&task).unwrap();
-            assert!(body.get("max_tokens").is_none(), "{provider_id}: {task_json}");
+            assert!(
+                body.get("max_tokens").is_none(),
+                "{provider_id}: {task_json}"
+            );
         }
     }
 
