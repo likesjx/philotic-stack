@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,6 +61,49 @@ class ReleaseManifestTest(unittest.TestCase):
         sums = (self.root / "SHA256SUMS").read_text()
         self.assertIn(f"{hashlib.sha256(b'philote-binary').hexdigest()}  bin/philote", sums)
 
+    def executable(self, output):
+        binary = self.root / 'bin/aiua'
+        binary.write_text(f'#!{sys.executable}\nimport os\nassert "PHILOTIC_RELEASE_TAG" not in os.environ\nprint({output!r})\n')
+        binary.chmod(0o755)
+
+    def test_native_version_smoke_accepts_exact_rc_and_sha(self):
+        self.executable('aiua 0.2.0-rc.1 (' + 'a' * 40 + ')')
+        self.generate()
+        self.assertEqual(quiet(rm.main, ['verify', '--dir', str(self.root), '--check-aiua-version'])[0], 0)
+
+    def test_native_version_smoke_rejects_stale_dev_or_wrong_sha(self):
+        for output in ['aiua 0.1.0', 'aiua 0.1.0-dev (unknown)',
+                       'aiua 0.2.0-rc.1 (' + 'b' * 40 + ')']:
+            self.executable(output)
+            self.generate()
+            rc, _, err = quiet(rm.main, ['verify', '--dir', str(self.root), '--check-aiua-version'])
+            self.assertEqual(rc, 1)
+            self.assertIn('does not match manifest', err)
+
+    def test_manifest_tag_version_or_sha_inconsistency_is_rejected(self):
+        for field, value in [('version', '0.1.0'), ('tag', 'v0.2.0-rc1'), ('sha', 'short')]:
+            self.generate()
+            path = self.root / 'manifest.json'
+            manifest = json.loads(path.read_text())
+            manifest[field] = value
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(quiet(rm.main, ['verify', '--dir', str(self.root)])[0], 1)
+
+    def test_generate_rejects_noncanonical_tag_and_missing_sha(self):
+        for tag, sha in [('v0.2.0-rc1', 'a' * 40), ('v00.2.0', 'a' * 40), ('v0.2.0-rc.1', '')]:
+            self.assertEqual(quiet(rm.main, ['generate', '--dir', str(self.root), '--tag', tag,
+                                           '--sha', sha, '--target', 'synthetic'])[0], 1)
+        self.assertFalse((self.root / 'manifest.json').exists())
+
+    def test_installed_version_observation_is_checked_without_executing_binary(self):
+        self.generate()
+        observed = self.root / 'observed.txt'
+        observed.write_text('aiua 0.2.0-rc.1 (' + 'a' * 40 + ')\n')
+        args = ['check-version', '--manifest', str(self.root / 'manifest.json'), '--output-file', str(observed)]
+        self.assertEqual(quiet(rm.main, args)[0], 0)
+        observed.write_text('aiua 0.3.0 (' + 'a' * 40 + ')\n')
+        self.assertEqual(quiet(rm.main, args)[0], 1)
+
     def test_sums_are_sha256sum_compatible(self):
         self.generate()
         tool = ["sha256sum", "-c", "--quiet", "SHA256SUMS"]
@@ -68,6 +112,18 @@ class ReleaseManifestTest(unittest.TestCase):
         except FileNotFoundError:
             self.skipTest("sha256sum not installed")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_requested_tag_and_target_must_match_manifest(self):
+        self.generate()
+        manifest_path = self.root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        args = ["check-metadata", "--manifest", str(manifest_path),
+                "--tag", manifest["tag"], "--target", manifest["target"]]
+        self.assertEqual(quiet(rm.main, args)[0], 0)
+        for field, value in [("tag", "v9.9.9"), ("target", "wrong-platform")]:
+            changed = args.copy()
+            changed[changed.index("--" + field) + 1] = value
+            self.assertEqual(quiet(rm.main, changed)[0], 1)
 
     def test_generate_fails_on_missing_required(self):
         rc, _, err = self.generate("--require", "aiua", "model-router")

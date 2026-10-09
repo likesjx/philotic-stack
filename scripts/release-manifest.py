@@ -14,9 +14,16 @@ Subcommands:
       Hash D/bin/*, write D/SHA256SUMS and D/manifest.json. Fails if a
       --require'd binary is missing.
 
-  verify --dir D
+  verify --dir D [--check-aiua-version]
       Re-hash D/bin/* and check against D/manifest.json and D/SHA256SUMS.
       Exit 1 on any mismatch, missing or extra binary.
+      The optional native smoke requires aiua --version to match tag/version/SHA.
+
+  check-version --manifest M --output-file F
+      Compare a captured aiua --version with the manifest without executing it.
+
+  check-metadata --manifest M --tag T --target TARGET
+      Bind a downloaded manifest to the requested release and platform.
 
   compare --manifest M --actual A [--installed I --presign P] [--label HOST]
       A holds sha256sum-format lines ("<sha256>  <path>") for the binaries
@@ -36,7 +43,10 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 MANIFEST_NAME = "manifest.json"
@@ -58,7 +68,26 @@ def list_bins(bin_dir: Path) -> list[Path]:
 
 
 def version_from_tag(tag: str) -> str:
-    return tag[1:] if tag.startswith("v") else tag
+    number = r"(?:0|[1-9][0-9]*)"
+    if not isinstance(tag, str) or not re.fullmatch(
+        rf"v{number}\.{number}\.{number}(?:-(?:alpha|beta|rc)\.{number})?", tag
+    ):
+        raise ValueError("invalid release tag")
+    return tag[1:]
+
+
+def validate_metadata(manifest: dict) -> None:
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be an object")
+    if manifest.get("version") != version_from_tag(manifest.get("tag")):
+        raise ValueError("manifest version differs from release tag")
+    if not isinstance(manifest.get("sha"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["sha"]):
+        raise ValueError("release requires a full lowercase commit SHA")
+
+
+def check_version(manifest: dict, reported: str) -> bool:
+    validate_metadata(manifest)
+    return reported.strip() == f"aiua {manifest['version']} ({manifest['sha']})"
 
 
 def build_manifest(root: Path, tag: str, sha: str, target: str, built_at: str | None) -> dict:
@@ -92,6 +121,11 @@ def parse_sums(text: str) -> dict[str, str]:
 
 def cmd_generate(args: argparse.Namespace) -> int:
     root = Path(args.dir)
+    try:
+        validate_metadata({"tag": args.tag, "version": version_from_tag(args.tag), "sha": args.sha})
+    except ValueError as exc:
+        print(f"release-manifest: {exc}", file=sys.stderr)
+        return 1
     bins = list_bins(root / "bin")
     if not bins:
         print(f"release-manifest: no binaries in {root / 'bin'}", file=sys.stderr)
@@ -119,6 +153,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if key not in manifest:
             print(f"release-manifest: manifest.json lacks '{key}'", file=sys.stderr)
             return 1
+    try:
+        validate_metadata(manifest)
+    except ValueError as exc:
+        print(f"release-manifest: {exc}", file=sys.stderr)
+        return 1
     expected = {b["name"]: b["sha256"] for b in manifest["bins"]}
     sums_path = root / SUMS_NAME
     sums = parse_sums(sums_path.read_text()) if sums_path.exists() else {}
@@ -140,7 +179,47 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"  ✗ {e}", file=sys.stderr)
     if errors:
         return 1
+    if args.check_aiua_version:
+        try:
+            # --version exits before hotel bootstrap; isolate logging and remove
+            # ambient credentials/config from this native packaging smoke.
+            with tempfile.TemporaryDirectory(prefix="philotic-version-") as work:
+                result = subprocess.run(
+                    [str((root / "bin/aiua").resolve()), "--version"],
+                    cwd=work, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                   "PHILOTIC_LOG_DIR": work},
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+            if result.returncode != 0 or not check_version(manifest, result.stdout):
+                raise ValueError("aiua --version does not match manifest version/SHA")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            print(f"release-manifest: {exc}", file=sys.stderr)
+            return 1
     print(f"release-manifest: {len(expected)} binaries verified against manifest ({manifest['version']}, {manifest['sha'][:12]})")
+    return 0
+
+
+def cmd_check_metadata(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(Path(args.manifest).read_text())
+        validate_metadata(manifest)
+        if manifest['tag'] != args.tag or manifest.get('target') != args.target:
+            raise ValueError("manifest does not match requested tag/target")
+    except (OSError, ValueError) as exc:
+        print(f"release-manifest: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_check_version(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(Path(args.manifest).read_text())
+        if not check_version(manifest, Path(args.output_file).read_text()):
+            raise ValueError("aiua --version does not match manifest version/SHA")
+    except (OSError, ValueError) as exc:
+        print(f"release-manifest: {exc}", file=sys.stderr)
+        return 1
+    print(f"release-manifest: aiua version/SHA verified ({manifest['version']}, {manifest['sha'][:12]})")
     return 0
 
 
@@ -207,7 +286,19 @@ def main(argv: list[str] | None = None) -> int:
 
     v = sub.add_parser("verify")
     v.add_argument("--dir", required=True)
+    v.add_argument("--check-aiua-version", action="store_true")
     v.set_defaults(func=cmd_verify)
+
+    cm = sub.add_parser("check-metadata")
+    cm.add_argument("--manifest", required=True)
+    cm.add_argument("--tag", required=True)
+    cm.add_argument("--target", required=True)
+    cm.set_defaults(func=cmd_check_metadata)
+
+    cv = sub.add_parser("check-version")
+    cv.add_argument("--manifest", required=True)
+    cv.add_argument("--output-file", required=True)
+    cv.set_defaults(func=cmd_check_version)
 
     c = sub.add_parser("compare")
     c.add_argument("--manifest", required=True)

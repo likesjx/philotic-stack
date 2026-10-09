@@ -94,6 +94,9 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
+      - name: Release manifest and version contract tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release_manifest.py'
+
       # Watch-live burn-down W0: proposal-status and DEFECTS status vocabulary
       # lint. NON-BLOCKING for now (continue-on-error, and --warn-only keeps the
       # vocabulary checks as warnings); the older required-keys checks still

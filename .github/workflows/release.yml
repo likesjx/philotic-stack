@@ -181,6 +181,7 @@ jobs:
         env:
           # Baked in via philotic_client::build_sha(); verify-release compares it.
           PHILOTIC_BUILD_SHA: ${{ github.sha }}
+          PHILOTIC_RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           read -r -a PKG_FLAGS <<< "$(scripts/release-packages.sh cargo-flags --platform "${PLATFORM}")"
@@ -218,14 +219,12 @@ jobs:
           python3 scripts/release-manifest.py generate --dir "${STAGE}" \
             --tag "${TAG}" --sha "${GITHUB_SHA}" --target "${TARGET}" \
             --require "${REQUIRED[@]}"
-          python3 scripts/release-manifest.py verify --dir "${STAGE}"
+          python3 scripts/release-manifest.py verify --dir "${STAGE}" --check-aiua-version
 
           # manifest.json last: installers treat its presence as "fully unpacked".
           tar -C "${STAGE}" -czf "dist/${NAME}.tar.gz" bin SHA256SUMS manifest.json
           cp "${STAGE}/manifest.json" "dist/${NAME}.manifest.json"
 
-          echo "--- smoke: bin/aiua --version"
-          "${STAGE}/bin/aiua" --version || echo "::warning::aiua --version exited non-zero"
           ls -la dist/
 
       - name: Upload build artifact
