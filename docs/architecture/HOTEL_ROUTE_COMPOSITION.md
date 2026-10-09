@@ -79,3 +79,29 @@ before the loop can enforce them. No unused resilience facade was added.
 
 No deployment or real-provider validation is authorized for this source-only
 work. Unit evidence does not establish installed or live routing behavior.
+
+## Protected runtime explain consumer
+
+`LocalAuthorityRpc::with_route_catalog` explicitly installs a hotel-owned catalog.
+The append-only `explain_model_route` protected request uses the existing Unix
+peer-authenticated RPC path. It accepts only an immutable authority envelope and
+an expected catalog revision. Actor preferences, aliases, override mode, hotel
+waterfall, endpoint classifications and request projection stay server-owned.
+Every otherwise eligible candidate is resolved through canonical task authority
+against its actual endpoint; catalog access denials remain denied. Missing
+installation, stale catalog, unsupported projection, missing actor policy and
+absence of any admitted endpoint fail closed. Successful diagnostics contain no
+source closure, provider credentials or resource policies. Policy revision and
+payload digest bind the explain result; it is not a dispatch grant. Dispatch
+must re-resolve the chosen endpoint immediately before each provider call.
+
+This is an opt-in runtime RPC consumer, not production installation. The context
+owner must supply the complete bound-payload projection and canonical catalog
+installation. A concrete dispatch adapter and fallback attempt/time/token budget
+remain dependencies. Legacy dispatch is unchanged. No production authority,
+provider calls or configuration changes are claimed.
+
+Validation for this integration: rustfmt and git diff --check only. New wire
+correlation/injection and diagnostic round-trip tests are authored but not run;
+local builds were explicitly prohibited. The earlier 3251 passing tests cover
+phase-one code on develop 86e154c8, not this privacy-base integration.

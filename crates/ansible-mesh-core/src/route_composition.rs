@@ -43,7 +43,7 @@ pub struct RoutePolicy {
 /// Exact dispatch identity, after alias resolution. Credential and endpoint
 /// fields are opaque handles, never secrets/URLs containing authentication.
 /// Policy scope distinguishes routes with different admission obligations.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CandidateIdentity {
     pub provider: String,
     pub model: String,
@@ -54,7 +54,7 @@ pub struct CandidateIdentity {
     pub policy_scope: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Admission {
     Allowed,
     PrivacyDenied,
@@ -69,14 +69,14 @@ pub struct ResolvedCandidate {
     pub admission: Admission,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteOrigin {
     DirectOverride,
     AgentPreference,
     HotelWaterfall,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandidateDisposition {
     Included,
     Duplicate { first_candidate: String },
@@ -86,14 +86,14 @@ pub enum CandidateDisposition {
     IdentityMismatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteDiagnostic {
     pub candidate: String,
     pub origin: RouteOrigin,
     pub disposition: CandidateDisposition,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveRoute {
     pub candidates: Vec<CandidateIdentity>,
     pub diagnostics: Vec<RouteDiagnostic>,

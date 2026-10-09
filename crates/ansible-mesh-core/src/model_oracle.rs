@@ -280,7 +280,7 @@ pub fn rank_models(
 }
 
 /// First hard restriction preventing a model from serving a route need.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModelRestriction {
     Unavailable,
     CoolingDown,
