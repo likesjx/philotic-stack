@@ -169,6 +169,9 @@ impl LocalLaunchRegistry {
     }
 }
 impl VerifiedLocalSession {
+    pub(crate) fn matches_guest(&self, hotel: &str, guest: &str) -> bool {
+        self.scope.hotel == hotel && self.scope.guest == guest
+    }
     pub fn consumer(&self) -> LocalConsumer {
         self.scope.clone()
     }
@@ -268,6 +271,42 @@ impl LocalTaskAuthority {
             limit,
         })
     }
+    pub(crate) fn check_registry(
+        &self,
+        hotel: &str,
+        launches: &Arc<LocalLaunchRegistry>,
+    ) -> Result<()> {
+        if hotel != self.hotel || !Arc::ptr_eq(launches, &self.launches) {
+            bail!("RPC issuer/registry mismatch");
+        }
+        Ok(())
+    }
+    pub fn cancel_envelope(
+        &self,
+        origin: &VerifiedLocalSession,
+        envelope: &LocalTaskEnvelope,
+    ) -> Result<()> {
+        origin.principal()?;
+        if !Arc::ptr_eq(&origin.registry, &self.launches) {
+            bail!("foreign cancellation registry");
+        }
+        {
+            let records = self
+                .records
+                .lock()
+                .map_err(|_| anyhow!("authority lock poisoned"))?;
+            let record = records
+                .by_handle
+                .get(&envelope.authority_handle)
+                .ok_or_else(|| anyhow!("unknown protected authority"))?;
+            if record.task_id != envelope.task_id
+                || record.digest != capture_payload_digest(&envelope.payload)
+            {
+                bail!("cancellation binding mismatch");
+            }
+        }
+        self.cancel(origin, envelope.authority_handle)
+    }
     pub fn issue(
         &self,
         origin: Arc<VerifiedLocalSession>,
@@ -300,7 +339,7 @@ impl LocalTaskAuthority {
         if sources.is_empty() || sources.len() > 256 {
             bail!("invalid source manifest");
         }
-        let current = self.policies.snapshot()?;
+        let current = self.policies.pin_commit()?;
         for source in &sources {
             authorize_read(&current, Some(&actor), source)
                 .map_err(|_| anyhow!("source access denied"))?;
@@ -313,7 +352,8 @@ impl LocalTaskAuthority {
         let task_key = (origin.scope.generation, task_id);
         if let Some(handle) = records.by_task.get(&task_key) {
             let r = &records.by_handle[handle];
-            if r.cancelled
+            if !current.local_authority_active(&handle.to_string())?
+                || r.cancelled
                 || Instant::now() >= r.expires
                 || r.consumer != consumer
                 || r.digest != digest
@@ -333,6 +373,20 @@ impl LocalTaskAuthority {
             bail!("local authority capacity");
         }
         let handle = Uuid::new_v4();
+        let binding = capture_payload_digest(&serde_json::to_string(&serde_json::json!({
+            "origin_generation": origin.scope.generation,
+            "consumer_generation": consumer.generation,
+            "consumer_agent": consumer.agent,
+            "consumer_guest": consumer.guest,
+            "digest": digest, "sources": sources, "revision": current.revision()
+        }))?);
+        current.admit_local_authority(
+            &self.hotel,
+            actor.stable_agent_id(),
+            &task_id.to_string(),
+            &handle.to_string(),
+            &binding,
+        )?;
         records.by_handle.insert(
             handle,
             Record {
@@ -394,6 +448,12 @@ impl LocalTaskAuthority {
         boundary: ProviderBoundary,
     ) -> Result<ResolvedLocalAuthority> {
         let policy = self.policies.snapshot()?;
+        if !self
+            .policies
+            .local_authority_active(&envelope.authority_handle.to_string())?
+        {
+            bail!("durably revoked/unknown authority");
+        }
         let records = self
             .records
             .lock()
@@ -423,6 +483,9 @@ impl LocalTaskAuthority {
         consumer: &VerifiedLocalSession,
     ) -> Result<(ResolvedLocalAuthority, PolicyCommitLease)> {
         let lease = self.policies.pin_commit()?;
+        if !lease.local_authority_active(&envelope.authority_handle.to_string())? {
+            bail!("durably revoked/unknown authority");
+        }
         let records = self
             .records
             .lock()
@@ -454,6 +517,9 @@ impl LocalTaskAuthority {
         consumer: &VerifiedLocalSession,
         lease: &PolicyCommitLease,
     ) -> Result<()> {
+        if !lease.local_authority_active(&envelope.authority_handle.to_string())? {
+            bail!("durably revoked/unknown authority");
+        }
         if !lease.belongs_to(&self.policies) {
             bail!("foreign policy reservation");
         }
@@ -475,6 +541,12 @@ impl LocalTaskAuthority {
         Ok(())
     }
     pub fn park(&self, envelope: &LocalTaskEnvelope) -> Result<ParkedLocalTask> {
+        if !self
+            .policies
+            .local_authority_active(&envelope.authority_handle.to_string())?
+        {
+            bail!("durably revoked/unknown authority");
+        }
         let records = self
             .records
             .lock()
@@ -509,18 +581,34 @@ impl LocalTaskAuthority {
     }
     pub fn cancel(&self, origin: &VerifiedLocalSession, handle: Uuid) -> Result<()> {
         origin.principal()?;
+        if !Arc::ptr_eq(&origin.registry, &self.launches) {
+            bail!("foreign cancellation registry");
+        }
+        {
+            let records = self
+                .records
+                .lock()
+                .map_err(|_| anyhow!("authority lock poisoned"))?;
+            let r = records
+                .by_handle
+                .get(&handle)
+                .ok_or_else(|| anyhow!("unknown protected authority"))?;
+            if origin.scope != r.origin.scope {
+                bail!("wrong cancellation principal");
+            }
+        }
+        // SQL reservation orders cancellation after an already-admitted graph
+        // commit. No registry lock is held while waiting for that reservation.
+        self.policies.cancel_local_authority(&handle.to_string())?;
         let mut records = self
             .records
             .lock()
             .map_err(|_| anyhow!("authority lock poisoned"))?;
-        let r = records
+        records
             .by_handle
             .get_mut(&handle)
-            .ok_or_else(|| anyhow!("unknown protected authority"))?;
-        if origin.scope != r.origin.scope {
-            bail!("wrong cancellation principal");
-        }
-        r.cancelled = true;
+            .ok_or_else(|| anyhow!("unknown protected authority"))?
+            .cancelled = true;
         Ok(())
     }
 }

@@ -263,3 +263,20 @@ fn policy_commit_reservation_blocks_separate_connection_revocation_until_release
     )
     .is_err());
 }
+
+#[test]
+fn prior_privacy_schema_requires_explicit_migration_and_is_not_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic-old-version.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TABLE old_fixture (value TEXT); INSERT INTO old_fixture VALUES ('synthetic'); PRAGMA user_version=1;").unwrap();
+    assert!(PolicyStore::open(&path).is_err());
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    let value: String = connection
+        .query_row("SELECT value FROM old_fixture", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(value, "synthetic");
+}

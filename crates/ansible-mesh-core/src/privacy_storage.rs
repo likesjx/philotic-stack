@@ -33,6 +33,38 @@ impl PolicyCommitLease {
     pub fn belongs_to(&self, store: &PolicyStore) -> bool {
         self.path == store.path
     }
+    pub(crate) fn admit_local_authority(
+        &self,
+        hotel: &str,
+        origin: &str,
+        task: &str,
+        handle: &str,
+        binding: &str,
+    ) -> Result<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow!("policy lease lock poisoned"))?;
+        let count: u64 = conn.query_row(
+            "SELECT count(*) FROM local_authority_receipt WHERE hotel=?1 AND origin=?2",
+            params![hotel, origin],
+            |r| r.get(0),
+        )?;
+        if count >= 4096 {
+            bail!("durable authority capacity; tombstones cannot be evicted");
+        }
+        // No upsert: an old event may not be silently regranted after restart.
+        conn.execute("INSERT INTO local_authority_receipt(hotel,origin,task,handle,binding,cancelled) VALUES (?1,?2,?3,?4,?5,0)", params![hotel, origin, task, handle, binding])?;
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+    pub(crate) fn local_authority_active(&self, handle: &str) -> Result<bool> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow!("policy lease lock poisoned"))?;
+        authority_active(&conn, handle)
+    }
     pub fn load_pending(
         &self,
         actor: &AuthenticatedAgent,
@@ -64,7 +96,50 @@ pub struct PolicySnapshot {
     revision: u64,
     policies: BTreeMap<String, ResourcePolicy>,
 }
+/// Implement only over a current snapshot from an authenticated server transport.
+/// Raw deserialized policies and client assertions must never implement this.
+pub trait ServerPolicySnapshotAuthority {
+    fn revision(&self) -> u64;
+    fn policies(&self) -> BTreeMap<String, ResourcePolicy>;
+}
 impl PolicySnapshot {
+    pub fn from_server(authority: &impl ServerPolicySnapshotAuthority) -> Result<Self> {
+        if authority.revision() == 0 {
+            bail!("missing policy revision");
+        }
+        let policies = authority.policies();
+        if policies.is_empty() || policies.len() > 4096 {
+            bail!("invalid policy snapshot size");
+        }
+        Ok(Self {
+            revision: authority.revision(),
+            policies,
+        })
+    }
+    /// Export just the already-authorized manifest and its inherited ancestors.
+    pub(crate) fn source_closure(
+        &self,
+        sources: &[String],
+    ) -> Result<BTreeMap<String, ResourcePolicy>> {
+        let mut pending = sources.to_vec();
+        let mut out = BTreeMap::new();
+        while let Some(source) = pending.pop() {
+            if out.contains_key(&source) {
+                continue;
+            }
+            if out.len() >= 4096 {
+                bail!("source closure bound");
+            }
+            let policy = self
+                .policies
+                .get(&source)
+                .ok_or_else(|| anyhow!("missing source policy"))?;
+            pending.extend(policy.sources.iter().cloned());
+            out.insert(source, policy.clone());
+        }
+        Ok(out)
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -124,9 +199,10 @@ impl PolicyStore {
                 INSERT INTO privacy_revision VALUES (1, 1);
                 CREATE TABLE privacy_policy (resource TEXT PRIMARY KEY, policy_json TEXT NOT NULL);
                 CREATE TABLE capture_inbox (producer TEXT NOT NULL, event_id TEXT NOT NULL, actor TEXT NOT NULL, payload TEXT NOT NULL, sources_json TEXT NOT NULL, policy_revision INTEGER NOT NULL, PRIMARY KEY(producer,event_id));
-                PRAGMA user_version=1;")?;
+                CREATE TABLE local_authority_receipt (hotel TEXT NOT NULL, origin TEXT NOT NULL, task TEXT NOT NULL, handle TEXT NOT NULL UNIQUE, binding TEXT NOT NULL, cancelled INTEGER NOT NULL CHECK(cancelled IN (0,1)), PRIMARY KEY(hotel,origin,task));
+                PRAGMA user_version=2;")?;
             tx.commit()?;
-        } else if version != 1 {
+        } else if version != 2 {
             bail!("unsupported privacy store version");
         }
         let store = Self {
@@ -135,6 +211,28 @@ impl PolicyStore {
         };
         store.snapshot()?; // Missing/corrupt authority is an error, never defaults.
         Ok(store)
+    }
+
+    pub(crate) fn local_authority_active(&self, handle: &str) -> Result<bool> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow!("policy store lock poisoned"))?;
+        authority_active(&conn, handle)
+    }
+    pub(crate) fn cancel_local_authority(&self, handle: &str) -> Result<()> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow!("policy store lock poisoned"))?;
+        if conn.execute(
+            "UPDATE local_authority_receipt SET cancelled=1 WHERE handle=?1",
+            [handle],
+        )? != 1
+        {
+            bail!("unknown durable authority receipt");
+        }
+        Ok(())
     }
 
     /// Acquire before authorization and hold through the canonical graph commit
@@ -366,4 +464,15 @@ fn snapshot(conn: &Connection) -> Result<PolicySnapshot> {
         );
     }
     Ok(PolicySnapshot { revision, policies })
+}
+
+fn authority_active(conn: &Connection, handle: &str) -> Result<bool> {
+    let state: Option<i64> = conn
+        .query_row(
+            "SELECT cancelled FROM local_authority_receipt WHERE handle=?1",
+            [handle],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(state == Some(0))
 }

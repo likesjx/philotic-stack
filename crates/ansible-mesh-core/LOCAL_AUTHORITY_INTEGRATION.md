@@ -1,4 +1,4 @@
-# Local authenticated task authority — consumer contract v1
+# Local authenticated task authority — consumer contract v2
 
 This isolated source checkpoint follows verified develop `689bfc7d` and the
 separate reviewed Beacon memory-refresh commit. Runtime installation is off.
@@ -43,7 +43,7 @@ Exported core module: `ansible_mesh_core::privacy_local`.
 * `park(&envelope)` / `flush(&parked, &verified_consumer)` preserve the same
   envelope and handle; flush revalidates. Neither API can issue from deserialized
   JSON. A replacement incarnation cannot inherit the parked binding.
-* `cancel(&verified_origin, handle)` creates a persistent-in-registry tombstone;
+* `cancel(&verified_origin, handle)` persists a SQLite cancellation tombstone;
   wrong actors deny, repeated cancellation is idempotent. Each retry/publication
   must resolve/check again; this does not itself abort active provider generation.
 * `pin_capture(&envelope, &verified_consumer)` returns the resolved context and
@@ -54,6 +54,60 @@ Boundary classification is a server configuration decision, not a wire flag.
 Source manifests must include tool results, summaries, context, attachments and
 microphone/synthesized text sources. A missing authoritative catalog denies.
 The methods perform blocking SQLite work and must execute on blocking workers.
+
+## Implemented opt-in hotel/SDK RPC
+
+`privacy_rpc::LocalAuthorityRpc::new(hotel, launches, authority, endpoints)`
+requires the same issuer/launch registry and server-owned endpoint map. Unknown
+endpoints deny. `IpcServer::with_protected_authority(Arc<LocalAuthorityRpc>)`
+installs the resolver on existing hotel UDS connections; absent installation
+returns a correlated Denied. Every request authenticates that socket's kernel
+peer against its named supervisor-owned child. Legacy Register grants nothing.
+SQLite work executes on `spawn_blocking`; bypassing the outer socket handler
+through `process_request` also denies.
+
+Wire `IpcRequest::ProtectedAuthority(ProtectedAuthorityRequest)` has Resolve and
+Cancel actions, exact envelope and correlation UUID. The response has a distinct
+`protected_authority` marker with an exact request UUID. Generic ACK, unknown
+correlation, malformed binding and unsolicited protected replies deny. A
+protected timeout closes the SDK connection, preventing late reply reuse.
+
+SDK module `philotic_client::protected_authority` exposes:
+
+* `TrustedHotelPeer { pid, uid }`: supervisor-supplied launch metadata, no serde.
+  An environment/caller PID or an ordinary Register ACK must not supply this.
+* `PhiloticClient::resolve_local_authority(peer, &envelope, endpoint, operation,
+  timeout)` returns a non-serde VerifiedLocalResolution with authenticated origin
+  actor, current PolicySnapshot, complete source closure, digest and consumer
+  incarnation. Resolve afresh for every provider/recall attempt; never cache.
+  The configured endpoint must be the actual attempted provider endpoint.
+* `cancel_local_authority(peer, &envelope, timeout)` returns only
+  `LocalCancellation::RevokedPendingQuiescence`. This MUST NOT be translated
+  to RuntimeTurnCancellation success. A runtime owner must abort/join generation
+  and fence text/audio before confirming stopped or advertising capability.
+
+Raw RPC DTOs remain untrusted data. Only the private SDK adapter, after kernel
+hotel verification and correlation/full-envelope checks, supplies the shared
+server identity/policy interfaces. Transport does not replace the final provider
+operation/boundary gate or bind arbitrary newly assembled output payloads.
+
+## Durable replay scope
+
+Fresh dedicated test stores use schema version 2. Existing version 1 stores are
+rejected without migration or modification; no live database was opened.
+Admission atomically records hotel + stable origin + canonical task/event ID,
+opaque handle and a digest of launch/consumer/payload/manifest/revision bindings.
+A duplicate persisted event cannot be admitted by a second or restarted issuer.
+The bound is 4096 durable receipts per hotel/origin; full capacity rejects, never
+evicts tombstones. These are agent task receipts, not per-device voice epochs.
+
+Cancellation is durable before replying. Resolution/park/graph pins observe the
+persisted state. SQL reservation precedes registry access during admission and
+canonical commit; cancellation never holds the registry while waiting for SQL.
+It waits for an existing graph reservation, preserving already committed tools.
+Lease validation remains able to acquire the registry while cancellation waits.
+No confirmed terminal cleanup, active-provider cancellation or crash resumption
+has been implemented. Revoked/unknown work remains denied; no timer eviction.
 
 ## Canonical graph bridge
 
@@ -75,8 +129,9 @@ required the approved test-only sandbox escalation. No hotel service was used.
 
 The present hotel/SDK InboundTask and ParkedInboundTask have not been rewritten.
 The existing legacy Register handler remains unchanged. Context/voice consumers
-can implement against this v1 contract now, but there is no live IPC resolve RPC
-or provider registry installation yet. Those require coordinated owner edits:
+can implement against this v2 contract now. The opt-in resolve/cancel RPC is
+implemented in source; startup/provider registry installation remains off.
+Those require coordinated owner edits:
 
 1. Supervisor supplies canonical agent/role mappings for persona and component
    guests; installs the protected child registry without trusting DB PID strings
@@ -85,7 +140,9 @@ or provider registry installation yet. Those require coordinated owner edits:
    and resolves policy context on every protected attempt. Park/repark/flush must
    retain it. Missing authority must not enter legacy provider dispatch. The
    in-memory handle registry cannot survive hotel restart: unknown old handles
-   deny and require new trusted admission; do not silently regrant on redelivery.
+   deny. Durable receipts also deny reissuing the same canonical event after
+   restart. Do not silently regrant on redelivery. Protected direct delivery and
+   legacy park/repark integration remain uninstalled.
 3. Model runtime decorates initial, credential-rebuild and decisions registries;
    streaming STT and native-live paths need separate enforcement. Context and
    voice owners coordinate consumer adapters. Native-live remains denied.

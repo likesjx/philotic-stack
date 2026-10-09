@@ -59,7 +59,8 @@ must define that consistency contract before production rollout.
 
 Current IPC split branch `codex/ipc-split-s3` still owns hotel IPC dispatch modules,
 including mod.rs, routing_policy.rs and config_vault.rs. Beacon owns its separate
-SDK/memory-integration patch. This work avoids those files, provider implementations,
+SDK/memory-integration patch, already preserved at the dependency checkpoint. The renewed source-only integration scope permits isolated SDK and mod.rs edits.
+It avoids provider implementations,
 runtime.rs, Apple files, and shared architecture/task documents. The renewed scope
 authorizes isolated integration preparation, not overriding those workstreams.
 
@@ -67,7 +68,9 @@ Next coordinated boundary: hotel issues a verified-session task handle bound to
 the full payload/source manifest/current policy revision; the controller resolves
 that handle through authenticated IPC and installs guarded_registry for every
 provider/fallback path. Unknown authority must deny, without a permissive legacy
-fallback. This requires SDK + IPC owner coordination before editing those files.
+fallback. The v2 opt-in resolve/cancel RPC now exists in source; live installation and
+protected delivery/park/repark still require owner coordination. See
+[LOCAL_AUTHORITY_INTEGRATION.md](LOCAL_AUTHORITY_INTEGRATION.md).
 
 Next graph boundary: Memgraph owner chooses canonical verified-key uniqueness and
 one atomic transaction for binding/root/extension/evidence/receipt writes, with

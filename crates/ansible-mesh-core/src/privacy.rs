@@ -24,6 +24,9 @@ pub struct AuthenticatedAgent {
 }
 
 impl AuthenticatedAgent {
+    pub fn roles(&self) -> BTreeSet<String> {
+        self.roles.clone()
+    }
     pub fn stable_agent_id(&self) -> &str {
         &self.id
     }
