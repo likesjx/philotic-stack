@@ -1,5 +1,3 @@
-pub mod recall_selection;
-pub mod recall_authority;
 pub mod approval_ref;
 pub mod catalog;
 pub mod commands;
@@ -9,6 +7,8 @@ pub mod mcp_ingress;
 pub mod plan_eval;
 pub mod procedures;
 pub mod protocol;
+pub mod recall_authority;
+pub mod recall_selection;
 pub mod reflex;
 pub mod runtime;
 pub mod scripted_loop;
