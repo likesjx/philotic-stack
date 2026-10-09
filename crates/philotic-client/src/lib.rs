@@ -2685,7 +2685,9 @@ pub struct MeshRosterEntryView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum IpcResponse {
-    ProtectedAuthorityReply { protected_authority: ansible_mesh_core::privacy_rpc::ProtectedAuthorityReply },
+    ProtectedAuthorityReply {
+        protected_authority: ansible_mesh_core::privacy_rpc::ProtectedAuthorityReply,
+    },
     Ack {
         req_id: String,
     },
@@ -3343,7 +3345,11 @@ pub fn is_ipc_timeout(err: &anyhow::Error) -> bool {
 impl PhiloticClient {
     fn ensure_connected(&self) -> Result<()> {
         if self.stream.is_none() {
-            return Err(std::io::Error::new(ErrorKind::BrokenPipe, "IPC connection closed; reconnect before reuse").into());
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "IPC connection closed; reconnect before reuse",
+            )
+            .into());
         }
         Ok(())
     }
@@ -3355,7 +3361,11 @@ impl PhiloticClient {
     }
     fn correlation_error(&mut self) -> anyhow::Error {
         self.disconnect();
-        std::io::Error::new(ErrorKind::ConnectionAborted, "Unexpected correlated IPC reply; reconnect before reuse").into()
+        std::io::Error::new(
+            ErrorKind::ConnectionAborted,
+            "Unexpected correlated IPC reply; reconnect before reuse",
+        )
+        .into()
     }
 
     async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
@@ -3363,11 +3373,20 @@ impl PhiloticClient {
         let len = u32::try_from(payload.len()).context("IPC payload too large")?;
         let result = async {
             let stream = self.stream.as_mut().expect("checked connected");
-            stream.write_all(&len.to_be_bytes()).await.context("Failed to send IPC frame header to Ansible")?;
-            stream.write_all(payload).await.context("Failed to send IPC frame payload to Ansible")?;
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .context("Failed to send IPC frame header to Ansible")?;
+            stream
+                .write_all(payload)
+                .await
+                .context("Failed to send IPC frame payload to Ansible")?;
             Ok(())
-        }.await;
-        if result.is_err() { self.disconnect(); }
+        }
+        .await;
+        if result.is_err() {
+            self.disconnect();
+        }
         result
     }
 
@@ -3389,13 +3408,20 @@ impl PhiloticClient {
                 }
             }
 
-            self.stream.as_ref().expect("checked connected")
+            self.stream
+                .as_ref()
+                .expect("checked connected")
                 .readable()
                 .await
                 .context("Failed to wait for IPC frame bytes")?;
 
             let mut chunk = [0u8; 8192];
-            match self.stream.as_ref().expect("checked connected").try_read(&mut chunk) {
+            match self
+                .stream
+                .as_ref()
+                .expect("checked connected")
+                .try_read(&mut chunk)
+            {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -3492,8 +3518,15 @@ impl PhiloticClient {
             let result = tokio::time::timeout(timeout, self.send_request(req)).await;
             return match result {
                 Ok(Ok(reply)) => Ok(reply),
-                Ok(Err(error)) => { self.disconnect(); Err(error) },
-                Err(elapsed) => { self.disconnect(); Err(anyhow::Error::new(elapsed).context("Protected IPC operation timed out; reconnect before reuse")) },
+                Ok(Err(error)) => {
+                    self.disconnect();
+                    Err(error)
+                }
+                Err(elapsed) => {
+                    self.disconnect();
+                    Err(anyhow::Error::new(elapsed)
+                        .context("Protected IPC operation timed out; reconnect before reuse"))
+                }
             };
         }
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
@@ -3525,8 +3558,14 @@ impl PhiloticClient {
     async fn read_matching_response(&mut self, req: &IpcRequest) -> Result<IpcResponse> {
         loop {
             let resp = self.read_response().await?;
-            if let IpcResponse::ProtectedAuthorityReply { protected_authority } = &resp {
-                if matches!(req, IpcRequest::ProtectedAuthority(request) if request.request_id() == protected_authority.request_id) { return Ok(resp); }
+            if let IpcResponse::ProtectedAuthorityReply {
+                protected_authority,
+            } = &resp
+            {
+                if matches!(req, IpcRequest::ProtectedAuthority(request) if request.request_id() == protected_authority.request_id)
+                {
+                    return Ok(resp);
+                }
                 return Err(self.correlation_error());
             }
 
@@ -3572,7 +3611,9 @@ impl PhiloticClient {
             if Self::is_ignorable_push(&resp) {
                 continue;
             }
-            if matches!(req, IpcRequest::ProtectedAuthority(_)) { return Err(self.correlation_error()); }
+            if matches!(req, IpcRequest::ProtectedAuthority(_)) {
+                return Err(self.correlation_error());
+            }
             return Ok(resp);
         }
     }
@@ -3685,7 +3726,9 @@ impl PhiloticClient {
 
         loop {
             let resp = self.read_response().await?;
-            if matches!(&resp, IpcResponse::ProtectedAuthorityReply { .. }) { return Err(self.correlation_error()); }
+            if matches!(&resp, IpcResponse::ProtectedAuthorityReply { .. }) {
+                return Err(self.correlation_error());
+            }
             if Self::is_push_message(&resp) {
                 return Ok(resp);
             }

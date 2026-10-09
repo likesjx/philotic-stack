@@ -401,4 +401,61 @@ mod tests {
         assert!(client.recv_task().await.is_err());
         assert!(client.stream.is_none());
     }
+    #[tokio::test]
+    async fn protected_cancel_never_promotes_resolution_or_claimed_stop_to_quiescence() {
+        for claimed_stop in [false, true] {
+            let (mut client, mut server, peer, envelope) = fixture();
+            let hotel = tokio::spawn(async move {
+                let r = request(&mut server).await;
+                if claimed_stop {
+                    let bytes = serde_json::to_vec(&serde_json::json!({
+                        "protected_authority": { "request_id": r.request_id(), "outcome": { "status": "confirmed_stop" } }
+                    })).unwrap();
+                    server.write_u32(bytes.len() as u32).await.unwrap();
+                    server.write_all(&bytes).await.unwrap();
+                } else {
+                    reply(&mut server, resolved(&r)).await;
+                }
+            });
+            assert!(
+                client
+                    .cancel_local_authority(peer, &envelope, Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+            assert!(client.stream.is_none());
+            hotel.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_rpc_deadline_includes_backpressured_partial_write() {
+        let (mut client, mut server, peer, mut envelope) = fixture();
+        envelope.payload = "s".repeat(1_048_576);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.resolve_local_authority(
+                peer,
+                &envelope,
+                "local",
+                ProcessingOperation::Inference,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(client.stream.is_none());
+        let mut bytes = vec![];
+        tokio::time::timeout(Duration::from_secs(1), server.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bytes.len() >= 4);
+        let advertised = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize + 4;
+        assert!(
+            bytes.len() < advertised,
+            "fixture must interrupt the write, not only its reply wait"
+        );
+    }
 }

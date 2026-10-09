@@ -1,7 +1,8 @@
 # Local authenticated task authority — consumer contract v2
 
-This isolated source checkpoint follows verified develop `689bfc7d` and the
-separate reviewed Beacon memory-refresh commit. Runtime installation is off.
+The publication branch follows verified develop `4de2b2ef`. The isolated
+checkpoint was replayed without its separate memory-refresh dependency.
+Runtime installation is off.
 No existing GuestIdentity registration has been promoted to authentication.
 
 ## Implemented trust boundary

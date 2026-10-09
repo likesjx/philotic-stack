@@ -59,7 +59,7 @@ must define that consistency contract before production rollout.
 
 Current IPC split branch `codex/ipc-split-s3` still owns hotel IPC dispatch modules,
 including mod.rs, routing_policy.rs and config_vault.rs. Beacon owns its separate
-SDK/memory-integration patch, already preserved at the dependency checkpoint. The renewed source-only integration scope permits isolated SDK and mod.rs edits.
+SDK/memory-integration patch; it is excluded from the publication branch. The renewed source-only integration scope permits isolated SDK and mod.rs edits.
 It avoids provider implementations,
 runtime.rs, Apple files, and shared architecture/task documents. The renewed scope
 authorizes isolated integration preparation, not overriding those workstreams.
