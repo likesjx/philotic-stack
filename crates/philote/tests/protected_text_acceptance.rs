@@ -87,10 +87,19 @@ fn state(case: &str) -> SessionState {
     let initial = SessionState::new(SESSION.into(), AGENT.into(), "synthetic-channel".into());
     let mut checkpoint = initial.checkpoint_json();
     checkpoint["active_turn"] = json!({"turn_id":"synthetic-turn","phase":"waiting_tool","user_content":"SYNTHETIC_USER",
-        "recalled_memories":[record()], "working_tool_history":[[
-        {"tool_name":"fixture.echo","arguments":{"input":"COMPLETE_TOOL_ARGUMENT"}},
-        {"tool_name":"fixture.echo","content":TOOL_RESULT}]]});
+        "recalled_memories":[record()], "working_tool_history":[{
+        "call":{"tool_name":"fixture.echo","arguments":{"input":"COMPLETE_TOOL_ARGUMENT"}},
+        "result":{"tool_name":"fixture.echo","content":TOOL_RESULT}}]});
     let mut state = SessionState::from_checkpoint(&checkpoint).unwrap();
+    assert_eq!(
+        state
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .working_tool_history
+            .len(),
+        1
+    );
     state.agent_profile.user_principal_id = Some(HUMAN.into());
     match case {
         "record-content" => state.active_turn.as_mut().unwrap().recalled_memories[0]
