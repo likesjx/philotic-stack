@@ -1,7 +1,8 @@
 //! Consumer adapter for the canonical local task authority, not an issuer.
 //!
-//! This synchronous seam must run on a blocking worker: local resolution reads
-//! SQLite. The hotel/SDK owner must supply the exact envelope, kernel-verified
+//! The local synchronous seam must run on a blocking worker: resolution reads
+//! SQLite. The async SDK seam offloads catalog/assembly work and rechecks before
+//! returning. The hotel/SDK owner supplies the exact envelope, kernel-verified
 //! consumer and server-classified endpoint for EACH assembly/attempt. Nothing
 //! here registers a guest, issues a handle, or trusts payload identity fields.
 use crate::{recall_selection::RecallAuthority, session::RecalledMemoryRecord};
@@ -11,6 +12,117 @@ use ansible_mesh_core::{
         LocalTaskAuthority, LocalTaskEnvelope, ResolvedLocalAuthority, VerifiedLocalSession,
     },
 };
+use philotic_client::{
+    PhiloticClient,
+    protected_authority::{TrustedHotelPeer, VerifiedLocalResolution},
+};
+use std::{sync::Arc, time::Duration};
+
+/// Supplied by the protected transport/endpoint owner, never task JSON or
+/// environment PID strings. This is an RPC request, not an authority grant.
+pub struct RecallRpcRequest<'a> {
+    pub hotel: TrustedHotelPeer,
+    pub envelope: &'a LocalTaskEnvelope,
+    pub endpoint: &'a str,
+    pub timeout: Duration,
+}
+
+impl crate::session::SessionState {
+    /// Resolve afresh for ONE immediate recall assembly, then discard the
+    /// snapshot. No legacy fallback on RPC failure. The canonical catalog must
+    /// bind full records/principals/sessions; there is no production lookup yet.
+    ///
+    /// This returns payloads, NOT a dispatch grant: selection changes bytes.
+    /// The final outgoing payload still needs fresh complete manifest binding
+    /// and actual-candidate authorization before every provider attempt.
+    pub async fn model_request_payloads_with_rpc_recall(
+        &self,
+        user_content: &str,
+        tools: &[crate::session::ToolDefinition],
+        client: &mut PhiloticClient,
+        request: RecallRpcRequest<'_>,
+        catalog: Arc<dyn CanonicalRecallCatalog + Send + Sync>,
+    ) -> anyhow::Result<(String, serde_json::Value, serde_json::Value)> {
+        if request.endpoint.trim().is_empty() || request.timeout.is_zero() {
+            anyhow::bail!("recall_authority_missing_endpoint_or_deadline");
+        }
+        let resolution = client
+            .resolve_local_authority(
+                request.hotel,
+                request.envelope,
+                request.endpoint,
+                ProcessingOperation::Inference,
+                request.timeout,
+            )
+            .await?;
+        let state = self.clone();
+        let content = user_content.to_owned();
+        let tools = tools.to_vec();
+        // Canonical lookups may block. The snapshot stays private to this one
+        // assembly; re-resolve after the worker before returning any payload.
+        let payloads = tokio::task::spawn_blocking(move || {
+            let authority = RpcRecallAuthority {
+                resolution,
+                catalog,
+            };
+            state.model_request_payloads_with_recall_authority(&content, &tools, Some(&authority))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("recall_assembly_worker_failed"))?;
+        // Queueing/storage work can outlive revocation, expiry or an incarnation.
+        // Deny the whole assembly if its original authority no longer resolves.
+        client
+            .resolve_local_authority(
+                request.hotel,
+                request.envelope,
+                request.endpoint,
+                ProcessingOperation::Inference,
+                request.timeout,
+            )
+            .await?;
+        Ok(payloads)
+    }
+}
+
+/// Private, single-assembly adapter. Only the SDK call above constructs it in
+/// production. The server already checked inference at its configured endpoint
+/// for the entire bound source manifest; this adds exact recall binding checks.
+struct RpcRecallAuthority {
+    resolution: VerifiedLocalResolution,
+    catalog: Arc<dyn CanonicalRecallCatalog + Send + Sync>,
+}
+impl RecallAuthority for RpcRecallAuthority {
+    fn permits(
+        &self,
+        principal: &str,
+        agent: &str,
+        session: &str,
+        record: &RecalledMemoryRecord,
+    ) -> bool {
+        if principal.trim().is_empty()
+            || session.trim().is_empty()
+            || self.resolution.actor.stable_agent_id() != agent
+        {
+            return false;
+        }
+        let Some(resource) =
+            self.catalog
+                .resource_for_record(&self.resolution.actor, principal, session, record)
+        else {
+            return false;
+        };
+        if resource.trim().is_empty() || !self.resolution.sources.contains(&resource) {
+            return false;
+        }
+        ansible_mesh_core::privacy::authorize_read(
+            &self.resolution.policies,
+            Some(&self.resolution.actor),
+            &resource,
+        )
+        .is_ok()
+    }
+    // No graph-content binding: retain default-deny.
+}
 
 /// Implemented by the authenticated transport owner. Never cache a resolved
 /// snapshot across attempts, retries, fallbacks, cancellation or re-entry.
@@ -339,5 +451,52 @@ mod tests {
             state.recent_turns[0].assistant_content.as_deref(),
             Some("MAIN_ASSISTANT")
         );
+    }
+
+    #[test]
+    fn rpc_assembly_adapter_requires_exact_record_subject_and_manifest_binding() {
+        // A synthetic binding-only fixture, not kernel/RPC authentication or
+        // egress proof. Production construction is private and follows SDK RPC.
+        let (local, record) = fixture(ProviderBoundary::LocalTrusted);
+        let resolved = local.resolver.resolve_current().unwrap();
+        let mut authority = RpcRecallAuthority {
+            resolution: VerifiedLocalResolution {
+                actor: resolved.actor,
+                policies: resolved.policies,
+                sources: resolved.sources,
+                payload_digest: resolved.payload_digest,
+                consumer_incarnation: resolved.consumer_incarnation,
+            },
+            catalog: Arc::new(Catalog(record.clone())),
+        };
+        assert!(permits(&authority, &record));
+        let mut changed = record.clone();
+        changed.content.push_str(" altered");
+        assert!(!permits(&authority, &changed));
+        assert!(!authority.permits(
+            "other-human",
+            "synthetic-agent",
+            "synthetic-session",
+            &record
+        ));
+        assert!(!authority.permits(
+            "synthetic-human",
+            "spoofed-agent",
+            "synthetic-session",
+            &record
+        ));
+        assert!(!authority.permits(
+            "synthetic-human",
+            "synthetic-agent",
+            "other-session",
+            &record
+        ));
+        assert!(!authority.permits_agent_graph(
+            "synthetic-human",
+            "synthetic-agent",
+            "synthetic-session"
+        ));
+        authority.resolution.sources.clear();
+        assert!(!permits(&authority, &record));
     }
 }
