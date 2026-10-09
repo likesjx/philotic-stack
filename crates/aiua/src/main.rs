@@ -44,6 +44,9 @@ use tracing::{error, info, warn};
 mod architect_charter;
 mod auth;
 mod autonomy_sweep;
+#[cfg(test)]
+#[path = "../build_version.rs"]
+mod build_version;
 mod cortex_viewer;
 mod dream;
 mod graph;
@@ -690,7 +693,7 @@ async fn handle_operator_surface_query_task(
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = env!("PHILOTIC_VERSION_DISPLAY"), about, long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
