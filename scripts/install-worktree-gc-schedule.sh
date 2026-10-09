@@ -3,18 +3,15 @@
 # every 2 hours on this macOS user account (the Air / mac-jane).
 #
 # WHAT IT SCHEDULES
-#   scripts/worktree-gc.sh --apply  — removes ONLY merged+clean+non-excluded
-#   sibling worktrees (see that script's safety invariants). Because --apply can
-#   never touch dirty or unmerged worktrees, an unattended run cannot destroy
-#   active work; the worst case is reclaiming a freshly-created, untouched
-#   worktree (pin it via PHILOTIC_WTGC_KEEP if that matters).
+#   scripts/worktree-gc.sh --dry-run — report only; never retire automatically.
+#   Applying a reviewed owner-release manifest is a separate manual operation.
 #
 # WHY launchd (not cron): survives logout/login, integrated logging, StartInterval.
 #
 # Behavior:
 #   - macOS only. Non-Darwin hosts print a note and exit 0.
 #   - RunAtLoad is FALSE: installing does NOT trigger an immediate --apply. The
-#     first run happens on the interval (or a manual `launchctl kickstart`).
+#     first report happens on the interval (or a manual `launchctl kickstart`).
 #   - Idempotent: re-running rewrites the plist and re-bootstraps cleanly.
 #
 # Usage: scripts/install-worktree-gc-schedule.sh
@@ -57,7 +54,7 @@ cat >"${PLIST}" <<PLIST_EOF
 	<key>ProgramArguments</key>
 	<array>
 		<string>${SCRIPT}</string>
-		<string>--apply</string>
+		<string>--dry-run</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

@@ -349,11 +349,11 @@ worktree-prune:
 worktree-gc:
     ./scripts/worktree-gc.sh --dry-run
 
-# Garbage-collect merged+clean sibling worktrees to reclaim cargo target/ disk (real deletion).
-worktree-gc-apply:
-    ./scripts/worktree-gc.sh --apply
+# Retire explicitly released, pristine worktrees (branches and artifacts are retained).
+worktree-gc-apply release_file:
+    ./scripts/worktree-gc.sh --apply --release-file {{quote(release_file)}}
 
-# Install the launchd schedule that runs worktree-gc --apply every 2 hours (mac-jane / macOS).
+# Install a report-only schedule. Re-enabling an existing disabled job is separate.
 worktree-gc-schedule:
     ./scripts/install-worktree-gc-schedule.sh
 
