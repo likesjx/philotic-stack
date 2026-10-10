@@ -76,6 +76,30 @@ final class VoiceSessionTests: XCTestCase {
         }
     }
 
+    func testCarPlayDeniedBeforeCaptureAndWithoutDispatchingAudio() async throws {
+        let h = try Harness()
+        try await h.select(AgentTarget.builtIn[3])
+        XCTAssertFalse(h.manager.canStartCarPlayConversation)
+        let lease = await h.manager.startConversation(carPlay: true)
+        XCTAssertNil(lease)
+        XCTAssertFalse(h.manager.isConversationActive)
+        XCTAssertFalse(h.manager.voiceController.isCapturingPCM)
+        XCTAssertEqual(h.submitted.count, 0)
+        XCTAssertTrue(h.manager.voiceController.voiceError?.contains("private local transcription") == true)
+        await h.close()
+    }
+
+    func testUnownedCarPlayEndCannotInvalidatePhoneReply() async throws {
+        let h = try Harness()
+        try await h.select(AgentTarget.builtIn[3])
+        let conversation = try await h.submit(turnID: "phone-turn")
+        await h.manager.endCarPlayConversation(lease: UUID())
+        await h.finish(conversationID: conversation, turnID: "phone-turn", text: "phone reply")
+        try await h.waitForSpeech()
+        XCTAssertEqual(h.spoken, ["phone reply"])
+        await h.close()
+    }
+
     func testRepeatedInterruptNewTurnOldFinalRaceSpeaksOnlyNewTurn() async throws {
         let h = try Harness()
         try await h.select(AgentTarget.builtIn[0])
