@@ -3,7 +3,7 @@ title: Native Apple App — Edge Client Program
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-09-17
+last_updated: 2026-10-10
 tags:
 - apple
 - ios
@@ -417,6 +417,18 @@ summary until that server-side persistence gap is closed.
 ## Disposition
 
 `accepted for current slice`
+
+CarPlay foundation (October 10): source adapter and capture-lease lifecycle are
+implemented behind `PHILOTIC_CARPLAY`, reusing existing chat/voice routing. The
+category requires iOS 26.4+ and Apple's voice-conversational entitlement; no
+eligibility, grant, capability activation or live-car verification is claimed.
+Integrated onto verified remote develop `3144e429` with existing private voice
+denial intact: the bridge and session cannot start capture; phone preparation
+is not a policy grant. Exact capture leases and existing correlated
+`VoiceTurnGate` invalidation replace the older suppression approach. Trusted
+voice/privacy dispatch remains blocked, and entitlement activation is deferred.
+See the [source contract and
+activation boundary](../../apps/philotic-apple/CARPLAY.md) and [execution work](../task.md).
 
 ## Slices (dependency-ordered)
 
