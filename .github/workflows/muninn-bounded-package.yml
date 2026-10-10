@@ -99,6 +99,8 @@ jobs:
           cargo run --locked --release -p philote --example muninn_rollout_fixture -- emit 12000 > ../fixture-output/baseline-long.json
       - name: Parse both generations through the baseline provider context code
         working-directory: baseline
+        env:
+          PHILOTIC_BUILD_SHA: '57b13ba0087722a2de062ff86710ae64a510d445'
         run: |
           set -euo pipefail
           for generation in baseline candidate; do
@@ -108,10 +110,14 @@ jobs:
           done
       - name: Restore baseline checkpoint with candidate session code
         working-directory: candidate
+        env:
+          PHILOTIC_BUILD_SHA: '3144e42930d575532249e0133dc15e10b45afb58'
         run: |
           python3 -c 'import json; print(json.dumps(json.load(open("../fixture-output/baseline-long.json"))["checkpoint"]))' | cargo run --locked --release -p philote --example muninn_rollout_fixture -- restore > ../fixture-output/candidate-restores-baseline.json
       - name: Restore candidate checkpoint with baseline session code
         working-directory: baseline
+        env:
+          PHILOTIC_BUILD_SHA: '57b13ba0087722a2de062ff86710ae64a510d445'
         run: |
           python3 -c 'import json; print(json.dumps(json.load(open("../fixture-output/candidate-long.json"))["checkpoint"]))' | cargo run --locked --release -p philote --example muninn_rollout_fixture -- restore > ../fixture-output/baseline-restores-candidate.json
       - name: Assert compatibility and record deliberate behavioral gaps
