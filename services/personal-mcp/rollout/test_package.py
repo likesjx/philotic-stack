@@ -131,6 +131,19 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(OSError):
             package.verify(alias, receipt)
 
+    def test_parent_alias_denies_inputs_outputs_and_verification(self):
+        alias = self.root / 'parent-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            package.package(alias / 'binaries', self.root / 'denied-input', package.CANDIDATE, 123)
+        with self.assertRaises(ValueError):
+            package.package(self.binaries, alias / 'denied-output', package.CANDIDATE, 123)
+        self.assertFalse((self.root / 'denied-input').exists())
+        self.assertFalse((self.root / 'denied-output').exists())
+        archive, receipt = self.build()
+        with self.assertRaises(ValueError):
+            package.verify(alias / archive.relative_to(self.root), receipt)
+
     def test_extra_archive_member_even_with_rehashed_receipt(self):
         archive, receipt = self.build()
         def extra(contents):

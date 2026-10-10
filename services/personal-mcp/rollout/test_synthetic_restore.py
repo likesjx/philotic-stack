@@ -106,6 +106,30 @@ class ColdStateRestoreTests(unittest.TestCase):
         with self.assertRaises(OSError):
             rollback.snapshot(self.root)
 
+    def test_crash_residue_and_alias_do_not_block_retry_or_get_touched(self):
+        before = {n: (self.root / n).read_bytes() for n in rollback.FILES}
+        rollback.snapshot(self.root)
+        self.mutate()
+        residue = self.root / 'hotel.db.restore.interrupted'
+        residue.write_bytes(b'partial public fixture')
+        old_fixed = self.root / 'hotel.db.restore.tmp'
+        old_fixed.symlink_to(residue)
+        rollback.restore(self.root)
+        self.assertEqual(before, {n: (self.root / n).read_bytes() for n in rollback.FILES})
+        self.assertEqual(residue.read_bytes(), b'partial public fixture')
+        self.assertTrue(old_fixed.is_symlink())
+
+    def test_invalid_later_target_denies_before_any_target_mutation(self):
+        rollback.snapshot(self.root)
+        self.mutate()
+        before = (self.root / rollback.FILES[0]).read_bytes()
+        target = self.root / rollback.FILES[-1]
+        target.unlink()
+        target.symlink_to(self.root / rollback.FILES[0])
+        with self.assertRaises(ValueError):
+            rollback.restore(self.root)
+        self.assertEqual((self.root / rollback.FILES[0]).read_bytes(), before)
+
 
 if __name__ == '__main__':
     unittest.main()

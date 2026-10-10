@@ -36,6 +36,7 @@ def canonical(value):
 
 
 def regular_bytes(path):
+    require(Path(path).absolute().parent == Path(path).parent.resolve(), 'binary parent alias')
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, 'rb') as stream:
         info = os.fstat(stream.fileno())
@@ -87,6 +88,8 @@ def package(binaries, output, source_sha, run_id):
     require(source_sha == CANDIDATE, 'only the reviewed candidate may be packaged')
     require(type(run_id) is int and run_id > 0, 'positive GitHub workflow run ID required')
     binaries, output = Path(binaries), Path(output)
+    require(binaries.absolute() == binaries.resolve() and output.absolute() == output.resolve(),
+            'binary/output directory alias')
     require(binaries.is_dir() and not binaries.is_symlink(), 'binary directory required')
     contents = {}
     for name in TRIO:
@@ -131,6 +134,7 @@ def package(binaries, output, source_sha, run_id):
 
 
 def verify(archive, receipt):
+    require(Path(archive).absolute().parent == Path(archive).parent.resolve(), 'archive parent alias')
     require(isinstance(receipt, dict) and set(receipt) == {'schema', 'candidate_source', 'workflow_run_id',
             'manifest_sha256', 'archive_sha256', 'components'}, 'receipt fields')
     require(receipt['schema'] == 1 and receipt['candidate_source'] == CANDIDATE, 'receipt source/schema')

@@ -72,11 +72,15 @@ def restore(root):
     # Validate every snapshot before the first write. On interruption callers
     # must keep the runtime stopped and rerun restoration; never start from a
     # partially restored tree. The immutable snapshot remains available.
+    require(all(stat.S_ISREG((root / name).lstat().st_mode) for name in FILES),
+            'restore targets must remain regular')
     for name, value in values.items():
         path = root / name
         require(stat.S_ISREG(path.lstat().st_mode), 'restore target must remain regular')
-        tmp = path.with_name(path.name + '.restore.tmp')
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        # Unique exclusive files make leftovers from a killed process harmless
+        # to retries. Never follow, reuse, or delete another attempt's residue.
+        fd, tmp_name = tempfile.mkstemp(prefix=path.name + '.restore.', dir=path.parent)
+        tmp = Path(tmp_name)
         try:
             with os.fdopen(fd, 'wb') as f:
                 f.write(value)
