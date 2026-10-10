@@ -16,30 +16,40 @@ Do not run `systemctl cat`, inspect Environment/ExecStart, dump `/proc/*/environ
 
 ## Existing canonical SQLite metadata
 
-The following script receives only the owner-reviewed existing path. It opens read-only with no CREATE, never selects policy/resource rows, and emits only file identity/ownership/mode, schema version, journal mode and allowlisted column definitions. Do not initialize/migrate/backfill the database. Do not include schema SQL text or row counts.
+The initial probe opens no SQLite connection. Even `mode=ro` can create/update WAL auxiliary files; `query_only` does not prevent that. Do not substitute `immutable=1` for an actively changing database: it disables locking and change detection. Read only the 100-byte main-file header through an existing file descriptor opened with O_RDONLY/O_NOFOLLOW. These are **main-file metadata, potentially stale**, not current transactional authority. Obtain column definitions from the owner's reviewed migration manifest; live schema inspection requires a separately reviewed method.
 
 ```sh
 python3 - "$APPROVED_CANONICAL_POLICY_PATH" <<'PY'
-import json, os, sqlite3, stat, sys
-from urllib.parse import quote
+import json, os, stat, sys
 path = os.path.abspath(sys.argv[1])
-s = os.lstat(path)
-if not stat.S_ISREG(s.st_mode): raise SystemExit('Metadata probe denied')
-db = sqlite3.connect('file:' + quote(path, safe='/') + '?mode=ro', uri=True)
-db.execute('PRAGMA query_only=ON')
-columns = {}
-for table in ('privacy_revision','privacy_policy','local_authority_receipt','capture_inbox'):
-    columns[table] = [{'name': r[1], 'type': r[2], 'notnull': bool(r[3]), 'pk': bool(r[5])}
-                      for r in db.execute('PRAGMA table_info(' + table + ')')]
-print(json.dumps({'device': str(s.st_dev), 'inode': str(s.st_ino), 'uid': s.st_uid,
-                  'mode': oct(stat.S_IMODE(s.st_mode)),
-                  'user_version': db.execute('PRAGMA user_version').fetchone()[0],
-                  'journal_mode': db.execute('PRAGMA journal_mode').fetchone()[0], 'columns': columns}))
-db.close()
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode): raise SystemExit('Metadata probe denied')
+    header = os.pread(fd, 100, 0)
+    after = os.fstat(fd)
+    current = os.lstat(path)
+    if not stat.S_ISREG(current.st_mode): raise SystemExit('Metadata probe denied')
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    if identity(before) != identity(after): raise SystemExit('Metadata probe denied')
+    if (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino):
+        raise SystemExit('Metadata probe denied')
+    if len(header) != 100 or header[:16] != b'SQLite format 3\x00':
+        raise SystemExit('Metadata probe denied')
+    read_format, write_format = header[19], header[18]
+    print(json.dumps({'device': str(after.st_dev), 'inode': str(after.st_ino),
+        'uid': after.st_uid, 'mode': oct(stat.S_IMODE(after.st_mode)),
+        'main_file_user_version': int.from_bytes(header[60:64], 'big'),
+        'read_format': read_format, 'write_format': write_format,
+        'metadata_authority': 'main-file-only-potentially-stale'}))
+    if (read_format, write_format) != (1, 1):
+        raise SystemExit('Stop: WAL or unknown format; further probe requires review')
+finally:
+    os.close(fd)
 PY
 ```
 
-Expected source requirement is version2 with the named columns and DELETE journal mode. An incompatible/missing store keeps admission disabled; it does not authorize changing the store.
+Format1/1 indicates rollback-journal format but does not distinguish DELETE from PERSIST/TRUNCATE or prove absence of an active transaction/hot journal. Format2/2 indicates WAL and stops this proposal. The source requires version2 and DELETE journal mode; header metadata does not authorize admission, initialization, migration or backfill. No records, schema SQL text, column values or counts are read.
 
 ## Memgraph metadata through the existing approved adapter
 
