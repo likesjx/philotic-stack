@@ -1,0 +1,134 @@
+name: Muninn bounded hotel package
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'services/personal-mcp/rollout/**'
+      - '.github/workflows/muninn-bounded-package.yml'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: muninn-package-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  package-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -B -m unittest discover -s services/personal-mcp/rollout -v
+  pinned-source-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      PHILOTIC_VAULT_MASTER_KEY: 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+          persist-credentials: false
+      - name: Check out exact candidate runtime source
+        uses: actions/checkout@v4
+        with:
+          ref: '3144e42930d575532249e0133dc15e10b45afb58'
+          path: candidate
+          persist-credentials: false
+      - name: Check out exact hotfix source for compatibility fixtures
+        uses: actions/checkout@v4
+        with:
+          ref: '57b13ba0087722a2de062ff86710ae64a510d445'
+          path: baseline
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            candidate/target
+            baseline/target
+          key: muninn-bounded-x86-v1-${{ hashFiles('candidate/Cargo.lock', 'baseline/Cargo.lock') }}
+      - name: Verify source pins before building
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = 3144e42930d575532249e0133dc15e10b45afb58
+          test "$(git -C baseline rev-parse HEAD)" = 57b13ba0087722a2de062ff86710ae64a510d445
+          test -z "$(git -C candidate status --porcelain)"
+      - name: Build only the candidate hotel packages
+        working-directory: candidate
+        env:
+          PHILOTIC_BUILD_SHA: '3144e42930d575532249e0133dc15e10b45afb58'
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p aiua -p philote -p heal-dispatcher
+      - name: Assemble and verify exact three-binary package
+        run: |
+          python3 tools/services/personal-mcp/rollout/package.py \
+            --binaries candidate/target/x86_64-unknown-linux-gnu/release \
+            --output package-output \
+            --source-sha 3144e42930d575532249e0133dc15e10b45afb58 \
+            --workflow-run-id "$GITHUB_RUN_ID"
+      - name: Stage public synthetic fixture examples after runtime packaging
+        run: |
+          set -euo pipefail
+          mkdir -p candidate/crates/philote/examples baseline/crates/philote/examples baseline/crates/model-router/examples fixture-output
+          cp tools/services/personal-mcp/rollout/compat/philote.rs candidate/crates/philote/examples/muninn_rollout_fixture.rs
+          cp tools/services/personal-mcp/rollout/compat/philote.rs baseline/crates/philote/examples/muninn_rollout_fixture.rs
+          cp tools/services/personal-mcp/rollout/compat/openrouter.rs baseline/crates/model-router/examples/muninn_rollout_parser.rs
+      - name: Produce candidate session and context fixtures
+        working-directory: candidate
+        env:
+          PHILOTIC_BUILD_SHA: '3144e42930d575532249e0133dc15e10b45afb58'
+        run: |
+          cargo run --locked --release -p philote --example muninn_rollout_fixture -- emit 0 > ../fixture-output/candidate-short.json
+          cargo run --locked --release -p philote --example muninn_rollout_fixture -- emit 12000 > ../fixture-output/candidate-long.json
+      - name: Produce baseline session and context fixtures
+        working-directory: baseline
+        env:
+          PHILOTIC_BUILD_SHA: '57b13ba0087722a2de062ff86710ae64a510d445'
+        run: |
+          cargo run --locked --release -p philote --example muninn_rollout_fixture -- emit 0 > ../fixture-output/baseline-short.json
+          cargo run --locked --release -p philote --example muninn_rollout_fixture -- emit 12000 > ../fixture-output/baseline-long.json
+      - name: Parse both generations through the baseline provider context code
+        working-directory: baseline
+        env:
+          PHILOTIC_BUILD_SHA: '57b13ba0087722a2de062ff86710ae64a510d445'
+        run: |
+          set -euo pipefail
+          for generation in baseline candidate; do
+            for size in short long; do
+              cargo run --locked --release -p model-router --example muninn_rollout_parser < "../fixture-output/${generation}-${size}.json" > "../fixture-output/${generation}-${size}-old-provider.json"
+            done
+          done
+      - name: Restore baseline checkpoint with candidate session code
+        working-directory: candidate
+        env:
+          PHILOTIC_BUILD_SHA: '3144e42930d575532249e0133dc15e10b45afb58'
+        run: |
+          python3 -c 'import json; print(json.dumps(json.load(open("../fixture-output/baseline-long.json"))["checkpoint"]))' | cargo run --locked --release -p philote --example muninn_rollout_fixture -- restore > ../fixture-output/candidate-restores-baseline.json
+      - name: Restore candidate checkpoint with baseline session code
+        working-directory: baseline
+        env:
+          PHILOTIC_BUILD_SHA: '57b13ba0087722a2de062ff86710ae64a510d445'
+        run: |
+          python3 -c 'import json; print(json.dumps(json.load(open("../fixture-output/candidate-long.json"))["checkpoint"]))' | cargo run --locked --release -p philote --example muninn_rollout_fixture -- restore > ../fixture-output/baseline-restores-candidate.json
+      - name: Assert compatibility and record deliberate behavioral gaps
+        run: python3 tools/services/personal-mcp/rollout/compat/assert_results.py fixture-output
+      - name: Publish non-secret package manifest and receipt
+        run: |
+          cat package-output/manifest.json
+          cat package-output/receipt.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muninn-bounded-hotel-linux-x86_64
+          path: package-output/
+          retention-days: 14
+          if-no-files-found: error
