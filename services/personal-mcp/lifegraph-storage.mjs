@@ -1,6 +1,7 @@
 // Read-only adapter to the existing canonical privacy SQLite schema. The graph
 // export and coordinated release barrier remain server-owned interfaces; no
 // Memgraph address, credentials, unreviewed schema mapping or grant is inferred.
+import { constants, openSync, closeSync, fstatSync, lstatSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -8,20 +9,38 @@ const fail = () => { throw new Error('LifeGraph storage unavailable'); };
 const boundedText = value => typeof value === 'string' && value.trim() && value.length <= 128;
 const ownKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k));
 const revisionFor = (graph, policy) => createHash('sha256').update(JSON.stringify([graph, policy])).digest('hex');
-export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, releaseBarrier }) {
+export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, releaseBarrier, storeIdentity }) {
   if (typeof policyDatabase !== 'string' || !isAbsolute(policyDatabase) || policyDatabase.includes('\0') ||
       typeof graphReader?.readSnapshot !== 'function' || typeof releaseBarrier?.admit !== 'function') fail();
-  let db;
+  let db, fd;
+  const expected = storeIdentity && { device: storeIdentity.device, inode: storeIdentity.inode };
+  const verifyIdentity = () => {
+    if (!expected) return;
+    for (const stat of [fstatSync(fd), lstatSync(policyDatabase)]) {
+      if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0 ||
+          String(stat.dev) !== expected.device || String(stat.ino) !== expected.inode) fail();
+    }
+  };
   try {
     // readOnly refuses a missing database; no init/migrate/create side effects.
-    db = new DatabaseSync(policyDatabase, { readOnly: true, timeout: 1000 });
+    if (expected) {
+      if (process.platform !== 'linux' || typeof expected.device !== 'string' || typeof expected.inode !== 'string') fail();
+      fd = openSync(policyDatabase, constants.O_RDONLY | constants.O_NOFOLLOW);
+      verifyIdentity();
+    }
+    db = new DatabaseSync(expected ? `/proc/self/fd/${fd}` : policyDatabase, { readOnly: true, timeout: 1000 });
+    verifyIdentity();
+    // FD aliases cannot safely locate canonical WAL sidecars. Deny rather than
+    // silently opening another journal authority; production mode is surveyed.
+    if (expected && db.prepare('PRAGMA journal_mode').get().journal_mode !== 'delete') fail();
     db.exec('PRAGMA query_only = ON');
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name);
     if (!tables.includes('privacy_revision') || !tables.includes('privacy_policy')) fail();
     db.prepare('SELECT singleton, revision FROM privacy_revision WHERE singleton=1').get();
     db.prepare('SELECT resource, policy_json FROM privacy_policy LIMIT 0').all();
-  } catch { db?.close(); fail(); }
+  } catch { try { db?.close(); } finally { if (fd !== undefined) closeSync(fd); } fail(); }
   const liveRevision = () => {
+    verifyIdentity();
     const rows = db.prepare('SELECT singleton, revision FROM privacy_revision').all();
     if (rows.length !== 1 || rows[0].singleton !== 1 || !Number.isSafeInteger(rows[0].revision) || rows[0].revision < 1) fail();
     return String(rows[0].revision);
@@ -48,7 +67,7 @@ export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, r
   }
   return Object.freeze({
     bindResponse(request, response) { releaseBarrier.bindResponse?.(request, response); },
-    verifyResponse(request, result) { return typeof releaseBarrier.verifyResponse !== 'function' || releaseBarrier.verifyResponse(request, result) === true; },
+    verifyResponse(request, result) { try { verifyIdentity(); return typeof releaseBarrier.verifyResponse !== 'function' || releaseBarrier.verifyResponse(request, result) === true; } catch { return false; } },
     async snapshot(context) {
       try {
         context.signal?.throwIfAborted();
@@ -77,6 +96,7 @@ export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, r
                 JSON.stringify([...sourcePolicyManifest].sort()) !== JSON.stringify([...policy.sources].sort()))) fail();
             return { ...record, policy };
           };
+          verifyIdentity();
           const selected = new Set(ids);
           return { namespace: context.namespace, revision: revisionFor(raw.revision, policyRevision),
             nodes: raw.nodes.map(withPolicy),
@@ -104,6 +124,6 @@ export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, r
         return checked && admitted === true;
       } catch { return false; }
     },
-    close() { db.close(); },
+    close() { try { db.close(); } finally { if (fd !== undefined) closeSync(fd); } },
   });
 }

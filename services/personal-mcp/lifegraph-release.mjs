@@ -71,6 +71,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
     verifyResponse(request, result) {
       const binding = responses.get(request);
       if (!binding || !active.has(binding) || binding.finished || binding.response.destroyed ||
+          (typeof binding.lease?.validate === 'function' && binding.lease.validate() !== true) ||
           !Array.isArray(result?.content) || result.content.length !== 1 || result.content[0]?.type !== 'text' ||
           typeof result.content[0].text !== 'string') return false;
       return createHash('sha256').update(result.content[0].text).digest('hex') === binding.responseDigest;
@@ -109,6 +110,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
         s.check();
         const graphRevision = await graphAuthority.currentRevision({ actor,
           namespace: admission.namespace, signal: s.signal }); s.check();
+        if (typeof lease.validate === 'function' && lease.validate() !== true) return false;
         if (validateCurrentPolicy({ actor, graphRevision }) !== true) return false;
         s.check();
         if (binding.finished || binding.response.destroyed || binding.response.writableEnded) return false;
@@ -121,6 +123,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
         const prior = binding.cleanup;
         binding.cleanup = () => { s.signal.removeEventListener('abort', abort); prior(); };
         binding.responseDigest = admission.responseDigest;
+        binding.lease = lease;
         active.add(binding); transferred = true; return true;
       } catch { return false; }
       finally { if (!transferred) await cleanup(); }

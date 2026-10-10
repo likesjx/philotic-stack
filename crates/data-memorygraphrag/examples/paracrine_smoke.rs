@@ -19,6 +19,7 @@ use ulid::Ulid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    datasource::memgraph_enrollment::require_memgraph_enrollment()?;
     let uri =
         std::env::var("PHILOTIC_MEMGRAPH_URI").unwrap_or_else(|_| "100.64.212.8:7687".to_string());
     let user = std::env::var("PHILOTIC_MEMGRAPH_USER").unwrap_or_default();
