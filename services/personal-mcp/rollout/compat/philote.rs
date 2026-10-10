@@ -21,7 +21,9 @@ fn main() {
     assert!(size <= 20_000);
     let checkpoint = json!({
         "session_id": "synthetic-rollout", "agent_id": "synthetic-agent", "source": "synthetic",
-        "fallback_override": ["model.openrouter", "model.ollama"],
+        "fallback_override": {"origin_tier_role":"model.openrouter", "active_tier_role":"model.openrouter",
+                              "reason":"synthetic", "since_epoch_ms":1,
+                              "last_probe_epoch_ms":1, "notice_sent":false},
         "context_request_limits": {"input_tokens":512, "output_tokens":256},
         "active_turn": {"turn_id":"synthetic-turn", "task_id":"00000000-0000-0000-0000-000000000001",
                         "phase":"waiting_tool", "user_content":"SYNTHETIC_CURRENT_MESSAGE"}

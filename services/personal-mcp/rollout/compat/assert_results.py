@@ -4,6 +4,9 @@ from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+override = {'origin_tier_role':'model.openrouter', 'active_tier_role':'model.openrouter',
+            'reason':'synthetic', 'since_epoch_ms':1, 'last_probe_epoch_ms':1, 'notice_sent':False}
+limits = {'input_tokens':512, 'output_tokens':256}
 def read(name):
     return json.loads((root / (name + '.json')).read_text())
 
@@ -14,7 +17,8 @@ for kind in ['baseline', 'candidate']:
     payload = read(kind + '-long')
     checkpoint = payload['checkpoint']
     assert checkpoint['session_id'] == 'synthetic-rollout'
-    assert checkpoint['fallback_override'] == ['model.openrouter', 'model.ollama']
+    assert checkpoint['fallback_override'] == override
+    assert checkpoint['context_request_limits'] == limits
     assert checkpoint['active_turn']['recalled_memories'][0]['content'] == 'SYNTHETIC_UNATTESTED_RECALL'
 
 candidate = read('candidate-long-old-provider')
@@ -28,7 +32,8 @@ assert candidate['current_message_occurrences'] == 2, 'expected old flat-prompt 
 for name in ['candidate-restores-baseline', 'baseline-restores-candidate']:
     checkpoint = read(name)['checkpoint']
     assert checkpoint['session_id'] == 'synthetic-rollout'
-    assert checkpoint['fallback_override'] == ['model.openrouter', 'model.ollama']
+    assert checkpoint['fallback_override'] == override
+    assert checkpoint['context_request_limits'] == limits
     assert checkpoint['active_turn']['turn_id'] == 'synthetic-turn'
     assert checkpoint['active_turn']['recalled_memories'][0]['content'] == 'SYNTHETIC_UNATTESTED_RECALL'
 
