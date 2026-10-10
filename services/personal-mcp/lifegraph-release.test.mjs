@@ -74,3 +74,16 @@ test('handoff verifies the exact admitted payload and rejects changed text or an
   assert.equal(f.coordinator.verifyResponse(f.request, { content: [{ type: 'text', text: 'changed' }] }), false);
   f.res.finish(); await turn(); assert.equal(f.coordinator.verifyResponse(f.request, result), false);
 });
+test('daemon fence is acquired before issuer checks and retained through policy release and HTTP handoff',async()=>{
+  const order=[];let valid=true;
+  const f=fixture({
+    issuerAuthority:{resolveCurrent:async()=>{order.push('actor');return actor;}},
+    policyAuthority:{pin:async()=>{order.push('policy');return{release:async()=>order.push('policy-release')};}},
+    graphAuthority:{readSnapshot:async()=>{},currentRevision:async()=>{throw Error('unfenced read');},
+      pinRelease:async()=>{order.push('daemon-pin');return{validate:()=>valid,currentRevision:async()=>{order.push('pinned-revision');return'1';},release:async()=>order.push('daemon-release')};}}
+  });
+  assert.equal(await f.coordinator.admit(f.admission,f.check),true);
+  assert.deepEqual(order,['daemon-pin','actor','policy','pinned-revision']);
+  valid=false;assert.equal(f.coordinator.verifyResponse(f.request,{content:[{type:'text',text:'synthetic'}]}),false);
+  f.res.finish();await turn();assert.deepEqual(order.slice(-2),['policy-release','daemon-release']);
+});

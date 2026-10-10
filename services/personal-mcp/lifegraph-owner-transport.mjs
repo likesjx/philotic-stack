@@ -28,9 +28,8 @@ export function createLifeGraphOwnerTransport({ socketPath, ownerIdentity, reque
         !socket.isSocket() || socket.uid !== process.getuid() || (socket.mode & 0o077) !== 0) fail();
     return `${socket.dev}:${socket.ino}`;
   };
-  return Object.freeze({ async readTransaction({ signal } = {}, work) {
+  async function openSession({ signal } = {}, begin) {
     signal?.throwIfAborted();
-    if (typeof work !== 'function') fail();
     const expectedSocket = checkSocket(), session = randomUUID(), deadline = performance.now() + requestDeadlineMs;
     const socket = createConnection({ path: socketPath });
     let pending, sequence = 0, closed = false, header = Buffer.alloc(4), headerBytes = 0, body, bodyBytes = 0;
@@ -84,18 +83,46 @@ export function createLifeGraphOwnerTransport({ socketPath, ownerIdentity, reque
         pending = { reject,sequence:0 };
         socket.once('connect', () => { pending = null; try { check(); resolve(); } catch { stop(); reject(new Error('LifeGraph owner unavailable')); } });
       });
-      if (await send('begin_snapshot', {}) !== true) fail();
-      const result = await work({ async query(query, parameters) {
-        const operation = operations.get(query); if (!operation) fail(); validateParameters(operation,parameters);
-        const rows = await send(operation,parameters); if (!Array.isArray(rows) || rows.length > (operation === 'nodes' ? 2049 : 2)) fail();
-        return rows;
-      } });
-      check(); if (await send('finish_snapshot', {}) !== true) fail(); check(); return result;
-    } catch { fail(); }
-    finally {
-      // Connection close is rollback/cancel on the owner. That owner must keep
-      // its reservation until transaction rollback and server quiescence ack.
-      stop(); clearTimeout(timer); signal?.removeEventListener('abort', stop);
+      if (await send(begin, {}) !== true) fail();
+      let reading = false, released = false;
+      return Object.freeze({
+        validate() { try { check(); return !released; } catch { return false; } },
+        async readTransaction(_context, work) {
+          check(); if (released || reading || typeof work !== 'function') fail();
+          reading = true;
+          try {
+            if (begin === 'begin_release' && await send('start_read', {}) !== true) fail();
+            const result = await work({ async query(query, parameters) {
+              const operation = operations.get(query); if (!operation) fail(); validateParameters(operation,parameters);
+              const rows = await send(operation,parameters);
+              if (!Array.isArray(rows) || rows.length > (operation === 'nodes' ? 2049 : 2)) fail();
+              return rows;
+            } });
+            check();
+            if (begin === 'begin_release' && await send('finish_read', {}) !== true) fail();
+            return result;
+          } catch { stop(); fail(); }
+          finally { reading = false; }
+        },
+        async release() {
+          if (released) return;
+          released = true;
+          try {
+            check(); if (reading) fail();
+            if (await send(begin === 'begin_release' ? 'end_release' : 'finish_snapshot', {}) !== true) fail();
+          } finally { stop(); clearTimeout(timer); signal?.removeEventListener('abort', stop); }
+        },
+      });
+    } catch {
+      stop(); clearTimeout(timer); signal?.removeEventListener('abort', stop); fail();
     }
-  } });
+  }
+  return Object.freeze({
+    pinRelease(context) { return openSession(context, 'begin_release'); },
+    async readTransaction(context, work) {
+      const session = await openSession(context, 'begin_snapshot');
+      try { return await session.readTransaction(context, work); }
+      finally { await session.release(); }
+    },
+  });
 }

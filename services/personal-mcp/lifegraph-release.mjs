@@ -72,6 +72,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
       const binding = responses.get(request);
       if (!binding || !active.has(binding) || binding.finished || binding.response.destroyed ||
           (typeof binding.lease?.validate === 'function' && binding.lease.validate() !== true) ||
+          (typeof binding.graphLease?.validate === 'function' && binding.graphLease.validate() !== true) ||
           !Array.isArray(result?.content) || result.content.length !== 1 || result.content[0]?.type !== 'text' ||
           typeof result.content[0].text !== 'string') return false;
       return createHash('sha256').update(result.content[0].text).digest('hex') === binding.responseDigest;
@@ -91,24 +92,29 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
       if (!binding || binding.used || binding.finished || typeof validateCurrentPolicy !== 'function' ||
           !/^[a-f0-9]{64}$/.test(admission.responseDigest ?? '')) return false;
       binding.used = true;
-      const s = scope(admission.signal); let unlock, lease, transferred = false;
+      const s = scope(admission.signal); let unlock, lease, graphLease, transferred = false;
       const cleanup = async () => {
         s.clear();
         // Keep the gate until the real reservation is released. A hung owner
         // fails closed; its supervisor must terminate/recover that owner.
-        try { await lease?.release(); }
+        try { await lease?.release(); await graphLease?.release(); }
         catch (error) { stopped = true; throw error; }
         finally { active.delete(binding); unlock?.(); }
       };
       try {
         unlock = await acquire(s.signal); s.check();
+        if (typeof graphAuthority.pinRelease === 'function') {
+          graphLease = await graphAuthority.pinRelease({ namespace: admission.namespace, signal: s.signal });
+          if (typeof graphLease?.release !== 'function' || typeof graphLease.currentRevision !== 'function') unavailable();
+          s.check();
+        }
         const actor = await issuerAuthority.resolveCurrent({ request: admission.request,
           actor: structuredClone(admission.actor), signal: s.signal }); s.check();
         if (!same(actor, admission.actor)) return false;
         lease = await policyAuthority.pin({ actor, namespace: admission.namespace, signal: s.signal });
         if (typeof lease?.release !== 'function') unavailable();
         s.check();
-        const graphRevision = await graphAuthority.currentRevision({ actor,
+        const graphRevision = await (graphLease ? graphLease.currentRevision : graphAuthority.currentRevision)({ actor,
           namespace: admission.namespace, signal: s.signal }); s.check();
         if (typeof lease.validate === 'function' && lease.validate() !== true) return false;
         if (validateCurrentPolicy({ actor, graphRevision }) !== true) return false;
@@ -123,7 +129,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
         const prior = binding.cleanup;
         binding.cleanup = () => { s.signal.removeEventListener('abort', abort); prior(); };
         binding.responseDigest = admission.responseDigest;
-        binding.lease = lease;
+        binding.lease = lease; binding.graphLease = graphLease;
         active.add(binding); transferred = true; return true;
       } catch { return false; }
       finally { if (!transferred) await cleanup(); }

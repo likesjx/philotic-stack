@@ -19,12 +19,18 @@ export function createLifeGraphOwnedStorage({ enabled = false, profile, policyDa
     const transport = createLifeGraphOwnerTransport({ socketPath: ownerSocket, ownerIdentity });
     const reader = createLifeGraphMemgraphReader({ transport, catalogs });
     coordinator = createLifeGraphReleaseCoordinator({ issuerAuthority, policyAuthority: policyOwner,
-      graphAuthority: { readSnapshot: c => reader.readSnapshot(c), currentRevision: async c => (await reader.readSnapshot(c)).revision } });
+      graphAuthority: { readSnapshot: c => reader.readSnapshot(c), currentRevision: async c => (await reader.readSnapshot(c)).revision,
+        async pinRelease(context) {
+          const lease = await transport.pinRelease(context);
+          const pinnedReader = createLifeGraphMemgraphReader({ transport: lease, catalogs });
+          return Object.freeze({ validate: () => lease.validate(), release: () => lease.release(),
+            currentRevision: async c => (await pinnedReader.readSnapshot(c)).revision });
+        } } });
     storage = createLifeGraphStorageAuthority({ policyDatabase, graphReader: coordinator, releaseBarrier: coordinator, storeIdentity });
     return Object.freeze({ snapshot: c => storage.snapshot(c), authorizeRelease: a => storage.authorizeRelease(a),
       bindResponse: (req,res) => storage.bindResponse(req,res), verifyResponse: (req,result) => storage.verifyResponse(req,result),
-      participateIssuerChange: (c,work) => coordinator.participateIssuerChange(c,work),
-      participateGraphChange: (c,work) => coordinator.participateGraphChange(c,work),
+      participateIssuerChange() { throw new Error('LifeGraph issuer must use its daemon enrollment'); },
+      participateGraphChange() { throw new Error('LifeGraph mutations are disabled'); },
       close() { coordinator.close(); storage.close(); policyOwner.close(); } });
   } catch (error) { coordinator?.close(); storage?.close(); policyOwner.close(); throw error; }
 }
