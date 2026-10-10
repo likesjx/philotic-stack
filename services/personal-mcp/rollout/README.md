@@ -16,6 +16,12 @@ The candidate intentionally omits unattested recalled memory and agent graph
 context. The old provider duplicates the current message and does not enforce
 the candidate's context budgets. These gaps must remain visible; changing the
 provider route or restoring unverified recall is not an acceptance workaround.
+The hotfix checkpoint format also lacks `context_request_limits`: candidate
+restoration of a hotfix checkpoint leaves that setting unset, and hotfix
+restoration of a candidate checkpoint drops the unsupported field. The fixtures
+assert and report this boundary rather than claiming limits survive rollback.
+Opaque cold-state rollback must restore the original hotfix state; preserving a
+new budget setting across a downgrade requires a separately reviewed solution.
 
 ## Acceptance gates, in order
 

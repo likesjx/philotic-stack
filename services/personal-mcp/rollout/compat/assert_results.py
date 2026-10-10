@@ -22,7 +22,10 @@ for kind in ['baseline', 'candidate']:
     checkpoint = payload['checkpoint']
     assert checkpoint['session_id'] == 'synthetic-rollout'
     assert checkpoint['fallback_override'] == override
-    assert checkpoint['context_request_limits'] == limits
+    if kind == 'candidate':
+        assert checkpoint['context_request_limits'] == limits
+    else:
+        assert 'context_request_limits' not in checkpoint, 'baseline gained unsupported context limits'
     assert checkpoint['active_turn']['recalled_memories'][0]['content'] == 'SYNTHETIC_UNATTESTED_RECALL'
 
 candidate = read('candidate-long-old-provider')
@@ -37,11 +40,15 @@ for name in ['candidate-restores-baseline', 'baseline-restores-candidate']:
     checkpoint = read(name)['checkpoint']
     assert checkpoint['session_id'] == 'synthetic-rollout'
     assert checkpoint['fallback_override'] == override
-    assert checkpoint['context_request_limits'] == limits
+    if name == 'candidate-restores-baseline':
+        assert checkpoint['context_request_limits'] is None, 'legacy missing limit should restore as unset'
+    else:
+        assert 'context_request_limits' not in checkpoint, 'baseline unexpectedly retained unsupported limit'
     assert checkpoint['active_turn']['turn_id'] == 'synthetic-turn'
     assert checkpoint['active_turn']['recalled_memories'][0]['content'] == 'SYNTHETIC_UNATTESTED_RECALL'
 
 print(json.dumps({'schema':1,'source_pair_fixture':'passed', 'external_provider_calls':0,
                   'loopback_provider_calls':4,
                   'implicit_recall':'fail_closed_omission', 'old_provider_budget':'not_enforced',
+                  'context_limit_checkpoint':'legacy_missing_restores_unset_and_baseline_drops_candidate_field',
                   'release_authorized':False}, sort_keys=True))
