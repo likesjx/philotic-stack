@@ -2,7 +2,9 @@
 percival_enabled: false
 percival_gateway_user: percival-gateway
 percival_gateway_uid: null
+percival_gateway_gid: null
 percival_hotel_uid: 999
+percival_hotel_gid: 987
 percival_hotel_binary: /opt/philotic/bin/aiua
 percival_hotel_sha256: ''
 percival_source_dir: ''

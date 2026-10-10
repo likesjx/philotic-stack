@@ -8,6 +8,10 @@
           - percival_gateway_user == 'percival-gateway'
           - percival_gateway_uid is integer
           - percival_gateway_uid > 0
+          - percival_gateway_gid is integer
+          - percival_gateway_gid > 0
+          - percival_hotel_gid is integer
+          - percival_gateway_gid != percival_hotel_gid
           - percival_gateway_uid != percival_hotel_uid
           - percival_hotel_uid == 999
           - percival_source_dir is match('^/')
@@ -24,16 +28,16 @@
           - percival_gateway_config.upstreams.muninn_recall.credentialEnv is not defined
           - percival_gateway_config.upstreams.muninn_recall.credentialSecretRef is not defined
           - percival_gateway_config.upstreams.muninn_recall.credentialSecretRefFile is not defined
-          - percival_source_sha256.keys() | list | sort == ['gateway.mjs', 'package.json', 'server.mjs', 'vault.mjs']
-        fail_msg: Supply the approved artifact, free UID, public config and two already vaulted credential references.
-    - name: Hash the four approved nonsecret gateway source files on controller
+          - percival_source_sha256.keys() | list | sort == ['gateway.mjs', 'lifegraph.mjs', 'package.json', 'server.mjs', 'vault.mjs']
+        fail_msg: Supply the approved artifact, free UID and independent GID, public config and two already vaulted credential references.
+    - name: Hash the five approved nonsecret gateway source files on controller
       ansible.builtin.stat:
         path: '{{ percival_source_dir }}/{{ item }}'
         checksum_algorithm: sha256
         follow: false
       delegate_to: localhost
       become: false
-      loop: [server.mjs, gateway.mjs, vault.mjs, package.json]
+      loop: [server.mjs, gateway.mjs, vault.mjs, lifegraph.mjs, package.json]
       register: percival_source_files
     - name: Require exact reviewed source file hashes
       ansible.builtin.assert:
@@ -68,13 +72,13 @@
     - name: Create isolated gateway group
       ansible.builtin.getent:
         database: group
-        key: '{{ percival_gateway_uid | string }}'
+        key: '{{ percival_gateway_gid | string }}'
         fail_key: false
       register: percival_gid_owner
     - name: Reject a GID owned by another group
       ansible.builtin.assert:
         that:
-          - (percival_gid_owner.ansible_facts.getent_group.keys() | list | difference([percival_gateway_user, percival_gateway_uid | string]) | length) == 0
+          - (percival_gid_owner.ansible_facts.getent_group.keys() | list | difference([percival_gateway_user, percival_gateway_gid | string]) | length) == 0
     - name: Inspect gateway group if it exists
       ansible.builtin.getent:
         database: group
@@ -84,7 +88,7 @@
     - name: Never migrate an existing gateway group GID
       ansible.builtin.assert:
         that:
-          - percival_named_group.ansible_facts.getent_group[percival_gateway_user] == none or (percival_named_group.ansible_facts.getent_group[percival_gateway_user][1] | int == percival_gateway_uid)
+          - percival_named_group.ansible_facts.getent_group[percival_gateway_user] == none or (percival_named_group.ansible_facts.getent_group[percival_gateway_user][1] | int == percival_gateway_gid)
     - name: Inspect existing group membership before account creation
       ansible.builtin.getent:
         database: group
@@ -92,13 +96,13 @@
     - name: Reject an unexpected existing gateway identity
       ansible.builtin.assert:
         that:
-          - percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user] == none or (percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][2] | int == percival_gateway_uid and percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][5] == '/usr/sbin/nologin')
+          - percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user] == none or (percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][2] | int == percival_gateway_gid and percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user][5] == '/usr/sbin/nologin')
           - item.key == percival_gateway_user or percival_gateway_user not in (item.value[2].split(',') if item.value[2] else [])
       loop: '{{ percival_groups.ansible_facts.getent_group | dict2items }}'
     - name: Create isolated gateway group with verified GID
       ansible.builtin.group:
         name: '{{ percival_gateway_user }}'
-        gid: '{{ percival_gateway_uid }}'
+        gid: '{{ percival_gateway_gid }}'
         system: true
     - name: Create isolated gateway account
       when: percival_named_owner.ansible_facts.getent_passwd[percival_gateway_user] == none
@@ -128,7 +132,7 @@
         owner: root
         group: root
         mode: '0644'
-      loop: [server.mjs, gateway.mjs, vault.mjs, package.json]
+      loop: [server.mjs, gateway.mjs, vault.mjs, lifegraph.mjs, package.json]
       notify: Restart scoped gateway
     - name: Select the reviewed gateway release
       ansible.builtin.file:
