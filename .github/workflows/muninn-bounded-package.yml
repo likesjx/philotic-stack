@@ -116,8 +116,10 @@ jobs:
           python3 -c 'import json; print(json.dumps(json.load(open("../fixture-output/candidate-long.json"))["checkpoint"]))' | cargo run --locked --release -p philote --example muninn_rollout_fixture -- restore > ../fixture-output/baseline-restores-candidate.json
       - name: Assert compatibility and record deliberate behavioral gaps
         run: python3 tools/services/personal-mcp/rollout/compat/assert_results.py fixture-output
-      - name: Publish non-secret package receipt
-        run: cat package-output/receipt.json
+      - name: Publish non-secret package manifest and receipt
+        run: |
+          cat package-output/manifest.json
+          cat package-output/receipt.json
       - uses: actions/upload-artifact@v4
         with:
           name: muninn-bounded-hotel-linux-x86_64
