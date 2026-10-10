@@ -16,7 +16,7 @@ echo "Building aiua startup-smoke binary..."
 cargo build -p aiua >/dev/null
 
 echo "Running startup-driven Gemini OAuth smoke against hotel '${HOTEL_NAME}'..."
-if ! target/debug/aiua \
+if ! PHILOTIC_HOTEL_SOCKET="/tmp/philotic-${HOTEL_NAME}.sock" target/debug/aiua \
   --hotel "${HOTEL_NAME}" \
   --test gemini-oauth-roundtrip \
   --test-text "oauth-guest-ok" \

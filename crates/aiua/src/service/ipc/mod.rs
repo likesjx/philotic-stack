@@ -372,6 +372,64 @@ pub(super) enum AgentRouteResolution {
     Park { guest_id: String },
 }
 
+/// Decides whether a peer uid may use the hotel socket: `(peer_uid, hotel_uid)`.
+pub(crate) type PeerUidPolicy = fn(u32, u32) -> bool;
+
+/// Production policy: only processes running as the hotel's own OS user.
+/// Every guest is spawned as that user; on vps-jane operators reach the socket
+/// with `sudo -u philotic` / `runuser -u philotic`.
+pub(crate) fn same_uid_only(peer_uid: u32, hotel_uid: u32) -> bool {
+    peer_uid == hotel_uid
+}
+
+/// Owner-only access to the hotel socket (PERIMETER_ENFORCEMENT P1, DEF-173).
+///
+/// The socket becomes `0600`. Its directory becomes `0700` only when this
+/// user owns it and it is not a sticky shared directory such as `/tmp`, so a
+/// test or an operator-chosen socket path never has someone else's directory
+/// chmodded. Returns the socket owner's uid, which is this process's
+/// effective uid and the uid peers must match.
+fn harden_socket_permissions(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let hotel_uid = std::fs::metadata(path)?.uid();
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(meta) = std::fs::metadata(dir) {
+            let sticky = meta.mode() & 0o1000 != 0;
+            if meta.uid() == hotel_uid && !sticky && meta.mode() & 0o777 != 0o700 {
+                if let Err(err) =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                {
+                    warn!(dir = %dir.display(), "could not restrict hotel socket directory to 0700: {err}");
+                }
+            }
+        }
+    }
+    Ok(hotel_uid)
+}
+
+/// Check the connecting process's uid (SO_PEERCRED on Linux, getpeereid on
+/// macOS). Fails closed: a connection whose credentials cannot be read is
+/// refused.
+fn peer_uid_permitted(stream: &UnixStream, hotel_uid: u32, policy: PeerUidPolicy) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) if policy(cred.uid(), hotel_uid) => true,
+        Ok(cred) => {
+            warn!(
+                peer_uid = cred.uid(),
+                peer_pid = ?cred.pid(),
+                hotel_uid,
+                "IPC: refusing a connection from another OS user (PERIMETER_ENFORCEMENT P1)"
+            );
+            false
+        }
+        Err(err) => {
+            warn!("IPC: refusing a connection whose peer credentials are unreadable: {err}");
+            false
+        }
+    }
+}
+
 pub struct IpcServer {
     protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
     socket_path: String,
@@ -418,6 +476,10 @@ pub struct IpcServer {
     /// Signal channel: send `()` to trigger a hotel-state broadcast to all backbone peers.
     /// Fired on guest register/deregister so peers stay in sync.
     hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
+    /// Which peer uids may connect (PERIMETER_ENFORCEMENT P1). Production:
+    /// only the hotel's own uid. Injectable so a test can simulate a foreign
+    /// user, which CI cannot create.
+    peer_uid_policy: PeerUidPolicy,
     /// Agent-resource-broker registry (agent-resource-broker seam). Records
     /// resource grants/denials and answers routing-table queries. Inert this
     /// slice: it does NOT materialize or tear down guests — that stays with the
@@ -1885,6 +1947,7 @@ impl IpcServer {
             perimeter_svc: None,
             egress_gw: None,
             hotel_state_dirty_tx: None,
+            peer_uid_policy: same_uid_only,
             resource_registry: Arc::new(Mutex::new(
                 crate::service::resource_registry::ResourceRegistry::new(),
             )),
@@ -1903,6 +1966,13 @@ impl IpcServer {
 
     pub fn with_hotel_state_dirty_tx(mut self, tx: mpsc::Sender<()>) -> Self {
         self.hotel_state_dirty_tx = Some(tx);
+        self
+    }
+
+    /// Replace the peer-uid policy (tests only: simulates a foreign user).
+    #[cfg(test)]
+    pub(crate) fn with_peer_uid_policy(mut self, policy: PeerUidPolicy) -> Self {
+        self.peer_uid_policy = policy;
         self
     }
 
@@ -2009,6 +2079,7 @@ impl IpcServer {
         }
 
         let listener = UnixListener::bind(path)?;
+        let hotel_uid = harden_socket_permissions(path)?;
         info!("Hotel Front Desk (UDS) listening on: {}", self.socket_path);
 
         // Golgi pipeline TTL watchdog — evicts entries that never received a capability reply.
@@ -2040,6 +2111,9 @@ impl IpcServer {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    if !peer_uid_permitted(&stream, hotel_uid, self.peer_uid_policy) {
+                        continue;
+                    }
                     let dispatcher = self.dispatcher_tx.clone();
                     let local_node_id = self.local_node_id.clone();
                     let graph = self.graph.clone();
@@ -3660,15 +3734,14 @@ impl IpcServer {
     ///
     /// Philotes register as `<agent_id>` or `<agent_id>:<role>`; both forms
     /// bind. Admin-class roles may act on any agent's behalf. An unregistered
-    /// connection (local ops tooling speaking raw IPC) is treated as
-    /// admin-equivalent — holding the hotel socket is already root-equivalent
-    /// for the hotel, which is the documented residual risk.
-    fn mcp_owner_identity_ok(
+    /// connection is refused (PERIMETER_ENFORCEMENT P1): ops tooling
+    /// registers as `role: "operator"` (scripts/philotic_ipc.py, DEF-209).
+    pub(crate) fn mcp_owner_identity_ok(
         current_identity: &Option<GuestIdentity>,
         owner_agent_id: &str,
     ) -> bool {
         let Some(identity) = current_identity.as_ref() else {
-            return true;
+            return false;
         };
         if matches!(
             identity.role.as_str(),

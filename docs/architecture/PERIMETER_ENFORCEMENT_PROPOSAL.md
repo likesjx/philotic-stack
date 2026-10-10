@@ -134,6 +134,36 @@ break the operator's scripts.
 **Rollout:** each hotel is independent, with no cross-hotel skew. Deploy the
 scripts and the hotel together.
 
+**Status (2026-10-07): implemented** on `codex/perimeter-p1`, test-green.
+- **Socket.** The socket is `0600`. Its directory becomes `0700` only when
+  the hotel user owns it and it is not sticky, so `/tmp` and other shared
+  directories are left alone. The vps unit's `RuntimeDirectoryMode` is now
+  `0700` to match.
+- **Startup.** A hotel with neither `PHILOTIC_PROFILE` nor
+  `PHILOTIC_HOTEL_SOCKET` refuses to start. All three supervisors already set
+  one:
+  - vps-jane: `PHILOTIC_HOTEL_SOCKET` in the systemd unit;
+  - mac-jane: `PHILOTIC_PROFILE` in the LaunchAgent;
+  - mbp-jane: `PHILOTIC_PROFILE` from `push-homebrew-remote.sh`.
+
+  Smoke scripts and the `just` dev recipes that relied on the fallback now
+  pass the same `/tmp/philotic-<hotel>.sock` path explicitly.
+- **Peer uid.** The check compares against the socket owner's uid and fails
+  closed. On vps-jane every other caller already runs as `philotic`
+  (`runuser`/`sudo -u philotic`), and nothing else uses `/run/philotic`.
+- **MCP owner.** `mcp_owner_identity_ok(None, _)` is `false`. The provisioning
+  scripts already register as `operator` (step 4), so hotels can deploy in
+  any order.
+- **`seq`.** It is now `u64`.
+- **Execution plane.** The accept allowlist admits loopback, `100.64.0.0/10`,
+  `fd7a:115c:a1e0::/48` and known `mesh_host` IPs, cached for 60 s.
+  **Deferred:** binding to the tailnet interface. The listener still binds
+  every interface; the allowlist and vps-jane's nftables filter cover it.
+- **Live proof owed after deploy:**
+  - `ls -l` shows the socket as `0600` on all 3 hotels;
+  - `sudo -u nobody socat - UNIX:<sock>` is refused;
+  - the provisioning scripts still work.
+
 ### P2 — Reserved roles and config ACL (S)
 
 1. `Register` with role `hotel.internal` or `hotel` over IPC is refused. The

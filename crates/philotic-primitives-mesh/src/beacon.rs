@@ -22,7 +22,7 @@ pub struct BeaconMessage {
     /// Message type identifier
     pub msg_type: MsgType,
     /// Sequence number for fragmented messages (0 for unfragmented)
-    pub seq: u32,
+    pub seq: u64,
     /// Total fragments in this sequence (1 for unfragmented)
     pub total: u32,
     /// Encoded payload (JSON, MsgPack, or CBOR). See [`BeaconPayload`] for the

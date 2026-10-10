@@ -52,7 +52,7 @@ cargo build \
 echo "Starting remote hotel [${REMOTE_HOTEL}]..."
 (
   PHILOTIC_SMOKE_MODE=1 \
-    "${ROOT_DIR}/target/debug/aiua" --hotel "${REMOTE_HOTEL}" \
+    PHILOTIC_HOTEL_SOCKET="/tmp/philotic-${REMOTE_HOTEL}.sock" "${ROOT_DIR}/target/debug/aiua" --hotel "${REMOTE_HOTEL}" \
     >"${TMP_DIR}/remote-aiua.log" 2>&1
 ) &
 REMOTE_ANSIBLE_PID=$!
@@ -73,7 +73,7 @@ REMOTE_MODEL_PID=$!
 echo "Starting source hotel [${SOURCE_HOTEL}]..."
 (
   PHILOTIC_SMOKE_MODE=1 \
-    "${ROOT_DIR}/target/debug/aiua" --hotel "${SOURCE_HOTEL}" \
+    PHILOTIC_HOTEL_SOCKET="/tmp/philotic-${SOURCE_HOTEL}.sock" "${ROOT_DIR}/target/debug/aiua" --hotel "${SOURCE_HOTEL}" \
     >"${TMP_DIR}/source-aiua.log" 2>&1
 ) &
 SOURCE_ANSIBLE_PID=$!

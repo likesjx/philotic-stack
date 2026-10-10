@@ -19,7 +19,7 @@ if [[ -f "${ROOT_DIR}/mesh-config.json" ]]; then
     --hotel "${HOTEL_NAME}" \
     >>"${LOG_FILE}" 2>&1
 fi
-if ! target/debug/aiua \
+if ! PHILOTIC_HOTEL_SOCKET="/tmp/philotic-${HOTEL_NAME}.sock" target/debug/aiua \
   --hotel "${HOTEL_NAME}" \
   --test gemini-live-roundtrip \
   --test-text "gemini live startup ok" \

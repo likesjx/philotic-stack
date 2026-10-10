@@ -68,7 +68,7 @@ DRIVER_BIN="${ROOT_DIR}/target/debug/examples/agent_graph_smoke_driver"
 echo "Starting hotel in smoke mode..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 "${AIUA_BIN}" --hotel "${HOTEL_NAME}" \
+  PHILOTIC_SMOKE_MODE=1 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" "${AIUA_BIN}" --hotel "${HOTEL_NAME}" \
     >"${AIUA_LOG}" 2>&1
 ) &
 AIUA_PID=$!

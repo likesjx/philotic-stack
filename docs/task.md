@@ -491,7 +491,8 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 - [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
   - [x] P1 step 4: provisioning scripts register as `operator` via shared `scripts/philotic_ipc.py` (also DEF-209).
   - [x] P7 firewall: nftables `inet philotic` hotel-port filter (on for jane-vps, validated with `nft -c`); ONNX ufw allow narrowed to tailnet; dead `PHILOTIC_MESH_PSK` removed.
-  - [ ] P1–P6 Rust slices; P7 mesh-config plaintext scrub (Rust `aiua load`), DEF-089, blob quota.
+  - [x] P1 Rust (2026-10-07, test-green): socket 0600 + peer-uid check, no /tmp fallback, MCP owner refuses unregistered, `seq` u64, exec-plane accept allowlist. Live proof owed after deploy.
+  - [ ] P2–P6 Rust slices; P7 mesh-config plaintext scrub (Rust `aiua load`), DEF-089, blob quota.
 - [ ] Agent frontdoor next slices (F1–F7): [AGENT_FRONTDOOR_PROPOSAL.md § Next slices](architecture/AGENT_FRONTDOOR_PROPOSAL.md). DEF-211 rest, DEF-209, caller tags, schemas, rotation.
   - [x] F2 DEF-209 script framing fix; F5 schema export/import in `provision-agent-frontdoor.py` (2026-10-07). Live re-provision pairs with the F6 rotation drill.
   - [ ] F1, F3, F6 (Rust/doctor); F4 operator decision; F7 after F1+F6.
