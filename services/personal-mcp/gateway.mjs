@@ -164,7 +164,7 @@ export function frontdoorAdapter({ endpoints, enabledTools, fetchImpl = fetch })
   };
 }
 
-export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients,
+export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients, clientPolicies,
   clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools, requestDeadlineMs = 45000 }) {
   const tools = selectedTools(enabledTools);
   const canonical = httpsUrl(resource);
@@ -177,6 +177,19 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
     typeof value !== 'string' || !value.trim() || value.length > 2048))) throw new Error('Bounded string allowlists required');
   if (!Number.isInteger(maxLifetimeSeconds) || maxLifetimeSeconds < 1 || maxLifetimeSeconds > 900) throw new Error('Bounded lifetime required');
   if (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault)) throw new Error('Explicit bounded Muninn vault required');
+  // Transitional remote-client milestone: synthetic recall only. No LifeGraph,
+  // private vault, operation authority or write projection may be inherited.
+  if (allowedClients.size > 1 && clientPolicies === undefined) throw new Error('Explicit synthetic per-client recall policies required');
+  if (clientPolicies !== undefined) {
+    if (!Array.isArray(clientPolicies) || clientPolicies.length !== allowedClients.size ||
+        new Set(clientPolicies.map(p => p?.clientId)).size !== clientPolicies.length ||
+        muninnVault !== 'percival_connection_test' || tools.length !== 1 || tools[0] !== 'muninn_recall' ||
+        clientPolicies.some(p => !p || !allowedClients.has(p.clientId) || !Array.isArray(p.subjects) ||
+          !p.subjects.length || p.subjects.some(s => !allowedSubjects.has(s)) || p.vault !== muninnVault ||
+          !Array.isArray(p.scopes) || p.scopes.length !== 1 || p.scopes[0] !== 'memory:recall'))
+      throw new Error('Explicit synthetic per-client recall policies required');
+    clientPolicies = structuredClone(clientPolicies);
+  }
   await issuer.ready({ allowPreregistered: true }); // Explicit client allowlist supports pre-registration.
   const descriptors = new Map();
   for (const tool of tools) {
@@ -205,6 +218,10 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
         token.exp <= token.iat || token.exp - token.iat > maxLifetimeSeconds ||
         !allowedSubjects.has(token.sub) || !allowedClients.has(token.client_id) || typeof token.scope !== 'string') {
       deny(401, 'invalid_token');
+    }
+    if (clientPolicies !== undefined) {
+      const policy = clientPolicies.find(p => p.clientId === token.client_id);
+      if (!policy?.subjects.includes(token.sub) || token.aud !== resource || token.scope !== 'memory:recall') deny(401, 'invalid_token');
     }
     return new Set(token.scope.split(' ').filter(Boolean));
   }
