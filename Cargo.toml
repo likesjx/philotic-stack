@@ -35,6 +35,7 @@ members = [
     "crates/exec-guard",
     "crates/prompt-guard",
 ]
+exclude = ["vendor/neo4rs"]
 resolver = "2"
 
 # Clippy ratchet — proposal:clippy-ratchet-workspace-lints.
@@ -53,3 +54,6 @@ resolver = "2"
 # only `cargo clippy` enforces them.
 [workspace.lints.clippy]
 all = "deny"
+
+[patch.crates-io]
+neo4rs = { path = "vendor/neo4rs" }

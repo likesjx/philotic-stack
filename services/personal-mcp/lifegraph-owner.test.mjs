@@ -105,3 +105,12 @@ test('readonly policy authority cannot split from its approved reservation inode
   await assert.rejects(storage.snapshot({namespace:'synthetic_dot'}),/unavailable/);
   assert.equal(storage.verifyResponse({},{}),false);
 });
+test('daemon release lease retains one correlated channel through nested read and handoff', async t=>{
+  const f=await socket(t,m=>m.operation==='nodes'?[{id:'goal:synthetic'}]:true);
+  const lease=await f.transport.pinRelease({});assert.equal(lease.validate(),true);
+  const rows=await lease.readTransaction({},tx=>tx.query(LIFEGRAPH_NODE_QUERY,{ids:['goal:synthetic']}));
+  assert.deepEqual(rows,[{id:'goal:synthetic'}]);
+  assert.deepEqual(f.calls.map(c=>c.operation),['begin_release','start_read','nodes','finish_read']);
+  assert.equal(lease.validate(),true);await lease.release();assert.equal(lease.validate(),false);await lease.release();
+  assert.equal(f.calls.at(-1).operation,'end_release');assert.equal(new Set(f.calls.map(c=>c.session)).size,1);
+});
