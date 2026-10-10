@@ -8,7 +8,9 @@ OpenRouter binary and every other installed binary remain outside this package.
 
 The workflow uses public fixtures to compare candidate and hotfix
 `57b13ba0087722a2de062ff86710ae64a510d445` session checkpoints and the hotfix
-provider's context parser. Passing results establish source compatibility for
+provider's context parser and HTTP serialization against a generated loopback
+stub. The stub uses no credential, proxy, redirect, or external model endpoint.
+Passing results establish source compatibility for
 these fixtures, not compatibility of the actual installed OpenRouter binary.
 The candidate intentionally omits unattested recalled memory and agent graph
 context. The old provider duplicates the current message and does not enforce

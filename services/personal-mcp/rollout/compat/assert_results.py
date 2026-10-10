@@ -14,6 +14,10 @@ for kind in ['baseline', 'candidate']:
     short = read(kind + '-short-old-provider')
     assert short['identity'] and short['rules'], 'mandatory identity/rules lost'
     assert short['current_message_occurrences'] >= 1
+    for size in ['short', 'long']:
+        request = read(kind + '-' + size + '-old-provider')
+        assert request['loopback_provider_calls'] == 1 and request['external_provider_calls'] == 0
+        assert request['serialized_prompt_matches'] and not request['context_budget_forwarded']
     payload = read(kind + '-long')
     checkpoint = payload['checkpoint']
     assert checkpoint['session_id'] == 'synthetic-rollout'
@@ -37,6 +41,7 @@ for name in ['candidate-restores-baseline', 'baseline-restores-candidate']:
     assert checkpoint['active_turn']['turn_id'] == 'synthetic-turn'
     assert checkpoint['active_turn']['recalled_memories'][0]['content'] == 'SYNTHETIC_UNATTESTED_RECALL'
 
-print(json.dumps({'schema':1,'source_pair_fixture':'passed', 'provider_network_calls':0,
+print(json.dumps({'schema':1,'source_pair_fixture':'passed', 'external_provider_calls':0,
+                  'loopback_provider_calls':4,
                   'implicit_recall':'fail_closed_omission', 'old_provider_budget':'not_enforced',
                   'release_authorized':False}, sort_keys=True))

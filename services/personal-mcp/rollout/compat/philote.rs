@@ -8,7 +8,7 @@ fn main() {
     let mode = std::env::args().nth(1).expect("emit or restore");
     if mode == "restore" {
         let mut raw = String::new();
-        io::stdin().read_to_string(&mut raw).unwrap();
+        io::stdin().take(200_001).read_to_string(&mut raw).unwrap();
         assert!(raw.len() <= 200_000);
         let checkpoint: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(checkpoint["session_id"], "synthetic-rollout");
