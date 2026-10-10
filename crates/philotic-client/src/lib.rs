@@ -1622,9 +1622,14 @@ pub enum IpcRequest {
     },
     /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
     FetchMemoryConfig,
-    /// Force the hotel to re-probe MuninnDB reachability immediately and broadcast the result.
-    /// Responds with [`IpcResponse::MuninnStatus`].
+    /// Legacy ambiguous probe operation, retained only to refuse old wire calls
+    /// explicitly. Use PhiloticClient::refresh_memory_config instead.
     RefreshMemoryConfig,
+    /// Correlated memory probe. Unlike the legacy operation, its reply cannot
+    /// be confused with an unsolicited MuninnStatus broadcast.
+    RefreshMemoryConfigCorrelated {
+        request_id: Uuid,
+    },
     /// MuninnDB rejected the stored bearer token for `vault` (HTTP 401 while
     /// reachable): ask the hotel to re-mint the token from the durable
     /// Context-Graph truth — admin mint via the MuninnDB admin API, then
@@ -2679,10 +2684,23 @@ pub struct MeshRosterEntryView {
     pub endpoints: Vec<MeshEndpointView>,
 }
 
+/// A solicited memory probe result. The outer response field is unique because
+/// IpcResponse is untagged; no top-level available/endpoint fields are emitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfigRefresh {
+    pub request_id: Uuid,
+    pub available: bool,
+    pub endpoint: String,
+}
+
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum IpcResponse {
+    MemoryConfigRefreshReply {
+        memory_config_refresh: MemoryConfigRefresh,
+    },
     Ack {
         req_id: String,
     },
@@ -3032,7 +3050,7 @@ pub enum IpcResponse {
         online: bool,
     },
     /// Hotel → guest broadcast: MuninnDB reachability state changed.
-    /// Also the direct response to [`IpcRequest::RefreshMemoryConfig`].
+    /// Broadcast only. Correlated probes use MemoryConfigRefreshReply.
     /// When `available=false`, guests should fall back to `NullMemoryEngine`.
     /// When `available=true`, guests should resume using the configured engine.
     MuninnStatus {
@@ -3286,7 +3304,7 @@ pub struct IpcPushEvent {
 
 /// The concrete Universal Hotel Client SDK
 pub struct PhiloticClient {
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     _identity: GuestIdentity,
     pending_push: VecDeque<IpcResponse>,
     read_buf: Vec<u8>,
@@ -3337,14 +3355,52 @@ pub fn is_ipc_timeout(err: &anyhow::Error) -> bool {
     })
 }
 
+/// A cancelled or timed-out correlated probe cannot leave a partial write or
+/// late reply on a reusable connection. Keep already buffered broadcasts for
+/// recv_task; only the ambiguous transport and partial frame bytes are dropped.
+struct MemoryRefreshGuard<'a> {
+    client: &'a mut PhiloticClient,
+    completed: bool,
+}
+
+impl Drop for MemoryRefreshGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.client.disconnect_after_cancelled_operation();
+        }
+    }
+}
+
 impl PhiloticClient {
+    /// Abandon a potentially partial operation. The transport cannot be reused,
+    /// but already buffered pushes remain available before the disconnect error.
+    /// Callers wrapping a sequence of IPC operations in a deadline must invoke
+    /// this on timeout or cancellation rather than dropping a partial frame.
+    pub fn disconnect_after_cancelled_operation(&mut self) {
+        self.stream.take();
+        self.read_buf.clear();
+        self.pending_stale_responses = 0;
+    }
+    fn ensure_connected(&self) -> Result<()> {
+        if self.stream.is_none() {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "IPC connection closed; reconnect before reuse",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
+        self.ensure_connected()?;
         let len = u32::try_from(payload.len()).context("IPC payload too large")?;
-        self.stream
+        let stream = self.stream.as_mut().expect("checked connected");
+        stream
             .write_all(&len.to_be_bytes())
             .await
             .context("Failed to send IPC frame header to Ansible")?;
-        self.stream
+        stream
             .write_all(payload)
             .await
             .context("Failed to send IPC frame payload to Ansible")?;
@@ -3352,6 +3408,7 @@ impl PhiloticClient {
     }
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
+        self.ensure_connected()?;
         loop {
             if self.read_buf.len() >= 4 {
                 let len = u32::from_be_bytes([
@@ -3369,12 +3426,19 @@ impl PhiloticClient {
             }
 
             self.stream
+                .as_ref()
+                .expect("checked connected")
                 .readable()
                 .await
                 .context("Failed to wait for IPC frame bytes")?;
 
             let mut chunk = [0u8; 8192];
-            match self.stream.try_read(&mut chunk) {
+            match self
+                .stream
+                .as_ref()
+                .expect("checked connected")
+                .try_read(&mut chunk)
+            {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -3408,7 +3472,7 @@ impl PhiloticClient {
         );
 
         let mut client = Self {
-            stream,
+            stream: Some(stream),
             _identity: identity.clone(),
             pending_push: VecDeque::new(),
             read_buf: Vec::new(),
@@ -3440,6 +3504,14 @@ impl PhiloticClient {
 
     /// Send an IPC request to the local Ansible and wait indefinitely for its reply.
     pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
+        if matches!(req, IpcRequest::RefreshMemoryConfig) {
+            anyhow::bail!(
+                "Legacy memory refresh is ambiguous; use refresh_memory_config with a deadline"
+            );
+        }
+        if matches!(req, IpcRequest::RefreshMemoryConfigCorrelated { .. }) {
+            return self.send_memory_refresh(req, Duration::from_secs(10)).await;
+        }
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
         self.write_frame(&payload).await?;
         self.read_matching_response(&req).await
@@ -3466,6 +3538,14 @@ impl PhiloticClient {
         req: IpcRequest,
         timeout: Duration,
     ) -> Result<IpcResponse> {
+        if matches!(req, IpcRequest::RefreshMemoryConfig) {
+            anyhow::bail!(
+                "Legacy memory refresh is ambiguous; use refresh_memory_config with a deadline"
+            );
+        }
+        if matches!(req, IpcRequest::RefreshMemoryConfigCorrelated { .. }) {
+            return self.send_memory_refresh(req, timeout).await;
+        }
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
         self.write_frame(&payload).await?;
 
@@ -3489,12 +3569,76 @@ impl PhiloticClient {
         }
     }
 
+    /// Probe with an end-to-end deadline, including serialization, partial writes
+    /// and reply reads. Cancellation invalidates the connection through the guard.
+    pub async fn refresh_memory_config(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<MemoryConfigRefresh> {
+        let request = IpcRequest::RefreshMemoryConfigCorrelated {
+            request_id: Uuid::new_v4(),
+        };
+        match self.send_memory_refresh(request, timeout).await? {
+            IpcResponse::MemoryConfigRefreshReply {
+                memory_config_refresh,
+            } => Ok(memory_config_refresh),
+            _ => unreachable!("send_memory_refresh only accepts the correlated reply"),
+        }
+    }
+
+    async fn send_memory_refresh(
+        &mut self,
+        req: IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse> {
+        self.ensure_connected()?;
+        // Legacy timed-out requests have no IDs. Their ambiguous owed reply
+        // must not be reinterpreted as a reply to this correlated operation.
+        let mut guard = MemoryRefreshGuard {
+            client: self,
+            completed: false,
+        };
+        if guard.client.pending_stale_responses != 0 {
+            anyhow::bail!(
+                "Memory refresh requires a synchronized IPC connection; reconnect before reuse"
+            );
+        }
+        let result = tokio::time::timeout(timeout, async {
+            let payload = serde_json::to_vec(&req)?;
+            guard.client.write_frame(&payload).await?;
+            guard.client.read_matching_response(&req).await
+        })
+        .await;
+        match result {
+            Ok(Ok(reply)) => { guard.completed = true; Ok(reply) }
+            Ok(Err(error)) => Err(error.context("Correlated memory refresh failed; reconnect before reuse")),
+            Err(elapsed) => Err(anyhow::Error::new(elapsed).context(
+                "Correlated memory refresh deadline exceeded (hotel support required); reconnect before reuse")),
+        }
+    }
+
     /// Read frames from the stream until one matches `req`, buffering any push
     /// messages encountered along the way and discarding stale replies owed to
     /// earlier timed-out requests (see [`Self::pending_stale_responses`]).
     async fn read_matching_response(&mut self, req: &IpcRequest) -> Result<IpcResponse> {
         loop {
             let resp = self.read_response().await?;
+            if let IpcResponse::MemoryConfigRefreshReply {
+                memory_config_refresh,
+            } = &resp
+            {
+                if matches!(req, IpcRequest::RefreshMemoryConfigCorrelated { request_id }
+                    if *request_id == memory_config_refresh.request_id)
+                {
+                    return Ok(resp);
+                }
+                // The refresh guard closes the transport but preserves pushes.
+                if matches!(req, IpcRequest::RefreshMemoryConfigCorrelated { .. }) {
+                    anyhow::bail!("Memory refresh reply correlation mismatch");
+                }
+                self.disconnect_after_cancelled_operation();
+                anyhow::bail!("Unexpected correlated IPC reply; reconnect before reuse");
+            }
 
             // Pushes are never stale-request fallout and must never be lost —
             // classify and buffer them before any stale-discard logic runs.
@@ -3537,6 +3681,11 @@ impl PhiloticClient {
             // response read. Skip them here so they don't masquerade as request responses.
             if Self::is_ignorable_push(&resp) {
                 continue;
+            }
+            if matches!(req, IpcRequest::RefreshMemoryConfigCorrelated { .. }) {
+                anyhow::bail!(
+                    "Hotel does not support the correlated memory refresh reply; upgrade hotel and guest together"
+                );
             }
             return Ok(resp);
         }
@@ -3646,6 +3795,7 @@ impl PhiloticClient {
         if let Some(pending) = self.pending_push.pop_front() {
             return Ok(pending);
         }
+        self.ensure_connected()?;
 
         loop {
             let resp = self.read_response().await?;
@@ -4306,6 +4456,335 @@ mod tests {
             .write_all(payload)
             .await
             .expect("write frame payload");
+    }
+
+    fn memory_refresh_pair() -> (PhiloticClient, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        (
+            PhiloticClient {
+                stream: Some(stream),
+                _identity: GuestIdentity {
+                    guest_id: "synthetic-memory-probe".into(),
+                    role: "test".into(),
+                    supported_tools: vec![],
+                },
+                pending_push: VecDeque::new(),
+                read_buf: vec![],
+                pending_stale_responses: 0,
+            },
+            peer,
+        )
+    }
+
+    async fn memory_refresh_id(peer: &mut UnixStream) -> Uuid {
+        match serde_json::from_slice::<IpcRequest>(&read_frame(peer).await).unwrap() {
+            IpcRequest::RefreshMemoryConfigCorrelated { request_id } => request_id,
+            other => panic!("unexpected synthetic request: {other:?}"),
+        }
+    }
+
+    async fn memory_refresh_reply(peer: &mut UnixStream, request_id: Uuid) {
+        write_frame(
+            peer,
+            &serde_json::to_vec(&IpcResponse::MemoryConfigRefreshReply {
+                memory_config_refresh: MemoryConfigRefresh {
+                    request_id,
+                    available: false,
+                    endpoint: "http://synthetic.invalid".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .await;
+    }
+
+    async fn memory_status_push(peer: &mut UnixStream) {
+        write_frame(
+            peer,
+            &serde_json::to_vec(&IpcResponse::MuninnStatus {
+                available: true,
+                endpoint: "http://broadcast.invalid".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+    }
+
+    #[test]
+    fn memory_refresh_wire_reply_is_distinct_from_broadcast() {
+        let id = Uuid::new_v4();
+        let wire = serde_json::to_vec(&IpcResponse::MemoryConfigRefreshReply {
+            memory_config_refresh: MemoryConfigRefresh {
+                request_id: id,
+                available: true,
+                endpoint: String::new(),
+            },
+        })
+        .unwrap();
+        assert!(
+            matches!(serde_json::from_slice::<IpcResponse>(&wire).unwrap(),
+            IpcResponse::MemoryConfigRefreshReply { memory_config_refresh } if memory_config_refresh.request_id == id)
+        );
+        assert!(matches!(
+            serde_json::from_str::<IpcResponse>(r#"{"available":true,"endpoint":"synthetic"}"#)
+                .unwrap(),
+            IpcResponse::MuninnStatus { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_matches_reply_and_preserves_before_after_broadcasts() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let server = tokio::spawn(async move {
+            let id = memory_refresh_id(&mut peer).await;
+            memory_status_push(&mut peer).await;
+            memory_refresh_reply(&mut peer, id).await;
+            memory_status_push(&mut peer).await;
+            assert!(matches!(
+                serde_json::from_slice::<IpcRequest>(&read_frame(&mut peer).await).unwrap(),
+                IpcRequest::GetConfig { .. }
+            ));
+            write_frame(
+                &mut peer,
+                &serde_json::to_vec(&IpcResponse::ConfigData {
+                    key: "synthetic".into(),
+                    value_json: None,
+                })
+                .unwrap(),
+            )
+            .await;
+        });
+        let result = client
+            .refresh_memory_config(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!result.available, "broadcast must not satisfy the probe");
+        assert!(matches!(
+            client.recv_task().await.unwrap(),
+            IpcResponse::MuninnStatus {
+                available: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client
+                .send_request(IpcRequest::GetConfig {
+                    key: "synthetic".into()
+                })
+                .await
+                .unwrap(),
+            IpcResponse::ConfigData { .. }
+        ));
+        assert!(matches!(
+            client.recv_task().await.unwrap(),
+            IpcResponse::MuninnStatus {
+                available: true,
+                ..
+            }
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_wrong_id_fails_closed_without_losing_broadcast() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let server = tokio::spawn(async move {
+            memory_refresh_id(&mut peer).await;
+            memory_status_push(&mut peer).await;
+            memory_refresh_reply(&mut peer, Uuid::new_v4()).await;
+        });
+        let error = client
+            .refresh_memory_config(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("correlation mismatch"));
+        assert!(client.stream.is_none());
+        assert!(matches!(
+            client.recv_task().await.unwrap(),
+            IpcResponse::MuninnStatus { .. }
+        ));
+        assert!(is_ipc_disconnect(
+            &client
+                .send_request(IpcRequest::GetConfig {
+                    key: "synthetic".into()
+                })
+                .await
+                .unwrap_err()
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_old_hotel_refusal_is_explicit() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let server = tokio::spawn(async move {
+            memory_refresh_id(&mut peer).await;
+            write_frame(
+                &mut peer,
+                &serde_json::to_vec(&IpcResponse::error(
+                    "unknown",
+                    "MALFORMED_PAYLOAD",
+                    "unknown operation",
+                ))
+                .unwrap(),
+            )
+            .await;
+        });
+        let error = client
+            .refresh_memory_config(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("upgrade hotel and guest together"));
+        assert!(client.stream.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_legacy_request_is_rejected_before_write() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        assert!(
+            client
+                .send_request(IpcRequest::RefreshMemoryConfig)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Legacy memory refresh")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), read_frame(&mut peer))
+                .await
+                .is_err()
+        );
+        assert!(client.stream.is_some());
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_timeout_closes_late_reply_transport_and_keeps_push() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let server = tokio::spawn(async move {
+            let id = memory_refresh_id(&mut peer).await;
+            memory_status_push(&mut peer).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let reply = serde_json::to_vec(&IpcResponse::MemoryConfigRefreshReply {
+                memory_config_refresh: MemoryConfigRefresh {
+                    request_id: id,
+                    available: false,
+                    endpoint: String::new(),
+                },
+            })
+            .unwrap();
+            let late = peer.write_all(&(reply.len() as u32).to_be_bytes()).await;
+            assert!(
+                late.is_err(),
+                "deadline must invalidate the late-reply connection"
+            );
+        });
+        let error = client
+            .refresh_memory_config(Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert!(is_ipc_timeout(&error));
+        assert!(client.stream.is_none());
+        assert!(matches!(
+            client.recv_task().await.unwrap(),
+            IpcResponse::MuninnStatus { .. }
+        ));
+        assert!(is_ipc_disconnect(&client.recv_task().await.unwrap_err()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_cancelled_read_closes_partial_frame_connection() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let server = tokio::spawn(async move {
+            memory_refresh_id(&mut peer).await;
+            memory_status_push(&mut peer).await;
+            peer.write_all(&100u32.to_be_bytes()).await.unwrap();
+            peer.write_all(b"{").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                client.refresh_memory_config(Duration::from_secs(60))
+            )
+            .await
+            .is_err()
+        );
+        assert!(client.stream.is_none());
+        assert!(client.read_buf.is_empty());
+        assert!(matches!(
+            client.recv_task().await.unwrap(),
+            IpcResponse::MuninnStatus { .. }
+        ));
+        assert!(is_ipc_disconnect(
+            &client
+                .send_request(IpcRequest::GetConfig {
+                    key: "synthetic".into()
+                })
+                .await
+                .unwrap_err()
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_deadline_includes_backpressured_write() {
+        let (mut client, _peer) = memory_refresh_pair();
+        let stream = client.stream.as_ref().unwrap();
+        stream.writable().await.unwrap();
+        let padding = [0u8; 8192];
+        loop {
+            match stream.try_write(&padding) {
+                Ok(_) => (),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                other => panic!("unexpected socket prefill result: {other:?}"),
+            }
+        }
+        let error = client
+            .refresh_memory_config(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(is_ipc_timeout(&error));
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_cancelled_write_invalidates_connection() {
+        let (mut client, _peer) = memory_refresh_pair();
+        let stream = client.stream.as_ref().unwrap();
+        stream.writable().await.unwrap();
+        while stream.try_write(&[0; 8192]).is_ok() {}
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                client.refresh_memory_config(Duration::from_secs(60))
+            )
+            .await
+            .is_err()
+        );
+        assert!(client.stream.is_none());
+        assert!(is_ipc_disconnect(&client.recv_task().await.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_refuses_legacy_owed_reply_without_losing_pushes() {
+        let (mut client, _peer) = memory_refresh_pair();
+        client.pending_stale_responses = 1;
+        client.pending_push.push_back(IpcResponse::MuninnStatus {
+            available: true,
+            endpoint: "synthetic".into(),
+        });
+        let error = client
+            .refresh_memory_config(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("synchronized IPC connection"));
+        assert!(client.stream.is_none());
+        assert!(matches!(
+            client.recv_task().await.unwrap(),
+            IpcResponse::MuninnStatus { .. }
+        ));
     }
 
     #[tokio::test]
