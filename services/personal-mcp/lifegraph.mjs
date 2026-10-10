@@ -1,5 +1,6 @@
 // Source-only synthetic LifeGraph admission boundary. No database, credential,
 // HTTP, embedding, model, write or grant implementation belongs in this module.
+import { createHash } from 'node:crypto';
 const kinds = new Set(['Goal', 'Idea', 'OpenLoop', 'Person', 'Place', 'Thing']);
 const text = (v, max = 128) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
 const strings = (v, max = 32) => Array.isArray(v) && v.length <= max && v.every(x => text(x)) && new Set(v).size === v.length;
@@ -152,10 +153,12 @@ export function createLifeGraphAdapter({ profile, resource, clientPolicies, auth
         // validate current graph/policy revision AND current actor/grant under
         // its release barrier. Two independent asynchronous reads are not one
         // authority decision. No permissive fallback is provided.
+        const serialized = JSON.stringify(result);
+        const responseDigest = createHash('sha256').update(serialized).digest('hex');
         if (await bounded(() => authorizeRelease({ request, actor: structuredClone(initial.actor),
-          namespace: context.namespace, revision: first.revision, signal }), signal) !== true) fail();
+          namespace: context.namespace, revision: first.revision, responseDigest, signal }), signal) !== true) fail();
         check();
-        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        return { content: [{ type: 'text', text: serialized }] };
       } catch { fail(); }
     },
   });
