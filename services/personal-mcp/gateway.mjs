@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
+import { createLifeGraphAdapter } from './lifegraph.mjs';
 
 export const SCOPES = Object.freeze({ muninn_recall: 'memory:recall', 'life.recall': 'life:recall' });
 export function selectedTools(value = ['muninn_recall']) {
@@ -165,7 +166,7 @@ export function frontdoorAdapter({ endpoints, enabledTools, fetchImpl = fetch })
 }
 
 export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients, clientPolicies,
-  clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools, requestDeadlineMs = 45000 }) {
+  lifeGraph, clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools, requestDeadlineMs = 45000 }) {
   const tools = selectedTools(enabledTools);
   const canonical = httpsUrl(resource);
   if (!Number.isInteger(requestDeadlineMs) || requestDeadlineMs < 1 || requestDeadlineMs > 45000) throw new Error('Bounded request deadline required');
@@ -176,10 +177,15 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
   if ([allowedSubjects, allowedClients].some(values => values.size > 16 || [...values].some(value =>
     typeof value !== 'string' || !value.trim() || value.length > 2048))) throw new Error('Bounded string allowlists required');
   if (!Number.isInteger(maxLifetimeSeconds) || maxLifetimeSeconds < 1 || maxLifetimeSeconds > 900) throw new Error('Bounded lifetime required');
-  if (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault)) throw new Error('Explicit bounded Muninn vault required');
+  const lifeOnly = lifeGraph?.enabled === true;
+  if (lifeGraph !== undefined && (!lifeOnly || tools.length !== 1 || tools[0] !== 'life.recall' || clientPolicies !== undefined ||
+      typeof lifeGraph.identityAuthority?.resolve !== 'function' || typeof lifeGraph.storageAuthority?.snapshot !== 'function' ||
+      typeof lifeGraph.storageAuthority?.authorizeRelease !== 'function')) throw new Error('Explicit separate LifeGraph authority required');
+  if (lifeOnly) lifeGraph = { ...lifeGraph, clientPolicies: structuredClone(lifeGraph.clientPolicies) };
+  if (!lifeOnly && (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault))) throw new Error('Explicit bounded Muninn vault required');
   // Transitional remote-client milestone: synthetic recall only. No LifeGraph,
   // private vault, operation authority or write projection may be inherited.
-  if (allowedClients.size > 1 && clientPolicies === undefined) throw new Error('Explicit synthetic per-client recall policies required');
+  if (!lifeOnly && allowedClients.size > 1 && clientPolicies === undefined) throw new Error('Explicit synthetic per-client recall policies required');
   if (clientPolicies !== undefined) {
     if (!Array.isArray(clientPolicies) || clientPolicies.length !== allowedClients.size ||
         new Set(clientPolicies.map(p => p?.clientId)).size !== clientPolicies.length ||
@@ -191,10 +197,27 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
     clientPolicies = structuredClone(clientPolicies);
   }
   await issuer.ready({ allowPreregistered: true }); // Explicit client allowlist supports pre-registration.
+  let lifeAdapter;
+  if (lifeOnly) {
+    if (!Array.isArray(lifeGraph.clientPolicies) || lifeGraph.clientPolicies.length !== allowedClients.size ||
+        lifeGraph.clientPolicies.some(p => !allowedClients.has(p.clientId) || !Array.isArray(p.subjects) || p.subjects.some(s => !allowedSubjects.has(s))))
+      throw new Error('LifeGraph client/subject policy mismatch');
+    lifeAdapter = createLifeGraphAdapter({ profile: lifeGraph.profile, resource, clientPolicies: lifeGraph.clientPolicies,
+      requestDeadlineMs,
+      authenticate: async (req, { signal }) => {
+        const { token } = await authorize(req, signal);
+        const identity = await abortable(() => lifeGraph.identityAuthority.resolve({ subject: token.sub, clientId: token.client_id,
+          grantVersion: token.grant_version, signal }), signal);
+        return { active: true, audience: token.aud, clientId: token.client_id, subject: token.sub, scope: token.scope,
+          agentId: identity?.agentId, roles: identity?.roles, grantVersion: token.grant_version };
+      }, snapshot: context => lifeGraph.storageAuthority.snapshot(context),
+      authorizeRelease: admission => lifeGraph.storageAuthority.authorizeRelease(admission),
+    });
+  }
   const descriptors = new Map();
   for (const tool of tools) {
-    const descriptor = await upstream.list(tool);
-    descriptors.set(tool, { name: tool, description: descriptor.description, inputSchema: recallSchema(tool, muninnVault),
+    const descriptor = lifeAdapter ? lifeAdapter.descriptor() : await upstream.list(tool);
+    descriptors.set(tool, { name: tool, description: descriptor.description, inputSchema: lifeAdapter ? descriptor.inputSchema : recallSchema(tool, muninnVault),
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       securitySchemes: [{ type: 'oauth2', scopes: [SCOPES[tool]] }],
       _meta: { securitySchemes: [{ type: 'oauth2', scopes: [SCOPES[tool]] }] } });
@@ -223,7 +246,10 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
       const policy = clientPolicies.find(p => p.clientId === token.client_id);
       if (!policy?.subjects.includes(token.sub) || token.aud !== resource || token.scope !== 'memory:recall') deny(401, 'invalid_token');
     }
-    return new Set(token.scope.split(' ').filter(Boolean));
+    if (lifeOnly && (token.aud !== resource || token.scope !== 'life:recall' || typeof token.grant_version !== 'string' ||
+        !token.grant_version.trim() || token.grant_version.length > 128 ||
+        !lifeGraph.clientPolicies.find(p => p.clientId === token.client_id)?.subjects.includes(token.sub))) deny(401, 'invalid_token');
+    return { scopes: new Set(token.scope.split(' ').filter(Boolean)), token };
   }
   const reply = (res, status, value, extra = {}) => {
     if (res.destroyed || res.writableEnded) return;
@@ -260,7 +286,7 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
       if ((known && knownInflight >= 24) || (!known && unknownInflight >= 8)) deny(429, 'too_many_requests');
       admittedLane = known ? 'known' : 'unknown';
       if (known) knownInflight++; else unknownInflight++;
-      const scopes = await authorize(req, signal);
+      const authorization = await authorize(req, signal), scopes = authorization.scopes;
       if (recentAdmissions.size >= 32 && !recentAdmissions.has(fingerprint)) recentAdmissions.delete(recentAdmissions.keys().next().value);
       recentAdmissions.set(fingerprint, clock() + 30000);
       if (req.method !== 'POST') return reply(res, 405, { error: 'method_not_allowed' }, { Allow: 'POST' });
@@ -289,8 +315,8 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
           const name = message.params?.name;
           if (!descriptors.has(name)) return reply(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'Tool unavailable' } });
           if (!scopes.has(SCOPES[name])) deny(403, 'insufficient_scope');
-          const args = recallArguments(name, message.params.arguments ?? {}, muninnVault);
-          result = await abortable(() => upstream.call(name, args, { signal }), signal);
+          const args = lifeAdapter ? message.params.arguments ?? {} : recallArguments(name, message.params.arguments ?? {}, muninnVault);
+          result = await abortable(() => lifeAdapter ? lifeAdapter.recall(req, args, { signal }) : upstream.call(name, args, { signal }), signal);
           if (!result || typeof result !== 'object' || Array.isArray(result) ||
               (result.isError !== undefined && typeof result.isError !== 'boolean') || !Array.isArray(result.content) ||
               result.content.some(item => !item || item.type !== 'text' || typeof item.text !== 'string')) deny(503, 'upstream_unavailable');
@@ -301,8 +327,12 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
             ? { isError: true, content: [{ type: 'text', text: 'Recall unavailable' }] }
             : { content: result.content.map(item => ({ type: 'text', text: item.text })),
                 ...(result.isError === false ? { isError: false } : {}) };
-          const freshScopes = await authorize(req, signal);
-          if (!freshScopes.has(SCOPES[name])) deny(403, 'insufficient_scope');
+          // The LifeGraph adapter already performed coordinated final admission;
+          // do not add another awaited authority call after its release boundary.
+          if (!lifeAdapter) {
+            const fresh = await authorize(req, signal);
+            if (!fresh.scopes.has(SCOPES[name])) deny(403, 'insufficient_scope');
+          }
           break;
         }
         default: return reply(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method unavailable' } });

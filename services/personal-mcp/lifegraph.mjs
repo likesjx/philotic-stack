@@ -26,16 +26,17 @@ export const lifeGraphDescriptor = Object.freeze({
 
 function indexSnapshot(snapshot, namespace, check = () => {}) {
   check();
-  if (!exact(snapshot, ['namespace', 'revision', 'nodes', 'edges']) || snapshot.namespace !== namespace ||
+  if (!exact(snapshot, ['namespace', 'revision', 'nodes', 'edges', 'sourcePolicies']) || snapshot.namespace !== namespace ||
       !text(snapshot.revision) || !Array.isArray(snapshot.nodes) || snapshot.nodes.length > 2048 ||
-      !Array.isArray(snapshot.edges) || snapshot.edges.length > 4096) fail();
+      !Array.isArray(snapshot.edges) || snapshot.edges.length > 4096 ||
+      (snapshot.sourcePolicies !== undefined && (!Array.isArray(snapshot.sourcePolicies) || snapshot.sourcePolicies.length > 4096))) fail();
   const records = new Map();
-  for (const [items, edge] of [[snapshot.nodes, false], [snapshot.edges, true]]) for (const r of items) {
+  for (const [items, edge, sourceOnly] of [[snapshot.nodes, false, false], [snapshot.edges, true, false], [snapshot.sourcePolicies ?? [], false, true]]) for (const r of items) {
     check();
-    if (!exact(r, edge ? ['id', 'namespace', 'from', 'to', 'relation', 'policy'] :
+    if (!exact(r, sourceOnly ? ['id', 'namespace', 'policy'] : edge ? ['id', 'namespace', 'from', 'to', 'relation', 'policy'] :
       ['id', 'namespace', 'kind', 'summary', 'canonicalId', 'policy']) || !text(r.id) || records.has(r.id) || r.namespace !== namespace) fail();
-    if (edge ? !text(r.from) || !text(r.to) || !text(r.relation) :
-      !kinds.has(r.kind) || !text(r.summary, 4096) || (r.canonicalId !== undefined && !text(r.canonicalId))) fail();
+    if (!sourceOnly && (edge ? !text(r.from) || !text(r.to) || !text(r.relation) :
+      !kinds.has(r.kind) || !text(r.summary, 4096) || (r.canonicalId !== undefined && !text(r.canonicalId)))) fail();
     const p = r.policy;
     if (!exact(p, ['owner', 'creator', 'creator_read_grant', 'read_roles', 'private', 'external_operations', 'sources']) ||
         !text(p.owner) || !text(p.creator) || typeof p.creator_read_grant !== 'boolean' ||
