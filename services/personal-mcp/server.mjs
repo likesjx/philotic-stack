@@ -46,7 +46,7 @@ export async function start(config, env = process.env) {
   const issuer = issuerAdapter({ ...config.issuer, credential: brokerCredential({ socketPath: config.issuer.credentialBrokerSocketPath, kind: 'introspection' }) });
   const upstream = frontdoorAdapter({ endpoints, enabledTools });
   const server = await createPersonalMcp({ resource: config.resource, issuer, upstream,
-    allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients), muninnVault: config.muninnVault, enabledTools });
+    allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients), clientPolicies: config.clientPolicies, muninnVault: config.muninnVault, enabledTools });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
   return server;
 }
