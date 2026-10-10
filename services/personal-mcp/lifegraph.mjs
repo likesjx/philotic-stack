@@ -142,8 +142,8 @@ export function createLifeGraphAdapter({ profile, resource, clientPolicies, auth
         // Any graph/policy change invalidates pending output. Never retry a
         // denied query against broader authority or return partial stale data.
         if (last.revision !== first.revision || JSON.stringify(last) !== JSON.stringify(first)) fail();
-        // Introspection is the last awaited operation before release, including
-        // revocations that occur while the second snapshot is being acquired.
+        // Refresh identity after acquiring the second snapshot. The coordinated
+        // release authority below validates changes during this awaited call.
         const fresh = await actorFor(request, signal);
         if (JSON.stringify(fresh.actor) !== JSON.stringify(initial.actor)) fail();
         check();
