@@ -273,6 +273,7 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
     req.once('aborted', disconnected);
     res.once('close', disconnected);
     try {
+      if (lifeAdapter) lifeGraph.storageAuthority.bindResponse?.(req, res);
       const url = new URL(req.url, canonical.origin);
       if (req.method === 'GET' && [metadataPath, '/.well-known/oauth-protected-resource'].includes(url.pathname)) {
         return reply(res, 200, metadata);
@@ -329,6 +330,8 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
                 ...(result.isError === false ? { isError: false } : {}) };
           // The LifeGraph adapter already performed coordinated final admission;
           // do not add another awaited authority call after its release boundary.
+          if (lifeAdapter && typeof lifeGraph.storageAuthority.verifyResponse === 'function' &&
+              lifeGraph.storageAuthority.verifyResponse(req, result) !== true) deny(503, 'upstream_unavailable');
           if (!lifeAdapter) {
             const fresh = await authorize(req, signal);
             if (!fresh.scopes.has(SCOPES[name])) deny(403, 'insufficient_scope');

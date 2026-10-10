@@ -47,6 +47,8 @@ export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, r
     return found;
   }
   return Object.freeze({
+    bindResponse(request, response) { releaseBarrier.bindResponse?.(request, response); },
+    verifyResponse(request, result) { return typeof releaseBarrier.verifyResponse !== 'function' || releaseBarrier.verifyResponse(request, result) === true; },
     async snapshot(context) {
       try {
         context.signal?.throwIfAborted();
@@ -57,7 +59,7 @@ export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, r
             !Array.isArray(raw.edges) || raw.edges.length > 4096) fail();
         for (const [items, edge] of [[raw.nodes, false], [raw.edges, true]]) for (const item of items) {
           // The graph cannot supply or override the canonical privacy ACL.
-          if (!ownKeys(item, edge ? ['id', 'namespace', 'from', 'to', 'relation'] : ['id', 'namespace', 'kind', 'summary', 'canonicalId']) ||
+          if (!ownKeys(item, edge ? ['id', 'namespace', 'from', 'to', 'relation', 'sourcePolicyManifest'] : ['id', 'namespace', 'kind', 'summary', 'canonicalId', 'sourcePolicyManifest']) ||
               item.namespace !== context.namespace || !boundedText(item.id)) fail();
         }
         db.exec('BEGIN');
@@ -66,10 +68,19 @@ export function createLifeGraphStorageAuthority({ policyDatabase, graphReader, r
           const ids = [...raw.nodes, ...raw.edges].map(r => r.id);
           if (new Set(ids).size !== ids.length) fail();
           const policies = policiesFor(ids, context.signal);
+          const withPolicy = item => {
+            const { sourcePolicyManifest, ...record } = item;
+            const policy = policies.get(item.id);
+            // A content binding's lineage must agree with canonical immutable
+            // ancestry. It cannot substitute a permissive graph manifest.
+            if (sourcePolicyManifest !== undefined && (!Array.isArray(sourcePolicyManifest) ||
+                JSON.stringify([...sourcePolicyManifest].sort()) !== JSON.stringify([...policy.sources].sort()))) fail();
+            return { ...record, policy };
+          };
           const selected = new Set(ids);
           return { namespace: context.namespace, revision: revisionFor(raw.revision, policyRevision),
-            nodes: raw.nodes.map(n => ({ ...n, policy: policies.get(n.id) })),
-            edges: raw.edges.map(e => ({ ...e, policy: policies.get(e.id) })),
+            nodes: raw.nodes.map(withPolicy),
+            edges: raw.edges.map(withPolicy),
             sourcePolicies: [...policies].filter(([id]) => !selected.has(id)).map(([id, policy]) => ({ id, namespace: context.namespace, policy })) };
         } finally { db.exec('ROLLBACK'); }
       } catch { fail(); }
