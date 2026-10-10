@@ -12,7 +12,8 @@ const node = (id, change = {}) => ({ id, namespace: 'synthetic_dot', kind: 'Goal
 function fixture(options = {}) {
   const calls = [], graph = { namespace: 'synthetic_dot', revision: '1', nodes: [node('root')], edges: [] };
   const adapter = createLifeGraphAdapter({ profile: 'synthetic-read-only-v1', resource, clientPolicies,
-    authenticate: async request => actor(request), snapshot: async context => { calls.push(context); return graph; }, ...options });
+    authenticate: async request => actor(request), snapshot: async context => { calls.push(context); return graph; },
+    authorizeRelease: async () => true, ...options });
   return { adapter, graph, calls };
 }
 const recall = async (adapter, client = 'dot', args = { query_text: 'synthetic' }) => JSON.parse((await adapter.recall(client, args)).content[0].text);
@@ -117,4 +118,20 @@ test('backend diagnostics, missing policies, duplicate ids and cancellation are 
   try { await assert.rejects(recall(stalled), /^Error: LifeGraph unavailable$/); } finally { clearTimeout(keepAlive); }
   const controller = new AbortController(); controller.abort();
   await assert.rejects(fixture().adapter.recall('dot', { query_text: 'synthetic' }, { signal: controller.signal }), /LifeGraph unavailable/);
+});
+test('coordinated release denies graph revocation while final authentication awaits', async () => {
+  let auths = 0, revision = '1';
+  const { adapter } = fixture({ authenticate: async () => { if (++auths === 2) revision = '2'; return actor('dot'); },
+    snapshot: async () => ({ namespace: 'synthetic_dot', revision, nodes: [node('root')], edges: [] }),
+    authorizeRelease: async admission => admission.revision === revision });
+  await assert.rejects(recall(adapter), /LifeGraph unavailable/);
+  assert.throws(() => fixture({ authorizeRelease: undefined }), /LifeGraph unavailable/);
+  await assert.rejects(recall(fixture({ authorizeRelease: async () => { throw new Error('secret'); } }).adapter), /^Error: LifeGraph unavailable$/);
+});
+test('monotonic deadline denies expensive projection even before timer callbacks run', async () => {
+  const nodes = Array.from({ length: 2048 }, (_, i) => node(`n${i}`, { policy: policy({ sources: i % 64 < 63 ? [`n${i + 1}`] : [] }) }));
+  let released = false;
+  const { adapter } = fixture({ requestDeadlineMs: 1, snapshot: async () => ({ namespace: 'synthetic_dot', revision: '1', nodes, edges: [] }),
+    authorizeRelease: async () => { released = true; return true; } });
+  await assert.rejects(recall(adapter), /LifeGraph unavailable/); assert.equal(released, false);
 });

@@ -36,7 +36,7 @@ createLifeGraphAdapter({
     { clientId: 'dot', subjects: ['synthetic-operator'], namespace: 'synthetic_dot', scopes: ['life:recall'] },
     { clientId: 'claude', subjects: ['synthetic-operator'], namespace: 'synthetic_claude', scopes: ['life:recall'] },
   ],
-  authenticate, snapshot,
+  authenticate, snapshot, authorizeRelease,
 });
 ```
 
@@ -62,6 +62,18 @@ There is no snapshot cache. The adapter clones each returned export immediately.
 Maximum export sizes are 2048 nodes and 4096 edges; larger exports fail closed.
 Signal cancellation applies across all authority calls and the total request budget.
 Authority implementations must honor cancellation to stop abandoned work.
+Monotonic deadline checks also guard synchronous validation and lineage/projection
+loops; timer callbacks alone cannot bound microtask-driven synchronous work.
+
+`authorizeRelease({request, actor, namespace, revision, signal})` is mandatory and
+returns exactly `true` only after coordinated current identity/grant/role and
+graph/policy admission under the server authority's release barrier. Independent
+asynchronous introspection and snapshot calls leave a revocation window and do not
+implement this interface correctly. The storage/session owner must establish the
+barrier and its consistency/linearization contract; unknown capability denies.
+This callback is a server authority (it may use the opaque server request), not
+the graph export function. This source adapter supplies no permissive release
+fallback and cannot manufacture an atomic distributed authority from a revision.
 
 Nodes: `{id, namespace, kind, summary, canonicalId?, policy}`.
 Edges: `{id, namespace, from, to, relation, policy}`. IDs are unique across both.
@@ -92,9 +104,10 @@ scores, aliases, private existence explanations, policies, authority metadata or
 raw backend diagnostics. Filter before matching, ranking and limiting. Unauthorized
 or missing resources contribute no hits. No-match output is always the same empty
 shape. Pending output is withheld if either the graph/policy export or authenticated
-grant/role mapping changes. Final introspection is the last awaited operation before
-returning; ordinary distributed revocation still has the unavoidable race after
-that final authority check. Errors are uniformly `LifeGraph unavailable`.
+grant/role mapping changes. Coordinated release admission is the last awaited
+operation before returning. The authority defines the release linearization point;
+revocation after that point cannot retroactively recall already released bytes.
+Errors are uniformly `LifeGraph unavailable`.
 
 Content correctness and privacy labels depend on trusted canonical storage. This
 is not a semantic content classifier or proof against timing side channels. The
@@ -138,6 +151,6 @@ explicit gateway admission, then storage-authority integration. Evidence is loca
 synthetic `test-green`, never installed-runtime or production acceptance.
 
 Local evidence on Node 24.19.0: unchanged baseline `npm test` passed 80 tests;
-final suite passed 92 tests, including 12 adapter acceptance tests. `npm run check`,
+review-fix suite passed 94 tests, including 14 adapter acceptance tests. `npm run check`,
 `node --check lifegraph.mjs` and `git diff --check` passed. No Rust source changed;
 workspace Rust builds and live binary smokes were not run for this isolated module.
