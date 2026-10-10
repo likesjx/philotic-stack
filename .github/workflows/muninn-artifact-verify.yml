@@ -1,0 +1,32 @@
+name: Verify official pinned Muninn artifact bytes
+on:
+  pull_request:
+    branches: [develop, main]
+    paths: ['services/personal-mcp/rollout/**', '.github/workflows/muninn-artifact-verify.yml']
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retrieve only the fixed official Actions artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = likesjx/philotic-stack
+          gh api repos/likesjx/philotic-stack/actions/runs/38077303896 > producing-run.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/11679148793 > producing-artifact.json
+          python3 -B -c 'import json,sys; sys.path.insert(0,"services/personal-mcp/rollout"); from verify_artifact import provenance; provenance(json.load(open("producing-run.json")),json.load(open("producing-artifact.json")))'
+          gh api repos/likesjx/philotic-stack/actions/artifacts/11679148793/zip > official-artifact.zip
+      - name: Verify downloaded ZIP, canonical package, exact trio bytes and source pins
+        run: >-
+          python3 -B services/personal-mcp/rollout/verify_artifact.py
+          --zip official-artifact.zip --run producing-run.json --artifact producing-artifact.json
+          --output verified-package
