@@ -1,0 +1,64 @@
+--- a/crates/aiua/src/service/ipc.rs
++++ b/crates/aiua/src/service/ipc.rs
+@@ -23392,6 +23392,61 @@
+         }
+     }
+ 
++
++    // Cross-version fixture: real old Rust hotel IPC, public payload only.
++    #[tokio::test]
++    async fn beacon_metadata_cross_version_old_hotel() {
++        let _env_guard = ipc_env_guard();
++        let socket_path = test_socket_path();
++        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
++        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
++        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
++        let server_task = tokio::spawn(async move { server.run().await.unwrap(); });
++        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
++        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
++        let mut sender = PhiloticClient::connect(GuestIdentity {
++            guest_id: "compat-public-sender".into(), role: "membrane".into(),
++            supported_tools: Vec::new(),
++        }).await.unwrap();
++        let mut frames = Vec::new();
++        for (index, role) in ["model.openrouter", "model", "model.ollama"].iter().enumerate() {
++            let guest_id = format!("compat-public-model-{index}");
++            let mut receiver = PhiloticClient::connect(GuestIdentity {
++                guest_id: guest_id.clone(), role: (*role).into(), supported_tools: Vec::new(),
++            }).await.unwrap();
++            let payload = serde_json::json!({
++                "action": "generate_text", "prompt": "PUBLIC_SYNTHETIC_ONLY",
++                "session_id": "synthetic-session", "turn_id": "synthetic-turn",
++                "model": "qwen2.5:1.5b", "tools_for_model": [],
++                "reply_to": "local-aiua-01", "reply_role": "agent",
++                "model_attempt_route": {"target_role": role, "phase": "fallback",
++                    "reason": "fallback_ladder", "tier": index}
++            });
++            let response = sender.send_request(IpcRequest::EmitTask {
++                target_node: "local-aiua-01".into(), target_role: (*role).into(),
++                target_guest_id: Some(guest_id), task_json: payload.to_string(),
++            }).await.unwrap();
++            assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
++            let delivered = tokio::time::timeout(tokio::time::Duration::from_secs(2),
++                receiver.recv_task()).await.unwrap().unwrap();
++            if let IpcResponse::InboundTask { source_node, task_json, .. } = &delivered {
++                assert_eq!(source_node, "local-aiua-01");
++                let actual: serde_json::Value = serde_json::from_str(task_json).unwrap();
++                for (key, value) in payload.as_object().unwrap() {
++                    assert_eq!(&actual[key], value, "old hotel altered public field {key}");
++                }
++                assert_eq!(actual["delivery_target_role"], *role);
++            } else { panic!("old hotel did not deliver InboundTask"); }
++            frames.push(serde_json::to_value(delivered).unwrap());
++        }
++        // Required output is a caller-owned disposable fixture path, never state.
++        let fixture = std::env::var("BEACON_COMPAT_WIRE_FIXTURE").unwrap();
++        std::fs::write(fixture, serde_json::to_vec(&frames).unwrap()).unwrap();
++        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
++        server_task.abort(); let _ = server_task.await;
++        let _ = std::fs::remove_file(socket_path);
++    }
++
+     #[tokio::test]
+     async fn emit_task_is_delivered_to_registered_local_role() {
+         let _env_guard = ipc_env_guard();
