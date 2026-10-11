@@ -52,7 +52,11 @@ try {
     assert.match(await response.text(), /public synthetic packet/);
   }
   assert.equal((await rpc('dot', { context: ['synthetic'], vault: 'user_likesjx' })).status, 403);
-  assert.equal((await rpc('dot', { context: ['synthetic'] }, 'life.recall')).status, 403);
+  const disabled = await rpc('dot', { context: ['synthetic'] }, 'life.recall');
+  assert.equal(disabled.status, 200);
+  const disabledBody = await disabled.json();
+  assert.equal(disabledBody.error.code, -32602);
+  assert.equal(disabledBody.result, undefined);
   assert.equal(calls, 2);
   revoked.add('dot'); assert.equal((await rpc('dot')).status, 401);
   assert.equal((await rpc('claude')).status, 200); assert.equal(calls, 3);
