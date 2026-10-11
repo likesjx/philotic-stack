@@ -3,6 +3,7 @@ import argparse
 import gzip
 import hashlib
 import io
+import inspect
 import json
 from pathlib import Path
 import re
@@ -21,8 +22,14 @@ SYSTEM_LIBRARIES = {'libc.so.6', 'libm.so.6', 'libgcc_s.so.1', 'libstdc++.so.6',
                     'libdl.so.2', 'libpthread.so.0', 'librt.so.1', 'libssl.so.3', 'libcrypto.so.3'}
 
 
+class ArtifactRefusal(ValueError):
+    """Public reviewed source-check location; never include inspected values."""
+
+
 def require(value):
-    if not value: raise ValueError('controller release refused')
+    if not value:
+        raise ArtifactRefusal('controller release refused at reviewed source check ' +
+                              str(inspect.currentframe().f_back.f_lineno))
 
 
 def canonical(value):
@@ -262,4 +269,5 @@ def main():
 
 if __name__ == '__main__':
     try: main()
+    except ArtifactRefusal as error: raise SystemExit(str(error)) from None
     except Exception: raise SystemExit('controller release refused; no private diagnostics disclosed') from None
