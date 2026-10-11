@@ -5,7 +5,7 @@ No inherited service configuration, host ports, production paths or credentials.
 Requires explicit compiled artifact and exact issuer source checkout arguments.
 """
 import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, signal
-import subprocess, tempfile, time, urllib.request, urllib.error, uuid
+import subprocess, tempfile, time, threading, urllib.request, urllib.error, uuid
 
 ISSUER_HEAD = 'bc97105557c30a17b9f966c1e1d0453c66c6f3ef'
 MONGO = 'mongo@sha256:d0d926f94df099bff534b7ee5b5986458131a22489dfff8664509af0c1e2ca9c'
@@ -51,6 +51,16 @@ def exercise():
         put('manifest.json',manifest)
         launch=lambda:subprocess.Popen([str(supervisor),'--config',str(d/'manifest.json')],env={},stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         child=launch();restart=None
+        contention=threading.Condition(); arrivals=[0]
+        def observe():
+            for line in child.stderr:
+                if line.strip()==b'LifeGraph owner fence contended':
+                    with contention:
+                        arrivals[0]+=1;contention.notify_all()
+        threading.Thread(target=observe,daemon=True).start()
+        def queued(previous):
+            with contention:
+                assert contention.wait_for(lambda: arrivals[0]>previous,timeout=4), (case,'contender never reached held owner fence')
         def wait(name):
             deadline=time.monotonic()+60
             while not (d/name).exists():
@@ -77,7 +87,8 @@ def exercise():
                     # Actual SQLite competing writer must fail during HTTP handoff.
                     script="const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1],{timeout:50});try{db.exec('UPDATE privacy_revision SET revision=revision+1');process.exitCode=1}catch(e){if(!String(e).includes('locked'))throw e}finally{db.close()}"
                     run(str(node),'-e',script,str(d/'privacy.sqlite'))
-                    revoke=pool.submit(control,'revoke-client');time.sleep(.1)
+                    previous=arrivals[0];revoke=pool.submit(control,'revoke-client');queued(previous)
+                    concurrent.futures.wait([revoke],timeout=.25)
                     assert not revoke.done() and not (d/'first-mongo-write').exists()
                     put('finish-handoff');visible(read.result());assert revoke.result()[0]==200
                     assert (d/'first-mongo-write').exists();(d/'pause-handoff').unlink()
@@ -88,7 +99,8 @@ def exercise():
                     put('finish-final');result=read.result();assert result==(503,'{"error":"service_unavailable"}'),result
                     assert recall('claude')[0]==200
                 elif case=='issuer-first':
-                    revoke=pool.submit(control,'hold-revoke');wait('issuer-held');read=pool.submit(recall);time.sleep(.1)
+                    revoke=pool.submit(control,'hold-revoke');wait('issuer-held');previous=arrivals[0];read=pool.submit(recall);queued(previous)
+                    concurrent.futures.wait([read],timeout=.25)
                     assert not read.done();put('finish-issuer');assert revoke.result()[0]==200
                     result=read.result();assert result==(503,'{"error":"service_unavailable"}'),result
                     assert recall('claude')[0]==200

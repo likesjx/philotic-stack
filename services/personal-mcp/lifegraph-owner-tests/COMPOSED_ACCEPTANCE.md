@@ -1,15 +1,18 @@
 # Synthetic composed acceptance
 
-This fixture depends on PR658's exact supervisor source head
-`165003b7b9811a75c5e358ad1deb2f91d2d68e5b` and the separately reviewed PR20
+This fixture depends on the reviewed PR658 supervisor source inherited by this
+branch and the separately reviewed PR20
 issuer source head `bc97105557c30a17b9f966c1e1d0453c66c6f3ef`. It never installs
-services or reads configured databases. Build the supervisor from that source
-with `cargo build --locked -p data-memorygraphrag --bin lifegraph-read-supervisor`.
-Use a clean exact issuer checkout with its locked npm dependencies installed.
+services or reads configured databases. The runner exports the supplied exact
+clean source commit and builds its supervisor with the pinned Rust image,
+locked dependencies, a fresh target directory and networking disabled. It does
+not accept an externally compiled supervisor. Supply an existing public Cargo
+registry cache and a clean exact issuer checkout with locked npm dependencies.
 
 ```sh
 python3 services/personal-mcp/lifegraph-owner-tests/run-composed.py \
-  --approved-fixture-run --supervisor /ABSOLUTE/BUILT/lifegraph-read-supervisor \
+  --approved-fixture-run --source-head "$(git rev-parse HEAD)" \
+  --cargo-registry /ABSOLUTE/PUBLIC/CARGO/registry \
   --issuer-source /ABSOLUTE/EXACT/ISSUER/CHECKOUT
 ```
 
@@ -35,8 +38,12 @@ Assertions cover creator access, independent role access and revocation, private
 records/ancestors/incident edges, external inference denial, canonical-root
 projection, dot/Claude isolation, revocation before final release and both fence
 race directions. A competing SQLite writer is excluded while the actual HTTP
-response is held; the actual Mongo helper's first write cannot run until handoff
-finishes. Global admission, provider logout and token revocation use actual
+response is held. Both contention directions wait for the owner's fixed diagnostic
+emitted only after the authenticated request polls the held mutex and registers
+as a waiter; scheduling delays cannot satisfy the exclusion assertion. The actual
+Mongo helper's first write cannot run until handoff finishes. This delays buffered
+`res.end`, not streaming writes, backpressure or remote receipt. Global admission,
+provider logout and token revocation use actual
 issuer helpers. An unknown committed Mongo result leaves durable dirty denial
 through supervisor restart. Negative results assert precise status/body or
 successful filtered packets rather than treating any backend failure as denial.
