@@ -1,4 +1,5 @@
 import copy
+import contextlib
 import gzip
 import importlib.util
 import io
@@ -98,7 +99,8 @@ class ControllerPackage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); binaries = root / 'binaries'; binaries.mkdir()
             for name in m.COMPONENTS: (binaries / name).write_bytes(public_elf())
-            with patch.object(m.subprocess, 'check_output', side_effect=[SOURCE, '']), \
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 patch.object(m.subprocess, 'check_output', side_effect=[SOURCE, '']), \
                  patch.object(m.subprocess, 'run'), patch.object(m, 'dependencies', return_value={'needed_libraries': ['libc.so.6'], 'glibc_minimum': '2.39'}):
                 m.assemble(binaries, root / 'dist', SOURCE)
             path = root / 'dist' / 'beacon-controller-diagnostics-x86_64.tar.gz'
