@@ -3,7 +3,7 @@
 @@ -23392,6 +23392,61 @@
          }
      }
- 
+
 +
 +    // Cross-version fixture: real old Rust hotel IPC, public payload only.
 +    #[tokio::test]
