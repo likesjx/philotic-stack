@@ -341,11 +341,21 @@ impl ControllerTask {
 
         let request_class = RequestClass::parse(task.get("request_class"), kind)?;
 
-        let provider_options = task
+        let mut provider_options = task
             .get("provider_options")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+
+        // Diagnostic metadata is projected, never authority or provider options.
+        if let Some(route) = task.get("model_attempt_route").cloned().and_then(|value| {
+            serde_json::from_value::<ansible_mesh_core::model_attempt::AttemptRoute>(value).ok()
+        }) {
+            provider_options.insert(
+                "__model_attempt_route".into(),
+                serde_json::to_value(route.projected())?,
+            );
+        }
 
         let controller_task = Self {
             resolved_context_capabilities: Vec::new(),

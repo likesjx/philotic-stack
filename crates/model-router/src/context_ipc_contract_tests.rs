@@ -87,7 +87,7 @@ async fn framed_ipc_retry_and_fallback_resolve_each_attempt_without_mutating_tas
         r#"[{"id":"synthetic/primary","ctx":1000000},{"id":"synthetic/fallback","ctx":8000}]"#,
     );
     for _ in 0..2 {
-        let error = invoke_ordinary_provider_attempt(&Probe, &task, None, &catalog)
+        let error = invoke_ordinary_provider_attempt(&Probe, &task, None, &catalog, 1)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("synthetic attempt observed"));
@@ -95,7 +95,7 @@ async fn framed_ipc_retry_and_fallback_resolve_each_attempt_without_mutating_tas
     let mut fallback = original.clone();
     fallback["model"] = json!("synthetic/fallback");
     let fallback = round_trip_task(&fallback).await;
-    let error = invoke_ordinary_provider_attempt(&Probe, &fallback, None, &catalog)
+    let error = invoke_ordinary_provider_attempt(&Probe, &fallback, None, &catalog, 1)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("synthetic attempt observed"));

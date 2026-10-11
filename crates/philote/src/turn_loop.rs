@@ -918,9 +918,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: local_node_id(),
-                target_role: origin_role,
+                target_role: origin_role.clone(),
                 target_guest_id: None,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &origin_role,
+                    "probe",
+                )?,
             })
             .await?;
 
@@ -2747,9 +2752,14 @@ impl AgentRuntime {
                 self.ipc_client
                     .send_request(IpcRequest::EmitTask {
                         target_node,
-                        target_role,
+                        target_role: target_role.clone(),
                         target_guest_id,
-                        task_json: serde_json::to_string(&model_req)?,
+                        task_json: model_attempt_task_json(
+                            &model_req,
+                            self.sessions.get(&session_id),
+                            &target_role,
+                            "initial",
+                        )?,
                     })
                     .await?;
 
@@ -2896,9 +2906,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node,
-                target_role,
+                target_role: target_role.clone(),
                 target_guest_id,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "retry",
+                )?,
             })
             .await?;
 
@@ -3156,9 +3171,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node,
-                target_role,
+                target_role: target_role.clone(),
                 target_guest_id,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
 
@@ -3592,9 +3612,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: local_node_id(),
-                target_role: next_role,
+                target_role: next_role.clone(),
                 target_guest_id: None,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &next_role,
+                    "fallback",
+                )?,
             })
             .await?;
 
