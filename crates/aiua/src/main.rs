@@ -7622,7 +7622,10 @@ async fn hotel_main() -> Result<()> {
     }
     let scoped_vault_enabled = scoped_vault_policy.is_some();
     if scoped_vault_enabled {
-        info!(build_sha = philotic_client::build_sha(), "Scoped broker source provenance");
+        info!(
+            build_sha = philotic_client::build_sha(),
+            "Scoped broker source provenance"
+        );
     }
     if scoped_vault_enabled && smoke_mode_enabled() {
         anyhow::bail!("scoped vault is incompatible with local IPC-only smoke mode");

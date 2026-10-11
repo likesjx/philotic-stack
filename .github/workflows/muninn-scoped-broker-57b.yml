@@ -47,21 +47,30 @@ jobs:
           PERSONAL_MCP_REQUIRE_GATEWAY_INTEROP=1 PERSONAL_MCP_GATEWAY_TEST_PATH="$GITHUB_WORKSPACE/services/personal-mcp/gateway.mjs" \
             node --loader ./services/personal-mcp/issuer-fixture/loader.mjs --test services/personal-mcp/issuer-fixture/tests/personal-oauth.test.ts
           python3 -B scripts/muninn-scoped-57b/source_contract.py
+      - name: Reviewed source formatting
+        run: cargo fmt --all --check
       - name: Reviewed native source build without system package installation
         run: |
           cargo build --locked --release -p aiua --target-dir /tmp/percival-hotel-target
           cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /tmp/percival-test-target
           cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /tmp/percival-test-target --no-run
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/percival-hotel-target
+            /tmp/percival-test-target
+          key: muninn-scoped-57b-${{ hashFiles('**/Cargo.lock') }}
       - name: Numeric-peer, actual encrypted hotel, guest FD and lifecycle fixtures
         run: |
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$GITHUB_EVENT_NAME" = pull_request
+          python3 -B scripts/muninn-scoped-57b/stage_public_fixtures.py
           test ! -e /tmp/muninn-scoped-57b-ci
           sudo touch /tmp/muninn-scoped-57b-ci
           sudo env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 PERCIVAL_FIXTURE_NODE="$(command -v node)" \
-            /usr/bin/python3 "$GITHUB_WORKSPACE/services/personal-mcp/scoped-vault-tests/run_linux_ci.py"
-      - name: Reviewed source formatting
-        run: cargo fmt --all --check
+            /usr/bin/python3 /tmp/percival-hosted-fixtures/personal-mcp/scoped-vault-tests/run_linux_ci.py
       - name: Package only the scoped-broker hotel executable
         run: python3 -B scripts/muninn-scoped-57b/package_candidate.py
       - uses: actions/upload-artifact@v4
