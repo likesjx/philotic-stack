@@ -169,14 +169,15 @@ fn resolve_secret_with_acl(
     }
 
     if exact_acl {
-        let expected_kind =
-            if secret_ref.starts_with("secret://hotel/default/percival-muninn-observe/") {
-                "percival-muninn-observe"
-            } else if secret_ref.starts_with("secret://hotel/default/percival-issuer-introspection/") {
-                "percival-issuer-introspection"
-            } else {
-                bail!("credential_unavailable");
-            };
+        let expected_kind = if secret_ref
+            .starts_with("secret://hotel/default/percival-muninn-observe/")
+        {
+            "percival-muninn-observe"
+        } else if secret_ref.starts_with("secret://hotel/default/percival-issuer-introspection/") {
+            "percival-issuer-introspection"
+        } else {
+            bail!("credential_unavailable");
+        };
         if secret.secret_ref != secret_ref
             || secret.secret_kind != expected_kind
             || secret.scope != "percival_connection_test"
