@@ -3,6 +3,7 @@ pub mod context_management;
 pub mod controller;
 pub mod credential_pool;
 pub mod decisions;
+pub mod model_attempt;
 pub mod privacy_dispatch;
 pub mod providers;
 pub mod runtime;

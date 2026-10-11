@@ -33,6 +33,7 @@ pub mod membership;
 pub mod memory_explain;
 pub mod mesh_alarm;
 pub mod meshops;
+pub mod model_attempt;
 pub mod model_catalog_discovery;
 pub mod model_manager;
 pub mod model_oracle;

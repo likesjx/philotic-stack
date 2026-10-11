@@ -41,6 +41,9 @@ philotic_agents:
       fallback_tiers:
         - "model.openrouter"
         - "model.ollama"
+      # Explicit inventory-bound local fallback; no model pull or route reorder.
+      model_bindings:
+        model.ollama: "qwen2.5:1.5b"
     voice_response_policy:
       mode: "off"                          # off | auto | on  (/tts to toggle)
       provider: "elevenlabs"
