@@ -44,6 +44,8 @@ jobs:
           cargo test --locked -p ansible-mesh-core model_attempt::tests -- --nocapture
           cargo test --locked -p model-router model_attempt::tests -- --nocapture
       - name: Baseline hotel to real controller dispatch and reply
-        run: python3 scripts/beacon-diagnostics-57b/check_acceptance.py
+        run: |
+          python3 scripts/beacon-diagnostics-57b/test_check_acceptance.py
+          python3 scripts/beacon-diagnostics-57b/check_acceptance.py
       - name: Formatting gate
         run: git diff --exit-code
