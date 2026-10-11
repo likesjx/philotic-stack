@@ -727,6 +727,9 @@ enum Command {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum StartupTest {
+    /// Validate configuration/teardown; retrieval requires the separate UID probe.
+    #[value(name = "scoped-vault-bootstrap")]
+    ScopedVaultBootstrap,
     #[value(name = "text-roundtrip", alias = "text-round-trip")]
     TextRoundTrip,
     #[value(name = "graph-roundtrip", alias = "graph-round-trip")]
@@ -5264,6 +5267,7 @@ fn enable_guest_test_overrides(
     }
 
     match test {
+        StartupTest::ScopedVaultBootstrap => {}
         StartupTest::GraphRoundTrip => {}
         StartupTest::TextRoundTrip => {
             for guest in &mut guests {
@@ -5971,6 +5975,9 @@ fn startup_test_force_kill_pid(pid: u32) -> Result<()> {
 }
 
 fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
+    if _test == StartupTest::ScopedVaultBootstrap {
+        return Ok(());
+    }
     let existing_bins = [
         "target/debug/membrane-telegram",
         "target/debug/philote",
@@ -6021,6 +6028,11 @@ async fn run_startup_test(
 ) -> Result<()> {
     let local_node_id = default_hotel_record(hotel_name).capabilities.node_id;
     match test {
+        StartupTest::ScopedVaultBootstrap => {
+            service::scoped_vault::load_policy(Path::new(service::scoped_vault::POLICY_PATH))?;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            Ok(())
+        }
         StartupTest::GraphRoundTrip => {
             let graph_name = format!("startup-graph-{}-{}", hotel_name, std::process::id());
 
@@ -7578,10 +7590,49 @@ fn spawn_session_history_retention(graph: Arc<GraphDomain>) {
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let scoped_enabled = std::env::var("PHILOTIC_SCOPED_VAULT_ENABLED").as_deref() == Ok("1");
+    service::scoped_vault_shutdown::install_signal_limit(
+        scoped_enabled,
+        service::scoped_vault_shutdown::NORMAL_STOP_LIMIT,
+    )?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(hotel_main());
+    if scoped_enabled {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    } else {
+        drop(runtime);
+    }
+    result
+}
+
+async fn hotel_main() -> Result<()> {
     init_logging();
     let args = Args::parse();
+    // Adopt and validate before opening state or materializing any guest.
+    let scoped_vault_listener = service::scoped_vault_activation::optional()?;
+    let scoped_vault_policy = scoped_vault_listener
+        .as_ref()
+        .map(|_| service::scoped_vault::load_policy(Path::new(service::scoped_vault::POLICY_PATH)))
+        .transpose()?;
+    if let (Some(listener), Some(policy)) = (&scoped_vault_listener, &scoped_vault_policy) {
+        service::scoped_vault::validate_listener(listener, policy)?;
+    }
+    let scoped_vault_enabled = scoped_vault_policy.is_some();
+    if scoped_vault_enabled {
+        info!(
+            build_sha = philotic_client::build_sha(),
+            "Scoped broker source provenance"
+        );
+    }
+    if scoped_vault_enabled && smoke_mode_enabled() {
+        anyhow::bail!("scoped vault is incompatible with local IPC-only smoke mode");
+    }
+    if args.test == Some(StartupTest::ScopedVaultBootstrap) && !scoped_vault_enabled {
+        anyhow::bail!("scoped vault bootstrap test requires enabled activation");
+    }
 
     if std::env::var_os("PHILOTIC_BIN_DIR").is_none() {
         if let Ok(current_exe) = std::env::current_exe() {
@@ -8458,6 +8509,19 @@ async fn main() -> Result<()> {
     // task below takes ownership of `network_broadcast_tx`.
     let placement_push_tx = network_broadcast_tx.clone();
 
+    let (scoped_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    if let (Some(listener), Some(policy)) = (scoped_vault_listener, scoped_vault_policy) {
+        let resolver = Arc::new(service::scoped_vault_resolver::HotelVaultResolver(
+            (*graph_domain_arc).clone(),
+        ));
+        service::scoped_vault_shutdown::supervise(
+            async move {
+                let _ = service::scoped_vault::serve(listener, policy, resolver).await;
+            },
+            scoped_shutdown_tx.subscribe(),
+        );
+    }
+
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
             error!("Hotel Front Desk (UDS) failed: {}", e);
@@ -8814,6 +8878,11 @@ async fn main() -> Result<()> {
             args.test_text.as_deref(),
         )
         .await;
+        service::scoped_vault_shutdown::arm(
+            scoped_vault_enabled,
+            service::scoped_vault_shutdown::STARTUP_TEST_STOP_LIMIT,
+        )?;
+        let _ = scoped_shutdown_tx.send(());
         let _ = shutdown_tx.send(());
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
@@ -8842,6 +8911,7 @@ async fn main() -> Result<()> {
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate())?;
+        info!("Hotel bootstrap complete; shutdown handlers ready.");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 warn!("Ctrl-C received — initiating graceful drain.");
@@ -8853,6 +8923,12 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
+
+    service::scoped_vault_shutdown::arm(
+        scoped_vault_enabled,
+        service::scoped_vault_shutdown::NORMAL_STOP_LIMIT,
+    )?;
+    let _ = scoped_shutdown_tx.send(());
 
     // Phase 1: signal every registered guest to drain in-flight work and exit.
     const DRAIN_TIMEOUT_SECS: u64 = 30;
