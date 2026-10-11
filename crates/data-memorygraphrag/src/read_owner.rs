@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, watch};
+use tokio::task::JoinSet;
 
 const NODES: &str = "MATCH (n) WHERE n.id IN $ids RETURN n.id AS id, labels(n) AS labels, n.claim_summary AS summary, n.source_policy_manifest AS sources LIMIT 2049";
 const EDGE: &str = "MATCH (a {id:$from})-[r]->(b {id:$to}) WHERE type(r)=$relation RETURN a.id AS from, b.id AS to, type(r) AS relation, r.source_policy_manifest AS sources LIMIT 2";
@@ -146,6 +147,7 @@ pub struct ReadOwner {
     journal: Arc<Mutex<Journal>>,
     graph: Graph,
     connections: Arc<Semaphore>,
+    stopping: watch::Sender<bool>,
 }
 impl ReadOwner {
     /// Own the private one-connection pool; no caller can retain a Graph clone.
@@ -168,6 +170,7 @@ impl ReadOwner {
             journal: Arc::new(Mutex::new(Journal::open(journal, uid)?)),
             graph: Graph::connect(connection.max_connections(1).fetch_size(32).build()?)?,
             connections: Arc::new(Semaphore::new(32)),
+            stopping: watch::channel(false).0,
         }))
     }
     /// Concrete child handles only; a claimed PID is never an enrollment.
@@ -179,6 +182,9 @@ impl ReadOwner {
         child: Arc<StdMutex<Child>>,
         role: OwnerRole,
     ) -> Result<Uuid> {
+        if *self.stopping.borrow() {
+            bail!("owner stopping");
+        }
         let gate = self.journal.lock().await;
         gate.validate()?;
         let mut roles = self
@@ -212,24 +218,59 @@ impl ReadOwner {
     /// Listener creation/permissions remain explicit installation actions.
     /// Existing listener and private durable journal must be operator reviewed.
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> Result<()> {
-        loop {
-            let permit = self.connections.clone().acquire_owned().await?;
-            let (stream, _) = listener.accept().await?;
-            let owner = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let outcome = owner.connection(stream).await;
-                #[cfg(test)]
-                if std::env::var("LIFEGRAPH_APPROVED_DISPOSABLE_BOLT").as_deref()
-                    == Ok("memgraph-3.10.1")
-                {
-                    if let Err(error) = &outcome {
-                        eprintln!("synthetic owner failure: {error}");
-                    }
+        let mut stopping = self.stopping.subscribe();
+        let mut tasks = JoinSet::new();
+        let outcome: Result<()> = async {
+            loop {
+                if *stopping.borrow() {
+                    break;
                 }
-                let _ = outcome;
-            });
+                let permit = tokio::select! {
+                    biased;
+                    _ = stopping.changed() => break,
+                    permit = self.connections.clone().acquire_owned() => permit?,
+                };
+                let (stream, _) = tokio::select! {
+                    biased;
+                    _ = stopping.changed() => break,
+                    accepted = listener.accept() => accepted?,
+                };
+                let owner = self.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let outcome = owner.connection(stream).await;
+                    #[cfg(test)]
+                    if std::env::var("LIFEGRAPH_APPROVED_DISPOSABLE_BOLT").as_deref()
+                        == Ok("memgraph-3.10.1")
+                    {
+                        if let Err(error) = &outcome {
+                            eprintln!("synthetic owner failure: {error}");
+                        }
+                    }
+                    let _ = outcome;
+                });
+                while tasks.try_join_next().is_some() {}
+            }
+            Ok(())
         }
+        .await;
+        self.stop_admission();
+        drop(listener);
+        // Stop new admission first. Existing five-second leases may acknowledge
+        // completion; abort/join any remainder so Fence::drop preserves denial.
+        if tokio::time::timeout(Duration::from_secs(6), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+        outcome
+    }
+    pub fn stop_admission(&self) {
+        self.stopping.send_replace(true);
     }
     async fn begin_read(&self) -> Result<Txn> {
         // Setup, SHOW and BEGIN hold one physical driver checkout. Pool
@@ -278,7 +319,8 @@ impl ReadOwner {
                 sequence = request.sequence;
                 let result = match request.operation.as_str() {
                     "begin_snapshot" | "begin_release" | "begin_issuer_change" => {
-                        if gate.is_some()
+                        if *self.stopping.borrow()
+                            || gate.is_some()
                             || !empty(&request.parameters)
                             || (request.operation == "begin_issuer_change")
                                 != (role == OwnerRole::Issuer)
@@ -290,6 +332,9 @@ impl ReadOwner {
                             self.journal.clone().lock_owned(),
                         )
                         .await?;
+                        if *self.stopping.borrow() {
+                            bail!("owner stopping");
+                        }
                         let mut lock = Fence {
                             journal: lock,
                             complete: false,
@@ -388,8 +433,9 @@ impl ReadOwner {
             }
         }
         .await;
-        // Never cancel a driver future mid-query: owned task retains the gate
-        // until it finishes and this explicit rollback acknowledges quiescence.
+        // Normal disconnect retains the gate until the driver and rollback
+        // acknowledge quiescence. Bounded supervisor shutdown may abort this
+        // task; Fence::drop then preserves durable dirty denial across restart.
         let rollback = if let Some(transaction) = tx.take() {
             transaction.rollback().await
         } else {
@@ -870,6 +916,49 @@ mod tests {
         assert_eq!(std::fs::read(&f.journal).unwrap(), b"clean\n");
         server.abort();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_denies_new_lease_on_already_accepted_enrolled_idle_socket() {
+        let f = Fixture::new();
+        let owner = ReadOwner::new(
+            "synthetic-hotel".into(),
+            "synthetic-owner".into(),
+            &f.journal,
+            f.uid,
+            f.graph(),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(f.dir.join("owner.sock")).unwrap();
+        let c = child(&f, "idle", "idle_deny");
+        owner
+            .attach(
+                "idle",
+                f.uid,
+                LaunchPrincipal {
+                    stable_agent_id: "synthetic-issuer".into(),
+                    roles: BTreeSet::new(),
+                },
+                c.clone(),
+                OwnerRole::Issuer,
+            )
+            .await
+            .unwrap();
+        let server = tokio::spawn(owner.clone().serve(listener));
+        std::fs::write(f.dir.join("start-idle"), b"synthetic").unwrap();
+        wait_file(&f.dir.join("connected-idle")).await;
+        for _ in 0..100 {
+            if owner.connections.available_permits() <= 30 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(owner.connections.available_permits() <= 30);
+        owner.stop_admission();
+        std::fs::write(f.dir.join("finish-idle"), b"synthetic").unwrap();
+        wait_child(&c).await;
+        server.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&f.journal).unwrap(), b"clean\n");
+    }
+
     // Executed only as the real supervisor-owned child of the synthetic tests.
     #[test]
     #[ignore]
@@ -884,6 +973,13 @@ mod tests {
             wait_file(&dir.join(format!("start-{name}"))).await;
             let mut stream=UnixStream::connect(dir.join("owner.sock")).await.unwrap();
             let session=Uuid::new_v4().to_string();
+            if operation=="idle_deny" {
+                std::fs::write(dir.join(format!("connected-{name}")),b"synthetic").unwrap();
+                wait_file(&dir.join(format!("finish-{name}"))).await;
+                let bytes=serde_json::to_vec(&json!({"version":1,"owner":"synthetic-owner","session":session,"sequence":1,"operation":"begin_issuer_change","parameters":{}})).unwrap();
+                stream.write_u32(bytes.len() as u32).await.unwrap();stream.write_all(&bytes).await.unwrap();
+                assert!(stream.read_u32().await.is_err());return;
+            }
             async fn send(stream:&mut UnixStream,session:&str,sequence:u32,op:&str,parameters:Value)->Value {
                 let bytes=serde_json::to_vec(&json!({"version":1,"owner":"synthetic-owner","session":session,"sequence":sequence,"operation":op,"parameters":parameters})).unwrap();
                 stream.write_u32(bytes.len() as u32).await.unwrap();stream.write_all(&bytes).await.unwrap();
