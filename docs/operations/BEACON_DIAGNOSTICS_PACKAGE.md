@@ -20,6 +20,8 @@ Preserve aiua/Philote/heal hashes from an approved installed receipt and confirm
 
 The operator receipt schema is exercised by `scripts/beacon-diagnostics-57b/test_package_release.py`. To prepare a plan, using the exact source and digests from the CI package receipt:
 
+Create the host-side receipt template with `python3 package_release.py template --manifest-sha256 REVIEWED_MANIFEST_SHA256`. It deliberately refuses planning until every required fact is supplied. Select only verified registered components; the template starts with OpenRouter, not an assumption that the other guests are installed. A configured journal mode of `auto` requires the operator to identify effective persistent/volatile/disabled storage.
+
 ```sh
 python3 package_release.py plan \
   --archive beacon-controller-diagnostics-x86_64.tar.gz \

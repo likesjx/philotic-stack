@@ -114,6 +114,7 @@ def assemble(binary_dir, output, source):
     (output / filename).write_bytes(raw)
     (output / 'manifest.json').write_bytes(entries['manifest.json'])
     (output / 'release-contract.json').write_bytes(entries['release-contract.json'])
+    require(verify(output / filename, digest(raw), digest(entries['manifest.json']), source) == manifest)
     receipt = {'source_sha': source, 'archive_sha256': digest(raw),
                'manifest_sha256': digest(entries['manifest.json']), 'components': records}
     (output / 'package-receipt.json').write_bytes(canonical(receipt))
@@ -138,6 +139,23 @@ def contract():
                 'record_rollback_then_release_fences'],
             'failure_policy': 'rollback entire selected set; retain fence if rollback cannot be proven',
             'executor': 'release owner must bind this contract to reviewed guest drain/restart and fenced swap operations; planner never installs'}
+
+
+def operator_template(manifest_sha):
+    require(re.fullmatch(HEX, manifest_sha) is not None)
+    return {'schema': 1, 'manifest_sha256': manifest_sha,
+            'selected': {'model-controller-openrouter': {
+                'installed_sha256': 'REQUIRED_CURRENT_INSTALLED_SHA256',
+                'running_sha256': 'REQUIRED_CURRENT_RUNNING_SHA256',
+                'guest_binding_manifest_sha256': 'REQUIRED_PRIVATE_BINDING_MANIFEST_SHA256',
+                'guest_count': 'REQUIRED_POSITIVE_INTEGER', 'roles': ['model.openrouter'],
+                'all_consumers_reviewed': False}},
+            'preserved': dict.fromkeys(sorted(PRESERVED), 'REQUIRED_APPROVED_INSTALLED_SHA256'),
+            'journal': {'policy_manifest_sha256': 'REQUIRED_PRIVATE_POLICY_MANIFEST_SHA256',
+                'storage_mode': 'REQUIRED_EFFECTIVE_MODE', 'retention_seconds': 'REQUIRED_INTEGER',
+                'maximum_bytes': 'REQUIRED_INTEGER', 'access_audience_reviewed': False,
+                'export_destinations_reviewed': False},
+            'existing_gates': dict.fromkeys(contract()['required_existing_gates'], 'REQUIRED_REVIEWED_EVIDENCE_MANIFEST_SHA256')}
 
 
 def validate_manifest(manifest):
@@ -201,7 +219,7 @@ def plan(manifest, receipt):
     require(re.fullmatch(HEX, journal['policy_manifest_sha256']) is not None)
     require(type(journal['retention_seconds']) is int and 0 <= journal['retention_seconds'] <= 2**63 - 1)
     require(type(journal['maximum_bytes']) is int and 0 <= journal['maximum_bytes'] <= 2**63 - 1)
-    require(journal['storage_mode'] in ('volatile', 'persistent', 'disabled', 'auto'))
+    require(journal['storage_mode'] in ('volatile', 'persistent', 'disabled'))
     require(journal['access_audience_reviewed'] is True and journal['export_destinations_reviewed'] is True)
     selected = {}
     for name, current in receipt['selected'].items():
@@ -229,11 +247,13 @@ def main():
     build.add_argument('--output', required=True); build.add_argument('--source', required=True)
     prepare = commands.add_parser('plan')
     guard = commands.add_parser('guard-source'); guard.add_argument('--source', required=True)
+    template = commands.add_parser('template'); template.add_argument('--manifest-sha256', required=True)
     for name in ('archive', 'archive-sha256', 'manifest-sha256', 'source'):
         prepare.add_argument('--' + name, required=True)
     prepare.add_argument('--operator-receipt', required=True)
     args = parser.parse_args()
-    if args.command == 'guard-source': source_guard(args.source)
+    if args.command == 'template': print(canonical(operator_template(args.manifest_sha256)).decode(), end='')
+    elif args.command == 'guard-source': source_guard(args.source)
     elif args.command == 'assemble': assemble(args.binary_dir, args.output, args.source)
     else:
         manifest = verify(args.archive, args.archive_sha256, args.manifest_sha256, args.source)

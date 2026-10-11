@@ -53,6 +53,11 @@ class ControllerPackage(unittest.TestCase):
         self.assertEqual(value['selected']['model-controller-openrouter']['rollback_sha256'], 'b' * 64)
         self.assertFalse(value['contract']['memory_activation'])
 
+    def test_operator_template_is_explicitly_unready(self):
+        value = m.operator_template(m.digest(m.canonical(manifest())))
+        with self.assertRaises(ValueError): m.plan(manifest(), value)
+        self.assertFalse(value['journal']['access_audience_reviewed'])
+
     def test_cross_source_components_guest_binding_and_unsafe_receipts_refuse(self):
         for mutate in (lambda r: r.update(manifest_sha256='a' * 64),
                        lambda r: r['selected'].update(aiua={}),
@@ -65,6 +70,7 @@ class ControllerPackage(unittest.TestCase):
                        lambda r: r['journal'].update(access_audience_reviewed=False),
                        lambda r: r['journal'].update(export_destinations_reviewed=False),
                        lambda r: r['journal'].update(retention_seconds='unknown'),
+                       lambda r: r['journal'].update(storage_mode='auto'),
                        lambda r: r['preserved'].pop('aiua')):
             value = copy.deepcopy(receipt()); mutate(value)
             with self.subTest(value=value), self.assertRaises((ValueError, TypeError)): m.plan(manifest(), value)
