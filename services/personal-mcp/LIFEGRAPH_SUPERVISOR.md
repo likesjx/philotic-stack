@@ -103,8 +103,10 @@ unenrolled peers, partial spawn failure and interrupted shutdown. The configured
 synthetic graph endpoint is deliberately unreachable; these fence tests issue no
 database queries. Existing owner acceptance separately covers disposable Memgraph.
 
-Remaining complete-path acceptance must combine PR20's actual Mongo helpers,
-synthetic HTTP response handoff, SQLite policy reservation and disposable
-Memgraph under this executable, including both race directions and client/
-revocation isolation. Passing local synthetic tests does not attest production
+The [composed acceptance fixture](lifegraph-owner-tests/COMPOSED_ACCEPTANCE.md)
+combines PR20's actual Mongo helpers, HTTP response handoff, canonical SQLite
+policy reservation and disposable Memgraph under this executable, including
+both race directions and client/revocation isolation. It uses separately labeled
+synthetic LifeGraph capabilities; PR20's actual memory tokens remain memory-only.
+Passing this fixture does not attest production LifeGraph scope issuance,
 installation, actor mappings or complete authority-writer coverage.
