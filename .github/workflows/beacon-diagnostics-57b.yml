@@ -1,0 +1,49 @@
+name: Beacon installed-baseline diagnostics contracts
+on:
+  pull_request:
+    branches: [codex/beacon-diagnostics-baseline-57b]
+permissions:
+  contents: read
+jobs:
+  synthetic-dispatch-reply:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      CI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_VAULT_MASTER_KEY: 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+          components: rustfmt
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-cargo-
+      - name: Produce reviewable formatting patch
+        run: |
+          cargo fmt --all
+          git diff > /tmp/beacon-format.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-format-patch
+          path: /tmp/beacon-format.patch
+      - name: Public bounded observation contracts
+        run: |
+          cargo test --locked -p ansible-mesh-core model_attempt::tests -- --nocapture
+          cargo test --locked -p model-router model_attempt::tests -- --nocapture
+      - name: Baseline hotel to real controller dispatch and reply
+        run: cargo test --locked -p aiua --bin aiua beacon_diagnostics_real_controller_dispatch_reply -- --nocapture
+      - name: Formatting gate
+        run: git diff --exit-code

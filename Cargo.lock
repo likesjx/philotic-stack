@@ -102,6 +102,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "memory-core",
+ "model-router",
  "parakeet-runner",
  "perimeter-core",
  "philotic-client",
