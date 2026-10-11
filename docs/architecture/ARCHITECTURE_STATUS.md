@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-10-08
+last_updated: 2026-10-10
 tags:
 - source-of-truth
 - current-state
@@ -74,6 +74,14 @@ Isolated Apple client commits `c4c3ff4d`/`46f871d2` implement local recognition,
 - when convenience docs disagree on concrete transport details, current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md) win over stale crate-level prose.
 
 ## Current Architecture Summary
+
+- The Apple CarPlay source foundation is dormant behind `PHILOTIC_CARPLAY`
+  and preserves current trusted voice/provider denial. Phone preparation cannot
+  grant egress. It reuses the voice pipeline with exact capture leases,
+  transport-scoped preparation and correlated reply invalidation; authoritative
+  dispatch and capability activation remain blocked. See the [CarPlay
+  contract](../../apps/philotic-apple/CARPLAY.md) and
+  [native Apple proposal](NATIVE_APPLE_APP_PROPOSAL.md#disposition).
 
 Philotic currently operates as a hotel-centered runtime:
 

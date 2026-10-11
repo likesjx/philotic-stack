@@ -19,10 +19,16 @@ import PhiloticKit
 @Observable
 public final class ChatSessionManager {
     public var settings: ConnectionSettings {
-        didSet { ConnectionSettingsStore.save(settings) }
+        didSet {
+            ConnectionSettingsStore.save(settings)
+            carPlayTransportEpoch = UUID()
+        }
     }
 
-    public private(set) var connectionState: EdgeConnectionState = .disconnected
+    public private(set) var connectionState: EdgeConnectionState = .disconnected {
+        didSet { if connectionState != oldValue { carPlayTransportEpoch = UUID() } }
+    }
+    public private(set) var carPlayTransportEpoch = UUID()
     public private(set) var selectedEndpointName: String?
     /// Live agent directory from the hotel; falls back to the built-in
     /// catalog until `refreshAgents()` succeeds.
@@ -32,6 +38,7 @@ public final class ChatSessionManager {
     public var currentAgent: AgentTarget? {
         didSet {
             guard currentAgent != oldValue else { return }
+            revokePendingConversationStart()
             invalidateVoiceOutput()
             voiceController.stopListening()
             voiceController.cancelRecording()
@@ -85,6 +92,9 @@ public final class ChatSessionManager {
     /// Transitional hard denial. Only the trusted privacy adapter may replace
     /// this boundary; neither user preferences nor server userJSON are grants.
     private var externalVoiceEligible: Bool { false }
+    /// The car surface reads the existing trusted eligibility boundary. Phone
+    /// disclosure, permissions, preferences and test adapters cannot grant it.
+    public var canStartCarPlayConversation: Bool { externalVoiceEligible }
     public var voiceProviderExplanation: String? { speakingProvider.availabilityExplanation }
     /// True while a recorded voice message is being uploaded + submitted
     /// (HTTP blob fallback path only — used when the WS is not connected).
@@ -148,6 +158,10 @@ public final class ChatSessionManager {
     private var conversationStreamId: String?
     /// chunk_seq for the open conversation utterance (resets per utterance).
     @ObservationIgnored private var conversationChunkSeq: UInt64 = 0
+    private var pendingConversationLease: UUID?
+    private var activeConversationLease: UUID?
+    private var carPlayConversationScope: VoiceTurnGate.Scope?
+    private var carPlayCaptureEpoch: UUID?
 
     /// Auto-reconnect triggers: network-path recovery, app activation, and
     /// a gentle periodic retry while frontmost. All of them only act on
@@ -270,6 +284,7 @@ public final class ChatSessionManager {
         guard !isConnectPending else { return }
         if case .connected = connectionState { return }
         if case .connecting = connectionState { return }
+        carPlayTransportEpoch = UUID()
         isConnectPending = true
         defer { isConnectPending = false }
 
@@ -332,7 +347,10 @@ public final class ChatSessionManager {
     }
 
     public func disconnect() async {
+        carPlayTransportEpoch = UUID()
+        revokePendingConversationStart()
         invalidateVoiceOutput()
+        await stopConversation()
         await voiceCancellationTask?.value
         voiceCancellationTask = nil
         serverSupportsTurnCancellation = false
@@ -597,7 +615,10 @@ public final class ChatSessionManager {
     /// otherwise it's a "🎤 Voice message" placeholder that a late
     /// `transcript_partial(is_final:true)` replaces (and remains a
     /// placeholder if partials never arrive — graceful degradation).
-    private func concludeVoiceUtterance(streamId: String) async {
+    private func concludeVoiceUtterance(streamId: String, conversationLease: UUID? = nil) async {
+        if let conversationLease {
+            guard !Task.isCancelled, activeConversationLease == conversationLease, carPlayScopeIsCurrent else { return }
+        }
         guard let conversation = currentConversation else { return }
         let bubbleText = earlyFinalTranscripts.removeValue(forKey: streamId) ?? "🎤 Voice message"
         let message = ChatMessage(role: .operatorUser, content: bubbleText)
@@ -605,6 +626,10 @@ public final class ChatSessionManager {
         updated.messages.append(message)
         currentConversation = updated
         await conversationStore.upsert(updated)
+        if let conversationLease {
+            guard !Task.isCancelled, activeConversationLease == conversationLease, carPlayScopeIsCurrent,
+                  currentConversation?.conversationId == conversation.conversationId else { return }
+        }
         if bubbleText == "🎤 Voice message" {
             pendingVoiceBubble = (streamId, conversation.conversationId, message.id)
         }
@@ -619,22 +644,39 @@ public final class ChatSessionManager {
     /// and streamed VoiceReply playback all apply per utterance unchanged.
     /// Requires a live connection (no HTTP fallback — hands-free over batch
     /// upload makes no sense). Push-to-talk is untouched.
-    public func startConversation() async {
+    @discardableResult
+    public func startConversation(carPlay: Bool = false) async -> UUID? {
         guard externalVoiceEligible else {
             voiceController.voiceError = "Hands-free mode is unavailable until private local transcription is supported. Use on-device dictation."
-            return
+            return nil
         }
-        guard currentAgent != nil, currentConversation != nil else { return }
-        guard !isConversationActive else { return }
+        guard !Task.isCancelled, let target = currentAgent, let conversation = currentConversation,
+              conversation.agentTarget == target else { return nil }
+        guard !isConversationActive, pendingConversationLease == nil else { return nil }
         guard !isStreamingVoice, !voiceController.isRecording, !voiceController.isListening,
             !voiceController.isCapturingPCM
-        else { return }
+        else { return nil }
         guard case .connected = connectionState else {
             lastError = "Conversation mode needs a live connection."
-            return
+            return nil
         }
 
-        guard let frames = await voiceController.startPCMStreaming() else { return }
+        let lease = UUID()
+        let epoch = carPlayTransportEpoch
+        let scope = VoiceTurnGate.Scope(nodeID: target.targetNodeId, agentID: target.targetAgentId,
+                                        conversationID: conversation.conversationId)
+        pendingConversationLease = lease
+        defer { if pendingConversationLease == lease { pendingConversationLease = nil } }
+        guard let frames = await voiceController.startPCMStreaming(carPlay: carPlay, lease: lease) else { return nil }
+        guard !Task.isCancelled, pendingConversationLease == lease,
+              currentAgent == target, currentConversation?.conversationId == scope.conversationID,
+              carPlayTransportEpoch == epoch, case .connected = connectionState else {
+            voiceController.stopPCMStreaming(lease: lease)
+            return nil
+        }
+        activeConversationLease = lease
+        carPlayConversationScope = carPlay ? scope : nil
+        carPlayCaptureEpoch = carPlay ? epoch : nil
 
         vad = VoiceActivityDetector()
         conversationStreamId = nil
@@ -650,27 +692,49 @@ public final class ChatSessionManager {
                 await self.handleConversationFrame(frame)
             }
         }
+        return lease
+    }
+
+    private func revokePendingConversationStart() {
+        guard let lease = pendingConversationLease else { return }
+        pendingConversationLease = nil
+        voiceController.stopPCMStreaming(lease: lease)
     }
 
     /// Ends conversation mode. An open (mid-speech) utterance is discarded
     /// (`cancel: true`) rather than submitted as a half phrase.
     public func stopConversation() async {
+        revokePendingConversationStart()
         guard isConversationActive else { return }
         isConversationActive = false
+        activeConversationLease = nil
+        if carPlayConversationScope != nil { invalidateVoiceOutput() }
+        carPlayConversationScope = nil
+        carPlayCaptureEpoch = nil
 
-        if let streamId = conversationStreamId {
-            conversationStreamId = nil
-            try? await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: true))
-        }
+        let streamId = conversationStreamId
+        conversationStreamId = nil
         voiceController.stopPCMStreaming()  // finishes the frame stream → task loop ends
         conversationTask?.cancel()
         conversationTask = nil
         activeVoiceStreamId = nil
         liveTranscript = nil
+        if let streamId { try? await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: true)) }
+    }
+
+    /// Never stop a newer phone or car lease using a stale cleanup callback.
+    public func endCarPlayConversation(lease: UUID) async {
+        guard activeConversationLease == lease, carPlayConversationScope != nil else { return }
+        invalidateVoiceOutput()
+        await stopConversation()
     }
 
     private func handleConversationFrame(_ frame: Data) async {
-        guard isConversationActive else { return }
+        guard !Task.isCancelled, isConversationActive, let lease = activeConversationLease else { return }
+        if !carPlayScopeIsCurrent {
+            await stopConversation()
+            return
+        }
         // Stricter (sustained) onset while agent audio is audible or queued,
         // to resist residual echo triggering false barge-ins.
         let agentAudioActive = voiceController.hasPendingReplyAudio
@@ -679,6 +743,7 @@ public final class ChatSessionManager {
         Self.vadLog.info(
             "frame rms=\(VoiceActivityDetector.rms(ofPCMS16LE: frame), format: .fixed(precision: 5)) threshold=\(self.vad.speechThreshold, format: .fixed(precision: 5)) agentAudio=\(agentAudioActive)")
         for event in vad.process(frame: frame, requireSustainedOnset: agentAudioActive) {
+            guard !Task.isCancelled, activeConversationLease == lease, carPlayScopeIsCurrent else { return }
             switch event {
             case .utteranceStarted(let preRollFrames):
                 if agentAudioActive {
@@ -749,6 +814,8 @@ public final class ChatSessionManager {
     }
 
     private func beginConversationUtterance(preRollFrames: [Data]) async {
+        guard !Task.isCancelled, isConversationActive, carPlayScopeIsCurrent,
+              let lease = activeConversationLease else { return }
         guard let target = currentAgent, let conversation = currentConversation else { return }
         let streamId = UUID().uuidString
         conversationStreamId = streamId
@@ -766,25 +833,28 @@ public final class ChatSessionManager {
                     mimeType: VoiceController.pcmStreamMimeType
                 )
             )
+            guard activeConversationLease == lease, carPlayScopeIsCurrent else { return }
             // Pre-roll first, so the utterance's first words aren't clipped.
             for frame in preRollFrames {
                 try await sendConversationChunk(frame, streamId: streamId)
             }
         } catch {
-            await failConversation(error)
+            await failConversation(error, lease: lease)
         }
     }
 
     private func sendConversationFrame(_ frame: Data) async {
-        guard let streamId = conversationStreamId else { return }
+        guard let streamId = conversationStreamId, let lease = activeConversationLease else { return }
         do {
             try await sendConversationChunk(frame, streamId: streamId)
         } catch {
-            await failConversation(error)
+            await failConversation(error, lease: lease)
         }
     }
 
     private func sendConversationChunk(_ frame: Data, streamId: String) async throws {
+        guard !Task.isCancelled, isConversationActive, conversationStreamId == streamId,
+              carPlayScopeIsCurrent, let lease = activeConversationLease else { throw CancellationError() }
         try await edgeClient.send(
             .audioChunk(
                 streamId: streamId,
@@ -792,35 +862,50 @@ public final class ChatSessionManager {
                 dataBase64: frame.base64EncodedString()
             )
         )
+        guard !Task.isCancelled, activeConversationLease == lease,
+              conversationStreamId == streamId, carPlayScopeIsCurrent else { throw CancellationError() }
         conversationChunkSeq += 1
     }
 
     private func endConversationUtterance(valid: Bool) async {
-        guard let streamId = conversationStreamId else { return }
+        guard !Task.isCancelled, isConversationActive, carPlayScopeIsCurrent else { return }
+        guard let streamId = conversationStreamId, let lease = activeConversationLease else { return }
         conversationStreamId = nil
         activeVoiceStreamId = nil
 
         do {
             // Too-short utterances (coughs) are discarded server-side.
             try await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: !valid))
+            guard !Task.isCancelled, activeConversationLease == lease, carPlayScopeIsCurrent else { return }
             if valid {
-                await concludeVoiceUtterance(streamId: streamId)
+                await concludeVoiceUtterance(streamId: streamId, conversationLease: lease)
             } else {
                 earlyFinalTranscripts[streamId] = nil
             }
         } catch {
-            await failConversation(error)
+            await failConversation(error, lease: lease)
         }
-        liveTranscript = nil
+        if activeConversationLease == lease { liveTranscript = nil }
     }
 
     /// A send failed mid-conversation (WS died): surface it and shut the
     /// mode down — the reconnect triggers will restore the connection, and
     /// the operator can re-enter conversation mode.
-    private func failConversation(_ error: Error) async {
-        guard isConversationActive else { return }
+    private func failConversation(_ error: Error, lease: UUID) async {
+        guard !(error is CancellationError) else { return }
+        guard isConversationActive, activeConversationLease == lease else { return }
         lastError = "Conversation stream failed: \(error.localizedDescription)"
         await stopConversation()
+    }
+
+    private var carPlayScopeIsCurrent: Bool {
+        guard let scope = carPlayConversationScope else { return true }
+        guard let target = currentAgent, case .connected = connectionState,
+              carPlayCaptureEpoch == carPlayTransportEpoch,
+              canStartCarPlayConversation else { return false }
+        return target.targetNodeId == scope.nodeID && target.targetAgentId == scope.agentID
+            && currentConversation?.conversationId == scope.conversationID
+            && currentConversation?.agentTarget == target
     }
 
     /// - Parameters:

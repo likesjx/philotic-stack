@@ -22,6 +22,22 @@
 
 ## Current Work Item Split
 
+### CarPlay voice conversation foundation
+
+Branch: `codex/carplay-foundation`; updated base: remote `develop`
+`3144e42930d575532249e0133dc15e10b45afb58`. Original `3f8ce9e6` preserved on
+`codex/carplay-foundation-before-update`.
+Contract: [CarPlay foundation](../apps/philotic-apple/CARPLAY.md).
+
+- [x] Verify Apple's iOS 26.4+ category, entitlement and voice-control template requirements; no eligibility/grant assumed.
+- [x] Preserve current voice/provider privacy denial. CarPlay source and phone preparation remain fail-closed; disclosure cannot enable external routing.
+- [x] Integrate exact PCM/session capture leases, pending permission cancellation, transport-scoped preparation, and existing `VoiceTurnGate` invalidation for late replies.
+- [x] Updated-base verification: PhiloticKit 140 tests (one existing skip, zero failures); hosted macOS 55 passed; gated iOS simulator test build passed arm64/x86_64. Exact commands and retained logs are in the CarPlay contract. Default iOS simulator build also passed (feature flag absent).
+- [ ] Execute simulator template tests: earlier attempt failed in Xcode's device-service/lockdown connection after boot. Updated diagnosis is read-only; no service restart/settings change.
+- [x] Independent source review: no blocking findings for dormant foundation after lease/cancellation rechecks for VAD, stream completions and suspended transcript bookkeeping; no runtime/audio eligibility claims.
+- [ ] Install and verify authoritative voice/privacy dispatch and correlated hands-free contracts before any capability activation. Entitlement request is deferred.
+- [ ] Device/live-car verification remains separately approved future work; no real audio, credential or live hotel traffic used in this source slice.
+
 ### Apple voice privacy and cancellation
 
 Current remote source integration: `codex/voice-integrated-689bfc7d` is based on verified develop `689bfc7ddce26341cac994bb77d0027bea2ac98a`, preserving the original seven-commit checkpoint. See [integrated source evidence](../crates/philotic-web/src/serve/VOICE_INTEGRATION_CHECKPOINT.md). This integrates voice only; other owners' iPad/privacy/notch deltas remain separate.

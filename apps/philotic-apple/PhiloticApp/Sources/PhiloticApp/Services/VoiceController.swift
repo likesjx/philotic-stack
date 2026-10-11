@@ -60,6 +60,9 @@ public final class VoiceController: NSObject {
     private var pcmEngine: AVAudioEngine?
     private var pcmContinuation: AsyncStream<Data>.Continuation?
     private var pcmAccumulator: PCMFrameAccumulator?
+    private var pendingPCMStart: UUID?
+    private var activePCMLease: UUID?
+    private var carPlayDuplex = false
 
     private var audioPlayer: AVAudioPlayer?
     private let speechSynthesizer = AVSpeechSynthesizer()
@@ -326,19 +329,48 @@ public final class VoiceController: NSObject {
     /// buffer via `AVAudioConverter` and accumulates bytes into fixed-size
     /// frames; ``stopPCMStreaming()`` flushes the remainder and finishes
     /// the stream.
-    public func startPCMStreaming() async -> AsyncStream<Data>? {
-        guard !isCapturingPCM, !isRecording, !isListening else { return nil }
+    public func startPCMStreaming(carPlay: Bool = false, lease: UUID = UUID()) async -> AsyncStream<Data>? {
+        guard !Task.isCancelled, pendingPCMStart == nil,
+              !isCapturingPCM, !isRecording, !isListening else { return nil }
+        let generation = lease
+        pendingPCMStart = generation
+        defer { if pendingPCMStart == generation { pendingPCMStart = nil } }
         voiceError = nil
 
-        guard await Self.requestMicrophoneAuthorization() else {
+        let granted: Bool
+        #if os(iOS)
+        if carPlay {
+            // CarPlay never prompts for permission. Phone preparation and
+            // authoritative routing eligibility are separate requirements.
+            granted = AVAudioApplication.shared.recordPermission == .granted
+        } else {
+            granted = await microphoneAuthorization()
+        }
+        #else
+        granted = await microphoneAuthorization()
+        #endif
+        guard !Task.isCancelled, pendingPCMStart == generation,
+              !isCapturingPCM, !isRecording, !isListening else { return nil }
+        guard granted else {
             voiceError = "Microphone permission was denied. Enable it in Settings to send voice messages."
             return nil
+        }
+        carPlayDuplex = carPlay
+        var captureStarted = false
+        defer {
+            if !captureStarted {
+                carPlayDuplex = false
+                #if os(iOS)
+                deactivateAudioSessionIfIdle()
+                #endif
+            }
         }
 
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setCategory(.playAndRecord, mode: carPlay ? .default : .voiceChat,
+                                    options: carPlay ? [] : [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -431,13 +463,18 @@ public final class VoiceController: NSObject {
         pcmContinuation = continuation
         pcmAccumulator = accumulator
         isCapturingPCM = true
+        activePCMLease = lease
+        captureStarted = true
         return stream
     }
 
     /// Stops PCM capture: removes the tap, stops the engine, flushes the
     /// accumulator's remaining sub-frame bytes as a final (short) frame,
     /// and finishes the stream.
-    public func stopPCMStreaming() {
+    public func stopPCMStreaming(lease: UUID? = nil) {
+        if let lease, pendingPCMStart != lease, activePCMLease != lease { return }
+        // Revoke a permission wait even when the engine has not started.
+        pendingPCMStart = nil
         guard isCapturingPCM else { return }
         pcmEngine?.inputNode.removeTap(onBus: 0)
         pcmEngine?.stop()
@@ -450,6 +487,8 @@ public final class VoiceController: NSObject {
         pcmContinuation?.finish()
         pcmContinuation = nil
         isCapturingPCM = false
+        activePCMLease = nil
+        carPlayDuplex = false
 
         #if os(iOS)
         deactivateAudioSessionIfIdle()
@@ -537,7 +576,8 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setCategory(.playAndRecord, mode: carPlayDuplex ? .default : .voiceChat,
+                                    options: carPlayDuplex ? [] : [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true)
         } catch {
             voiceError = "Could not configure audio playback: \(error.localizedDescription)"

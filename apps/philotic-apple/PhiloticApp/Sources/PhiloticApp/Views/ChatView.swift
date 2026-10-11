@@ -8,6 +8,10 @@ struct ChatView: View {
     @Bindable var session: ChatSessionManager
     @State private var draft: String = ""
     @FocusState private var inputFocused: Bool
+    #if os(iOS) && PHILOTIC_CARPLAY
+    @State private var showCarPlayPreparation = false
+    @State private var carPlayPreparationFailed = false
+    #endif
 
     private var voice: VoiceController { session.voiceController }
 
@@ -32,6 +36,14 @@ struct ChatView: View {
                     .padding(.horizontal, 12)
                     .padding(.top, 4)
             }
+            #if os(iOS) && PHILOTIC_CARPLAY
+            if carPlayPreparationFailed {
+                Text("CarPlay voice is unavailable until private transcription and routing are ready. Check again while parked.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 12)
+            }
+            #endif
 
             ScrollViewReader { proxy in
                 ScrollView {
@@ -100,6 +112,12 @@ struct ChatView: View {
         }
         .navigationTitle(session.currentAgent?.displayName ?? "Chat")
         .toolbar {
+            #if os(iOS) && PHILOTIC_CARPLAY
+            ToolbarItem(placement: .automatic) {
+                Button("Prepare CarPlay") { showCarPlayPreparation = true }
+                    .disabled(session.currentConversation == nil || session.isConversationActive)
+            }
+            #endif
             if voice.hasPendingReplyAudio {
                 ToolbarItem(placement: .automatic) {
                     Button { session.interruptVoiceReply() } label: {
@@ -108,6 +126,16 @@ struct ChatView: View {
                 }
             }
         }
+        #if os(iOS) && PHILOTIC_CARPLAY
+        .confirmationDialog("Prepare this conversation for CarPlay?", isPresented: $showCarPlayPreparation,
+                            titleVisibility: .visible) {
+            Button("Prepare microphone") {
+                Task { carPlayPreparationFailed = !(await CarPlayBridge.shared.prepare()) }
+            }
+        } message: {
+            Text("Prepare only while parked. CarPlay voice is currently unavailable until private transcription and routing are ready. Microphone permission and this confirmation cannot enable external processing. Select Beacon on the phone for a future eligible conversation.")
+        }
+        #endif
     }
 
     /// True while the mic is captured by a PUSH-TO-TALK mode (streaming,
