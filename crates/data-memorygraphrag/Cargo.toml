@@ -7,6 +7,10 @@ edition = "2024"
 name = "life-graph-runner"
 path = "src/main.rs"
 
+[[bin]]
+name = "lifegraph-read-supervisor"
+path = "src/bin/lifegraph-read-supervisor.rs"
+
 [lib]
 name = "data_memorygraphrag"
 path = "src/lib.rs"
@@ -27,6 +31,8 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 ulid = "1"
+sha2 = "0.10"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Clippy ratchet: this crate is warning-free and must stay that way.
