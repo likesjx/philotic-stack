@@ -46,7 +46,8 @@ def main():
         ]:
             # cargo permits a misspelled filter to pass with zero tests. List and
             # require exactly one match before executing it.
-            command = ["cargo", "test", "--locked", "-p", package, "--lib", test]
+            target = ["--bin", "aiua"] if package == "aiua" else ["--lib"]
+            command = ["cargo", "test", "--locked", "-p", package] + target + [test]
             listing = subprocess.check_output(command + ["--", "--list"],
                                               cwd=checkout, env=env, text=True)
             matches = [line for line in listing.splitlines() if line.endswith(": test")]
