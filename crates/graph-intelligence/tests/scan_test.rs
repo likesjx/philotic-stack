@@ -1,4 +1,4 @@
-use graph_intelligence::{full_scan, GraphEngine, NodeKind, ScanConfig};
+use graph_intelligence::{full_scan, Edge, EdgeRelation, GraphEngine, Node, NodeKind, ScanConfig};
 use std::path::PathBuf;
 
 /// Find the workspace root by walking up from the current crate's manifest dir.
@@ -225,4 +225,91 @@ fn test_graph_authored_doc_content_survives_rescan() {
         .as_str()
         .unwrap_or_default()
         .contains("Graph-owned content"));
+}
+
+/// A doc-kind node authored directly in the graph (via `graph_create_node`) has
+/// no backing file, so the scanner's on-disk rebuild loop can never recreate it.
+/// `clear_scanned_doc_nodes` must therefore leave it — and its edges — alone.
+/// Regression: before the `file_path IS NOT NULL` guard, such nodes were deleted
+/// permanently and silently by the next scan (including the 6h freshness run).
+#[test]
+fn test_graph_authored_fileless_proposal_survives_rescan() {
+    let root = workspace_root();
+    let mut engine = GraphEngine::open(":memory:").expect("Failed to create engine");
+
+    let config = ScanConfig {
+        rust_roots: vec!["crates".to_string()],
+        doc_roots: vec!["docs".to_string()],
+        git_repo: ".".to_string(),
+        worktree: "develop".to_string(),
+    };
+
+    full_scan(&root, &config, &mut engine).expect("Initial scan failed");
+
+    // Mirror exactly what the `graph_create_node` MCP tool builds:
+    // file_path: None, worktree: "".
+    let authored = Node {
+        id: "proposal:graph-native-authoring-test".to_string(),
+        kind: NodeKind::Proposal,
+        name: "Graph Native Authoring Test".to_string(),
+        properties: serde_json::json!({
+            "status": "proposed",
+            "domain": "workflow-docs",
+            "content": "# Authored in the graph\n\nNo markdown file backs this node.",
+            "content_source": "graph",
+        }),
+        file_path: None,
+        worktree: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
+    };
+    engine
+        .upsert_node(&authored)
+        .expect("Failed to author file-less proposal");
+
+    // An edge from the authored node to a scanned node must also survive.
+    let scanned_proposal = engine
+        .query_nodes(Some(NodeKind::Proposal), None)
+        .expect("Failed to query proposals")
+        .into_iter()
+        .find(|n| n.file_path.is_some())
+        .expect("Expected at least one file-backed proposal");
+    engine
+        .upsert_edge(&Edge {
+            source_id: authored.id.clone(),
+            target_id: scanned_proposal.id.clone(),
+            relation: EdgeRelation::References,
+            properties: serde_json::json!({}),
+            worktree: String::new(),
+        })
+        .expect("Failed to create edge from authored node");
+
+    full_scan(&root, &config, &mut engine).expect("Rescan failed");
+
+    let survived = engine
+        .get_node(&authored.id)
+        .expect("Failed to fetch authored proposal")
+        .expect("File-less graph-authored proposal must survive rescan");
+    assert_eq!(survived.name, "Graph Native Authoring Test");
+    assert_eq!(
+        survived.properties["content_source"],
+        serde_json::json!("graph")
+    );
+    assert!(survived.properties["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Authored in the graph"));
+
+    let edges = engine
+        .get_edges_from(&authored.id)
+        .expect("Failed to fetch edges for authored proposal");
+    assert!(
+        edges.iter().any(|e| e.target_id == scanned_proposal.id),
+        "Edge from the graph-authored node must survive rescan"
+    );
 }
