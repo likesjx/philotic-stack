@@ -139,9 +139,50 @@ pub fn resolve_secret(
     secret_ref: &str,
     access: &SecretAccess,
 ) -> Result<Option<String>> {
+    resolve_secret_with_acl(graph, secret_ref, access, false)
+}
+
+/// Check singleton role/guest ACLs and decrypt the same fetched record.
+pub fn resolve_secret_exact_acl(
+    graph: &GraphDomain,
+    secret_ref: &str,
+    access: &SecretAccess,
+) -> Result<Option<String>> {
+    resolve_secret_with_acl(graph, secret_ref, access, true)
+}
+
+fn resolve_secret_with_acl(
+    graph: &GraphDomain,
+    secret_ref: &str,
+    access: &SecretAccess,
+    exact_acl: bool,
+) -> Result<Option<String>> {
     let Some(secret) = graph.get_secret(secret_ref)? else {
         return Ok(None);
     };
+
+    if exact_acl
+        && (secret.allowed_roles != [access.role.as_str()]
+            || secret.allowed_guests != [access.guest_id.as_str()])
+    {
+        bail!("credential_unavailable");
+    }
+
+    if exact_acl {
+        let expected_kind = if secret_ref.starts_with("secret://hotel/default/percival-muninn-observe/") {
+            "percival-muninn-observe"
+        } else if secret_ref.starts_with("secret://hotel/default/percival-issuer-introspection/") {
+            "percival-issuer-introspection"
+        } else {
+            bail!("credential_unavailable");
+        };
+        if secret.secret_ref != secret_ref
+            || secret.secret_kind != expected_kind
+            || secret.scope != "percival_connection_test"
+        {
+            bail!("credential_unavailable");
+        }
+    }
 
     if !secret.allowed_roles.is_empty()
         && !secret.allowed_roles.iter().any(|role| role == &access.role)
