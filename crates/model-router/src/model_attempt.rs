@@ -188,28 +188,123 @@ impl Drop for Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            if !fields.0.is_empty() {
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    fn assert_private_fields_absent(fields: &BTreeMap<String, String>) {
+        let event = serde_json::to_string(fields).unwrap();
+        for fragment in [
+            "PRIVATE_PROMPT",
+            "Bearer PRIVATE_TOKEN",
+            "PRIVATE_REPLY",
+            "PRIVATE_MODEL",
+        ] {
+            assert!(
+                !event.contains(fragment),
+                "private fragment reached emitted record"
+            );
+        }
+        let record = &fields["model_attempt"];
+        let value: serde_json::Value = serde_json::from_str(record).unwrap();
+        assert!(value.get("message").is_none());
+        assert!(record.len() < 1024);
+    }
 
     #[test]
     fn malicious_provider_errors_are_projected_without_messages_or_labels() {
-        let secret = "private prompt Bearer secret\nprovider reply";
+        // A fresh test process isolates the production global rate limiter and
+        // try_lock from parallel controller tests. No emitter is substituted.
+        const CHILD: &str = "PHILOTIC_TEST_MODEL_ATTEMPT_CAPTURE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model_attempt::tests::malicious_provider_errors_are_projected_without_messages_or_labels",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "isolated capture test failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed; 0 failed; 0 ignored"));
+            return;
+        }
+        let secret = "PRIVATE_PROMPT Bearer PRIVATE_TOKEN\nPRIVATE_REPLY";
         let error = TaskErrorPayload::provider_failure("router", None, Some(secret), secret);
         assert_eq!(category(&error), "unclassified");
-        let attempt = Attempt::start(
-            secret,
-            secret,
-            secret,
-            AttemptRoute {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let route = AttemptRoute {
                 phase: secret.into(),
                 reason: secret.into(),
                 tier: Some(255),
                 ..Default::default()
-            },
-            1,
+            };
+            Attempt::start(secret, secret, secret, route.clone(), 1)
+                .finish(Some(&error), Some("PRIVATE_MODEL"));
+            Attempt::start(secret, secret, secret, route.clone(), 2)
+                .finish(None, Some("PRIVATE_MODEL"));
+            drop(Attempt::start(secret, secret, secret, route, 3));
+            // Positive capture control bypasses the production emitter. The
+            // validator must also reject an intentionally leaking observation.
+            tracing::info!(model_attempt = %"{\"message\":\"PRIVATE_PROMPT\"}", "synthetic leak control");
+            tracing::info!(model_attempt = %"{}", provider_error = %secret, "synthetic extra-field leak control");
+        });
+        let records = capture.0.lock().unwrap();
+        assert_eq!(records.len(), 8, "six real events plus two capture controls");
+        for record in &records[..6] {
+            assert_private_fields_absent(record);
+        }
+        let outcomes: Vec<serde_json::Value> = records[..6]
+            .iter()
+            .map(|fields| serde_json::from_str(&fields["model_attempt"]).unwrap())
+            .collect();
+        for (index, outcome) in [(1, "failure"), (3, "success"), (5, "cancelled_or_timeout")] {
+            assert_eq!(outcomes[index]["outcome"], outcome);
+            assert_eq!(outcomes[index]["final_for_attempt"], true);
+        }
+        assert_eq!(outcomes[1]["error_category"], "unclassified");
+        assert_eq!(
+            outcomes[1]["resolved_model_sha256"],
+            fingerprint("model-attempt-model", "PRIVATE_MODEL")
         );
-        let json = serde_json::to_string(&attempt.record).unwrap();
-        assert!(!json.contains(secret));
-        assert!(!json.contains("message"));
-        assert!(json.len() < 1024);
+        assert!(std::panic::catch_unwind(|| assert_private_fields_absent(&records[6])).is_err());
+        assert!(std::panic::catch_unwind(|| assert_private_fields_absent(&records[7])).is_err());
     }
 
     #[test]

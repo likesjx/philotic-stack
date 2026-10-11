@@ -3,10 +3,17 @@
 Base: develop a81507134d19d3cc44b589f8e71911cc20730fc3. The deployed
 57b13ba0087722a2de062ff86710ae64a510d445 is separately verified by the parent;
 this branch has not been installed or used against personal sessions. Hosted
-PR660 CI passed on e0303810 before the normal-request regression revision;
-the revised head must independently pass CI.
+PR660 CI passed on 65494817fa4190ac2f5a26138297925650fb128a, including the
+normal-request regression. Subsequent test-validity revisions require their
+own passing CI before integration.
 
 ## Change and diagnostic contract
+
+The privacy regression now captures actual tracing events from failure/success
+completion and cancellation. A synthetic leaking event proves both capture and
+the private-field assertion are active; removing completion emission or leaking
+provider error/prompt/model fragments fails the test. These are synthetic
+in-process observations, not installed logging or retention acceptance.
 
 Philote attaches projected observation-only metadata to ordinary model tasks:
 initial, same-provider retry, fallback, or origin probe; route reason, actual
