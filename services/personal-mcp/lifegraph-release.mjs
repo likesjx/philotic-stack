@@ -59,6 +59,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
       if (stopped || !request || responses.has(request) || typeof response?.once !== 'function' ||
           typeof response.destroy !== 'function') unavailable();
       const binding = { response, finished: false, used: false, cleanup: null };
+      issuerAuthority.bindResponse?.(request, response);
       responses.set(request, binding);
       const finish = () => {
         if (binding.finished) return;
@@ -71,6 +72,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
     verifyResponse(request, result) {
       const binding = responses.get(request);
       if (!binding || !active.has(binding) || binding.finished || binding.response.destroyed ||
+          (typeof issuerAuthority.verifyResponse === 'function' && issuerAuthority.verifyResponse(request) !== true) ||
           (typeof binding.lease?.validate === 'function' && binding.lease.validate() !== true) ||
           (typeof binding.graphLease?.validate === 'function' && binding.graphLease.validate() !== true) ||
           !Array.isArray(result?.content) || result.content.length !== 1 || result.content[0]?.type !== 'text' ||
