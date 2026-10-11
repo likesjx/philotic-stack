@@ -27,7 +27,7 @@ impl<S: tracing::Subscriber> Layer<S> for Observations {
 
 struct SyntheticProvider {
     id: &'static str,
-    calls: Arc<Mutex<Vec<(ControllerTask, bool)>>>,
+    calls: Arc<Mutex<Vec<(&'static str, ControllerTask, bool)>>>,
 }
 
 #[async_trait::async_trait]
@@ -39,14 +39,14 @@ impl ModelProvider for SyntheticProvider {
         task.prompt.as_deref() == Some("PUBLIC_STREAM")
     }
     async fn invoke(&self, task: &ControllerTask) -> anyhow::Result<ProviderOutput> {
-        self.calls.lock().unwrap().push((task.clone(), false));
+        self.calls.lock().unwrap().push((self.id, task.clone(), false));
         if task.prompt.as_deref() == Some("PUBLIC_ERROR") {
             anyhow::bail!("provider_error: HTTP 503 PUBLIC_ERROR_ONLY");
         }
         Ok(public_output())
     }
     async fn invoke_streaming(&self, task: &ControllerTask, tokens: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<ProviderOutput> {
-        self.calls.lock().unwrap().push((task.clone(), true));
+        self.calls.lock().unwrap().push((self.id, task.clone(), true));
         tokens.send("PUBLIC_TOKEN".into()).await.unwrap();
         Ok(public_output())
     }
@@ -67,14 +67,22 @@ fn public_output() -> ProviderOutput {
 async fn beacon_diagnostics_real_controller_dispatch_reply() {
     const CHILD: &str = "PHILOTIC_BEACON_SYNTHETIC_CHILD";
     if std::env::var_os(CHILD).is_none() {
+        let exact = format!("{}::beacon_diagnostics_real_controller_dispatch_reply", module_path!().split_once("::").unwrap().1);
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["beacon_diagnostics_real_controller_dispatch_reply", "--nocapture"])
+            .args([exact.as_str(), "--exact", "--nocapture"])
             .env_clear().env(CHILD, "1").env("CI", "true")
             .env("PHILOTIC_VAULT_MASTER_KEY", "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         loop {
-            if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                let summary = String::from_utf8(output.stdout).unwrap();
+                assert!(status.success(), "synthetic child failed: {}", String::from_utf8_lossy(&output.stderr));
+                assert!(summary.contains("1 passed; 0 failed; 0 ignored;"), "child did not execute exact acceptance");
+                break;
+            }
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap(); let _ = child.wait(); panic!("synthetic acceptance timed out");
             }
@@ -156,8 +164,9 @@ async fn beacon_diagnostics_real_controller_dispatch_reply() {
                 assert_eq!(value["turn_id"], turn);
             }
             let actual = calls.lock().unwrap().last().cloned().unwrap();
-            assert_eq!(actual.0, expected, "observation changed provider input");
-            assert_eq!(actual.1, prompt == "PUBLIC_STREAM");
+            assert_eq!(actual.0, provider, "wrong provider handled addressed role");
+            assert_eq!(actual.1, expected, "observation changed provider input");
+            assert_eq!(actual.2, prompt == "PUBLIC_STREAM");
             let records = captures.0.lock().unwrap();
             assert_eq!(records.len(), before + 2, "real attempt start/finish must emit");
             let final_record = records.last().unwrap();
