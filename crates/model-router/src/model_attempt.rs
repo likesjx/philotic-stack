@@ -286,7 +286,11 @@ mod tests {
             tracing::info!(model_attempt = %"{}", provider_error = %secret, "synthetic extra-field leak control");
         });
         let records = capture.0.lock().unwrap();
-        assert_eq!(records.len(), 8, "six real events plus two capture controls");
+        assert_eq!(
+            records.len(),
+            8,
+            "six real events plus two capture controls"
+        );
         for record in &records[..6] {
             assert_private_fields_absent(record);
         }
