@@ -38,26 +38,52 @@ async fn invoke_ordinary_provider_attempt(
     catalog: &[crate::context_management::ModelCapabilityRecord],
     attempt_number: u8,
 ) -> Result<ProviderOutput> {
-    let route = task.provider_options.get("__model_attempt_route")
-        .cloned().and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
-    let correlation = format!("{}:{}",
-        ansible_mesh_core::model_attempt::fingerprint("session", task.session_id.as_deref().unwrap_or("")),
-        ansible_mesh_core::model_attempt::fingerprint("turn", task.turn_id.as_deref().unwrap_or("")));
-    let model = provider.context_models(task).into_iter().next().unwrap_or_default();
-    let observation = crate::model_attempt::Attempt::start(&correlation, &model, provider.id(), route, attempt_number);
+    let route = task
+        .provider_options
+        .get("__model_attempt_route")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let correlation = format!(
+        "{}:{}",
+        ansible_mesh_core::model_attempt::fingerprint(
+            "session",
+            task.session_id.as_deref().unwrap_or("")
+        ),
+        ansible_mesh_core::model_attempt::fingerprint(
+            "turn",
+            task.turn_id.as_deref().unwrap_or("")
+        )
+    );
+    let model = provider
+        .context_models(task)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let observation = crate::model_attempt::Attempt::start(
+        &correlation,
+        &model,
+        provider.id(),
+        route,
+        attempt_number,
+    );
     let result: Result<ProviderOutput> = async {
         let mut prepared = if task.kind == TaskKind::TextGenerate {
             let mut resolved = task.clone();
             if provider.id() == "ollama" && model == "qwen2.5:1.5b" {
                 // Tighten the implicit output reservation; an explicit larger
                 // request remains unchanged and is refused by the provider.
-                resolved.provider_options.entry("max_tokens".to_string()).or_insert(json!(256));
+                resolved
+                    .provider_options
+                    .entry("max_tokens".to_string())
+                    .or_insert(json!(256));
             }
-            resolved.resolved_context_capabilities = crate::context_management::resolve_capabilities(
-                provider.id(),
-                provider.context_models(task),
-                catalog,
-            );
+            resolved.resolved_context_capabilities =
+                crate::context_management::resolve_capabilities(
+                    provider.id(),
+                    provider.context_models(task),
+                    catalog,
+                );
             let (prepared, accounting) = crate::context_management::prepare(&resolved)?;
             info!(accounting = %serde_json::to_string(&accounting)?,
                 "model context selection (conservative estimate; metadata only)");
@@ -72,7 +98,13 @@ async fn invoke_ordinary_provider_attempt(
         }
     }
     .await;
-    let classified = result.as_ref().err().map(|error| classify_provider_failure(Some(task.kind.as_str()), Some(provider.id()), &error.to_string()));
+    let classified = result.as_ref().err().map(|error| {
+        classify_provider_failure(
+            Some(task.kind.as_str()),
+            Some(provider.id()),
+            &error.to_string(),
+        )
+    });
     let resolved_model = result.as_ref().ok().and_then(extract_output_model_gen);
     observation.finish(classified.as_ref(), resolved_model.as_deref());
     result
@@ -2223,8 +2255,12 @@ fn classify_provider_failure(
         return payload;
     }
 
-    if provider == Some("ollama") && matches!(message,
-        "OLLAMA_FALLBACK_CAPABILITY_UNVERIFIED" | "OLLAMA_FALLBACK_BUDGET_EXCEEDED") {
+    if provider == Some("ollama")
+        && matches!(
+            message,
+            "OLLAMA_FALLBACK_CAPABILITY_UNVERIFIED" | "OLLAMA_FALLBACK_BUDGET_EXCEEDED"
+        )
+    {
         payload.code = Some("LOCAL_FALLBACK_NOT_ADMITTED".into());
         payload.sub_kind = Some("unsupported_capability".into());
         payload.retryable = Some(false);
@@ -2234,8 +2270,10 @@ fn classify_provider_failure(
 
     // A local model is absent, not a transient request failure. The Ollama
     // adapter emits this fixed marker only after a bounded structured404 check.
-    if provider == Some("ollama") && payload.status == Some(404)
-        && message.starts_with("OLLAMA_MODEL_UNAVAILABLE:") {
+    if provider == Some("ollama")
+        && payload.status == Some(404)
+        && message.starts_with("OLLAMA_MODEL_UNAVAILABLE:")
+    {
         payload.code = Some("MODEL_UNAVAILABLE".into());
         payload.sub_kind = Some("model_unavailable".into());
         payload.retryable = Some(false);
@@ -2767,14 +2805,26 @@ mod failure_tests {
 
     #[test]
     fn missing_local_model_switches_without_repeating_the_same_request() {
-        let missing = classify_provider_failure(Some("text.generate"), Some("ollama"), "OLLAMA_MODEL_UNAVAILABLE: HTTP 404");
+        let missing = classify_provider_failure(
+            Some("text.generate"),
+            Some("ollama"),
+            "OLLAMA_MODEL_UNAVAILABLE: HTTP 404",
+        );
         assert_eq!(missing.sub_kind.as_deref(), Some("model_unavailable"));
         assert_eq!(missing.status, Some(404));
         assert_eq!(missing.retryable, Some(false));
         assert_eq!(missing.error_class.as_deref(), Some("switch_provider"));
-        let endpoint = classify_provider_failure(Some("text.generate"), Some("ollama"), "OllamaProvider: HTTP 404");
+        let endpoint = classify_provider_failure(
+            Some("text.generate"),
+            Some("ollama"),
+            "OllamaProvider: HTTP 404",
+        );
         assert_eq!(endpoint.sub_kind.as_deref(), Some("invalid_request"));
-        let malicious = classify_provider_failure(Some("text.generate"), Some("gemini"), "OLLAMA_MODEL_UNAVAILABLE: HTTP 404");
+        let malicious = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "OLLAMA_MODEL_UNAVAILABLE: HTTP 404",
+        );
         assert_ne!(malicious.sub_kind.as_deref(), Some("model_unavailable"));
     }
 

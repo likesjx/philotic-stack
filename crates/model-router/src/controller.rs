@@ -348,9 +348,13 @@ impl ControllerTask {
             .unwrap_or_default();
 
         // Diagnostic metadata is projected, never authority or provider options.
-        if let Some(route) = task.get("model_attempt_route").cloned()
-            .and_then(|value| serde_json::from_value::<ansible_mesh_core::model_attempt::AttemptRoute>(value).ok()) {
-            provider_options.insert("__model_attempt_route".into(), serde_json::to_value(route.projected())?);
+        if let Some(route) = task.get("model_attempt_route").cloned().and_then(|value| {
+            serde_json::from_value::<ansible_mesh_core::model_attempt::AttemptRoute>(value).ok()
+        }) {
+            provider_options.insert(
+                "__model_attempt_route".into(),
+                serde_json::to_value(route.projected())?,
+            );
         }
 
         let controller_task = Self {

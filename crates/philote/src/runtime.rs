@@ -1065,20 +1065,34 @@ fn model_attempt_task_json(
     target_role: &str,
     phase: &str,
 ) -> Result<String> {
-    let reason = if phase == "fallback" { "fallback_ladder" }
-        else if phase == "probe" { "origin_probe" }
-        else if phase == "retry" { "same_provider_retry" }
-        else if state.is_some_and(|s| s.pinned_tier_role.is_some()) { "operator_pin" }
-        else if state.is_some_and(|s| s.fallback_override.is_some()) { "sticky_fallback" }
-        else if pre_ladder_dispatch_target(state, "text.generate", DEFAULT_TEXT_MODEL_ROLE).is_some() { "explicit_or_remote" }
-        else if ladder_primary_role(state, DEFAULT_TEXT_MODEL_ROLE).as_deref() == Some(target_role) { "role_ladder" }
-        else { "legacy_or_default" };
+    let reason = if phase == "fallback" {
+        "fallback_ladder"
+    } else if phase == "probe" {
+        "origin_probe"
+    } else if phase == "retry" {
+        "same_provider_retry"
+    } else if state.is_some_and(|s| s.pinned_tier_role.is_some()) {
+        "operator_pin"
+    } else if state.is_some_and(|s| s.fallback_override.is_some()) {
+        "sticky_fallback"
+    } else if pre_ladder_dispatch_target(state, "text.generate", DEFAULT_TEXT_MODEL_ROLE).is_some()
+    {
+        "explicit_or_remote"
+    } else if ladder_primary_role(state, DEFAULT_TEXT_MODEL_ROLE).as_deref() == Some(target_role) {
+        "role_ladder"
+    } else {
+        "legacy_or_default"
+    };
     let tier = role_ladder_tiers(state)
         .and_then(|tiers| tiers.iter().take(16).position(|role| role == target_role))
         .map(|index| index as u8);
     let route = ansible_mesh_core::model_attempt::AttemptRoute {
-        target_role: target_role.into(), phase: phase.into(), reason: reason.into(), tier,
-    }.projected();
+        target_role: target_role.into(),
+        phase: phase.into(),
+        reason: reason.into(),
+        tier,
+    }
+    .projected();
     let mut value = serde_json::to_value(request)?;
     value["model_attempt_route"] = serde_json::to_value(route)?;
     Ok(serde_json::to_string(&value)?)
@@ -3126,7 +3140,12 @@ impl AgentRuntime {
                         target_node,
                         target_role: target_role.clone(),
                         target_guest_id,
-                        task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                        task_json: model_attempt_task_json(
+                            &model_req,
+                            self.sessions.get(&session_id),
+                            &target_role,
+                            "initial",
+                        )?,
                     })
                     .await?;
                 return Ok(());
@@ -3992,7 +4011,12 @@ impl AgentRuntime {
                 target_node,
                 target_role: target_role.clone(),
                 target_guest_id,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
 
@@ -4491,7 +4515,12 @@ impl AgentRuntime {
                 target_node,
                 target_role: target_role.clone(),
                 target_guest_id,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
 
@@ -5195,7 +5224,12 @@ impl AgentRuntime {
                 target_node,
                 target_role: target_role.clone(),
                 target_guest_id,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
 
@@ -5812,7 +5846,12 @@ impl AgentRuntime {
                 target_node,
                 target_role: target_role.clone(),
                 target_guest_id,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
         Ok(())

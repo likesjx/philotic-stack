@@ -27,17 +27,22 @@ impl AttemptRoute {
     pub fn projected(&self) -> Self {
         Self {
             target_role: match self.target_role.as_str() {
-                "model" => "model", "model.openrouter" => "model.openrouter",
-                "model.ollama" => "model.ollama", "model.openai" => "model.openai",
-                "model.anthropic" => "model.anthropic", _ => "unknown",
-            }.into(),
+                "model" => "model",
+                "model.openrouter" => "model.openrouter",
+                "model.ollama" => "model.ollama",
+                "model.openai" => "model.openai",
+                "model.anthropic" => "model.anthropic",
+                _ => "unknown",
+            }
+            .into(),
             phase: match self.phase.as_str() {
                 "initial" => "initial",
                 "fallback" => "fallback",
                 "probe" => "probe",
                 "retry" => "retry",
                 _ => "unknown",
-            }.into(),
+            }
+            .into(),
             reason: match self.reason.as_str() {
                 "operator_pin" => "operator_pin",
                 "sticky_fallback" => "sticky_fallback",
@@ -48,7 +53,8 @@ impl AttemptRoute {
                 "origin_probe" => "origin_probe",
                 "same_provider_retry" => "same_provider_retry",
                 _ => "unknown",
-            }.into(),
+            }
+            .into(),
             tier: self.tier.filter(|tier| *tier < 16),
         }
     }
@@ -61,7 +67,12 @@ mod tests {
     #[test]
     fn arbitrary_diagnostic_labels_and_identifiers_never_echo() {
         let secret = "Bearer private-prompt\ncredential";
-        let route = AttemptRoute { phase: secret.into(), reason: secret.into(), tier: Some(255), ..Default::default() };
+        let route = AttemptRoute {
+            phase: secret.into(),
+            reason: secret.into(),
+            tier: Some(255),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&route.projected()).unwrap();
         assert!(!json.contains(secret));
         assert_eq!(route.projected().tier, None);

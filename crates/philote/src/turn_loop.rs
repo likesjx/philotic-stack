@@ -920,7 +920,12 @@ impl AgentRuntime {
                 target_node: local_node_id(),
                 target_role: origin_role.clone(),
                 target_guest_id: None,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &origin_role, "probe")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &origin_role,
+                    "probe",
+                )?,
             })
             .await?;
 
@@ -2749,7 +2754,12 @@ impl AgentRuntime {
                         target_node,
                         target_role: target_role.clone(),
                         target_guest_id,
-                        task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                        task_json: model_attempt_task_json(
+                            &model_req,
+                            self.sessions.get(&session_id),
+                            &target_role,
+                            "initial",
+                        )?,
                     })
                     .await?;
 
@@ -2898,7 +2908,12 @@ impl AgentRuntime {
                 target_node,
                 target_role: target_role.clone(),
                 target_guest_id,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "retry")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "retry",
+                )?,
             })
             .await?;
 
@@ -3158,7 +3173,12 @@ impl AgentRuntime {
                 target_node,
                 target_role: target_role.clone(),
                 target_guest_id,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &target_role, "initial")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
 
@@ -3594,7 +3614,12 @@ impl AgentRuntime {
                 target_node: local_node_id(),
                 target_role: next_role.clone(),
                 target_guest_id: None,
-                task_json: model_attempt_task_json(&model_req, self.sessions.get(&session_id), &next_role, "fallback")?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &next_role,
+                    "fallback",
+                )?,
             })
             .await?;
 
