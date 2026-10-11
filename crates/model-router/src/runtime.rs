@@ -171,7 +171,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     info!(
         build_sha = philotic_client::build_sha(),
         "Starting Materialized Model Controller Guest [{}] for role [{}]...",
-        config.guest_id, config.role
+        config.guest_id,
+        config.role
     );
 
     let identity = GuestIdentity {

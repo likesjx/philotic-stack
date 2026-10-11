@@ -89,8 +89,16 @@ jobs:
             --bin model-controller-ollama --bin model-router
       - name: Package and record immutable public artifact hashes
         run: |
+          # Cargo may hard-link final executables to target/deps. Copy only the
+          # four reviewed outputs into a fresh staging directory; keep nlink=1
+          # and all other archive guards intact.
+          stage="$RUNNER_TEMP/beacon-controller-package"
+          mkdir "$stage"
+          for component in model-controller-openrouter model-controller-gemini model-controller-ollama model-router; do
+            cp -- "target/$TARGET/release/$component" "$stage/$component"
+          done
           python3 -B scripts/beacon-diagnostics-57b/package_release.py assemble \
-            --binary-dir "target/$TARGET/release" --output dist \
+            --binary-dir "$stage" --output dist \
             --source "$PHILOTIC_BUILD_SHA"
       - uses: actions/upload-artifact@v4
         with:
