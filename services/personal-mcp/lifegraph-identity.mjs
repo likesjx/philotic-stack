@@ -2,13 +2,13 @@
 // This adapter never upgrades a memory token or supplies roles from request data.
 const fail = () => { throw new Error('LifeGraph identity unavailable'); };
 const text = x => typeof x === 'string' && x.trim() && x.length <= 128;
-export function createLifeGraphIdentityAuthority({ issuer, resource, resolveBinding, maxLifetimeSeconds = 900 }) {
+export function createLifeGraphIdentityAuthority({ issuer, resource, resolveBinding, maxLifetimeSeconds = 900, clock = () => Date.now() }) {
   if (typeof issuer?.inspect !== 'function' || typeof issuer.issuer !== 'string' ||
       typeof resource !== 'string' || typeof resolveBinding !== 'function' ||
-      !Number.isInteger(maxLifetimeSeconds) || maxLifetimeSeconds < 1 || maxLifetimeSeconds > 900) fail();
+      !Number.isInteger(maxLifetimeSeconds) || maxLifetimeSeconds < 1 || maxLifetimeSeconds > 900 || typeof clock !== 'function') fail();
   const responses = new WeakMap();
   const valid = token => {
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(clock() / 1000);
     return token?.active === true && token.iss === issuer.issuer && token.aud === resource && token.scope === 'life:recall' &&
       Number.isSafeInteger(token.iat) && token.iat <= now && Number.isSafeInteger(token.exp) && token.exp > now &&
       token.exp > token.iat && token.exp - token.iat <= maxLifetimeSeconds;
@@ -35,7 +35,7 @@ export function createLifeGraphIdentityAuthority({ issuer, resource, resolveBind
     },
     verifyResponse(request) {
       const binding = responses.get(request);
-      return !!binding && !binding.response.destroyed && binding.expiry > Date.now();
+      return !!binding && !binding.response.destroyed && binding.expiry > clock();
     },
     async resolveCurrent({ request, signal }) {
       signal?.throwIfAborted();
@@ -49,7 +49,7 @@ export function createLifeGraphIdentityAuthority({ issuer, resource, resolveBind
       if (binding) {
         binding.expiry = token.exp * 1000;
         clearTimeout(binding.timer);
-        binding.timer = setTimeout(() => binding.response.destroy(), Math.max(0, binding.expiry - Date.now()));
+        binding.timer = setTimeout(() => binding.response.destroy(), Math.max(0, binding.expiry - clock()));
         binding.timer.unref?.();
       }
       return { active:true, audience:resource, clientId:token.client_id, subject:token.sub, scope:'life:recall',

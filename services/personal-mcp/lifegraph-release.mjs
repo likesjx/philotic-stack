@@ -121,6 +121,7 @@ export function createLifeGraphReleaseCoordinator({ issuerAuthority, policyAutho
         if (typeof lease.validate === 'function' && lease.validate() !== true) return false;
         if (validateCurrentPolicy({ actor, graphRevision }) !== true) return false;
         s.check();
+        if (typeof issuerAuthority.verifyResponse === 'function' && issuerAuthority.verifyResponse(admission.request) !== true) return false;
         if (binding.finished || binding.response.destroyed || binding.response.writableEnded) return false;
         // This request-bound single-use permit retains the issuer/graph gate and
         // actual policy reservation through HTTP finish/close, not merely until
