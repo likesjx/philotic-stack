@@ -276,6 +276,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_beacon_payload_keeps_required_channels_and_refuses_qwen_before_http() {
+        use philote::protocol::ModelRequestPayload;
+        use philote::session::ToolDefinition;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"choices": [{"message": {"content": "PUBLIC"}}]}))
+                }
+            }),
+        );
+        let worker = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OllamaProvider::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            Some(base),
+            None,
+        );
+        // Use the actual Philote wire type and ordinary fallback channels.
+        // Even the no-tools case cannot safely become a plain-text request.
+        let mut request = ModelRequestPayload {
+            action: "generate_text".into(),
+            request_class: Some("cognitive".into()),
+            session_id: "public-synthetic-beacon-session".into(),
+            turn_id: "public-synthetic-turn".into(),
+            prompt: "PUBLIC_SYNTHETIC_PROMPT".into(),
+            user_content: "PUBLIC_SYNTHETIC_USER".into(),
+            context: Some(json!({
+                "active_turn": {"role": "user", "text": "PUBLIC_SYNTHETIC_USER"}
+            })),
+            context_projection: None,
+            affordances: None,
+            attachments: Vec::new(),
+            tools_for_model: Vec::new(),
+            model: Some("qwen2.5:1.5b".into()),
+            response_contract: Some(json!({
+                "channels": ["spoken_text", "memory_candidate", "active_plan"],
+                "memory_candidate_policy": "PUBLIC_SYNTHETIC_REQUIRED_POLICY"
+            })),
+            response_route: Some("text_only".into()),
+            ligand: None,
+            provider_options: serde_json::Map::new(),
+            chat_id: "public-synthetic-chat".into(),
+            reply_to: "public-synthetic-hotel".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: Some("public-synthetic-beacon".into()),
+            final_reply_to: "public-synthetic-hotel".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            agent_id: Some("public-synthetic-beacon".into()),
+            oracle_pick: None,
+            oracle_agreement: None,
+        };
+        for with_tools in [false, true] {
+            if with_tools {
+                request.tools_for_model.push(ToolDefinition {
+                    tool_name: "synthetic.required_tool".into(),
+                    description: "Public fixture only".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                    class: None,
+                });
+            }
+            let before = serde_json::to_value(&request).unwrap();
+            let task = ControllerTask::from_value(&before).unwrap();
+            assert_eq!(task.kind, TaskKind::TextGenerate);
+            assert_eq!(task.tools.len(), usize::from(with_tools));
+            assert_eq!(
+                task.response_contract.channels,
+                ["spoken_text", "memory_candidate", "active_plan"]
+            );
+            assert_eq!(
+                provider.invoke(&task).await.unwrap_err().to_string(),
+                "OLLAMA_FALLBACK_CAPABILITY_UNVERIFIED"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(serde_json::to_value(&request).unwrap(), before);
+        }
+        worker.abort();
+    }
+
+    #[tokio::test]
     async fn unverified_tools_structured_output_and_large_context_refuse_before_network() {
         let provider = OllamaProvider::new(
             reqwest::Client::builder().no_proxy().build().unwrap(),

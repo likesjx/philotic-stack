@@ -1,8 +1,10 @@
-# Beacon model-attempt preparation (local, not deployed)
+# Beacon model-attempt diagnostics (draft, not deployed)
 
 Base: develop a81507134d19d3cc44b589f8e71911cc20730fc3. The deployed
 57b13ba0087722a2de062ff86710ae64a510d445 is separately verified by the parent;
-this branch has not been built, installed or used against personal sessions.
+this branch has not been installed or used against personal sessions. Hosted
+PR660 CI passed on e0303810 before the normal-request regression revision;
+the revised head must independently pass CI.
 
 ## Change and diagnostic contract
 
@@ -38,20 +40,27 @@ model_unavailable/nonretryable/switch_provider. Endpoint404 stays invalid_reques
 Neither case retries an identical missing request. Existing philote pin handling
 still prevents provider escalation when explicitly pinned.
 
-## Inventory-bound proposed local fallback and limits
+## Explicitly unavailable normal Beacon qwen fallback
 
-Only Beacon's source model binding adds model.ollama=qwen2.5:1.5b, matching the
-reported installed inventory. The source ladder stays OpenRouter then Ollama;
-this does not rewrite the reported live OpenRouter/Gemini/Ollama ladder. No
-model downloads, global-default rewrites or hardware changes are proposed.
+This PR does not wire Beacon to qwen. The source model binding was removed
+because normal Beacon fallback requires cognitive channels (spoken_text,
+memory_candidate, active_plan), and can require tools. Plain-text Ollama cannot
+satisfy that contract. Dropping channels/tools would change semantics, so no
+such adaptation is attempted. Source role configuration matches the base;
+the reported live ladder, overrides and provider defaults are not rewritten.
 
-Presence is not capability acceptance. This selected small model fails closed
+Presence is not capability acceptance. An explicitly requested small model fails closed
 before network for tools, structured response channels/format, or nontext
 modalities. Wire size is conservatively bounded to8192 bytes and output to256
 requested tokens. Existing context preparation/admission remains in force.
 These are tighten-only limits, not proof of model capability or quality.
-A normal tool-enabled/structured Beacon turn can therefore remain inadmissible;
-this branch does not claim that the actual iPhone failure is repaired.
+A normal Beacon turn remains unavailable through qwen even without tools.
+It receives explicit OLLAMA_FALLBACK_CAPABILITY_UNVERIFIED, classified as
+unsupported_capability/nonretryable/switch_provider. Required channels remain
+intact and HTTP invocation is not attempted. This PR fixes diagnostic visibility
+and absent-model error classification, not the missing local model or actual
+iPhone outcome. A usable cognitive local fallback requires a separately reviewed
+contract-preserving adapter and capability acceptance.
 
 The heal classifier's gemma3:4b default remains unchanged. Its existing
 PHILOTIC_HEAL_MODEL configuration can select another model, but setting it to
@@ -60,20 +69,23 @@ such acceptance, provider outcome, Gemini cause or billing diagnosis is claimed.
 
 ## Verification and proposed publication scope
 
-Local Python test verifies the actual public YAML binding and unchanged ladder.
+Local Python test verifies no unverified qwen binding and unchanged source ladder.
 Rust tests are authored for malicious diagnostic projection, hashing, bounded
 retention/rate limits, missing-model classification, synthetic HTTP success and
 404 sanitization, and unsupported tool/structured/budget requests. Existing
 context-isolation/streaming helper fixtures remain wired to the updated helper.
+The normal-Beacon regression serializes the actual ModelRequestPayload with
+required channels, both without and with a tool. It checks explicit refusal,
+zero HTTP requests and an unchanged original payload.
 No Rust compiler/cargo/rustfmt was found on PATH or inspected standard installed
-locations. Rust compilation, formatting and test execution remain blocking gates.
-Static checks do not substitute for them.
+locations. Rust compilation, formatting and tests run in hosted CI; each amended
+head needs independent review and exact-head CI evidence. Static checks do not
+substitute for them.
 
-Proposed next approval: push only codex/beacon-model-attempts-local and open one
-draft against develop, allowing existing credential-free PR Check/source tests
-and scoped cargo tests for ansible-mesh-core, model-router and philote. No workflow
-files, merge, dispatch, release, deployment, grants or live provider calls are
-included. Verify hosted workflows on the exact proposed head before publishing.
+Approved source scope: update codex/beacon-model-attempts-local and draft PR660
+against develop; existing credential-free PR/source workflows run on updates.
+No workflow files, merge, manual dispatch, release, deployment, grants or live
+provider calls are included.
 
 ## Tested deployment scope and rollback gate
 

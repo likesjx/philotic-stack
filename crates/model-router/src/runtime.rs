@@ -2805,6 +2805,17 @@ mod failure_tests {
 
     #[test]
     fn missing_local_model_switches_without_repeating_the_same_request() {
+        let unsupported = classify_provider_failure(
+            Some("text.generate"),
+            Some("ollama"),
+            "OLLAMA_FALLBACK_CAPABILITY_UNVERIFIED",
+        );
+        assert_eq!(
+            unsupported.sub_kind.as_deref(),
+            Some("unsupported_capability")
+        );
+        assert_eq!(unsupported.retryable, Some(false));
+        assert_eq!(unsupported.error_class.as_deref(), Some("switch_provider"));
         let missing = classify_provider_failure(
             Some("text.generate"),
             Some("ollama"),
