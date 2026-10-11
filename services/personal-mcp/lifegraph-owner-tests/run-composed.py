@@ -58,14 +58,17 @@ with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-',dir=args
         subprocess.run(['git','-C',str(ROOT),'archive',source_head],stdout=output,check=True)
     run('tar','-xf',str(archive),'-C',str(source));archive.unlink()
     fixture=source/'services/personal-mcp/lifegraph-owner-tests'
-    (work/'cargo').mkdir()
-    run('docker','run','--rm','--network','none','--user',f'{os.geteuid()}:{os.getegid()}','--cpus','2','--memory','3g',
-        '-v',str(source)+':/src:ro','-v',str(work)+':/build',
-        '-v',str(args.cargo_registry.resolve(strict=True))+':/build/cargo/registry:ro',
-        '-e','CARGO_HOME=/build/cargo','-e','CARGO_TARGET_DIR=/build/target','-e','CARGO_BUILD_JOBS=2','-e','CARGO_INCREMENTAL=0',
+    (work/'target').mkdir()
+    # The existing public cache can contain root-readable files. The isolated
+    # builder uses no host Cargo config/credentials and hands only its newly
+    # generated output back to the invoking UID, including on build failure.
+    build_command=f'trap "chown -hR {os.geteuid()}:{os.getegid()} /target" EXIT; /usr/local/rustup/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin/cargo build --offline --locked -p data-memorygraphrag --bin lifegraph-read-supervisor'
+    run('docker','run','--rm','--network','none','--cpus','2','--memory','3g',
+        '-v',str(source)+':/src:ro','-v',str(work/'target')+':/target',
+        '-v',str(args.cargo_registry.resolve(strict=True))+':/cargo/registry:ro',
+        '-e','CARGO_HOME=/cargo','-e','CARGO_TARGET_DIR=/target','-e','CARGO_BUILD_JOBS=2','-e','CARGO_INCREMENTAL=0',
         '-e','CARGO_PROFILE_DEV_DEBUG=0','-e','RUSTC=/usr/local/rustup/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin/rustc',
-        '-w','/src',RUST,'/usr/local/rustup/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin/cargo',
-        'build','--offline','--locked','-p','data-memorygraphrag','--bin','lifegraph-read-supervisor')
+        '-w','/src',RUST,'sh','-c',build_command)
     supervisor=work/'target/debug/lifegraph-read-supervisor'
     assert supervisor.is_file()
     node = work/'node'; shutil.copyfile(node_source, node); node.chmod(0o555)
