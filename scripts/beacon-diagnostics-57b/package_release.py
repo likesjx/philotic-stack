@@ -19,7 +19,8 @@ PRESERVED = {'aiua', 'philote', 'heal-dispatcher'}
 HEX = r'[0-9a-f]{64}'
 MAX_BINARY = 256 * 1024 * 1024
 SYSTEM_LIBRARIES = {'libc.so.6', 'libm.so.6', 'libgcc_s.so.1', 'libstdc++.so.6',
-                    'libdl.so.2', 'libpthread.so.0', 'librt.so.1', 'libssl.so.3', 'libcrypto.so.3'}
+                    'libdl.so.2', 'libpthread.so.0', 'librt.so.1', 'libssl.so.3', 'libcrypto.so.3',
+                    'ld-linux-x86-64.so.2'}
 
 
 class ArtifactRefusal(ValueError):
@@ -79,7 +80,11 @@ def dependencies(path):
     needed = sorted(set(needed))
     # This package contains executables only. A non-system dependency requires
     # a separately reviewed package instead of silently shipping a broken guest.
-    require(set(needed) <= SYSTEM_LIBRARIES)
+    unsupported = sorted(set(needed) - SYSTEM_LIBRARIES)
+    if unsupported:
+        # Only bounded public ELF dependency basenames; never paths or raw output.
+        require(len(unsupported) <= 10 and all(re.fullmatch('[A-Za-z0-9_.+-]{1,64}', name) for name in unsupported))
+        raise ArtifactRefusal('controller release refused: unsupported public ELF libraries ' + ','.join(unsupported))
     versions = [tuple(map(int, value.split('.'))) for value in re.findall(r'GLIBC_([0-9]+\.[0-9]+)', text)]
     maximum = max(versions, default=(0, 0)); require(maximum <= (2, 39))
     return {'needed_libraries': needed, 'glibc_minimum': '.'.join(map(str, maximum))}
@@ -177,7 +182,7 @@ def validate_manifest(manifest):
         require(type(candidate['sha256']) is str and re.fullmatch(HEX, candidate['sha256']) is not None)
         require(type(candidate['bytes']) is int and 64 <= candidate['bytes'] <= MAX_BINARY)
         require(candidate['roles'] == COMPONENTS[name])
-        require(type(candidate['needed_libraries']) is list and len(candidate['needed_libraries']) <= 8)
+        require(type(candidate['needed_libraries']) is list and len(candidate['needed_libraries']) <= len(SYSTEM_LIBRARIES))
         require(all(type(value) is str and re.fullmatch('[A-Za-z0-9_.+-]{1,64}', value) for value in candidate['needed_libraries']))
         require(candidate['needed_libraries'] == sorted(set(candidate['needed_libraries'])) and set(candidate['needed_libraries']) <= SYSTEM_LIBRARIES)
         require(type(candidate['glibc_minimum']) is str and re.fullmatch('[0-9]{1,2}\\.[0-9]{1,2}', candidate['glibc_minimum']))

@@ -92,7 +92,7 @@ class ControllerPackage(unittest.TestCase):
             with self.assertRaises(ValueError): m.elf(raw)
 
     def test_dependency_and_glibc_projection_fail_closed(self):
-        result = subprocess.CompletedProcess([], 0, b'(NEEDED) Shared library: [libc.so.6]\nName: GLIBC_2.39')
+        result = subprocess.CompletedProcess([], 0, b'(NEEDED) Shared library: [libc.so.6]\n(NEEDED) Shared library: [ld-linux-x86-64.so.2]\nName: GLIBC_2.39')
         with patch.object(m.subprocess, 'run', return_value=result):
             self.assertEqual(m.dependencies(Path('PUBLIC_ELF'))['glibc_minimum'], '2.39')
         for raw in (b'(NEEDED) Shared library: [private.so]',
