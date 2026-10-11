@@ -61,6 +61,12 @@ def main():
                       '-w', '/source', IMAGE]
             cargo = '/usr/local/rustup/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin/cargo'
             common = ['--offline', '--locked', '-p', 'data-memorygraphrag', '--test', 'read_supervisor']
+            # Archive mtimes and the fixed /source mount can otherwise reuse a
+            # previous mutant's workspace artifacts. Clean only the two mutated
+            # packages in this disposable target before every variant.
+            subprocess.run(docker+[cargo, 'clean', '--offline', '--locked',
+                                   '-p', 'ansible-mesh-core', '-p', 'data-memorygraphrag'],
+                           check=True, timeout=120)
             subprocess.run(docker+[cargo, 'test', *common, '--no-run'], check=True, timeout=900)
             for test in tests:
                 result = subprocess.run(docker+[cargo, 'test', *common, test, '--', '--exact', '--test-threads=1'],
