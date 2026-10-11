@@ -1,0 +1,108 @@
+name: Beacon installed-baseline diagnostics contracts
+on:
+  pull_request:
+    branches: [codex/beacon-diagnostics-baseline-57b]
+permissions:
+  contents: read
+concurrency:
+  group: beacon-diagnostics-57b-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  synthetic-dispatch-reply:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      CI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_VAULT_MASTER_KEY: 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+          components: rustfmt
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-cargo-
+      - name: Produce reviewable formatting patch
+        run: |
+          cargo fmt --all
+          git diff > /tmp/beacon-format.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-format-patch
+          path: /tmp/beacon-format.patch
+      - name: Public bounded observation contracts
+        run: |
+          cargo test --locked -p ansible-mesh-core model_attempt::tests -- --nocapture
+          cargo test --locked -p model-router model_attempt::tests -- --nocapture
+      - name: Baseline hotel to real controller dispatch and reply
+        run: |
+          python3 scripts/beacon-diagnostics-57b/test_check_acceptance.py
+          python3 scripts/beacon-diagnostics-57b/check_acceptance.py
+      - name: Formatting gate
+        run: git diff --exit-code
+  controller-x86-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      PHILOTIC_BUILD_SHA: ${{ github.event.pull_request.head.sha }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: beacon-controller-x86-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            linux-x86_64-cargo-
+            linux-pr-cargo-
+      - name: Fail-closed controller release contracts
+        run: python3 -B scripts/beacon-diagnostics-57b/test_package_release.py
+      - name: Build only candidate controller executables
+        run: |
+          python3 -B scripts/beacon-diagnostics-57b/package_release.py guard-source --source "$PHILOTIC_BUILD_SHA"
+          cargo build --locked --release --target "$TARGET" -p model-router \
+            --bin model-controller-openrouter --bin model-controller-gemini \
+            --bin model-controller-ollama --bin model-router
+      - name: Package and record immutable public artifact hashes
+        run: |
+          # Cargo may hard-link final executables to target/deps. Copy only the
+          # four reviewed outputs into a fresh staging directory; keep nlink=1
+          # and all other archive guards intact.
+          stage="$RUNNER_TEMP/beacon-controller-package"
+          mkdir "$stage"
+          for component in model-controller-openrouter model-controller-gemini model-controller-ollama model-router; do
+            cp -- "target/$TARGET/release/$component" "$stage/$component"
+          done
+          python3 -B scripts/beacon-diagnostics-57b/package_release.py assemble \
+            --binary-dir "$stage" --output dist \
+            --source "$PHILOTIC_BUILD_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-controller-diagnostics-x86_64
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

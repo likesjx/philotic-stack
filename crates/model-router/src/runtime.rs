@@ -169,8 +169,10 @@ enum StubResponse {
 pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     let _ = tracing_subscriber::fmt().try_init();
     info!(
+        build_sha = philotic_client::build_sha(),
         "Starting Materialized Model Controller Guest [{}] for role [{}]...",
-        config.guest_id, config.role
+        config.guest_id,
+        config.role
     );
 
     let identity = GuestIdentity {
@@ -796,6 +798,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
                         let mut result: Option<Result<ProviderOutput>> = None;
                         let mut attempt: u8 = 0;
+                        let mut observed_attempt: u8 = 0;
                         // Layer 1 (credential pools): on auth/rate-limit failures the
                         // pool rotates to a sibling key and the rotated member gets
                         // exactly one fresh attempt. Bounded so worst-case wall clock
@@ -825,6 +828,20 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     .await;
                                 }
                             }
+
+                            observed_attempt = observed_attempt.saturating_add(1);
+                            let correlation = format!(
+                                "{}:{}",
+                                ansible_mesh_core::model_attempt::fingerprint("session", controller_task.session_id.as_deref().unwrap_or("")),
+                                ansible_mesh_core::model_attempt::fingerprint("turn", controller_task.turn_id.as_deref().unwrap_or("")),
+                            );
+                            let observation = crate::model_attempt::Attempt::start(
+                                &correlation,
+                                controller_task.model.as_deref().unwrap_or(""),
+                                provider.id(),
+                                ansible_mesh_core::model_attempt::AttemptRoute::default(),
+                                observed_attempt,
+                            );
 
                             // Streaming path: spawn a forwarder task for this attempt.
                             // Connect the stream IPC BEFORE starting the SSE fetch so the
@@ -925,6 +942,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     ))
                                 })
                             };
+
+                            let observed_error = attempt_result.as_ref().err().map(|error| {
+                                classify_provider_failure(Some(task_kind.as_str()), Some(provider.id()), &error.to_string())
+                            });
+                            let resolved_model = attempt_result.as_ref().ok().and_then(extract_output_model_gen);
+                            observation.finish(observed_error.as_ref(), resolved_model.as_deref());
 
                             match attempt_result {
                                 Ok(output) => {

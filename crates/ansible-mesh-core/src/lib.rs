@@ -177,3 +177,4 @@ pub struct NodeHealthSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perimeter: Option<PerimeterSnapshot>,
 }
+pub mod model_attempt;

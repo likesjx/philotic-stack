@@ -22649,6 +22649,10 @@ pub(crate) mod tests {
         }
     }
 
+    mod beacon_diagnostics_acceptance {
+        include!("beacon_diagnostics_acceptance.rs");
+    }
+
     #[derive(Default)]
     pub(crate) struct TestGraphAdapter;
 
