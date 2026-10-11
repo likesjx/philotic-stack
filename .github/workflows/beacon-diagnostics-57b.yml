@@ -4,6 +4,9 @@ on:
     branches: [codex/beacon-diagnostics-baseline-57b]
 permissions:
   contents: read
+concurrency:
+  group: beacon-diagnostics-57b-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
   synthetic-dispatch-reply:
     runs-on: macos-14
@@ -49,3 +52,48 @@ jobs:
           python3 scripts/beacon-diagnostics-57b/check_acceptance.py
       - name: Formatting gate
         run: git diff --exit-code
+  controller-x86-package:
+    needs: synthetic-dispatch-reply
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      PHILOTIC_BUILD_SHA: ${{ github.event.pull_request.head.sha }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: beacon-controller-x86-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            linux-x86_64-cargo-
+            linux-pr-cargo-
+      - name: Fail-closed controller release contracts
+        run: python3 -B scripts/beacon-diagnostics-57b/test_package_release.py
+      - name: Build only candidate controller executables
+        run: |
+          cargo build --locked --release --target "$TARGET" -p model-router \
+            --bin model-controller-openrouter --bin model-controller-gemini \
+            --bin model-controller-ollama --bin model-router
+      - name: Package and record immutable public artifact hashes
+        run: |
+          python3 -B scripts/beacon-diagnostics-57b/package_release.py assemble \
+            --binary-dir "target/$TARGET/release" --output dist \
+            --source "$PHILOTIC_BUILD_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-controller-diagnostics-x86_64
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
