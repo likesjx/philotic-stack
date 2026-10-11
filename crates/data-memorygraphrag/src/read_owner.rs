@@ -327,9 +327,21 @@ impl ReadOwner {
                         {
                             bail!("owner unavailable");
                         }
+                        let waiting = self.journal.clone().lock_owned();
+                        tokio::pin!(waiting);
+                        let mut reported = false;
                         let lock = tokio::time::timeout(
                             Duration::from_secs(5),
-                            self.journal.clone().lock_owned(),
+                            std::future::poll_fn(|cx| {
+                                let state = std::future::Future::poll(waiting.as_mut(), cx);
+                                if state.is_pending() && !reported {
+                                    // Fixed, bounded diagnostic only after the authenticated
+                                    // waiter is actually registered; never emit caller data.
+                                    eprintln!("LifeGraph owner fence contended");
+                                    reported = true;
+                                }
+                                state
+                            }),
                         )
                         .await?;
                         if *self.stopping.borrow() {
