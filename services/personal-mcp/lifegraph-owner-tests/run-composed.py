@@ -35,6 +35,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--approved-fixture-run', action='store_true', required=True)
 parser.add_argument('--source-head', required=True)
 parser.add_argument('--cargo-registry', type=pathlib.Path, required=True, help='Existing public dependency registry cache; no Cargo credentials/config loaded')
+parser.add_argument('--temporary-parent', type=pathlib.Path, help='Disposable scratch parent with space for a fresh build')
 parser.add_argument('--issuer-source', type=pathlib.Path, required=True)
 args = parser.parse_args()
 assert os.uname().sysname == 'Linux'
@@ -48,7 +49,7 @@ node_source = pathlib.Path(shutil.which('node')).resolve(strict=True)
 assert int(run(str(node_source), '-p', 'process.versions.node.split(".")[0]')) >= 24
 containers, results = [], []
 network = 'synthetic-lifegraph-' + uuid.uuid4().hex[:12]
-with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-') as temporary:
+with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-',dir=args.temporary_parent) as temporary:
     work = pathlib.Path(temporary); work.chmod(0o700)
     source=work/'source';source.mkdir()
     # Export the exact Git object rather than mutable working-tree bytes.
@@ -57,10 +58,11 @@ with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-') as temp
         subprocess.run(['git','-C',str(ROOT),'archive',source_head],stdout=output,check=True)
     run('tar','-xf',str(archive),'-C',str(source));archive.unlink()
     fixture=source/'services/personal-mcp/lifegraph-owner-tests'
-    run('docker','run','--rm','--network','none','--cpus','2','--memory','3g',
+    (work/'cargo').mkdir()
+    run('docker','run','--rm','--network','none','--user',f'{os.geteuid()}:{os.getegid()}','--cpus','2','--memory','3g',
         '-v',str(source)+':/src:ro','-v',str(work)+':/build',
-        '-v',str(args.cargo_registry.resolve(strict=True))+':/cargo/registry:ro',
-        '-e','CARGO_HOME=/cargo','-e','CARGO_TARGET_DIR=/build/target','-e','CARGO_BUILD_JOBS=2','-e','CARGO_INCREMENTAL=0',
+        '-v',str(args.cargo_registry.resolve(strict=True))+':/build/cargo/registry:ro',
+        '-e','CARGO_HOME=/build/cargo','-e','CARGO_TARGET_DIR=/build/target','-e','CARGO_BUILD_JOBS=2','-e','CARGO_INCREMENTAL=0',
         '-e','CARGO_PROFILE_DEV_DEBUG=0','-e','RUSTC=/usr/local/rustup/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin/rustc',
         '-w','/src',RUST,'/usr/local/rustup/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin/cargo',
         'build','--offline','--locked','-p','data-memorygraphrag','--bin','lifegraph-read-supervisor')

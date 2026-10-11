@@ -13,6 +13,7 @@ registry cache and a clean exact issuer checkout with locked npm dependencies.
 python3 services/personal-mcp/lifegraph-owner-tests/run-composed.py \
   --approved-fixture-run --source-head "$(git rev-parse HEAD)" \
   --cargo-registry /ABSOLUTE/PUBLIC/CARGO/registry \
+  --temporary-parent /ABSOLUTE/DISPOSABLE/SCRATCH \
   --issuer-source /ABSOLUTE/EXACT/ISSUER/CHECKOUT
 ```
 
