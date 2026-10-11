@@ -14,6 +14,14 @@ const backend = createServer(async (request, response) => {
   assert.equal(request.headers.authorization, 'Bearer mk_synthetic');
   const chunks = []; for await (const chunk of request) chunks.push(chunk);
   const rpc = JSON.parse(Buffer.concat(chunks));
+  if (rpc.method === 'tools/list') {
+    assert.deepEqual(rpc.params, {});
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id,
+      result: { tools: [{ name: 'muninn_recall', description: 'Synthetic recall',
+        inputSchema: { type: 'object' } }] } }));
+    return;
+  }
   assert.equal(rpc.method, 'tools/call'); assert.equal(rpc.params.name, 'muninn_recall');
   assert.equal(rpc.params.arguments.vault, 'percival_connection_test');
   assert.equal(rpc.params.arguments.read_only, true); calls++;
