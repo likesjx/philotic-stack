@@ -169,6 +169,7 @@ enum StubResponse {
 pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     let _ = tracing_subscriber::fmt().try_init();
     info!(
+        build_sha = philotic_client::build_sha(),
         "Starting Materialized Model Controller Guest [{}] for role [{}]...",
         config.guest_id, config.role
     );

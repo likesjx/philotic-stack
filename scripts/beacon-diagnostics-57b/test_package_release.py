@@ -88,7 +88,9 @@ class ControllerPackage(unittest.TestCase):
         result = subprocess.CompletedProcess([], 0, b'(NEEDED) Shared library: [libc.so.6]\nName: GLIBC_2.39')
         with patch.object(m.subprocess, 'run', return_value=result):
             self.assertEqual(m.dependencies(Path('PUBLIC_ELF'))['glibc_minimum'], '2.39')
-        for raw in (b'(NEEDED) Shared library: [private.so]', b'Name: GLIBC_2.40'):
+        for raw in (b'(NEEDED) Shared library: [private.so]',
+                    b'(NEEDED) Shared library: [/opt/private/libfoo.so]',
+                    b'(NEEDED) malformed', b'Name: GLIBC_2.40'):
             with patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, raw)), self.assertRaises(ValueError):
                 m.dependencies(Path('PUBLIC_ELF'))
 
@@ -96,7 +98,7 @@ class ControllerPackage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); binaries = root / 'binaries'; binaries.mkdir()
             for name in m.COMPONENTS: (binaries / name).write_bytes(public_elf())
-            with patch.object(m.subprocess, 'check_output', return_value=SOURCE), \
+            with patch.object(m.subprocess, 'check_output', side_effect=[SOURCE, '']), \
                  patch.object(m.subprocess, 'run'), patch.object(m, 'dependencies', return_value={'needed_libraries': ['libc.so.6'], 'glibc_minimum': '2.39'}):
                 m.assemble(binaries, root / 'dist', SOURCE)
             path = root / 'dist' / 'beacon-controller-diagnostics-x86_64.tar.gz'
@@ -112,6 +114,13 @@ class ControllerPackage(unittest.TestCase):
                 item = tarfile.TarInfo('../PRIVATE'); item.size = 1; tar.addfile(item, io.BytesIO(b'x'))
             path.write_bytes(output.getvalue())
             with self.assertRaises(ValueError): m.verify(path, m.digest(path.read_bytes()), recorded['manifest_sha256'], SOURCE)
+
+    def test_dirty_or_mismatched_source_refuses_before_build(self):
+        for replies in ([SOURCE, ' M PUBLIC_SOURCE.py\n'], ['b' * 40]):
+            with patch.object(m.subprocess, 'check_output', side_effect=replies), \
+                 patch.object(m.subprocess, 'run') as ancestor, self.assertRaises(ValueError):
+                m.source_guard(SOURCE)
+            ancestor.assert_not_called()
 
 
 if __name__ == '__main__': unittest.main()

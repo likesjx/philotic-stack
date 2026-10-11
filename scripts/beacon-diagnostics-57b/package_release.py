@@ -63,7 +63,13 @@ def dependencies(path):
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True)
     require(len(result.stdout) <= 65536)
     text = result.stdout.decode('ascii')
-    needed = sorted(set(re.findall(r'\(NEEDED\).*Shared library: \[([A-Za-z0-9_.+-]+)\]', text)))
+    needed = []
+    for line in text.splitlines():
+        if '(NEEDED)' not in line: continue
+        match = re.fullmatch(r'.*\(NEEDED\)\s+Shared library: \[([^\]\n]+)\]\s*', line)
+        require(match is not None)
+        needed.append(match.group(1))
+    needed = sorted(set(needed))
     # This package contains executables only. A non-system dependency requires
     # a separately reviewed package instead of silently shipping a broken guest.
     require(set(needed) <= SYSTEM_LIBRARIES)
@@ -72,11 +78,16 @@ def dependencies(path):
     return {'needed_libraries': needed, 'glibc_minimum': '.'.join(map(str, maximum))}
 
 
-def assemble(binary_dir, output, source):
+def source_guard(source):
     require(re.fullmatch('[0-9a-f]{40}', source) is not None)
     checkout = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     require(checkout == source)
+    require(subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all'], text=True) == '')
     subprocess.run(['git', 'merge-base', '--is-ancestor', BASE, source], check=True)
+
+
+def assemble(binary_dir, output, source):
+    source_guard(source)
     entries = {}; records = {}
     for name, roles in COMPONENTS.items():
         path = Path(binary_dir) / name; raw = binary(path)
@@ -217,11 +228,13 @@ def main():
     build = commands.add_parser('assemble'); build.add_argument('--binary-dir', required=True)
     build.add_argument('--output', required=True); build.add_argument('--source', required=True)
     prepare = commands.add_parser('plan')
+    guard = commands.add_parser('guard-source'); guard.add_argument('--source', required=True)
     for name in ('archive', 'archive-sha256', 'manifest-sha256', 'source'):
         prepare.add_argument('--' + name, required=True)
     prepare.add_argument('--operator-receipt', required=True)
     args = parser.parse_args()
-    if args.command == 'assemble': assemble(args.binary_dir, args.output, args.source)
+    if args.command == 'guard-source': source_guard(args.source)
+    elif args.command == 'assemble': assemble(args.binary_dir, args.output, args.source)
     else:
         manifest = verify(args.archive, args.archive_sha256, args.manifest_sha256, args.source)
         print(canonical(plan(manifest, json_file(args.operator_receipt))).decode(), end='')
