@@ -277,8 +277,8 @@ mod tests {
 
     #[tokio::test]
     async fn normal_beacon_payload_keeps_required_channels_and_refuses_qwen_before_http() {
-        use philote::protocol::ModelRequestPayload;
-        use philote::session::ToolDefinition;
+        use agent_core::protocol::ModelRequestPayload;
+        use agent_core::session::ToolDefinition;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
