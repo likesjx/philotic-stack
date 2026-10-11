@@ -2,7 +2,7 @@
 // tokens remain memory-only. Never imported by a production entrypoint.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { MongoClient } from 'mongodb';
 import { mongoStore, ensureIndexes, changePersonalClientAdmission, changePersonalAdmission, revokeProviderSessions } from '__ISSUER__/src/lib/auth/personal-oauth/mongo';
@@ -16,7 +16,12 @@ import { lifeGraphContentDigest } from '../lifegraph-memgraph.mjs';
 const dir=process.env.SYNTHETIC_DIR!, role=process.env.SYNTHETIC_ROLE!;
 process.on('uncaughtException',error=>{writeFileSync(`${dir}/fixture-error-${role}`,String(error.stack),{mode:0o600});process.exit(1);});
 process.on('unhandledRejection',error=>{writeFileSync(`${dir}/fixture-error-${role}`,String(error),{mode:0o600});process.exit(1);});
-const put=(name:string,value:any='synthetic')=>writeFileSync(`${dir}/${name}`,typeof value==='string'?value:JSON.stringify(value),{mode:0o600});
+let markerSequence=0;
+const put=(name:string,value:any='synthetic')=>{
+ const staged=`${dir}/.fixture-${process.pid}-${++markerSequence}`;
+ writeFileSync(staged,typeof value==='string'?value:JSON.stringify(value),{mode:0o600});
+ renameSync(staged,`${dir}/${name}`);
+};
 const wait=async(name:string)=>{for(let i=0;i<1000;i++){if(existsSync(`${dir}/${name}`))return;await new Promise(r=>setTimeout(r,5));}throw Error('synthetic deadline');};
 const resource='https://synthetic.example/life/mcp', issuerUrl='https://synthetic-issuer.example';
 if(role==='issuer'){
