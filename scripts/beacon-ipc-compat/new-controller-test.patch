@@ -1,0 +1,38 @@
+--- a/crates/model-router/src/context_ipc_contract_tests.rs
++++ b/crates/model-router/src/context_ipc_contract_tests.rs
+@@ -104,3 +104,35 @@
+     assert_eq!(task.model.as_deref(), Some("synthetic/primary"));
+     assert_eq!(task.prompt.as_deref(), Some("LEGACY_DUPLICATE"));
+ }
++
++
++struct CrossVersionProbe;
++#[async_trait::async_trait]
++impl ModelProvider for CrossVersionProbe {
++    fn id(&self) -> &'static str { "ollama" }
++    fn supports(&self, _: &ControllerTask) -> bool { true }
++    async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
++        assert_eq!(task.model.as_deref(), Some("qwen2.5:1.5b"));
++        assert_eq!(task.provider_options["max_tokens"], 256);
++        assert!(!task.provider_options.contains_key("__model_attempt_route"));
++        assert!(task.composed_prompt_text().unwrap().contains("PUBLIC_SYNTHETIC_ONLY"));
++        anyhow::bail!("PUBLIC_SYNTHETIC_PROBE_REACHED")
++    }
++}
++
++#[tokio::test]
++async fn beacon_metadata_cross_version_new_controller() {
++    let fixture = std::env::var("BEACON_COMPAT_WIRE_FIXTURE").unwrap();
++    let frames: Vec<Value> = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
++    assert_eq!(frames.len(), 3);
++    for (frame, role) in frames.iter().zip(["model.openrouter", "model", "model.ollama"]) {
++        let IpcResponse::InboundTask { task_json, .. } =
++            serde_json::from_value(frame.clone()).unwrap() else { panic!("expected old hotel frame"); };
++        let task = ControllerTask::from_value(&serde_json::from_str::<Value>(&task_json).unwrap()).unwrap();
++        assert_eq!(task.provider_options["__model_attempt_route"]["target_role"], role);
++        let result = invoke_ordinary_provider_attempt(&CrossVersionProbe, &task, None, &[], 1).await;
++        assert_eq!(result.unwrap_err().to_string(), "PUBLIC_SYNTHETIC_PROBE_REACHED");
++        assert!(task.provider_options.contains_key("__model_attempt_route"));
++        assert!(!task.provider_options.contains_key("max_tokens"));
++    }
++}
