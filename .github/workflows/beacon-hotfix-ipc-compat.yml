@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: likesjx/philotic-stack
-          ref: 65494817fa4190ac2f5a26138297925650fb128a
+          ref: 8e21074a7e400762e3e0eedbc887106db99ce9b9
           persist-credentials: false
           path: new-controller
       - name: Install public build dependencies on disposable runner

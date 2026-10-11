@@ -1,18 +1,25 @@
 """Disposable synthetic IPC test; no model HTTP or installed hotel access."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
 OLD = "57b13ba0087722a2de062ff86710ae64a510d445"
-NEW = "65494817fa4190ac2f5a26138297925650fb128a"
+NEW = "8e21074a7e400762e3e0eedbc887106db99ce9b9"
 HERE = Path(__file__).resolve().parent
 
 
 def run(argv, cwd, env=None):
     subprocess.run(argv, cwd=cwd, env=env, check=True)
+
+
+def verify_test_output(output):
+    summaries = re.findall(r'test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;', output)
+    if summaries != [('ok', '1', '0', '0')]:
+        raise RuntimeError('expected exactly one executed synthetic test, no failures or skips')
 
 
 def main():
@@ -53,13 +60,20 @@ def main():
             matches = [line for line in listing.splitlines() if line.endswith(": test")]
             if len(matches) != 1 or test not in matches[0]:
                 raise RuntimeError("expected exactly one synthetic test")
-            run(command + ["--", "--nocapture", "--test-threads=1"], checkout, env)
+            completed = subprocess.run(
+                command + ["--", "--nocapture", "--test-threads=1"],
+                cwd=checkout, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            print(completed.stdout, flush=True)
+            completed.check_returncode()
+            verify_test_output(completed.stdout)
             if checkout == old:
                 frames = json.loads(fixture.read_text())
                 if len(frames) != 3:
                     raise RuntimeError("old hotel did not export three frames")
-        print("PASS: three old-hotel IPC frames parsed by candidate; synthetic provider reached")
-        print("UNPROVEN: real providers, role materialization, systemd, binary backport and rollout")
+        print("PASS: three explicitly addressed old-hotel IPC frames parsed; same synthetic Ollama helper probe reached for each role label")
+        print("UNPROVEN: controller event-loop dispatch, role-specific provider selection, reply delivery, normal cognitive success, real providers, role materialization, systemd, binary backport and rollout")
 
 
 if __name__ == "__main__":

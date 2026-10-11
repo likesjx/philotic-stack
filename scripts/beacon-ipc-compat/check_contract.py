@@ -22,4 +22,20 @@ assert "TestGraphAdapter" in old and "IpcServer::new" in old and "receiver.recv_
 assert "PUBLIC_SYNTHETIC_ONLY" in old
 assert "CrossVersionProbe" in new and "PUBLIC_SYNTHETIC_PROBE_REACHED" in new
 assert "invoke_ordinary_provider_attempt" in new
+verify = runner['verify_test_output']
+verify('test result: ok. 1 passed; 0 failed; 0 ignored; 238 filtered out;')
+for summary in [
+    'test result: ok. 0 passed; 0 failed; 0 ignored;',
+    'test result: ok. 0 passed; 0 failed; 1 ignored;',
+    'test result: ok. 2 passed; 0 failed; 0 ignored;',
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored;',
+    '',
+]:
+    try:
+        verify(summary)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('execution-count negative control was accepted')
 print("PASS: pinned sources, single bounded PR-only job, read-only permissions, synthetic harness")
+print("PASS: executed-test count positive control and five zero/skipped/failed/missing-output negative controls")
