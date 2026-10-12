@@ -243,6 +243,31 @@ slices edit `config_vault`, `mcp_endpoint` (`mcp_owner_identity_ok`) and
 Register. Do those families' moves **before** that work starts, or after it
 merges.
 
+**Status (2026-10-12): S3a done** on `codex/ipc-split-s3`, one commit per
+family.
+- **Families moved:**
+  - `skills` and `procedures` arms, into the existing files;
+  - `heal_autonomy`: 9 methods plus 5 arms;
+  - `routing_policy`: 15 arms;
+  - `integrations`: 3 methods plus 7 arms;
+  - `mcp_upstream`: 6 arms;
+  - `config_vault`: 1 method plus 5 arms;
+  - `mesh_invite`: 14 methods.
+- **Thin arms stay.** Arms that were already one-call delegates stay in
+  `mod.rs`.
+- **Name collisions.** A handler whose name collided with an existing free
+  function got a `_request` suffix.
+- **Verification.** Each move was checked body-for-body. The only accepted
+  differences are rustfmt re-wraps: an arm or closure block wrapped or
+  unwrapped around a single expression.
+- **Parameter detection fix.** Two parameters that the word-based detection
+  picked up from text only were dropped.
+- **Size.** `mod.rs` 14,244 → 10,495 lines. aiua tests are unchanged.
+- **Still open (S3b):**
+  - `mcp_endpoint`, after PERIMETER P1 (it edits `mcp_owner_identity_ok`);
+  - `session_snapshot`, `agent_bundle`, `remote_handoff`, `subagents`;
+  - the lease arms, which go into `service/lease_handlers.rs` outside `ipc/`.
+
 ### S4 — Operator-surface coupled families (M, 2 PRs)
 
 `desktop_membrane` (1,581–2,876 plus arms 5,974–6,149) and `placement`.
