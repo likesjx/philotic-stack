@@ -40,7 +40,7 @@ cargo build -p aiua -p philote -p philotic-client --example smoke_driver >/dev/n
 echo "Starting aiua in ${TMP_DIR}..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 "${ROOT_DIR}/target/debug/aiua" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
+  PHILOTIC_SMOKE_MODE=1 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" "${ROOT_DIR}/target/debug/aiua" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 

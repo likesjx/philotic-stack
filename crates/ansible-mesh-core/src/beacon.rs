@@ -216,13 +216,9 @@ impl BeaconDaemon {
                         }
                     };
                     let auth = MeshAuth::new(auth_key);
-                    if let Err(e) = auth.validate(
-                        &msg.msg_id,
-                        msg.seq as u64,
-                        &msg.payload,
-                        msg.timestamp,
-                        &msg.hmac,
-                    ) {
+                    if let Err(e) =
+                        auth.validate(&msg.msg_id, msg.seq, &msg.payload, msg.timestamp, &msg.hmac)
+                    {
                         warn!(
                             "Packet dropped: Auth validation failed for {} from {}: {}",
                             msg.msg_id, src, e

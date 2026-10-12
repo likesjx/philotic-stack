@@ -188,7 +188,7 @@ fn hotel_state_wire_len(payload: &HotelStateSyncPayload) -> Result<usize> {
         src_node: payload.node_id.clone(),
         dest_node: "broadcast".to_string(),
         msg_type: MsgType::HotelStateSync,
-        seq: u32::MAX,
+        seq: u64::MAX,
         total: u32::MAX,
         timestamp: u64::MAX,
         payload: payload_bytes.into(),
