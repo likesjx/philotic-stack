@@ -7804,14 +7804,17 @@ fn percival_gateway_dry_run_output() -> String {
 }
 
 fn run_store_percival_gateway_credential(secret_fd: Option<i32>, dry_run: bool) -> Result<()> {
-    let db_path = percival_gateway_profile_db_path()?;
-    let secret = read_operator_secret(secret_fd)?;
     if dry_run {
+        if secret_fd.is_some() {
+            anyhow::bail!("--dry-run does not accept credential input; omit --secret-fd");
+        }
+        let db_path = percival_gateway_profile_db_path()?;
         dry_run_percival_gateway_credential_at(&db_path)?;
-        drop(secret);
         println!("{}", percival_gateway_dry_run_output());
         return Ok(());
     }
+    let db_path = percival_gateway_profile_db_path()?;
+    let secret = read_operator_secret(secret_fd)?;
     let secret_ref = store_percival_gateway_credential_at(&db_path, secret)?;
     println!("{}", percival_gateway_secret_ref_output(&secret_ref));
     Ok(())
@@ -9278,9 +9281,10 @@ mod tests {
         percival_gateway_secret_ref_output, preserve_runtime_guest_activation,
         read_bounded_secret_from, read_operator_secret, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
-        seed_abstract_skill_catalog, seed_abstract_tool_catalog, seed_operator_timezone,
-        seed_orchestrator_roles, seed_skill_crafting, seed_toolset_profiles,
-        startup_test_gemini_base_url, store_percival_gateway_credential_at, validate_profile_name,
+        run_store_percival_gateway_credential, seed_abstract_skill_catalog,
+        seed_abstract_tool_catalog, seed_operator_timezone, seed_orchestrator_roles,
+        seed_skill_crafting, seed_toolset_profiles, startup_test_gemini_base_url,
+        store_percival_gateway_credential_at, validate_profile_name,
     };
 
     #[test]
@@ -9489,6 +9493,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vault_secrets", [], |row| row.get(0))
             .expect("count secrets");
         assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_dry_run_cli_refuses_secret_fd() {
+        let err = run_store_percival_gateway_credential(Some(3), true)
+            .expect_err("dry-run must not accept credential-bearing fd input");
+        assert!(err.to_string().contains("does not accept credential input"));
     }
 
     #[cfg(unix)]
