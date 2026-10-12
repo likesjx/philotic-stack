@@ -1,0 +1,81 @@
+name: Muninn installed-baseline scoped broker
+on:
+  pull_request:
+    branches: [codex/beacon-diagnostics-baseline-57b]
+permissions:
+  contents: read
+concurrency:
+  group: muninn-scoped-57b-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  synthetic-source-and-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_BUILD_SHA: ${{ github.event.pull_request.head.sha }}
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/percival-hotel-target
+            /tmp/percival-test-target
+          key: muninn-scoped-57b-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            linux-x86_64-cargo-
+            beacon-controller-x86-
+      - name: Synthetic callback, revocation and unary transport contracts
+        run: |
+          node --test services/personal-mcp/*.test.mjs
+          PERSONAL_MCP_REQUIRE_GATEWAY_INTEROP=1 PERSONAL_MCP_GATEWAY_TEST_PATH="$GITHUB_WORKSPACE/services/personal-mcp/gateway.mjs" \
+            node --loader ./services/personal-mcp/issuer-fixture/loader.mjs --test services/personal-mcp/issuer-fixture/tests/personal-oauth.test.ts
+          python3 -B scripts/muninn-scoped-57b/source_contract.py
+      - name: Reviewed source formatting
+        run: cargo fmt --all --check
+      - name: Reviewed native source build without system package installation
+        run: |
+          cargo build --locked --release -p aiua --target-dir /tmp/percival-hotel-target
+          cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /tmp/percival-test-target
+          cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /tmp/percival-test-target --no-run
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/percival-hotel-target
+            /tmp/percival-test-target
+          key: muninn-scoped-57b-${{ hashFiles('**/Cargo.lock') }}
+      - name: Numeric-peer, actual encrypted hotel, guest FD and lifecycle fixtures
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$GITHUB_EVENT_NAME" = pull_request
+          python3 -B scripts/muninn-scoped-57b/stage_public_fixtures.py
+          test ! -e /tmp/muninn-scoped-57b-ci
+          sudo touch /tmp/muninn-scoped-57b-ci
+          sudo env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 PERCIVAL_FIXTURE_NODE="$(command -v node)" \
+            /usr/bin/python3 /tmp/percival-hosted-fixtures/personal-mcp/scoped-vault-tests/run_linux_ci.py
+      - name: Package only the scoped-broker hotel executable
+        run: python3 -B scripts/muninn-scoped-57b/package_candidate.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muninn-scoped-broker-57b-x86_64
+          path: dist-ci/muninn-scoped-57b/
+          retention-days: 14
+          if-no-files-found: error

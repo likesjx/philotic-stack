@@ -661,6 +661,14 @@ impl SqliteGraphStorage {
         Ok(s)
     }
 
+    /// Open an already-initialized graph database without creating or migrating schema.
+    pub fn open_existing_without_init(db_path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(db_path).context("Failed to open GraphStorage SQLite DB")?;
+        let conn = Arc::new(Mutex::new(conn));
+        let adapter = SqliteGraphAdapter::new(conn.clone());
+        Ok(Self { conn, adapter })
+    }
+
     /// Open an in-memory SQLite database. Useful for tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
