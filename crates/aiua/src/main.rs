@@ -726,6 +726,9 @@ enum Command {
     },
     /// Store the Percival personal-gateway Muninn observe credential locally.
     StorePercivalGatewayCredential {
+        /// Explicit existing context DB path. Use for service layouts outside PHILOTIC_PROFILE.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
         /// Inherited file descriptor to read the credential from. Defaults to stdin.
         #[arg(long)]
         secret_fd: Option<i32>,
@@ -7596,6 +7599,16 @@ fn percival_gateway_profile_db_path() -> Result<PathBuf> {
     Ok(philotic_root.join(profile).join("context.db"))
 }
 
+fn percival_gateway_db_path(explicit_db_path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(db_path) = explicit_db_path {
+        if !db_path.is_absolute() {
+            anyhow::bail!("--db-path must be an absolute path to an existing context DB");
+        }
+        return Ok(db_path.to_path_buf());
+    }
+    percival_gateway_profile_db_path()
+}
+
 #[cfg(unix)]
 fn validate_private_dir(path: &Path, label: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -7803,17 +7816,21 @@ fn percival_gateway_dry_run_output() -> String {
     .to_string()
 }
 
-fn run_store_percival_gateway_credential(secret_fd: Option<i32>, dry_run: bool) -> Result<()> {
+fn run_store_percival_gateway_credential(
+    db_path: Option<&Path>,
+    secret_fd: Option<i32>,
+    dry_run: bool,
+) -> Result<()> {
     if dry_run {
         if secret_fd.is_some() {
             anyhow::bail!("--dry-run does not accept credential input; omit --secret-fd");
         }
-        let db_path = percival_gateway_profile_db_path()?;
+        let db_path = percival_gateway_db_path(db_path)?;
         dry_run_percival_gateway_credential_at(&db_path)?;
         println!("{}", percival_gateway_dry_run_output());
         return Ok(());
     }
-    let db_path = percival_gateway_profile_db_path()?;
+    let db_path = percival_gateway_db_path(db_path)?;
     let secret = read_operator_secret(secret_fd)?;
     let secret_ref = store_percival_gateway_credential_at(&db_path, secret)?;
     println!("{}", percival_gateway_secret_ref_output(&secret_ref));
@@ -7887,8 +7904,13 @@ fn main() -> Result<()> {
 
 async fn hotel_main() -> Result<()> {
     let args = Args::parse();
-    if let Some(Command::StorePercivalGatewayCredential { secret_fd, dry_run }) = &args.command {
-        return run_store_percival_gateway_credential(*secret_fd, *dry_run);
+    if let Some(Command::StorePercivalGatewayCredential {
+        db_path,
+        secret_fd,
+        dry_run,
+    }) = &args.command
+    {
+        return run_store_percival_gateway_credential(db_path.as_deref(), *secret_fd, *dry_run);
     }
 
     init_logging();
@@ -9269,7 +9291,7 @@ mod tests {
         PERCIVAL_GATEWAY_SCOPE, PERCIVAL_GATEWAY_SECRET_KIND, PERCIVAL_GATEWAY_SECRET_MAX_BYTES,
         SecretAccess, StartupTest, agent_graph_guest_record, agent_graph_runner_guest,
         agent_identity_record_for_profile, agent_profile_from_config,
-        all_agent_profiles_from_config, deactivate_legacy_managed_guests,
+        all_agent_profiles_from_config, current_euid, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         dry_run_percival_gateway_credential_at, enable_guest_test_overrides,
         enforce_graph_datasource_home, execution_reachability_for_hotel,
@@ -9277,11 +9299,11 @@ mod tests {
         guest_supervision_enabled_from, hotel_base_port, hotel_ipc_socket_path,
         local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
-        nearest_available_base_port, node_id_bound_to_other_hotel, percival_gateway_dry_run_output,
-        percival_gateway_secret_ref_output, preserve_runtime_guest_activation,
-        read_bounded_secret_from, read_operator_secret, read_string_config,
-        reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
-        run_store_percival_gateway_credential, seed_abstract_skill_catalog,
+        nearest_available_base_port, node_id_bound_to_other_hotel, percival_gateway_db_path,
+        percival_gateway_dry_run_output, percival_gateway_secret_ref_output,
+        preserve_runtime_guest_activation, read_bounded_secret_from, read_operator_secret,
+        read_string_config, reconcile_peer_execution_reachability, resolve_runtime_ports,
+        resolve_secret, run_store_percival_gateway_credential, seed_abstract_skill_catalog,
         seed_abstract_tool_catalog, seed_operator_timezone, seed_orchestrator_roles,
         seed_skill_crafting, seed_toolset_profiles, startup_test_gemini_base_url,
         store_percival_gateway_credential_at, validate_profile_name,
@@ -9367,6 +9389,41 @@ mod tests {
         db_path
     }
 
+    #[cfg(unix)]
+    fn synthetic_service_context_db(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir(name);
+        let data_dir = root.join("opt").join("philotic").join("data");
+        std::fs::create_dir_all(&data_dir).expect("create synthetic service data dir");
+        std::fs::set_permissions(root.join("opt"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod synthetic opt");
+        std::fs::set_permissions(
+            root.join("opt").join("philotic"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("chmod synthetic philotic home");
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod synthetic data dir");
+        let db_path = data_dir.join("aiua_context.db");
+        {
+            let storage =
+                SqliteGraphStorage::open(&db_path).expect("init synthetic service context DB");
+            drop(storage);
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod synthetic service context DB");
+        db_path
+    }
+
+    #[cfg(unix)]
+    fn file_sha256(path: &std::path::Path) -> String {
+        use sha2::Digest;
+
+        let raw = std::fs::read(path).expect("read file for sha256");
+        format!("{:x}", sha2::Sha256::digest(&raw))
+    }
+
     fn synthetic_vault_key() -> String {
         BASE64_STANDARD.encode([7u8; 32])
     }
@@ -9382,6 +9439,14 @@ mod tests {
     fn percival_gateway_profile_name_rejects_path_escape() {
         assert!(validate_profile_name("../default").is_err());
         assert!(validate_profile_name("default").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_explicit_db_path_must_be_absolute() {
+        let err = percival_gateway_db_path(Some(std::path::Path::new("relative/context.db")))
+            .expect_err("explicit DB path must not depend on process cwd");
+        assert!(err.to_string().contains("absolute path"));
     }
 
     #[test]
@@ -9487,7 +9552,9 @@ mod tests {
     #[test]
     fn percival_gateway_dry_run_validates_db_without_writing_secret() {
         let db_path = synthetic_context_db("percival-dry-run");
+        let before = file_sha256(&db_path);
         dry_run_percival_gateway_credential_at(&db_path).expect("dry-run validates existing DB");
+        assert_eq!(file_sha256(&db_path), before);
         let conn = rusqlite::Connection::open(&db_path).expect("open synthetic DB");
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vault_secrets", [], |row| row.get(0))
@@ -9498,9 +9565,86 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn percival_gateway_dry_run_cli_refuses_secret_fd() {
-        let err = run_store_percival_gateway_credential(Some(3), true)
+        let err = run_store_percival_gateway_credential(None, Some(3), true)
             .expect_err("dry-run must not accept credential-bearing fd input");
         assert!(err.to_string().contains("does not accept credential input"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_dry_run_accepts_explicit_service_layout_without_mutation() {
+        let db_path = synthetic_service_context_db("percival-service-layout");
+        let before = file_sha256(&db_path);
+        run_store_percival_gateway_credential(Some(&db_path), None, true)
+            .expect("explicit service DB dry-run validates");
+        assert_eq!(file_sha256(&db_path), before);
+        let conn = rusqlite::Connection::open(&db_path).expect("open synthetic service DB");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vault_secrets", [], |row| row.get(0))
+            .expect("count secrets");
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_explicit_db_path_rejects_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let db_path = synthetic_service_context_db("percival-symlink-target");
+        let link_dir = unique_test_dir("percival-symlink");
+        let link_path = link_dir.join("aiua_context.db");
+        symlink(&db_path, &link_path).expect("create DB symlink");
+        std::fs::set_permissions(&link_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod symlink dir");
+        let err = dry_run_percival_gateway_credential_at(&link_path)
+            .expect_err("symlink DB path must be rejected");
+        assert!(err.to_string().contains("regular private file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_explicit_db_path_rejects_unsafe_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db_path = synthetic_service_context_db("percival-unsafe-mode");
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o620))
+            .expect("chmod unsafe DB mode");
+        let err = dry_run_percival_gateway_credential_at(&db_path)
+            .expect_err("group-writable DB path must be rejected");
+        assert!(err.to_string().contains("regular private file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_explicit_db_path_accepts_readonly_private_file_for_dry_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db_path = synthetic_service_context_db("percival-readonly-dry-run");
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o400))
+            .expect("chmod readonly DB");
+        let before = file_sha256(&db_path);
+        dry_run_percival_gateway_credential_at(&db_path)
+            .expect("read-only private DB should still support dry-run");
+        assert_eq!(file_sha256(&db_path), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_explicit_db_path_rejects_wrong_owner_when_test_can_chown() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let db_path = synthetic_service_context_db("percival-wrong-owner");
+        let wrong_uid = current_euid().saturating_add(1);
+        let path =
+            std::ffi::CString::new(db_path.as_os_str().as_bytes()).expect("path contains no nul");
+        // SAFETY: chown receives a valid NUL-terminated path and primitive IDs.
+        let changed = unsafe { libc::chown(path.as_ptr(), wrong_uid, u32::MAX) } == 0;
+        if !changed {
+            return;
+        }
+        let err = dry_run_percival_gateway_credential_at(&db_path)
+            .expect_err("wrong-owner DB path must be rejected");
+        assert!(err.to_string().contains("regular private file"));
     }
 
     #[cfg(unix)]
