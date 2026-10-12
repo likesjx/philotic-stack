@@ -729,6 +729,9 @@ enum Command {
         /// Inherited file descriptor to read the credential from. Defaults to stdin.
         #[arg(long)]
         secret_fd: Option<i32>,
+        /// Validate the profile, context DB, and credential input without writing a secret.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -7779,13 +7782,36 @@ fn store_percival_gateway_credential_at(db_path: &Path, secret: String) -> Resul
     })
 }
 
+fn dry_run_percival_gateway_credential_at(db_path: &Path) -> Result<()> {
+    validate_operator_db_path(db_path)
+}
+
 fn percival_gateway_secret_ref_output(secret_ref: &str) -> String {
     serde_json::json!({ "secret_ref": secret_ref }).to_string()
 }
 
-fn run_store_percival_gateway_credential(secret_fd: Option<i32>) -> Result<()> {
+fn percival_gateway_dry_run_output() -> String {
+    serde_json::json!({
+        "dry_run": true,
+        "would_store": {
+            "secret_kind": PERCIVAL_GATEWAY_SECRET_KIND,
+            "scope": PERCIVAL_GATEWAY_SCOPE,
+            "allowed_roles": [PERCIVAL_GATEWAY_ROLE],
+            "allowed_guests": [PERCIVAL_GATEWAY_GUEST]
+        }
+    })
+    .to_string()
+}
+
+fn run_store_percival_gateway_credential(secret_fd: Option<i32>, dry_run: bool) -> Result<()> {
     let db_path = percival_gateway_profile_db_path()?;
     let secret = read_operator_secret(secret_fd)?;
+    if dry_run {
+        dry_run_percival_gateway_credential_at(&db_path)?;
+        drop(secret);
+        println!("{}", percival_gateway_dry_run_output());
+        return Ok(());
+    }
     let secret_ref = store_percival_gateway_credential_at(&db_path, secret)?;
     println!("{}", percival_gateway_secret_ref_output(&secret_ref));
     Ok(())
@@ -7858,8 +7884,8 @@ fn main() -> Result<()> {
 
 async fn hotel_main() -> Result<()> {
     let args = Args::parse();
-    if let Some(Command::StorePercivalGatewayCredential { secret_fd }) = &args.command {
-        return run_store_percival_gateway_credential(*secret_fd);
+    if let Some(Command::StorePercivalGatewayCredential { secret_fd, dry_run }) = &args.command {
+        return run_store_percival_gateway_credential(*secret_fd, *dry_run);
     }
 
     init_logging();
@@ -9237,16 +9263,18 @@ mod tests {
     use super::resolve_retention_days;
     use super::{
         AgentProfile, BASE64_STANDARD, PERCIVAL_GATEWAY_GUEST, PERCIVAL_GATEWAY_ROLE,
-        PERCIVAL_GATEWAY_SECRET_MAX_BYTES, SecretAccess, StartupTest, agent_graph_guest_record,
-        agent_graph_runner_guest, agent_identity_record_for_profile, agent_profile_from_config,
+        PERCIVAL_GATEWAY_SCOPE, PERCIVAL_GATEWAY_SECRET_KIND, PERCIVAL_GATEWAY_SECRET_MAX_BYTES,
+        SecretAccess, StartupTest, agent_graph_guest_record, agent_graph_runner_guest,
+        agent_identity_record_for_profile, agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
-        enable_guest_test_overrides, enforce_graph_datasource_home,
-        execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
-        guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
-        hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
+        dry_run_percival_gateway_credential_at, enable_guest_test_overrides,
+        enforce_graph_datasource_home, execution_reachability_for_hotel,
+        extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
+        guest_supervision_enabled_from, hotel_base_port, hotel_ipc_socket_path,
+        local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
-        nearest_available_base_port, node_id_bound_to_other_hotel,
+        nearest_available_base_port, node_id_bound_to_other_hotel, percival_gateway_dry_run_output,
         percival_gateway_secret_ref_output, preserve_runtime_guest_activation,
         read_bounded_secret_from, read_operator_secret, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
@@ -9367,6 +9395,27 @@ mod tests {
         assert!(!output.contains("mk_synthetic"));
     }
 
+    #[test]
+    fn percival_gateway_dry_run_output_names_exact_acl_without_secret() {
+        let output = percival_gateway_dry_run_output();
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        assert_eq!(parsed["dry_run"], true);
+        assert_eq!(
+            parsed["would_store"]["secret_kind"],
+            PERCIVAL_GATEWAY_SECRET_KIND
+        );
+        assert_eq!(parsed["would_store"]["scope"], PERCIVAL_GATEWAY_SCOPE);
+        assert_eq!(
+            parsed["would_store"]["allowed_roles"],
+            serde_json::json!([PERCIVAL_GATEWAY_ROLE])
+        );
+        assert_eq!(
+            parsed["would_store"]["allowed_guests"],
+            serde_json::json!([PERCIVAL_GATEWAY_GUEST])
+        );
+        assert!(!output.contains("mk_synthetic"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn percival_gateway_secret_fd_reads_bounded_secret() {
@@ -9428,6 +9477,18 @@ mod tests {
             std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
             std::env::remove_var("PHILOTIC_VAULT_KEYCHAIN");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_dry_run_validates_db_without_writing_secret() {
+        let db_path = synthetic_context_db("percival-dry-run");
+        dry_run_percival_gateway_credential_at(&db_path).expect("dry-run validates existing DB");
+        let conn = rusqlite::Connection::open(&db_path).expect("open synthetic DB");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vault_secrets", [], |row| row.get(0))
+            .expect("count secrets");
+        assert_eq!(count, 0);
     }
 
     #[cfg(unix)]
