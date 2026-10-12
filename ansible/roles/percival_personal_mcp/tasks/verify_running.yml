@@ -1,0 +1,15 @@
+---
+- name: Close gateway if running hotel provenance cannot be established
+  block:
+    - name: Verify running hotel artifact
+      ansible.builtin.import_tasks: verify_hotel.yml
+      vars:
+        percival_verify_running: true
+  rescue:
+    - name: Stop gateway on provenance failure without reverting unrelated units
+      ansible.builtin.systemd_service:
+        name: percival-personal-mcp.service
+        state: stopped
+    - name: Fail rollout after closing the gateway
+      ansible.builtin.fail:
+        msg: Running hotel provenance failed; gateway stopped. Operator review is required.

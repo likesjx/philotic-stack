@@ -1,0 +1,75 @@
+name: Percival Linux acceptance
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'crates/aiua/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'services/personal-mcp/**'
+      - 'ansible/roles/percival_personal_mcp/**'
+      - 'ansible/deploy_personal_mcp.yml'
+      - 'ansible/library/percival_hotel_provenance.py'
+      - 'ansible/module_utils/percival_provenance.py'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/percival-linux-acceptance.yml'
+  push:
+    branches: [develop]
+    paths:
+      - 'crates/aiua/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'services/personal-mcp/**'
+      - 'ansible/roles/percival_personal_mcp/**'
+      - 'ansible/deploy_personal_mcp.yml'
+      - 'ansible/library/percival_hotel_provenance.py'
+      - 'ansible/module_utils/percival_provenance.py'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/percival-linux-acceptance.yml'
+permissions:
+  contents: read
+concurrency:
+  group: percival-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  synthetic-acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Root/numeric UID and fixed /run paths stay inside a disposable container.
+    # No privileged mode, host service sockets, credentials or production mounts.
+    container: ubuntu:24.04
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - name: Install container build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev libopus-dev python3
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Gateway policy and protocol tests
+        working-directory: services/personal-mcp
+        run: npm test
+      - name: Synthetic role executable provenance tests
+        run: python3 services/personal-mcp/scoped-vault-tests/provenance_test.py
+      - name: Build real hotel and specialized source harness
+        run: |
+          cargo build --locked -p aiua --target-dir /hotel-target
+          cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target
+          cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target --no-run
+      - name: Native Linux numeric-peer, FD and lifecycle acceptance
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: |
+          python3 services/personal-mcp/scoped-vault-tests/run_linux_ci.py

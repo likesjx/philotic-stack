@@ -39,7 +39,7 @@ philotic_agents:
       default_model: "{{ philotic_default_model }}"
     turn_loop_config:
       fallback_tiers:
-        - "model"
+        - "model.openrouter"
         - "model.ollama"
     voice_response_policy:
       mode: "off"                          # off | auto | on  (/tts to toggle)

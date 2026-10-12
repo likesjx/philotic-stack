@@ -1,0 +1,6 @@
+{
+  "caller_uid": 1234,
+  "hotel_uid": 999,
+  "secret_ref": "secret://hotel/default/percival-muninn-observe/REPLACE_WITH_CREATED_REF",
+  "introspection_secret_ref": "secret://hotel/default/percival-issuer-introspection/REPLACE_WITH_CREATED_REF"
+}

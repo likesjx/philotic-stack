@@ -122,7 +122,14 @@
       "note": "Dedicated administrative protocol for the configured Muninn service."
     },
     {
-      "path": "crates/aiua/src/service/ipc.rs",
+      "path": "crates/aiua/src/service/ipc/memory.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "hotel IPC and artifact contracts",
+      "note": "Muninn probes and delta digest calls moved from service/ipc.rs."
+    },
+    {
+      "path": "crates/aiua/src/service/ipc/mod.rs",
       "traffic_classes": ["artifact", "local-resource"],
       "disposition": "named-exception",
       "authority": "hotel IPC and artifact contracts",

@@ -574,7 +574,12 @@ impl TestServer {
             EdgeMessage::HelloAck {
                 session_id,
                 replay_from,
+                features,
             } => {
+                assert!(
+                    features.is_empty(),
+                    "unsupported runtime cancellation must be unadvertised"
+                );
                 assert!(
                     session_id.starts_with("edge-sess-"),
                     "unexpected session id {session_id}"
@@ -622,7 +627,7 @@ async fn recv_envelope(ws: &mut WsStream) -> EdgeEnvelope {
             .expect("websocket error while waiting for a frame");
         match message {
             WsMessage::Text(text) => {
-                return serde_json::from_str(&text).expect("decode edge envelope")
+                return serde_json::from_str(&text).expect("decode edge envelope");
             }
             WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
             other => panic!("unexpected non-text websocket frame: {other:?}"),
@@ -987,6 +992,7 @@ async fn turn_submit_streams_turn_events() {
         &mut ws,
         2,
         EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: LOCAL_TARGET_NODE.into(),
             target_agent_id: "jane".into(),
             conversation_id: Some("conv-e2e".into()),
@@ -1026,6 +1032,144 @@ async fn turn_submit_streams_turn_events() {
     ws.close(None).await.ok();
 }
 
+/// Correlation is retained before the fastest mocked hotel response, and a
+/// duplicate cannot dispatch another job under the same request binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_correlated_acceptance_precedes_output_and_rejects_duplicate() {
+    let server = spawn_server().await;
+    let (mut ws, _) = server.open_session("cHVia2V5LWNvcnJlbGF0ZWQ", None).await;
+    let submit = EdgeMessage::TurnSubmit {
+        request_id: Some("synthetic-request".into()),
+        target_node_id: LOCAL_TARGET_NODE.into(),
+        target_agent_id: "jane".into(),
+        conversation_id: Some("synthetic-conv".into()),
+        content: "synthetic text".into(),
+        blob_refs: vec![],
+        message_kind: None,
+    };
+    send_envelope(&mut ws, 2, submit.clone()).await;
+    let events = collect_turn_events_until_final(&mut ws).await;
+    assert!(matches!(&events[0].msg, EdgeMessage::TurnEvent {
+        request_id: Some(request), turn_id: Some(_), event_kind: TurnEventKind::Status, content, ..
+    } if request == "synthetic-request" && content == "accepted"));
+    assert_eq!(events.len(), 5);
+    send_envelope(&mut ws, 3, submit).await;
+    let rejected = recv_envelope(&mut ws).await;
+    assert!(matches!(rejected.msg, EdgeMessage::TurnEvent {
+        request_id: Some(ref request), event_kind: TurnEventKind::Error, turn_id: None, ..
+    } if request == "synthetic-request"));
+    // No runtime adapter is installed in the production test binary.
+    send_envelope(
+        &mut ws,
+        4,
+        EdgeMessage::TurnCancel {
+            target_node_id: LOCAL_TARGET_NODE.into(),
+            target_agent_id: "jane".into(),
+            conversation_id: "synthetic-conv".into(),
+            request_id: "synthetic-request".into(),
+            turn_id: None,
+        },
+    )
+    .await;
+    assert!(matches!(recv_envelope(&mut ws).await.msg,
+        EdgeMessage::Error { ref code, fatal: false, .. } if code == "turn_cancel_unavailable"));
+    send_envelope(&mut ws, 5, EdgeMessage::Ping { nonce: 88 }).await;
+    assert_eq!(
+        recv_envelope(&mut ws).await.msg,
+        EdgeMessage::Pong { nonce: 88 }
+    );
+    ws.close(None).await.ok();
+}
+
+/// More than the original 256 lifetime entries, mixing completed turns and
+/// failed validation. Reconnect preserves completed replay and rejects old IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_ledger_releases_capacity_after_completed_and_failed_submissions() {
+    let server = spawn_server().await;
+    let (mut ws, enrollment) = server.open_session("cHVia2V5LWxpZmVjeWNsZQ", None).await;
+    let mut last_completed = Vec::new();
+    for i in 0..270u64 {
+        let failed = i % 2 == 1;
+        send_envelope(
+            &mut ws,
+            i + 2,
+            EdgeMessage::TurnSubmit {
+                request_id: Some(format!("lifecycle-{i}")),
+                target_node_id: if failed {
+                    "missing-hotel"
+                } else {
+                    LOCAL_TARGET_NODE
+                }
+                .into(),
+                target_agent_id: "jane".into(),
+                conversation_id: Some("lifecycle-conv".into()),
+                content: "synthetic lifecycle text".into(),
+                blob_refs: vec![],
+                message_kind: None,
+            },
+        )
+        .await;
+        if failed {
+            assert!(matches!(
+                recv_envelope(&mut ws).await.msg,
+                EdgeMessage::TurnEvent {
+                    event_kind: TurnEventKind::Error,
+                    turn_id: None,
+                    ..
+                }
+            ));
+        } else {
+            last_completed = collect_turn_events_until_final(&mut ws).await;
+            assert_eq!(last_completed.len(), 5);
+        }
+    }
+    ws.close(None).await.ok();
+    drop(ws);
+    let cursor = last_completed[0].seq.to_string();
+    let mut ws = server
+        .hello(&enrollment.edge_token, &enrollment.node_id, Some(&cursor))
+        .await;
+    for expected in &last_completed[1..] {
+        assert_eq!(&recv_envelope(&mut ws).await, expected);
+    }
+    // The subsequent failed request is also retained and remains replayable.
+    assert!(matches!(
+        recv_envelope(&mut ws).await.msg,
+        EdgeMessage::TurnEvent {
+            event_kind: TurnEventKind::Error,
+            ..
+        }
+    ));
+    send_envelope(
+        &mut ws,
+        2,
+        EdgeMessage::TurnSubmit {
+            request_id: Some("lifecycle-0".into()),
+            target_node_id: LOCAL_TARGET_NODE.into(),
+            target_agent_id: "jane".into(),
+            conversation_id: Some("lifecycle-conv".into()),
+            content: "must not dispatch twice".into(),
+            blob_refs: vec![],
+            message_kind: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_envelope(&mut ws).await.msg,
+        EdgeMessage::TurnEvent {
+            event_kind: TurnEventKind::Error,
+            turn_id: None,
+            ..
+        }
+    ));
+    send_envelope(&mut ws, 3, EdgeMessage::Ping { nonce: 270 }).await;
+    assert_eq!(
+        recv_envelope(&mut ws).await.msg,
+        EdgeMessage::Pong { nonce: 270 }
+    );
+    ws.close(None).await.ok();
+}
+
 /// 5. Disconnect, then reconnect with a cursor: the ring buffer replays every
 ///    retained frame after the cursor, byte-identical to the live delivery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1039,6 +1183,7 @@ async fn reconnect_with_cursor_replays_missed_frames() {
         &mut ws,
         2,
         EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: LOCAL_TARGET_NODE.into(),
             target_agent_id: "jane".into(),
             conversation_id: Some("conv-replay".into()),
@@ -1107,6 +1252,7 @@ async fn events_broadcast_while_disconnected_are_recovered_on_reconnect() {
         &mut ws,
         2,
         EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: LOCAL_TARGET_NODE.into(),
             target_agent_id: "jane".into(),
             conversation_id: Some("conv-offline".into()),
@@ -1181,6 +1327,7 @@ async fn second_hello_kicks_previous_session_and_avoids_duplicates() {
         &mut second,
         2,
         EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: LOCAL_TARGET_NODE.into(),
             target_agent_id: "jane".into(),
             conversation_id: Some("conv-kick".into()),

@@ -86,6 +86,35 @@ separate requirements.
 
 ## Build and references
 
+### iPad readiness slice — 2026-10-08
+
+The existing iOS target supports iPhone and iPad (device families `1,2`, iOS
+17 minimum); no separate iPad target is needed. The current project source
+already leaves SDK selection to the destination and enables automatic device
+signing with no team pinned. Select the operator's team in Xcode for a signed
+device build; unsigned CLI validation must override signing explicitly.
+
+Agents uses a balanced split view with a bounded sidebar. Selecting an agent
+requests the detail column when the split view collapses in a narrow window;
+the system navigation controls return to the sidebar. iPad declares all four
+orientations without requiring full screen. Rotation, narrow multitasking
+windows, selection/back navigation, keyboard presentation, and signed physical
+iPad installation remain device acceptance work. Source typechecking cannot
+prove those interactions.
+
+Validation: XcodeGen project generation and macOS/iOS Simulator source typechecking passed
+with Xcode 27 beta, using a matching locally emitted PhiloticKit module and
+existing compiler caches. No app launch, device signing, enrollment, permission
+prompt, or simulator boot was performed. This is source validation, not live
+or physical-device acceptance.
+
+The Companion is part of `PhiloticApp-macOS`, implemented by
+`Mac/NotchController.swift` and `Mac/NotchView.swift`. In an already-running
+current app, use the waveform menu's **Show companion**, or
+**Option-Command-N** while the app is active. An older app bundle is not proof
+that these controls are installed. The build/run script below launches the app
+and should only be used when launch is authorized.
+
 Use `script/build_and_run.sh` for the Mac companion; `--verify` checks that the
 new process launches. The Codex Run action uses this script. XcodeGen's
 `PhiloticApp/project.yml` is the project source. Signed device builds require a

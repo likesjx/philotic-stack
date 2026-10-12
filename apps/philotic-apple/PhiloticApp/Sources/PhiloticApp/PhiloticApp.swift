@@ -23,7 +23,11 @@ struct PhiloticApp: App {
                 return
             }
         #endif
-        _session = State(initialValue: ChatSessionManager())
+        let session = ChatSessionManager()
+        _session = State(initialValue: session)
+        #if os(iOS) && PHILOTIC_CARPLAY
+        CarPlayBridge.shared.session = session
+        #endif
     }
 
     @ViewBuilder

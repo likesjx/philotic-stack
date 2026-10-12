@@ -1,0 +1,280 @@
+--- a/src/lib/auth/personal-oauth/policy.ts
++++ b/src/lib/auth/personal-oauth/policy.ts
+@@ -29,7 +29,7 @@
+   rotate(key: string, refreshHash: string, generation: number, next: Family, at: Date): Promise<boolean>;
+   revoke(key: string): Promise<void>;
+ }
+-export const scopes = ['memory:recall', 'life:recall'];
++export const scopes = ['memory:recall'];
+ export function validateConfig(c: Config) {
+   for (const v of [c.issuer, c.resource, ...c.callbacks]) {
+     const u = new URL(v); if (u.protocol !== 'https:' || u.username || u.password || u.hash) deny('invalid_configuration');
+@@ -94,7 +94,7 @@
+     const verifier = input.get('code_verifier') || '', code = input.get('code') || '', redirect = input.get('redirect_uri') || '';
+     if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || !/^[A-Za-z0-9_-]{43}$/.test(code) || !this.config.callbacks.includes(redirect)) deny();
+     const c = await this.store.takeCode(hash(code), client, redirect, resource, challenge(verifier), this.clock());
+-    if (!c) deny(); await this.admitted(c!.subject, c!.version);
++    if (!c || c.scopes.length !== 1 || c.scopes[0] !== 'memory:recall') deny(); await this.admitted(c!.subject, c!.version);
+     const f: Family = { key: opaque(), clientId: client, subject: c!.subject, version: c!.version, resource,
+       scopes: c!.scopes, refreshHash: '', used: [], access: [], revoked: false, generation: 0,
+       expiresAt: new Date(this.clock().getTime() + 7 * 86400_000) };
+@@ -103,7 +103,7 @@
+   private async refresh(token: string, client: string, resource: string) {
+     if (!/^[A-Za-z0-9_-]{43}$/.test(token)) deny();
+     const h = hash(token), f = await this.store.findRefresh(h, client);
+-    if (!f || f.revoked || f.expiresAt <= this.clock() || f.resource !== resource) deny();
++    if (!f || f.revoked || f.expiresAt <= this.clock() || f.resource !== resource || f.scopes.length !== 1 || f.scopes[0] !== 'memory:recall') deny();
+     if (f!.used.includes(h) || f!.generation >= 128) { await this.store.revoke(f!.key); deny(); }
+     await this.admitted(f!.subject, f!.version);
+     const minted = this.mint({ ...f!, generation: f!.generation + 1, used: [...f!.used, h], access: f!.access.filter(a => a.expiresAt > this.clock()) });
+@@ -113,7 +113,7 @@
+   async introspect(token: string) {
+     if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return { active: false };
+     const h = hash(token), f = await this.store.findAccess(h);
+-    if (!f || f.revoked || f.expiresAt <= this.clock()) return { active: false };
++    if (!f || f.revoked || f.expiresAt <= this.clock() || f.scopes.length !== 1 || f.scopes[0] !== 'memory:recall') return { active: false };
+     const a = f.access.find(a => a.key === h && a.expiresAt > this.clock());
+     const admission = await this.store.admission(f.subject);
+     if (!a || !admission?.enabled || admission.version !== f.version) return { active: false };
+--- a/src/lib/auth/personal-oauth/http.ts
++++ b/src/lib/auth/personal-oauth/http.ts
+@@ -12,11 +12,22 @@
+   for (const k of p.keys()) if (p.getAll(k).length !== 1) throw new OAuthError('invalid_request');
+   return p;
+ }
+-export function confidential(req: Request, client: string, secret: string) {
+-  if (secret.length < 32) throw new OAuthError('temporarily_unavailable', 503);
+-  const expected = 'Basic ' + Buffer.from(encodeURIComponent(client) + ':' + encodeURIComponent(secret)).toString('base64');
+-  const digest = (s: string) => createHash('sha256').update(s).digest();
+-  if (!timingSafeEqual(digest(req.headers.get('authorization') || ''), digest(expected))) throw new OAuthError('invalid_client', 401);
++export function introspectionVerifier(client: string, secret: string) {
++  if (!client || /[:\r\n]/.test(client) || secret.startsWith('mk_') || !/^[A-Za-z0-9_-]{43,128}$/.test(secret)) throw new OAuthError('invalid_client');
++  return createHash('sha256').update('Basic ' + Buffer.from(encodeURIComponent(client) + ':' + encodeURIComponent(secret)).toString('base64')).digest('hex');
++}
++export function confidential(req: Request, client: string, verifier: string) {
++  // SHA256 of the complete expected Basic header. Only a verifier is configured
++  // in the issuer; the raw random secret belongs to the encrypted hotel vault.
++  if (!client || /[:\r\n]/.test(client) || !/^[a-f0-9]{64}$/.test(verifier)) throw new OAuthError('temporarily_unavailable', 503);
++  const supplied = req.headers.get('authorization') || '';
++  if (supplied.length > 8192 || !supplied.startsWith('Basic ')) throw new OAuthError('invalid_client', 401);
++  let username: string;
++  try { username = decodeURIComponent(Buffer.from(supplied.slice(6), 'base64').toString('utf8').split(':')[0]); }
++  catch { throw new OAuthError('invalid_client', 401); }
++  if (username !== client) throw new OAuthError('invalid_client', 401);
++  const actual = createHash('sha256').update(supplied).digest();
++  if (!timingSafeEqual(actual, Buffer.from(verifier, 'hex'))) throw new OAuthError('invalid_client', 401);
+ }
+ export async function respond(action: () => Promise<Response | unknown>) {
+   try { const r = await action(); return r instanceof Response ? r : Response.json(r, { headers }); }
+--- a/src/lib/auth/personal-oauth/runtime.ts
++++ b/src/lib/auth/personal-oauth/runtime.ts
+@@ -32,5 +32,5 @@
+ export async function routeHandlers() {
+   const { handlers } = await import('./handlers');
+   return handlers(await runtime(), operator, { client: process.env.PERSONAL_OAUTH_INTROSPECTION_CLIENT || '',
+-    secret: process.env.PERSONAL_OAUTH_INTROSPECTION_SECRET || '' });
++    verifier: process.env.PERSONAL_OAUTH_INTROSPECTION_VERIFIER || '' });
+ }
+--- a/src/lib/auth/personal-oauth/handlers.ts
++++ b/src/lib/auth/personal-oauth/handlers.ts
+@@ -1,7 +1,7 @@
+ import { PersonalOAuth, OAuthError, type Identity } from './policy';
+ import { respond, headers, escapeHtml, form, confidential } from './http';
+ export type Operator = { identity: Identity; session: string };
+-export function handlers(auth: PersonalOAuth, operator: () => Promise<Operator | null>, introspection: { client: string; secret: string }) {
++export function handlers(auth: PersonalOAuth, operator: () => Promise<Operator | null>, introspection: { client: string; verifier: string }) {
+   return {
+     discovery: () => respond(async () => auth.metadata()),
+     authorize: (req: Request) => respond(async () => {
+@@ -52,7 +52,7 @@
+       return auth.exchange(await form(req));
+     }),
+     introspect: (req: Request) => respond(async () => {
+-      confidential(req, introspection.client, introspection.secret);
++      confidential(req, introspection.client, introspection.verifier);
+       return auth.introspect((await form(req)).get('token') || '');
+     }),
+     revoke: (req: Request) => respond(async () => {
+--- a/tests/personal-oauth.test.ts
++++ b/tests/personal-oauth.test.ts
+@@ -1,4 +1,5 @@
+ import { test } from 'node:test';
++import { createHash } from 'node:crypto';
+ import assert from 'node:assert/strict';
+ import { PersonalOAuth, challenge, hash, OAuthError, type Store, type Pending, type Code, type Family } from '../src/lib/auth/personal-oauth/policy';
+ import { form, confidential, respond } from '../src/lib/auth/personal-oauth/http';
+@@ -22,7 +23,7 @@
+   };
+   const make = () => new PersonalOAuth(config, store, () => now); const auth = make();
+   const request = () => new URLSearchParams({ client_id: config.clientId, redirect_uri: config.callbacks[0], resource: config.resource,
+-    response_type: 'code', scope: 'memory:recall life:recall', state: 'client-state', code_challenge_method: 'S256', code_challenge: challenge(verifier) });
++    response_type: 'code', scope: 'memory:recall', state: 'client-state', code_challenge_method: 'S256', code_challenge: challenge(verifier) });
+   const consent = async () => { const p = await auth.begin(auth.binding(request()), identity, 'browser-session'); return { p,
+     finish: (approve = true) => auth.consent(p.transaction, p.csrf, 'browser-session', identity, config.issuer, approve) }; };
+   const code = async () => new URL(await (await consent()).finish()).searchParams.get('code')!;
+@@ -36,7 +37,7 @@
+ test('first-party S256 consent, exchange and introspection preserve stable subject and exact claims', async () => {
+   const f = fixture(), t = await f.tokens(), a = await f.auth.introspect(t.access_token);
+   assert.equal(a.active, true); assert.equal(a.sub, 'stable-internal-subject'); assert.equal(a.aud, config.resource);
+-  assert.equal(a.client_id, config.clientId); assert.equal(a.scope, 'memory:recall life:recall'); assert.equal(a.exp! - a.iat!, 900);
++  assert.equal(a.client_id, config.clientId); assert.equal(a.scope, 'memory:recall'); assert.equal(a.exp! - a.iat!, 900);
+   assert.ok(!JSON.stringify([...f.families.values()]).includes(t.access_token));
+   assert.ok(!JSON.stringify([...f.families.values()]).includes(t.refresh_token));
+ });
+@@ -113,8 +114,9 @@
+ });
+ test('introspection requires separate confidential credential', () => {
+   const secret = 's'.repeat(32), req = (value: string) => new Request('https://identity.example', { headers: { Authorization: value } });
+-  assert.throws(() => confidential(req('Bearer website-session'), 'gateway', secret));
+-  confidential(req('Basic ' + Buffer.from('gateway:' + secret).toString('base64')), 'gateway', secret);
++  const verifierHash = createHash('sha256').update('Basic ' + Buffer.from('gateway:' + secret).toString('base64')).digest('hex');
++  assert.throws(() => confidential(req('Bearer website-session'), 'gateway', verifierHash));
++  confidential(req('Basic ' + Buffer.from('gateway:' + secret).toString('base64')), 'gateway', verifierHash);
+ });
+ test('discovery advertises only implemented preregistered public S256 flow', () => {
+   const m = fixture().auth.metadata(); assert.deepEqual(m.token_endpoint_auth_methods_supported, ['none']);
+@@ -133,3 +135,29 @@
+   assert.deepEqual(await f.make().introspect(next.refresh_token), { active: false });
+   assert.deepEqual(await f.make().introspect(first.refresh_token), { active: false });
+ });
++
++test('life recall and mixed scope cannot be authorized', () => {
++  const f = fixture();
++  for (const scope of ['life:recall', 'memory:recall life:recall']) {
++    const input = f.request(); input.set('scope', scope);
++    assert.throws(() => f.auth.binding(input), /invalid_scope/);
++  }
++  assert.deepEqual(f.auth.metadata().scopes_supported, ['memory:recall']);
++});
++test('issuer verifier rejects malformed config and another client or secret', () => {
++  const secret = 's'.repeat(43);
++  const header = 'Basic ' + Buffer.from('gateway:' + secret).toString('base64');
++  const verifier = createHash('sha256').update(header).digest('hex');
++  const req = (h: string) => new Request('https://identity.example/oauth/introspect', { headers: { Authorization: h } });
++  confidential(req(header), 'gateway', verifier);
++  for (const h of ['Basic ' + Buffer.from('other:' + secret).toString('base64'), 'Basic ' + Buffer.from('gateway:' + 'x'.repeat(43)).toString('base64'), 'Bearer ' + secret]) assert.throws(() => confidential(req(h), 'gateway', verifier));
++  assert.throws(() => confidential(req(header), 'gateway', secret));
++  assert.throws(() => confidential(req(header), 'other', verifier));
++});
++
++test('previously persisted broader grants cannot introspect or refresh', async () => {
++  const f = fixture(), tokens = await f.tokens();
++  const family = [...f.families.values()][0]; family.scopes.push('life:recall');
++  assert.deepEqual(await f.auth.introspect(tokens.access_token), { active: false });
++  await assert.rejects(f.auth.exchange(f.refresh(tokens.refresh_token)));
++});
+--- a/tests/personal-oauth-mongo.test.ts
++++ b/tests/personal-oauth-mongo.test.ts
+@@ -2,7 +2,7 @@
+ import assert from 'node:assert/strict';
+ import { MongoClient } from 'mongodb';
+ import { spawnSync } from 'node:child_process';
+-import { randomUUID } from 'node:crypto';
++import { createHash, randomUUID } from 'node:crypto';
+ import { mongoStore, ensureIndexes, revokeProviderSessions, changePersonalAdmission } from '../src/lib/auth/personal-oauth/mongo';
+ import { PersonalOAuth, challenge, hash } from '../src/lib/auth/personal-oauth/policy';
+ import { handlers } from '../src/lib/auth/personal-oauth/handlers';
+@@ -21,10 +21,10 @@
+     await db.collection('personal_oauth_admissions').insertOne({ subject, enabled: true, version: 0 });
+     const config = { issuer: 'https://identity.example', resource: 'https://mcp.example/personal/mcp', clientId: 'percival', callbacks: ['https://client.example/callback'] };
+     const auth = new PersonalOAuth(config, store), verifier = 'v'.repeat(64);
+-    const operator = { identity, session: 'synthetic-browser-session' }, credentials = { client: 'gateway', secret: 's'.repeat(32) };
++    const operator = { identity, session: 'synthetic-browser-session' }, credentials = { client: 'gateway', verifier: createHash('sha256').update('Basic ' + Buffer.from('gateway:' + 's'.repeat(43)).toString('base64')).digest('hex') };
+     const h = handlers(auth, async () => operator, credentials);
+     const query = new URLSearchParams({ client_id: config.clientId, redirect_uri: config.callbacks[0], resource: config.resource,
+-      response_type: 'code', scope: 'memory:recall life:recall', state: 'opaque-client-state', code_challenge: challenge(verifier), code_challenge_method: 'S256' });
++      response_type: 'code', scope: 'memory:recall', state: 'opaque-client-state', code_challenge: challenge(verifier), code_challenge_method: 'S256' });
+     const request = (path: string, params: URLSearchParams, extra: Record<string, string> = {}) => new Request(config.issuer + path, {
+       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...extra }, body: params });
+     const initial = await h.authorize(new Request(config.issuer + '/oauth/authorize?' + query));
+@@ -53,7 +53,7 @@
+         input: JSON.stringify({ database: db.databaseName, access: tokens.access_token, subject }), encoding: 'utf8', timeout: 15000 });
+       assert.equal(worker.status, 0, 'isolated issuer worker failed'); assert.equal(worker.stdout, 'active');
+     });
+-    const inspect = await h.introspect(request('/oauth/introspect', new URLSearchParams({ token: tokens.access_token }), { Authorization: 'Basic ' + Buffer.from('gateway:' + credentials.secret).toString('base64') }));
++    const inspect = await h.introspect(request('/oauth/introspect', new URLSearchParams({ token: tokens.access_token }), { Authorization: 'Basic ' + Buffer.from('gateway:' + 's'.repeat(43)).toString('base64') }));
+     assert.ok(inspect instanceof Response); assert.equal((await inspect.json()).sub, subject);
+     const badInspect = await h.introspect(request('/oauth/introspect', new URLSearchParams({ token: tokens.access_token })));
+     assert.ok(badInspect instanceof Response); assert.equal(badInspect.status, 401);
+@@ -65,7 +65,7 @@
+     if (process.env.PERSONAL_MCP_GATEWAY_TEST_PATH) await t.test('actual first-party handlers and real MCP adapter interoperate with isolated Mongo', async () => {
+       const { createPersonalMcp, issuerAdapter, frontdoorAdapter } = await import(process.env.PERSONAL_MCP_GATEWAY_TEST_PATH!);
+       const adapter = issuerAdapter({ issuer: config.issuer, discovery: config.issuer + '/.well-known/oauth-authorization-server',
+-        introspection: config.issuer + '/oauth/introspect', clientId: credentials.client, clientSecret: credentials.secret,
++        introspection: config.issuer + '/oauth/introspect', clientId: credentials.client, clientSecret: 's'.repeat(43),
+         fetchImpl: async (url: string, init: RequestInit) => {
+           const request = new Request(url, init);
+           if (new URL(url).pathname === '/.well-known/oauth-authorization-server') return h.discovery();
+@@ -83,14 +83,14 @@
+           return Response.json({ jsonrpc: '2.0', id: rpc.id, result: { content: [{ type: 'text', text: 'synthetic personal packet', debug: 'private-diagnostic' }], debug: 'private-diagnostic' } });
+         } });
+       const gateway = await createPersonalMcp({ resource: config.resource, issuer: adapter, upstream: backend,
+-        allowedSubjects: new Set([subject]), allowedClients: new Set([config.clientId]), muninnVault: 'user_likesjx' });
++        allowedSubjects: new Set([subject]), allowedClients: new Set([config.clientId]), muninnVault: 'percival_connection_test' });
+       await new Promise<void>(resolve => gateway.listen(0, '127.0.0.1', resolve));
+       try {
+         const base = 'http://127.0.0.1:' + gateway.address().port;
+         const rpc = (name: string, args: unknown) => fetch(base + '/personal/mcp', { method: 'POST', headers: {
+           Authorization: 'Bearer ' + tokens.access_token, 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });
+         const recall = await rpc('muninn_recall', { context: ['synthetic context'] }); assert.equal(recall.status, 200);
+-        assert.doesNotMatch(await recall.text(), /private-diagnostic/); assert.equal(calls[0].args.vault, 'user_likesjx'); assert.equal(calls[0].args.read_only, true);
++        assert.doesNotMatch(await recall.text(), /private-diagnostic/); assert.equal(calls[0].args.vault, 'percival_connection_test'); assert.equal(calls[0].args.read_only, true);
+         const write = await rpc('muninn_remember', {}); assert.equal((await write.json()).error.code, -32602); assert.equal(calls.length, 1);
+         await changePersonalAdmission(db, subject, false);
+         assert.equal((await rpc('life.recall', { query_text: 'synthetic' })).status, 401);
+--- a/docs/PERSONAL_OAUTH.md
++++ b/docs/PERSONAL_OAUTH.md
+@@ -13,7 +13,7 @@
+ Existing Google/GitHub browser sign-in supplies the verified provider identity.
+ Consent requires a ten-minute recent signed session, fresh website admin authority,
+ one explicitly configured internal subject, and active personal OAuth admission.
+-It lists the requested `memory:recall`/`life:recall` permissions and offers Allow/Deny.
++It lists the requested `memory:recall` permissions and offers Allow/Deny.
+ An older session goes through explicit reauthentication instead of a login loop.
+ The existing cookie remains HttpOnly, Secure in production, SameSite=Lax.
+ Consent transactions bind hashed browser session, hashed CSRF nonce and subject;
+@@ -86,9 +86,10 @@
+ - `PERSONAL_OAUTH_CLIENT_ID`, `PERSONAL_OAUTH_CALLBACK`: one preregistered client
+   and its exact callback. No callback wildcards or user-selected audiences.
+ - `PERSONAL_OAUTH_SUBJECT`: explicitly provisioned stable operator UUID.
+-- `PERSONAL_OAUTH_INTROSPECTION_CLIENT`, `PERSONAL_OAUTH_INTROSPECTION_SECRET`:
+-  separate server-only credential with at least 32 characters of entropy-backed
+-  secret. Store in existing secret management; never supply to ChatGPT.
++- `PERSONAL_OAUTH_INTROSPECTION_CLIENT`, `PERSONAL_OAUTH_INTROSPECTION_VERIFIER`:
++  SHA256 verifier of the full expected Basic header, derived with
++  introspectionVerifier from a >=32-byte random base64url secret encrypted in
++  Philote vault. The issuer receives no raw introspection-secret environment value.
+ - Existing `SESSION_SECRET`, `MONGODB_URI`, `MONGODB_DB_NAME` continue serving the
+   identity app; no new DB/service is required.
+ 
+@@ -108,7 +109,7 @@
+ The isolated Philotic `services/personal-mcp` adapter is retained as a transitional
+ contract boundary for this milestone. It provides a separately reviewed deny-only
+ projection without changing the active Rust auth/IPC model. Its exact introspection
+-contract matches this issuer. Pin `user_likesjx` for personal recall and retain
++contract matches this issuer. Pin `percival_connection_test` for synthetic-only recall and retain
+ separate per-tool backend grants. Folding checks into a dedicated `membrane-mcp`
+ auth mode remains the preferred eventual topology; it is not implemented here.
+ 
+@@ -171,3 +172,21 @@
+ Read-only inspection of the VPS test script confirmed that a main merge restarts
+ `jaredlikes-com-main` and its Mongo service in `~/jaredlikes-com-test`, retaining
+ the external test database volume. This source change has not changed live settings.
++
++
++## Readiness source correction (isolated copy, not deployed)
++
++This candidate grants memory:recall only; old broader persisted grants fail
++introspection/refresh/code redemption. The issuer receives only
++PERSONAL_OAUTH_INTROSPECTION_VERIFIER (SHA256 of the complete expected Basic
++header), not a raw introspection secret. Derive the verifier using
++introspectionVerifier(client, randomBase64urlSecret) in the same in-memory
++provisioning step that encrypts the raw secret in the Philote vault. Generate
++32 random bytes (43 base64url characters) or stronger. No raw env/file/log output.
++Gateway retrieves the fixed introspection reference from the scoped hotel
++listener per call. The verifier is authentication configuration, not a gateway
++bearer key; it cannot be used as the Basic secret. Rotate verifier and encrypted
++vault value together through a separately approved operation.
++
++Only percival_connection_test synthetic data is admitted. Earlier private-vault
++examples in this document are not approval to connect private data.

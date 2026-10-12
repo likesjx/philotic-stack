@@ -210,22 +210,36 @@ public enum EdgeMessage: Equatable, Sendable {
     /// and presents the resume cursor.
     case hello(EdgeHello)
     /// Server -> client: accepts the hello and opens the session.
-    case helloAck(sessionId: String, replayFrom: String?)
+    case helloAck(sessionId: String, replayFrom: String?, features: [String] = [])
     /// Client -> server: submit an operator/agent turn to a target agent.
+    /// `requestId` is an additive client correlation extension. A server must
+    /// echo it on the accepted turnEvent before the client enables speech;
+    /// the current Rust server ignores this extension and stays text-only.
     case turnSubmit(
         targetNodeId: String,
         targetAgentId: String,
         conversationId: String?,
         content: String,
         blobRefs: [BlobRef],
-        messageKind: String? = nil
+        messageKind: String? = nil,
+        requestId: String? = nil
+    )
+    /// Sent only when helloAck advertises `turn_cancel_v1`. The server must
+    /// bind this to the authenticated device and exact request/turn; committed
+    /// tools are never undone. Current Rust server support is still pending.
+    case turnCancel(
+        targetNodeId: String, targetAgentId: String, conversationId: String,
+        requestId: String, turnId: String?
     )
     /// Server -> client: streamed turn output and status.
+    /// `requestId` is required on accepted statuses for correlated speech,
+    /// optional for legacy text transport and subsequent turnID-bound events.
     case turnEvent(
         conversationId: String,
         eventKind: TurnEventKind,
         content: String,
-        turnId: String?
+        turnId: String?,
+        requestId: String? = nil
     )
     /// Server -> client: an action awaits operator approval.
     case approvalRequest(approvalId: String, description: String, risk: String?)
@@ -295,6 +309,7 @@ extension EdgeMessage: Codable {
         case cursor
         case sessionId = "session_id"
         case replayFrom = "replay_from"
+        case features
         case targetNodeId = "target_node_id"
         case targetAgentId = "target_agent_id"
         case conversationId = "conversation_id"
@@ -303,6 +318,7 @@ extension EdgeMessage: Codable {
         case messageKind = "message_kind"
         case eventKind = "event_kind"
         case turnId = "turn_id"
+        case requestId = "request_id"
         case approvalId = "approval_id"
         case description
         case risk
@@ -338,6 +354,7 @@ extension EdgeMessage: Codable {
         case hello
         case helloAck = "hello_ack"
         case turnSubmit = "turn_submit"
+        case turnCancel = "turn_cancel"
         case turnEvent = "turn_event"
         case approvalRequest = "approval_request"
         case approvalResolve = "approval_resolve"
@@ -377,7 +394,8 @@ extension EdgeMessage: Codable {
         case .helloAck:
             let sessionId = try container.decode(String.self, forKey: .sessionId)
             let replayFrom = try container.decodeIfPresent(String.self, forKey: .replayFrom)
-            self = .helloAck(sessionId: sessionId, replayFrom: replayFrom)
+            let features = try container.decodeIfPresent([String].self, forKey: .features) ?? []
+            self = .helloAck(sessionId: sessionId, replayFrom: replayFrom, features: features)
 
         case .turnSubmit:
             let targetNodeId = try container.decode(String.self, forKey: .targetNodeId)
@@ -386,25 +404,37 @@ extension EdgeMessage: Codable {
             let content = try container.decode(String.self, forKey: .content)
             let blobRefs = try container.decodeIfPresent([BlobRef].self, forKey: .blobRefs) ?? []
             let messageKind = try container.decodeIfPresent(String.self, forKey: .messageKind)
+            let requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
             self = .turnSubmit(
                 targetNodeId: targetNodeId,
                 targetAgentId: targetAgentId,
                 conversationId: conversationId,
                 content: content,
                 blobRefs: blobRefs,
-                messageKind: messageKind
+                messageKind: messageKind,
+                requestId: requestId
             )
+
+        case .turnCancel:
+            self = .turnCancel(
+                targetNodeId: try container.decode(String.self, forKey: .targetNodeId),
+                targetAgentId: try container.decode(String.self, forKey: .targetAgentId),
+                conversationId: try container.decode(String.self, forKey: .conversationId),
+                requestId: try container.decode(String.self, forKey: .requestId),
+                turnId: try container.decodeIfPresent(String.self, forKey: .turnId))
 
         case .turnEvent:
             let conversationId = try container.decode(String.self, forKey: .conversationId)
             let eventKind = try container.decode(TurnEventKind.self, forKey: .eventKind)
             let content = try container.decode(String.self, forKey: .content)
             let turnId = try container.decodeIfPresent(String.self, forKey: .turnId)
+            let requestId = try container.decodeIfPresent(String.self, forKey: .requestId)
             self = .turnEvent(
                 conversationId: conversationId,
                 eventKind: eventKind,
                 content: content,
-                turnId: turnId
+                turnId: turnId,
+                requestId: requestId
             )
 
         case .approvalRequest:
@@ -530,14 +560,15 @@ extension EdgeMessage: Codable {
             try container.encode(hello.capabilities, forKey: .capabilities)
             try container.encodeIfPresent(hello.cursor, forKey: .cursor)
 
-        case .helloAck(let sessionId, let replayFrom):
+        case .helloAck(let sessionId, let replayFrom, let features):
             try container.encode(Tag.helloAck.rawValue, forKey: .type)
             try container.encode(sessionId, forKey: .sessionId)
             try container.encodeIfPresent(replayFrom, forKey: .replayFrom)
+            if !features.isEmpty { try container.encode(features, forKey: .features) }
 
         case .turnSubmit(
             let targetNodeId, let targetAgentId, let conversationId, let content, let blobRefs,
-            let messageKind):
+            let messageKind, let requestId):
             try container.encode(Tag.turnSubmit.rawValue, forKey: .type)
             try container.encode(targetNodeId, forKey: .targetNodeId)
             try container.encode(targetAgentId, forKey: .targetAgentId)
@@ -547,13 +578,23 @@ extension EdgeMessage: Codable {
                 try container.encode(blobRefs, forKey: .blobRefs)
             }
             try container.encodeIfPresent(messageKind, forKey: .messageKind)
+            try container.encodeIfPresent(requestId, forKey: .requestId)
 
-        case .turnEvent(let conversationId, let eventKind, let content, let turnId):
+        case .turnCancel(let targetNodeId, let targetAgentId, let conversationId, let requestId, let turnId):
+            try container.encode(Tag.turnCancel.rawValue, forKey: .type)
+            try container.encode(targetNodeId, forKey: .targetNodeId)
+            try container.encode(targetAgentId, forKey: .targetAgentId)
+            try container.encode(conversationId, forKey: .conversationId)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encodeIfPresent(turnId, forKey: .turnId)
+
+        case .turnEvent(let conversationId, let eventKind, let content, let turnId, let requestId):
             try container.encode(Tag.turnEvent.rawValue, forKey: .type)
             try container.encode(conversationId, forKey: .conversationId)
             try container.encode(eventKind, forKey: .eventKind)
             try container.encode(content, forKey: .content)
             try container.encodeIfPresent(turnId, forKey: .turnId)
+            try container.encodeIfPresent(requestId, forKey: .requestId)
 
         case .approvalRequest(let approvalId, let description, let risk):
             try container.encode(Tag.approvalRequest.rawValue, forKey: .type)

@@ -14,8 +14,8 @@
 # that <base>/current points at <tag>, that the running aiua executable comes
 # from that release, and reports `aiua --version`.
 #
-# Exit 0 only if every check passes. build_sha reporting in `--version` lands
-# with Rust slice R2; until then its absence is reported, not failed.
+# Exit 0 only if every check passes, including exact manifest version and full
+# commit SHA reported by the installed aiua. Missing build provenance fails.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,6 +58,12 @@ if [[ -z "${MANIFEST_URL}" ]]; then
   exit 1
 fi
 curl -fsSL --connect-timeout 15 --retry 3 -o "${WORK}/manifest.json" "${MANIFEST_URL}"
+case "${PLATFORM}" in
+  linux-x86_64) MANIFEST_TARGET="x86_64-unknown-linux-gnu" ;;
+  darwin-arm64) MANIFEST_TARGET="aarch64-apple-darwin" ;;
+esac
+python3 "${ROOT_DIR}/scripts/release-manifest.py" check-metadata \
+  --manifest "${WORK}/manifest.json" --tag "${TAG}" --target "${MANIFEST_TARGET}"
 mapfile -t BINS < <(python3 -c 'import json,sys; [print(b["name"]) for b in json.load(open(sys.argv[1]))["bins"]]' "${WORK}/manifest.json")
 MANIFEST_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "${WORK}/manifest.json")"
 
@@ -136,16 +142,13 @@ else
   FAIL=1
 fi
 
-if [[ -z "${VERSION}" ]]; then
-  row "aiua version" "FAIL" "current/bin/aiua --version produced nothing"
-  FAIL=1
-elif [[ "${VERSION}" == *"${MANIFEST_SHA:0:7}"* ]]; then
-  row "build sha" "PASS" "${VERSION}"
-elif [[ "${VERSION}" =~ [0-9a-f]{7,40} ]]; then
-  row "build sha" "FAIL" "${VERSION} (manifest sha ${MANIFEST_SHA:0:12})"
-  FAIL=1
+printf '%s\n' "${VERSION}" > "${WORK}/version.txt"
+if python3 "${ROOT_DIR}/scripts/release-manifest.py" check-version \
+     --manifest "${WORK}/manifest.json" --output-file "${WORK}/version.txt"; then
+  row "version/build sha" "PASS" "${VERSION}"
 else
-  row "build sha" "--" "not reported: '${VERSION}' (build_sha in --version lands with R2)"
+  row "version/build sha" "FAIL" "${VERSION:-<missing>}"
+  FAIL=1
 fi
 
 echo

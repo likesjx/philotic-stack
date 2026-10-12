@@ -1177,8 +1177,9 @@ async fn execute_action(
                 guest_id,
                 "heal-dispatcher: triggering immediate MuninnDB probe"
             );
-            match send_request_timeout(ipc, IpcRequest::RefreshMemoryConfig, IPC_TIMEOUT).await {
-                Ok(IpcResponse::MuninnStatus {
+            match ipc.refresh_memory_config(IPC_TIMEOUT).await {
+                Ok(philotic_client::MemoryConfigRefresh {
+                    request_id: _,
                     available,
                     endpoint,
                 }) => {
@@ -1189,14 +1190,6 @@ async fn execute_action(
                         warn!(guest_id, endpoint = %endpoint, "MuninnDB still unreachable after probe");
                         Ok("still_unreachable".into())
                     }
-                }
-                Ok(resp) => {
-                    warn!(
-                        guest_id,
-                        ?resp,
-                        "refresh_memory_config got unexpected response"
-                    );
-                    Ok("probe_failed".into())
                 }
                 Err(e) => {
                     if is_ipc_disconnect(&e) {

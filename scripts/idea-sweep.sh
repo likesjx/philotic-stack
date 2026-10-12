@@ -27,6 +27,13 @@
 
 set -euo pipefail
 
+# Direct SSH writes are outside the external read release owner. Refuse this
+# entire legacy route before host discovery when coordinated reads are required.
+case "${PHILOTIC_LIFE_EXTERNAL_READ_COORDINATION-disabled}" in
+  disabled) ;;
+  *) echo 'Unfenced idea-sweep route unavailable under external read coordination.' >&2; exit 1 ;;
+esac
+
 SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
 CONTAINER="${PHILOTIC_MEMGRAPH_CONTAINER:-philotic-memgraph}"
 

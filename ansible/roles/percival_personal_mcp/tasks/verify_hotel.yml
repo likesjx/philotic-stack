@@ -1,0 +1,6 @@
+---
+- name: Verify effective or running hotel executable provenance
+  percival_hotel_provenance:
+    approved_path: '{{ percival_hotel_binary }}'
+    approved_sha256: '{{ percival_hotel_sha256 }}'
+    require_running: '{{ percival_verify_running | default(false) }}'
