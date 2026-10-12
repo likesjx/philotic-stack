@@ -183,7 +183,7 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
   if (clientPolicies !== undefined) {
     if (!Array.isArray(clientPolicies) || clientPolicies.length !== allowedClients.size ||
         new Set(clientPolicies.map(p => p?.clientId)).size !== clientPolicies.length ||
-        muninnVault !== 'percival_connection_test' || tools.length !== 1 || tools[0] !== 'muninn_recall' ||
+        muninnVault !== 'percival_synthetic_recall_acceptance' || tools.length !== 1 || tools[0] !== 'muninn_recall' ||
         clientPolicies.some(p => !p || !allowedClients.has(p.clientId) || !Array.isArray(p.subjects) ||
           !p.subjects.length || p.subjects.some(s => !allowedSubjects.has(s)) || p.vault !== muninnVault ||
           !Array.isArray(p.scopes) || p.scopes.length !== 1 || p.scopes[0] !== 'memory:recall'))

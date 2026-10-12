@@ -23,7 +23,7 @@ const backend = createServer(async (request, response) => {
     return;
   }
   assert.equal(rpc.method, 'tools/call'); assert.equal(rpc.params.name, 'muninn_recall');
-  assert.equal(rpc.params.arguments.vault, 'percival_connection_test');
+  assert.equal(rpc.params.arguments.vault, 'percival_synthetic_recall_acceptance');
   assert.equal(rpc.params.arguments.read_only, true); calls++;
   response.writeHead(200, { 'Content-Type': 'application/json' });
   response.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id,
@@ -35,9 +35,9 @@ try {
   const upstream = frontdoorAdapter({ enabledTools: ['muninn_recall'], endpoints: {
     muninn_recall: { url: `http://127.0.0.1:${backend.address().port}/mcp`, backendProtocol: 'muninn-unary-json', credential } } });
   gateway = await createPersonalMcp({ resource, clock: () => 1001 * 1000,
-    enabledTools: ['muninn_recall'], muninnVault: 'percival_connection_test',
+    enabledTools: ['muninn_recall'], muninnVault: 'percival_synthetic_recall_acceptance',
     allowedSubjects: new Set(['synthetic-operator']), allowedClients: new Set(['dot', 'claude']),
-    clientPolicies: ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['synthetic-operator'], scopes: ['memory:recall'], vault: 'percival_connection_test' })),
+    clientPolicies: ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['synthetic-operator'], scopes: ['memory:recall'], vault: 'percival_synthetic_recall_acceptance' })),
     issuer: { issuer: authority, ready: async () => {}, inspect: async (token, options) => {
       assert.equal(await introspection(options), 'i'.repeat(43));
       return { active: ['dot', 'claude'].includes(token) && !revoked.has(token), iss: authority, aud: resource,

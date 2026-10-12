@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPersonalMcp } from './gateway.mjs';
 const resource = 'https://mcp.example.test/personal/mcp', authority = 'https://identity.example.test';
-const policies = ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['synthetic-operator'], vault: 'percival_connection_test', scopes: ['memory:recall'] }));
-const config = { resource, enabledTools: ['muninn_recall'], muninnVault: 'percival_connection_test',
+const policies = ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['synthetic-operator'], vault: 'percival_synthetic_recall_acceptance', scopes: ['memory:recall'] }));
+const config = { resource, enabledTools: ['muninn_recall'], muninnVault: 'percival_synthetic_recall_acceptance',
   allowedSubjects: new Set(['synthetic-operator']), allowedClients: new Set(['dot', 'claude']), clientPolicies: policies, clock: () => 1100000 };
 test('remote policy cannot inherit private vault, LifeGraph or missing client policy', async () => {
   for (const change of [{ muninnVault: 'default' }, { enabledTools: ['muninn_recall', 'life.recall'] }, { clientPolicies: policies.slice(0, 1) }])
@@ -26,7 +26,7 @@ test('both clients recall synthetic packets; revocation and privacy failures fai
   for (const client of ['dot', 'claude']) {
     const response = await rpc(client); assert.equal(response.status, 200); assert.doesNotMatch(await response.text(), /discard/);
   }
-  assert.ok(calls.every(a => a.vault === 'percival_connection_test' && a.read_only === true));
+  assert.ok(calls.every(a => a.vault === 'percival_synthetic_recall_acceptance' && a.read_only === true));
   for (const change of [{ client_id: 'operations' }, { sub: 'other' }, { scope: 'memory:recall life:recall' }, { aud: [resource, 'https://ops.example.test'] }]) {
     mutation = change; assert.equal((await rpc('dot')).status, 401);
   }

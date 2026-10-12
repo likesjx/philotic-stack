@@ -7,7 +7,7 @@
   },
   "scripts": {
     "test": "node --test *.test.mjs",
-    "check": "node --check gateway.mjs && node --check server.mjs && node --check vault.mjs",
+    "check": "node --check gateway.mjs && node --check server.mjs && node --check vault.mjs && node --check synthetic-onboarding.mjs",
     "test:scoped": "cargo test --manifest-path scoped-vault-tests/Cargo.toml"
   }
 }

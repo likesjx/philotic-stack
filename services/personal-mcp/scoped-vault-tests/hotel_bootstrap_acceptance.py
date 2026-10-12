@@ -54,7 +54,7 @@ def seed(name):
         assert row
         hotel=json.loads(row[1]); hotel['ipc_socket_path']=str(work/'general.sock')
         db.execute('UPDATE graph_nodes SET data_json=? WHERE node_key=?',(json.dumps(hotel),row[0]))
-        record={'secret_ref':REFERENCE,'secret_kind':'percival-muninn-observe','scope':'percival_connection_test',
+        record={'secret_ref':REFERENCE,'secret_kind':'percival-muninn-observe','scope':'percival_synthetic_recall_acceptance',
                 'allowed_roles':['percival-personal-recall'],'allowed_guests':['percival-personal-gateway'],
                 'ciphertext_b64':ciphertext,'nonce_b64':nonce,'created_at':0,'updated_at':0}
         db.execute('INSERT INTO graph_nodes(node_key,kind,label,data_json) VALUES(?,?,?,?)',
@@ -135,7 +135,7 @@ try:
         db.execute('UPDATE graph_nodes SET data_json=? WHERE node_key=?', (json.dumps(record),'secret:'+REFERENCE))
     assert client().get('accepted') is False, 'private-scope encrypted record admitted'
     with sqlite3.connect(work/'aiua_context.db') as db:
-        record['scope']='percival_connection_test'
+        record['scope']='percival_synthetic_recall_acceptance'
         db.execute('UPDATE graph_nodes SET data_json=? WHERE node_key=?', (json.dumps(record),'secret:'+REFERENCE))
     assert client().get('accepted') is True
     print('PASS real encrypted record private namespace denied without credential release',flush=True)
