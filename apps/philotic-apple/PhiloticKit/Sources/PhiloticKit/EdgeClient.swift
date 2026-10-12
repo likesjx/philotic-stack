@@ -56,7 +56,7 @@ public actor EdgeClient {
     private var localSeq: UInt64 = 0
     /// Highest seq of a *durably processed server-push frame* (the retained,
     /// replayable kinds: turn events, approvals, LifeGraph changes, voice
-    /// blobs, tool invokes). Piggybacked as `ack` on outbound envelopes —
+    /// blobs, tool invokes). Inline voice replies are ephemeral. Piggybacked as `ack` on outbound envelopes —
     /// the server prunes its replay ring up to this value — and presented
     /// (as a decimal string) as the resume cursor on reconnect. Control
     /// frames (HelloAck / Pong / Error) never advance it: their seqs are
@@ -194,14 +194,14 @@ public actor EdgeClient {
     /// see `highestPeerSeqSeen`.
     static func advancesResumeCursor(_ message: EdgeMessage) -> Bool {
         switch message {
-        case .turnEvent, .approvalRequest, .lifeGraphChange, .voiceBlob, .voiceReply, .toolInvoke:
+        case .turnEvent, .approvalRequest, .lifeGraphChange, .voiceBlob, .toolInvoke:
             return true
-        case .hello, .helloAck, .turnSubmit, .approvalResolve, .toolResult,
+        case .hello, .helloAck, .turnSubmit, .turnCancel, .approvalResolve, .toolResult,
             .capabilitiesUpdate, .ping, .pong, .error,
             .audioStreamStart, .audioChunk, .audioStreamEnd,
             // Server-push but ephemeral live feedback — never retained in
             // the replay ring, so it must not move the ack watermark.
-            .transcriptPartial:
+            .transcriptPartial, .voiceReply:
             return false
         }
     }
@@ -239,7 +239,7 @@ public actor EdgeClient {
 
         let ackEnvelope = try await receiveEnvelope(on: newTask)
         switch ackEnvelope.msg {
-        case .helloAck(let sessionId, _):
+        case .helloAck(let sessionId, _, _):
             // Note: HelloAck neither seeds the ack watermark nor moves the
             // cursor — `replayFrom` is an echo of the cursor we presented,
             // and the HelloAck's own seq is minted AFTER the retained frames

@@ -1673,6 +1673,11 @@ pub fn truncate_for_wire(text: &str, max_chars: usize) -> String {
 /// Configurable via `agent.configure` with `settings.*` config path prefix.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AgentSettings {
+    /// Explicit session request budgets, independently validated against the
+    /// resolved model ceiling by the router. Not a dialogue-window setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_request_limits: Option<serde_json::Value>,
+
     #[serde(default)]
     pub context_window: ContextWindowPolicy,
     #[serde(default)]

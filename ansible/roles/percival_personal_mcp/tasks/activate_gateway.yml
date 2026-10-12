@@ -1,0 +1,7 @@
+---
+- name: Confirm effective ExecStart and running proc executable after hotel activation
+  ansible.builtin.import_tasks: verify_running.yml
+- name: Restart the gateway only after hotel provenance succeeds
+  ansible.builtin.systemd_service:
+    name: percival-personal-mcp.service
+    state: restarted

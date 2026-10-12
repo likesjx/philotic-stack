@@ -1,0 +1,9 @@
+# Pinned neo4rs session continuity patch
+
+Source: crates.io neo4rs 0.9.0-rc.9, The published package declares MIT in Cargo.toml but contains no separate license file; upstream attribution is retained in Cargo.toml and this notice. Upstream source commit:7be45a0fc1ca0bb5c3a22fec3e1a7fa28200abd3 (lib). The checked-in Cargo.toml, README, tests, examples, include documentation and src are copied from the cached published crate. Root Cargo.toml overrides the exact existing dependency through [patch.crates-io]; Cargo.lock removes the registry identity/checksum for this local package. No version is advanced.
+
+Only executable source change: Graph::start_txn_with_verified_session in src/graph.rs. It acquires one ManagedConnection, runs setup without retries, fully consumes at most128 metadata rows, invokes a fail-closed validator, then moves that same connection into Txn::new. No checkout/recycle occurs between setup and BEGIN. Existing driver APIs and their retry semantics remain unchanged. The owner marks uncertainty before entering this API and retains durable denial on failed/cancelled work.
+
+Reason: Memgraph3.10.1 prohibits SHOW STORAGE INFO inside explicit transactions. Separate Graph calls can recycle/replace the physical connection even with max_connections1, invalidating checked session isolation. The new API uses the existing internal Query/RowStream/Txn operations on one checkout. It does not retry or claim remote quiescence after cancellation.
+
+Acceptance: actual isolated Memgraph3.10.1 owner fixture, registered cross-process children, strict owner tests/Clippy, and exact-head workspace CI covering all existing neo4rs consumers. The patch is source-only until independently reviewed deployment approval. Upstream submission and removal of this local patch when an equivalent supported API exists are follow-up maintenance work.

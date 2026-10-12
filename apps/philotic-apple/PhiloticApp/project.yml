@@ -91,6 +91,7 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
         INFOPLIST_KEY_NSHealthShareUsageDescription: "Review selected activity, sleep, and heart-rate summaries for personal wellness. Data stays on this device unless you separately confirm sharing summaries with your LifeGraph and agents."

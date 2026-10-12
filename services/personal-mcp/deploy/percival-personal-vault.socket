@@ -1,0 +1,17 @@
+# TEMPLATE ONLY: UID must match policy; no other unit may inherit this socket.
+[Unit]
+Description=Percival fixed credential vault listener
+
+[Socket]
+ListenStream=/run/percival-personal-vault-broker.sock
+SocketUser=percival-gateway
+SocketGroup=percival-gateway
+SocketMode=0600
+DirectoryMode=0755
+Accept=no
+FileDescriptorName=percival-scoped-vault
+Service=philotic-hotel.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -13,6 +13,12 @@ import OSLog
 import Observation
 import Speech
 
+public struct AppleSpeechProfile: Identifiable {
+    public let id: String
+    public let name: String
+    public let language: String
+}
+
 /// Owns speech-to-text capture, inline voice-reply playback, and
 /// text-to-speech fallback. A single instance is expected to live for the
 /// lifetime of the chat session.
@@ -33,14 +39,20 @@ public final class VoiceController: NSObject {
     public private(set) var isCapturingPCM: Bool = false
     /// True while a voice reply or fallback utterance is audible.
     public private(set) var isPlaying: Bool = false
+    public private(set) var isSpeakingFallback: Bool = false
     /// Last voice-related failure, suitable for display in the UI. Cleared
     /// at the start of the next ``startListening()`` attempt.
     public var voiceError: String?
 
     private let speechRecognizer: SFSpeechRecognizer?
+    @ObservationIgnored private var speechAuthorization: () async -> Bool = { await VoiceController.requestSpeechAuthorization() }
+    @ObservationIgnored private var microphoneAuthorization: () async -> Bool = { await VoiceController.requestMicrophoneAuthorization() }
+    @ObservationIgnored private var recognitionAvailabilityOverride: (available: Bool, onDevice: Bool)?
     private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognitionGeneration = UUID()
+    private var pendingCaptureGeneration = UUID()
 
     private var audioRecorder: AVAudioRecorder?
     private var recordingURL: URL?
@@ -48,9 +60,13 @@ public final class VoiceController: NSObject {
     private var pcmEngine: AVAudioEngine?
     private var pcmContinuation: AsyncStream<Data>.Continuation?
     private var pcmAccumulator: PCMFrameAccumulator?
+    private var pendingPCMStart: UUID?
+    private var activePCMLease: UUID?
+    private var carPlayDuplex = false
 
     private var audioPlayer: AVAudioPlayer?
     private let speechSynthesizer = AVSpeechSynthesizer()
+    private var activeUtteranceID: ObjectIdentifier?
 
     /// MIME type of files produced by ``startRecording()`` (.m4a / AAC).
     public static let recordingMimeType = "audio/mp4"
@@ -61,6 +77,20 @@ public final class VoiceController: NSObject {
     public override init() {
         self.speechRecognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
         super.init()
+        speechSynthesizer.delegate = self
+    }
+
+    /// Test adapter for permission races. Production always reads platform
+    /// support and permissions; these closures never grant provider policy.
+    init(available: Bool, onDevice: Bool,
+         speechAuthorization: @escaping () async -> Bool,
+         microphoneAuthorization: @escaping () async -> Bool) {
+        self.speechRecognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
+        super.init()
+        self.speechAuthorization = speechAuthorization
+        self.microphoneAuthorization = microphoneAuthorization
+        self.recognitionAvailabilityOverride = (available, onDevice)
+        speechSynthesizer.delegate = self
     }
 
     // MARK: - Speech-to-text
@@ -71,27 +101,43 @@ public final class VoiceController: NSObject {
     /// ``isListening`` false.
     public func startListening() async {
         guard !isListening else { return }
+        let captureGeneration = UUID()
+        pendingCaptureGeneration = captureGeneration
         voiceError = nil
         transcript = ""
 
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
+        let available = recognitionAvailabilityOverride?.available ?? (speechRecognizer?.isAvailable ?? false)
+        let supportsLocal = recognitionAvailabilityOverride?.onDevice ?? (speechRecognizer?.supportsOnDeviceRecognition ?? false)
+        guard available else {
             voiceError = "Speech recognition is not available on this device right now."
             return
         }
+        guard supportsLocal else {
+            voiceError = "On-device speech recognition is unavailable for this language. Voice capture cannot use an external recognizer."
+            return
+        }
 
-        guard await Self.requestSpeechAuthorization() else {
+        let speechGranted = await speechAuthorization()
+        guard pendingCaptureGeneration == captureGeneration else { return }
+        guard speechGranted else {
             voiceError = "Speech recognition permission was denied. Enable it in Settings to send voice messages."
             return
         }
-        guard await Self.requestMicrophoneAuthorization() else {
+        let microphoneGranted = await microphoneAuthorization()
+        guard pendingCaptureGeneration == captureGeneration else { return }
+        guard microphoneGranted else {
             voiceError = "Microphone permission was denied. Enable it in Settings to send voice messages."
+            return
+        }
+        guard let speechRecognizer else {
+            voiceError = "On-device speech recognition is not available."
             return
         }
 
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -102,12 +148,7 @@ public final class VoiceController: NSObject {
         let engine = AVAudioEngine()
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        // Prefer on-device recognition when the locale supports it (privacy
-        // + works offline); fall back to the default (server-assisted)
-        // recognizer otherwise rather than failing outright.
-        if speechRecognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        request.requiresOnDeviceRecognition = true
 
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
@@ -127,6 +168,8 @@ public final class VoiceController: NSObject {
         audioEngine = engine
         recognitionRequest = request
         isListening = true
+        let generation = UUID()
+        recognitionGeneration = generation
 
         recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
             // Extract Sendable primitives here, on whatever thread this
@@ -135,7 +178,8 @@ public final class VoiceController: NSObject {
             let isFinal = result?.isFinal ?? false
             let errorDescription = error?.localizedDescription
             Task { @MainActor [weak self] in
-                self?.handleRecognitionUpdate(text: text, isFinal: isFinal, errorDescription: errorDescription)
+                guard let self, self.recognitionGeneration == generation else { return }
+                self.handleRecognitionUpdate(text: text, isFinal: isFinal, errorDescription: errorDescription)
             }
         }
     }
@@ -159,6 +203,7 @@ public final class VoiceController: NSObject {
     /// does not block for the recognizer's final result).
     @discardableResult
     public func stopListening() -> String {
+        pendingCaptureGeneration = UUID()
         guard isListening else { return transcript }
         recognitionRequest?.endAudio()
         teardownAudioCapture()
@@ -168,6 +213,7 @@ public final class VoiceController: NSObject {
     }
 
     private func teardownAudioCapture() {
+        recognitionGeneration = UUID()
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
@@ -176,7 +222,7 @@ public final class VoiceController: NSObject {
         recognitionRequest = nil
         isListening = false
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        deactivateAudioSessionIfIdle()
         #endif
     }
 
@@ -214,7 +260,7 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .default, options: .duckOthers)
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -258,7 +304,7 @@ public final class VoiceController: NSObject {
         let url = recordingURL
         recordingURL = nil
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        deactivateAudioSessionIfIdle()
         #endif
         return url
     }
@@ -283,19 +329,48 @@ public final class VoiceController: NSObject {
     /// buffer via `AVAudioConverter` and accumulates bytes into fixed-size
     /// frames; ``stopPCMStreaming()`` flushes the remainder and finishes
     /// the stream.
-    public func startPCMStreaming() async -> AsyncStream<Data>? {
-        guard !isCapturingPCM, !isRecording, !isListening else { return nil }
+    public func startPCMStreaming(carPlay: Bool = false, lease: UUID = UUID()) async -> AsyncStream<Data>? {
+        guard !Task.isCancelled, pendingPCMStart == nil,
+              !isCapturingPCM, !isRecording, !isListening else { return nil }
+        let generation = lease
+        pendingPCMStart = generation
+        defer { if pendingPCMStart == generation { pendingPCMStart = nil } }
         voiceError = nil
 
-        guard await Self.requestMicrophoneAuthorization() else {
+        let granted: Bool
+        #if os(iOS)
+        if carPlay {
+            // CarPlay never prompts for permission. Phone preparation and
+            // authoritative routing eligibility are separate requirements.
+            granted = AVAudioApplication.shared.recordPermission == .granted
+        } else {
+            granted = await microphoneAuthorization()
+        }
+        #else
+        granted = await microphoneAuthorization()
+        #endif
+        guard !Task.isCancelled, pendingPCMStart == generation,
+              !isCapturingPCM, !isRecording, !isListening else { return nil }
+        guard granted else {
             voiceError = "Microphone permission was denied. Enable it in Settings to send voice messages."
             return nil
+        }
+        carPlayDuplex = carPlay
+        var captureStarted = false
+        defer {
+            if !captureStarted {
+                carPlayDuplex = false
+                #if os(iOS)
+                deactivateAudioSessionIfIdle()
+                #endif
+            }
         }
 
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try session.setCategory(.playAndRecord, mode: carPlay ? .default : .voiceChat,
+                                    options: carPlay ? [] : [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             voiceError = "Could not configure the audio session: \(error.localizedDescription)"
@@ -388,13 +463,18 @@ public final class VoiceController: NSObject {
         pcmContinuation = continuation
         pcmAccumulator = accumulator
         isCapturingPCM = true
+        activePCMLease = lease
+        captureStarted = true
         return stream
     }
 
     /// Stops PCM capture: removes the tap, stops the engine, flushes the
     /// accumulator's remaining sub-frame bytes as a final (short) frame,
     /// and finishes the stream.
-    public func stopPCMStreaming() {
+    public func stopPCMStreaming(lease: UUID? = nil) {
+        if let lease, pendingPCMStart != lease, activePCMLease != lease { return }
+        // Revoke a permission wait even when the engine has not started.
+        pendingPCMStart = nil
         guard isCapturingPCM else { return }
         pcmEngine?.inputNode.removeTap(onBus: 0)
         pcmEngine?.stop()
@@ -407,9 +487,11 @@ public final class VoiceController: NSObject {
         pcmContinuation?.finish()
         pcmContinuation = nil
         isCapturingPCM = false
+        activePCMLease = nil
+        carPlayDuplex = false
 
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        deactivateAudioSessionIfIdle()
         #endif
     }
 
@@ -429,11 +511,15 @@ public final class VoiceController: NSObject {
 
     /// Stops any in-flight voice-reply playback, discarding queued chunks.
     public func stopPlayback() {
+        cancelFallback()
         chunkQueue.removeAll()
         isChunkedPlayback = false
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false
+        #if os(iOS)
+        deactivateAudioSessionIfIdle()
+        #endif
     }
 
     // MARK: - Chunked voice-reply playback
@@ -441,7 +527,7 @@ public final class VoiceController: NSObject {
     /// True while agent reply audio is audible or queued — the barge-in
     /// condition for conversation mode (stricter VAD onset applies).
     public var hasPendingReplyAudio: Bool {
-        isPlaying || !chunkQueue.isEmpty
+        isPlaying || isSpeakingFallback || !chunkQueue.isEmpty
     }
 
     /// FIFO of decoded audio chunks awaiting playback (per-sentence TTS).
@@ -460,6 +546,7 @@ public final class VoiceController: NSObject {
             voiceError = "Could not decode a voice reply chunk."
             return
         }
+        cancelFallback()
         chunkQueue.append(data)
         isChunkedPlayback = true
         if !isPlaying {
@@ -489,7 +576,8 @@ public final class VoiceController: NSObject {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
+            try session.setCategory(.playAndRecord, mode: carPlayDuplex ? .default : .voiceChat,
+                                    options: carPlayDuplex ? [] : [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true)
         } catch {
             voiceError = "Could not configure audio playback: \(error.localizedDescription)"
@@ -514,7 +602,8 @@ public final class VoiceController: NSObject {
 
     /// Delegate-chained continuation: called on the main actor when the
     /// current player finishes (or fails to decode mid-flight).
-    fileprivate func handlePlaybackFinished(errorDescription: String? = nil) {
+    fileprivate func handlePlaybackFinished(playerID: ObjectIdentifier, errorDescription: String? = nil) {
+        guard let currentPlayer = audioPlayer, ObjectIdentifier(currentPlayer) == playerID else { return }
         audioPlayer = nil
         isPlaying = false
         if let errorDescription {
@@ -523,38 +612,100 @@ public final class VoiceController: NSObject {
         if isChunkedPlayback {
             playNextChunk()
         }
+        #if os(iOS)
+        deactivateAudioSessionIfIdle()
+        #endif
     }
+
+    #if os(iOS)
+    private func deactivateAudioSessionIfIdle() {
+        guard !isListening, !isRecording, !isCapturingPCM, !isPlaying,
+            !isSpeakingFallback else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+    #endif
 
     // MARK: - Fallback TTS
 
     /// Speaks `text` via on-device text-to-speech, used when a voice turn's
     /// server-side audio reply hasn't arrived within the fallback window.
-    public func speakFallback(text: String) {
+    public var appleSpeechProfiles: [AppleSpeechProfile] {
+        AVSpeechSynthesisVoice.speechVoices().map {
+            AppleSpeechProfile(id: $0.identifier, name: $0.name, language: $0.language)
+        }.sorted { ($0.language, $0.name, $0.id) < ($1.language, $1.name, $1.id) }
+    }
+
+    public func speakFallback(text: String, voiceIdentifier: String = "") {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        #if os(iOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true)
+        } catch {
+            voiceError = "Could not configure speech playback: \(error.localizedDescription)"
+            return
+        }
+        #endif
         let utterance = AVSpeechUtterance(string: text)
+        if !voiceIdentifier.isEmpty {
+            guard let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) else {
+                voiceError = "The selected Apple voice is unavailable. Choose an installed voice in Settings."
+                return
+            }
+            utterance.voice = voice
+        }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        cancelFallback()
+        activeUtteranceID = ObjectIdentifier(utterance)
+        isSpeakingFallback = true
         speechSynthesizer.speak(utterance)
     }
 
     /// Cancels a scheduled/in-progress fallback utterance (e.g. because the
     /// real voice reply arrived in the meantime).
     public func cancelFallback() {
+        activeUtteranceID = nil
+        isSpeakingFallback = false
         guard speechSynthesizer.isSpeaking else { return }
         speechSynthesizer.stopSpeaking(at: .immediate)
+    }
+
+    fileprivate func handleSpeechFinished(utteranceID: ObjectIdentifier) {
+        guard activeUtteranceID == utteranceID else { return }
+        activeUtteranceID = nil
+        isSpeakingFallback = false
+        #if os(iOS)
+        deactivateAudioSessionIfIdle()
+        #endif
+    }
+}
+
+extension VoiceController: AVSpeechSynthesizerDelegate {
+    public nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        let utteranceID = ObjectIdentifier(utterance)
+        Task { @MainActor [weak self] in self?.handleSpeechFinished(utteranceID: utteranceID) }
+    }
+
+    public nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        let utteranceID = ObjectIdentifier(utterance)
+        Task { @MainActor [weak self] in self?.handleSpeechFinished(utteranceID: utteranceID) }
     }
 }
 
 extension VoiceController: AVAudioPlayerDelegate {
     public nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        let playerID = ObjectIdentifier(player)
         Task { @MainActor [weak self] in
-            self?.handlePlaybackFinished()
+            self?.handlePlaybackFinished(playerID: playerID)
         }
     }
 
     public nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         let description = error?.localizedDescription ?? "Voice reply playback failed."
+        let playerID = ObjectIdentifier(player)
         Task { @MainActor [weak self] in
-            self?.handlePlaybackFinished(errorDescription: description)
+            self?.handlePlaybackFinished(playerID: playerID, errorDescription: description)
         }
     }
 }

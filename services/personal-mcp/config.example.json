@@ -1,0 +1,28 @@
+{
+  "resource": "https://mcp.example.test/personal/mcp",
+  "port": 8913,
+  "muninnVault": "percival_connection_test",
+  "issuer": {
+    "issuer": "https://identity.example.test",
+    "discovery": "https://identity.example.test/.well-known/oauth-authorization-server",
+    "introspection": "https://identity.example.test/oauth/introspect",
+    "clientId": "configured-confidential-introspection-client",
+    "credentialBrokerSocketPath": "/run/percival-personal-vault-broker.sock"
+  },
+  "allowedSubjects": [
+    "configured-operator-subject"
+  ],
+  "allowedClients": [
+    "configured-plugin-oauth-client"
+  ],
+  "upstreams": {
+    "muninn_recall": {
+      "url": "http://127.0.0.1:8750/mcp",
+      "credentialBrokerSocketPath": "/run/percival-personal-vault-broker.sock",
+      "backendProtocol": "muninn-unary-json"
+    }
+  },
+  "enabledTools": [
+    "muninn_recall"
+  ]
+}

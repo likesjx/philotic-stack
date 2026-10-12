@@ -172,6 +172,7 @@ async fn replay(graph: &Graph, input: &LoopAction, request: &str) -> Result<Opti
 }
 
 pub async fn apply(graph: &Graph, input: &LoopAction, now: &str) -> Result<Value> {
+    datasource::memgraph_enrollment::require_memgraph_enrollment()?;
     let changes = match input.changes(now) {
         Ok(changes) => changes,
         Err(error) => return Ok(json!({"status":"invalid_request", "error":error})),

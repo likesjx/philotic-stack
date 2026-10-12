@@ -15,6 +15,10 @@ pub mod loop_action;
 pub mod node_edit;
 pub mod ontology;
 pub mod projection;
+#[cfg(target_os = "linux")]
+pub mod read_owner;
+#[cfg(target_os = "linux")]
+pub mod read_supervisor;
 pub mod zoning;
 
 use serde::{Deserialize, Serialize};

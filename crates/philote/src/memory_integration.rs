@@ -12,6 +12,23 @@
 
 use super::*;
 
+/// Covers the entire inline tool, including checkpoint/result IPC after the
+/// probe has answered. An interrupted frame may not escape onto a reused socket.
+struct MemoryFixGuard<'a> {
+    runtime: &'a mut AgentRuntime,
+    completed: bool,
+}
+
+impl Drop for MemoryFixGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.runtime
+                .ipc_client
+                .disconnect_after_cancelled_operation();
+        }
+    }
+}
+
 pub(super) fn engram_metadata_string(metadata: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         metadata
@@ -3089,12 +3106,43 @@ impl AgentRuntime {
         &mut self,
         payload: ToolExecutionPayload,
     ) -> Result<()> {
+        self.execute_memory_fix_tool_with_timeout(payload, std::time::Duration::from_secs(10))
+            .await
+    }
+
+    async fn execute_memory_fix_tool_with_timeout(
+        &mut self,
+        payload: ToolExecutionPayload,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let mut guard = MemoryFixGuard {
+            runtime: self,
+            completed: false,
+        };
+        match tokio::time::timeout(
+            timeout,
+            guard.runtime.execute_memory_fix_tool_inner(payload),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                guard.completed = true;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(elapsed) => Err(anyhow::Error::new(elapsed)
+                .context("memory.fix deadline exceeded; IPC connection closed before recovery")),
+        }
+    }
+
+    async fn execute_memory_fix_tool_inner(&mut self, payload: ToolExecutionPayload) -> Result<()> {
         let (content, tool_err) = match self
             .ipc_client
-            .send_request(IpcRequest::RefreshMemoryConfig)
+            .refresh_memory_config(std::time::Duration::from_secs(10))
             .await
         {
-            Ok(IpcResponse::MuninnStatus {
+            Ok(philotic_client::MemoryConfigRefresh {
+                request_id: _,
                 available,
                 endpoint,
             }) => {
@@ -3110,7 +3158,6 @@ impl AgentRuntime {
                 };
                 (msg, None)
             }
-            Ok(_) => ("MuninnDB probe response unrecognized.".into(), None),
             Err(e) => {
                 let err = TaskErrorPayload::transport_error(
                     "philote",
@@ -3214,6 +3261,231 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn memory_refresh_payload(session_id: &str, turn_id: &str) -> ToolExecutionPayload {
+        ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            chat_id: "synthetic".into(),
+            tool_name: "memory.fix".into(),
+            arguments: json!({}),
+            execution_mode: "inline".into(),
+            agent_id: "synthetic-memory-agent".into(),
+            user_id: None,
+            runner_id: None,
+            incarnation_id: None,
+            hotel_id: None,
+            environment_id: None,
+            task_runner_kind: None,
+            task_runner_config: None,
+            selection_reason: None,
+            workspace_ref: None,
+            task_runner_overlay: None,
+            return_route: None,
+            reply_to: "synthetic-hotel".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: None,
+            final_reply_to: "synthetic-hotel".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_fix_deadline_and_cancellation_cover_result_checkpoint() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for cancel in [false, true] {
+            let socket = format!(
+                "/tmp/philote-memory-deadline-{}.sock",
+                Uuid::new_v4().simple()
+            );
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let stalled_checkpoint = std::sync::Arc::new(AtomicBool::new(false));
+            let observed = stalled_checkpoint.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut probe_answered = false;
+                loop {
+                    let Ok(len) = stream.read_u32().await else {
+                        return;
+                    };
+                    let mut payload = vec![0; len as usize];
+                    stream.read_exact(&mut payload).await.unwrap();
+                    let req: IpcRequest = serde_json::from_slice(&payload).unwrap();
+                    let reply = match req {
+                        IpcRequest::GetConfig { key } => IpcResponse::ConfigData {
+                            key,
+                            value_json: None,
+                        },
+                        IpcRequest::RefreshMemoryConfigCorrelated { request_id } => {
+                            probe_answered = true;
+                            IpcResponse::MemoryConfigRefreshReply {
+                                memory_config_refresh: philotic_client::MemoryConfigRefresh {
+                                    request_id,
+                                    available: false,
+                                    endpoint: "synthetic".into(),
+                                },
+                            }
+                        }
+                        IpcRequest::SyncApartment { .. } if probe_answered => {
+                            observed.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                            unreachable!()
+                        }
+                        _ => IpcResponse::success("synthetic", None),
+                    };
+                    let payload = serde_json::to_vec(&reply).unwrap();
+                    stream
+                        .write_all(&(payload.len() as u32).to_be_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(&payload).await.unwrap();
+                }
+            });
+            let client = philotic_client::PhiloticClient::connect_at(
+                &socket,
+                philotic_client::GuestIdentity {
+                    guest_id: "synthetic-memory-agent".into(),
+                    role: "agent".into(),
+                    supported_tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let mut runtime = AgentRuntime::new(client, "synthetic-memory-agent");
+            let session_id = "synthetic-memory-session";
+            runtime
+                .ensure_session_loaded(session_id, "synthetic")
+                .await
+                .unwrap();
+            runtime.sessions.get_mut(session_id).unwrap().start_turn(
+                super::super::tests::def004_working_turn("synthetic-turn", "memory.fix"),
+            );
+            let payload = memory_refresh_payload(session_id, "synthetic-turn");
+            if cancel {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        runtime.execute_memory_fix_tool(payload)
+                    )
+                    .await
+                    .is_err()
+                );
+            } else {
+                let error = runtime
+                    .execute_memory_fix_tool_with_timeout(
+                        payload,
+                        std::time::Duration::from_millis(200),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(philotic_client::is_ipc_timeout(&error));
+            }
+            assert!(
+                stalled_checkpoint.load(Ordering::SeqCst),
+                "probe answered before the result checkpoint stalled"
+            );
+            assert!(philotic_client::is_ipc_disconnect(
+                &runtime
+                    .ipc_client
+                    .send_request(IpcRequest::GetConfig {
+                        key: "synthetic".into()
+                    })
+                    .await
+                    .unwrap_err()
+            ));
+            server.abort();
+            let _ = std::fs::remove_file(socket);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_refresh_fix_result_releases_waiting_tool_turn() {
+        let socket = format!(
+            "/tmp/philote-memory-refresh-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let server = tokio::spawn(super::super::tests::run_recording_hotel(
+            listener,
+            emitted.clone(),
+        ));
+        let client = philotic_client::PhiloticClient::connect_at(
+            &socket,
+            philotic_client::GuestIdentity {
+                guest_id: "synthetic-memory-agent".into(),
+                role: "agent".into(),
+                supported_tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let mut runtime = AgentRuntime::new(client, "synthetic-memory-agent");
+        let session_id = "synthetic-memory-session";
+        let turn_id = "synthetic-memory-turn";
+        runtime
+            .ensure_session_loaded(session_id, "synthetic")
+            .await
+            .unwrap();
+        runtime.sessions.get_mut(session_id).unwrap().start_turn(
+            super::super::tests::def004_working_turn(turn_id, "memory.fix"),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.execute_memory_fix_tool(ToolExecutionPayload {
+                action: "execute_tool",
+                session_id: session_id.into(),
+                turn_id: turn_id.into(),
+                chat_id: "synthetic".into(),
+                tool_name: "memory.fix".into(),
+                arguments: json!({}),
+                execution_mode: "inline".into(),
+                agent_id: "synthetic-memory-agent".into(),
+                user_id: None,
+                runner_id: None,
+                incarnation_id: None,
+                hotel_id: None,
+                environment_id: None,
+                task_runner_kind: None,
+                task_runner_config: None,
+                selection_reason: None,
+                workspace_ref: None,
+                task_runner_overlay: None,
+                return_route: None,
+                reply_to: "synthetic-hotel".into(),
+                reply_role: "agent".into(),
+                reply_guest_id: None,
+                final_reply_to: "synthetic-hotel".into(),
+                final_reply_role: "membrane".into(),
+                final_reply_guest_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let turn = runtime
+            .sessions
+            .get(session_id)
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap();
+        assert_ne!(turn.phase, TurnPhase::WaitingTool);
+        assert_eq!(turn.working_tool_history.len(), 1);
+        assert!(!runtime.muninn_available);
+        assert!(
+            emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|item| item["task"]["action"] == "generate_text")
+        );
+        server.abort();
+        let _ = std::fs::remove_file(socket);
+    }
 
     #[test]
     fn default_turn_recall_scope_includes_fleet_knowledge() {

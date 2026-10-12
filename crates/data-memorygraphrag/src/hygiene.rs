@@ -376,6 +376,7 @@ enum PlannedWrite {
 /// ['proposed','inferred']` server-side as a second guard against retiring
 /// anything confirmed/retired/conflicted.
 pub async fn sweep(graph: &Graph) -> Result<SweepSummary> {
+    datasource::memgraph_enrollment::require_memgraph_enrollment()?;
     let stale_days = stale_days_from_env();
     let max_writes = max_writes_from_env();
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(stale_days)).to_rfc3339();

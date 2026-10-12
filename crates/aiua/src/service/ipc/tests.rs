@@ -24,6 +24,84 @@ fn register_skill_test_graph() -> GraphDomain {
     GraphDomain::new(Arc::new(graph_store.adapter()))
 }
 
+#[tokio::test]
+async fn memory_refresh_hotel_correlates_probe_and_refuses_legacy_wire() {
+    let socket_path = test_socket_path();
+    let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+    let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+    // No configured memory endpoint: synthetic fixture never makes a network call.
+    let server = IpcServer::new(socket_path.clone(), "synthetic-hotel", dispatcher_tx, graph);
+    let server_task = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    let id = Uuid::new_v4();
+    for (request, correlated) in [
+        (
+            IpcRequest::RefreshMemoryConfigCorrelated { request_id: id },
+            true,
+        ),
+        (IpcRequest::RefreshMemoryConfig, false),
+    ] {
+        let payload = serde_json::to_vec(&request).unwrap();
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&payload).await.unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let len = stream.read_u32().await.unwrap() as usize;
+                let mut payload = vec![0; len];
+                stream.read_exact(&mut payload).await.unwrap();
+                let reply = serde_json::from_slice::<IpcResponse>(&payload).unwrap();
+                // The first probe flips reachability and broadcasts a status.
+                // That independent frame is not the next request's refusal.
+                if !matches!(
+                    reply,
+                    IpcResponse::MuninnStatus { .. } | IpcResponse::NetworkState { .. }
+                ) {
+                    break reply;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if correlated {
+            assert!(
+                matches!(reply, IpcResponse::MemoryConfigRefreshReply { memory_config_refresh }
+                if memory_config_refresh.request_id == id && !memory_config_refresh.available && memory_config_refresh.endpoint.is_empty())
+            );
+        } else {
+            assert!(
+                matches!(&reply, IpcResponse::Standard { ok: false, code, .. } if code == "MEMORY_REFRESH_PROTOCOL_REQUIRED"),
+                "legacy refusal decoded as {reply:?}"
+            );
+        }
+    }
+    // Upgrade-compatible guest uses the same real hotel's typed API.
+    let mut client = PhiloticClient::connect_at(
+        &socket_path,
+        GuestIdentity {
+            guest_id: "synthetic-memory-client".into(),
+            role: "test".into(),
+            supported_tools: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !client
+            .refresh_memory_config(std::time::Duration::from_secs(2))
+            .await
+            .unwrap()
+            .available
+    );
+    server_task.abort();
+    let _ = std::fs::remove_file(socket_path);
+}
+
 // ── stamp_reply_owner_agent (cron brief sent by every bot, 2026-09-18) ────
 
 mod reply_owner_stamp {
