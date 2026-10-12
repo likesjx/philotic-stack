@@ -29,6 +29,7 @@ use philotic_client::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -723,6 +724,12 @@ enum Command {
         #[arg(long, default_value = "default")]
         hotel: String,
     },
+    /// Store the Percival personal-gateway Muninn observe credential locally.
+    StorePercivalGatewayCredential {
+        /// Inherited file descriptor to read the credential from. Defaults to stdin.
+        #[arg(long)]
+        secret_fd: Option<i32>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -753,6 +760,11 @@ const STARTUP_TEST_GEMINI_API_KEY: &str = "startup-test-gemini-key";
 const STARTUP_TEST_TELEGRAM_TEXT_REPLY: &str = "startup telegram text smoke ok";
 const STARTUP_TEST_TELEGRAM_PHOTO_REPLY: &str = "startup telegram photo smoke ok";
 const STARTUP_TEST_TELEGRAM_VOICE_REPLY: &str = "startup telegram voice smoke ok";
+const PERCIVAL_GATEWAY_SECRET_KIND: &str = "percival-muninn-observe";
+const PERCIVAL_GATEWAY_SCOPE: &str = "percival_connection_test";
+const PERCIVAL_GATEWAY_ROLE: &str = "percival-personal-recall";
+const PERCIVAL_GATEWAY_GUEST: &str = "percival-personal-gateway";
+const PERCIVAL_GATEWAY_SECRET_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Default)]
 struct FakeTelegramState {
@@ -7543,6 +7555,242 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn current_euid() -> u32 {
+    0
+}
+
+fn validate_profile_name(profile: &str) -> Result<()> {
+    if profile.is_empty()
+        || profile == "."
+        || profile == ".."
+        || profile.contains('/')
+        || profile.contains('\\')
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "PHILOTIC_PROFILE names the target profile and must not contain path separators"
+        );
+    }
+    Ok(())
+}
+
+fn percival_gateway_profile_db_path() -> Result<PathBuf> {
+    let profile = std::env::var("PHILOTIC_PROFILE")
+        .context("PHILOTIC_PROFILE must name an existing local profile")?;
+    validate_profile_name(&profile)?;
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let philotic_root = PathBuf::from(home).join(".philotic");
+    validate_private_dir(&philotic_root, "Philotic profile root")?;
+    Ok(philotic_root.join(profile).join("context.db"))
+}
+
+#[cfg(unix)]
+fn validate_private_dir(path: &Path, label: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} at {}", path.display()))?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != current_euid()
+        || meta.mode() & 0o022 != 0
+    {
+        anyhow::bail!("{label} is not a private directory owned by this OS account");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_dir(_path: &Path, _label: &str) -> Result<()> {
+    anyhow::bail!("Percival gateway credential storage is only supported on Unix hosts");
+}
+
+#[cfg(unix)]
+fn validate_operator_db_path(db_path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("context DB path has no parent"))?;
+    validate_private_dir(parent, "context DB parent")?;
+
+    let db_meta = fs::symlink_metadata(db_path)
+        .with_context(|| format!("context DB does not already exist at {}", db_path.display()))?;
+    if !db_meta.is_file()
+        || db_meta.file_type().is_symlink()
+        || db_meta.uid() != current_euid()
+        || db_meta.mode() & 0o022 != 0
+    {
+        anyhow::bail!("context DB must be a regular private file owned by this OS account");
+    }
+
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
+    let canonical_db = db_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", db_path.display()))?;
+    if canonical_db.parent() != Some(canonical_parent.as_path()) {
+        anyhow::bail!("context DB resolved outside its validated profile directory");
+    }
+
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("failed to inspect existing context DB")?;
+    for table in [
+        "graph_nodes",
+        "graph_edges",
+        "node_config",
+        "vault_secrets",
+        "hotels",
+        "materialized_guests",
+        "agent_identities",
+        "memory_apartments",
+    ] {
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = ?1
+                )",
+                [table],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("failed to inspect context DB schema table {table}"))?;
+        if !present {
+            anyhow::bail!(
+                "context DB is missing required table {table}; refusing to initialize a new schema"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_operator_db_path(_db_path: &Path) -> Result<()> {
+    anyhow::bail!("Percival gateway credential storage is only supported on Unix hosts");
+}
+
+fn read_bounded_secret_from(mut reader: impl std::io::Read) -> Result<String> {
+    let mut buf = Vec::new();
+    let mut limited = reader
+        .by_ref()
+        .take((PERCIVAL_GATEWAY_SECRET_MAX_BYTES + 1) as u64);
+    limited
+        .read_to_end(&mut buf)
+        .context("failed to read credential input")?;
+    if buf.is_empty() {
+        anyhow::bail!("credential input is empty");
+    }
+    if buf.len() > PERCIVAL_GATEWAY_SECRET_MAX_BYTES {
+        anyhow::bail!(
+            "credential input exceeds {} bytes",
+            PERCIVAL_GATEWAY_SECRET_MAX_BYTES
+        );
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        anyhow::bail!("credential input is empty");
+    }
+    String::from_utf8(buf).context("credential input must be UTF-8")
+}
+
+#[cfg(unix)]
+fn read_operator_secret_from_fd(fd: i32) -> Result<String> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the operator explicitly passes ownership of this inherited
+    // descriptor to this one-shot CLI, which exits after consuming it.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    read_bounded_secret_from(file)
+}
+
+#[cfg(not(unix))]
+fn read_operator_secret_from_fd(_fd: i32) -> Result<String> {
+    anyhow::bail!("inherited credential fd input is only supported on Unix hosts");
+}
+
+fn read_operator_secret(secret_fd: Option<i32>) -> Result<String> {
+    match secret_fd {
+        Some(fd) if fd >= 0 => read_operator_secret_from_fd(fd),
+        Some(_) => anyhow::bail!("secret fd must be non-negative"),
+        None => {
+            let stdin = std::io::stdin();
+            read_bounded_secret_from(stdin.lock())
+        }
+    }
+}
+
+fn with_sqlite_write_lock<T>(
+    storage: &ansible_mesh_core::sqlite_storage::SqliteGraphStorage,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    {
+        let conn = storage.raw_conn().lock().unwrap();
+        conn.busy_timeout(std::time::Duration::from_millis(250))
+            .context("failed to configure SQLite busy timeout")?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .context("failed to acquire context DB write lock")?;
+    }
+
+    let result = work();
+    let conn = storage.raw_conn().lock().unwrap();
+    match result {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")
+                .context("failed to commit context DB transaction")?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+fn store_percival_gateway_credential_at(db_path: &Path, secret: String) -> Result<String> {
+    validate_operator_db_path(db_path)?;
+    let storage =
+        ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open_existing_without_init(db_path)
+            .context("failed to open existing context DB")?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    with_sqlite_write_lock(&storage, || {
+        store_secret(
+            &graph,
+            SecretInput {
+                secret_kind: PERCIVAL_GATEWAY_SECRET_KIND.to_string(),
+                scope: PERCIVAL_GATEWAY_SCOPE.to_string(),
+                allowed_roles: vec![PERCIVAL_GATEWAY_ROLE.to_string()],
+                allowed_guests: vec![PERCIVAL_GATEWAY_GUEST.to_string()],
+                plaintext: secret,
+            },
+        )
+    })
+}
+
+fn percival_gateway_secret_ref_output(secret_ref: &str) -> String {
+    serde_json::json!({ "secret_ref": secret_ref }).to_string()
+}
+
+fn run_store_percival_gateway_credential(secret_fd: Option<i32>) -> Result<()> {
+    let db_path = percival_gateway_profile_db_path()?;
+    let secret = read_operator_secret(secret_fd)?;
+    let secret_ref = store_percival_gateway_credential_at(&db_path, secret)?;
+    println!("{}", percival_gateway_secret_ref_output(&secret_ref));
+    Ok(())
+}
+
 /// Days of session_event / completed session_turn history the hotel retains.
 /// Override with PHILOTIC_SESSION_RETENTION_DAYS; 0 disables the sweep.
 ///
@@ -7609,8 +7857,12 @@ fn main() -> Result<()> {
 }
 
 async fn hotel_main() -> Result<()> {
-    init_logging();
     let args = Args::parse();
+    if let Some(Command::StorePercivalGatewayCredential { secret_fd }) = &args.command {
+        return run_store_percival_gateway_credential(*secret_fd);
+    }
+
+    init_logging();
     // Adopt and validate before opening state or materializing any guest.
     let scoped_vault_listener = service::scoped_vault_activation::optional()?;
     let scoped_vault_policy = scoped_vault_listener
@@ -8984,7 +9236,8 @@ mod tests {
     use super::BLOB_BIND_ADDR;
     use super::resolve_retention_days;
     use super::{
-        AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
+        AgentProfile, BASE64_STANDARD, PERCIVAL_GATEWAY_GUEST, PERCIVAL_GATEWAY_ROLE,
+        PERCIVAL_GATEWAY_SECRET_MAX_BYTES, SecretAccess, StartupTest, agent_graph_guest_record,
         agent_graph_runner_guest, agent_identity_record_for_profile, agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
@@ -8994,11 +9247,12 @@ mod tests {
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
         nearest_available_base_port, node_id_bound_to_other_hotel,
-        preserve_runtime_guest_activation, read_string_config,
+        percival_gateway_secret_ref_output, preserve_runtime_guest_activation,
+        read_bounded_secret_from, read_operator_secret, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_abstract_skill_catalog, seed_abstract_tool_catalog, seed_operator_timezone,
         seed_orchestrator_roles, seed_skill_crafting, seed_toolset_profiles,
-        startup_test_gemini_base_url,
+        startup_test_gemini_base_url, store_percival_gateway_credential_at, validate_profile_name,
     };
 
     #[test]
@@ -9050,6 +9304,200 @@ mod tests {
     use ansible_mesh_core::storage::{GuestRecord, HotelRecord};
     use base64::Engine;
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aiua-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod test dir");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn synthetic_context_db(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir(name);
+        let db_path = dir.join("context.db");
+        {
+            let storage = SqliteGraphStorage::open(&db_path).expect("init synthetic context DB");
+            drop(storage);
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod synthetic context DB");
+        db_path
+    }
+
+    fn synthetic_vault_key() -> String {
+        BASE64_STANDARD.encode([7u8; 32])
+    }
+
+    #[test]
+    fn percival_gateway_input_rejects_oversized_secret() {
+        let input = vec![b'a'; PERCIVAL_GATEWAY_SECRET_MAX_BYTES + 1];
+        let err = read_bounded_secret_from(std::io::Cursor::new(input)).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn percival_gateway_profile_name_rejects_path_escape() {
+        assert!(validate_profile_name("../default").is_err());
+        assert!(validate_profile_name("default").is_ok());
+    }
+
+    #[test]
+    fn percival_gateway_output_contains_only_secret_ref() {
+        let output = percival_gateway_secret_ref_output(
+            "secret://hotel/default/percival-muninn-observe/synthetic",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "secret_ref": "secret://hotel/default/percival-muninn-observe/synthetic"
+            })
+        );
+        assert!(!output.contains("mk_synthetic"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_secret_fd_reads_bounded_secret() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("percival-fd");
+        let secret_path = dir.join("credential.in");
+        {
+            let mut file = std::fs::File::create(&secret_path).expect("create fd fixture");
+            file.write_all(b"mk_from_fd\n").expect("write fd fixture");
+        }
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fd fixture");
+        let file = std::fs::File::open(&secret_path).expect("open fd fixture");
+        let fd = file.into_raw_fd();
+        let secret = read_operator_secret(Some(fd)).expect("read inherited fd secret");
+        assert_eq!(secret, "mk_from_fd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_store_roundtrips_with_exact_acl() {
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
+        unsafe {
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", synthetic_vault_key());
+            std::env::set_var("PHILOTIC_VAULT_KEYCHAIN", "0");
+        }
+        let db_path = synthetic_context_db("percival-roundtrip");
+        let secret_ref = store_percival_gateway_credential_at(&db_path, "mk_synthetic".into())
+            .expect("store exact ACL credential");
+        assert!(secret_ref.starts_with("secret://hotel/default/percival-muninn-observe/"));
+
+        let storage = SqliteGraphStorage::open(&db_path).expect("open synthetic context DB");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let plaintext = crate::vault::resolve_secret_exact_acl(
+            &graph,
+            &secret_ref,
+            &SecretAccess {
+                role: PERCIVAL_GATEWAY_ROLE.into(),
+                guest_id: PERCIVAL_GATEWAY_GUEST.into(),
+            },
+        )
+        .expect("exact ACL resolves")
+        .expect("secret exists");
+        assert_eq!(plaintext, "mk_synthetic");
+
+        let denied = crate::vault::resolve_secret_exact_acl(
+            &graph,
+            &secret_ref,
+            &SecretAccess {
+                role: PERCIVAL_GATEWAY_ROLE.into(),
+                guest_id: "other-guest".into(),
+            },
+        );
+        assert!(denied.is_err(), "wrong guest must fail exact ACL");
+        unsafe {
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
+            std::env::remove_var("PHILOTIC_VAULT_KEYCHAIN");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_store_refuses_missing_profile_db() {
+        let missing = unique_test_dir("percival-missing").join("context.db");
+        let err = store_percival_gateway_credential_at(&missing, "mk_synthetic".into())
+            .expect_err("missing DB must fail before schema init");
+        assert!(
+            err.to_string()
+                .contains("context DB does not already exist")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_store_refuses_partial_existing_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("percival-partial");
+        let db_path = dir.join("context.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open partial db");
+            conn.execute_batch(
+                "CREATE TABLE graph_nodes (
+                    node_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    label TEXT,
+                    data_json TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );",
+            )
+            .expect("seed partial schema");
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod partial context DB");
+
+        let err = store_percival_gateway_credential_at(&db_path, "mk_synthetic".into())
+            .expect_err("partial DB must not be initialized");
+        assert!(
+            err.to_string()
+                .contains("missing required table graph_edges"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn percival_gateway_store_refuses_lock_contention() {
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
+        unsafe {
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", synthetic_vault_key());
+            std::env::set_var("PHILOTIC_VAULT_KEYCHAIN", "0");
+        }
+        let db_path = synthetic_context_db("percival-lock");
+        let lock = rusqlite::Connection::open(&db_path).expect("open lock connection");
+        lock.execute_batch("BEGIN IMMEDIATE")
+            .expect("hold write lock");
+        let err = store_percival_gateway_credential_at(&db_path, "mk_synthetic".into())
+            .expect_err("contended DB must fail closed");
+        assert!(
+            err.to_string().contains("write lock") || format!("{err:#}").contains("locked"),
+            "unexpected error: {err:#}"
+        );
+        lock.execute_batch("ROLLBACK").expect("release lock");
+        unsafe {
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
+            std::env::remove_var("PHILOTIC_VAULT_KEYCHAIN");
+        }
+    }
 
     #[test]
     fn guest_supervision_defaults_enabled() {
