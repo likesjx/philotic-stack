@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { start } from './server.mjs';
 const config = { port: 8799, mode: 'active', resource: 'https://mcp.example/personal/mcp',
   allowedSubjects: ['synthetic'], allowedClients: ['dot', 'claude'],
-  clientPolicies: [], muninnVault: 'percival_synthetic_recall_acceptance', enabledTools: ['muninn_recall'],
+  clientPolicies: [], muninnVault: 'percival_connection_test', enabledTools: ['muninn_recall'],
   issuer: { credentialBrokerSocketPath: '/run/percival-personal-vault-broker.sock' },
   upstreams: { muninn_recall: { url: 'http://127.0.0.1:8750/mcp', backendProtocol: 'muninn-unary-json',
     credentialBrokerSocketPath: '/run/percival-personal-vault-broker.sock' } } };

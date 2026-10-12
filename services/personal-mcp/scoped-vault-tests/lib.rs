@@ -77,7 +77,7 @@ mod adapter_tests {
             record: domain::Record {
                 secret_ref: "secret://hotel/default/percival-muninn-observe/synthetic".into(),
                 secret_kind: "percival-muninn-observe".into(),
-                scope: "percival_synthetic_recall_acceptance".into(),
+                scope: "percival_connection_test".into(),
                 allowed_roles: roles.into_iter().map(str::to_owned).collect(),
                 allowed_guests: guests.into_iter().map(str::to_owned).collect(),
                 nonce_b64: nonce,
@@ -113,8 +113,8 @@ mod adapter_tests {
         let policy = Policy::new(1234, 999, reference.into()).unwrap();
         for (kind, scope) in [
             ("percival-muninn-observe", "user_likesjx"),
-            ("muninn_vault_token", "percival_synthetic_recall_acceptance"),
-            ("percival-issuer-introspection", "percival_synthetic_recall_acceptance"),
+            ("muninn_vault_token", "percival_connection_test"),
+            ("percival-issuer-introspection", "percival_connection_test"),
         ] {
             let graph = fixture(vec![ROLE], vec![GUEST], false);
             {

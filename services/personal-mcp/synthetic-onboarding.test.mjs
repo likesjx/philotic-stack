@@ -96,3 +96,11 @@ test('exact broker ACL fields are required for stored Muninn observe credential'
     }), /exact_acl_required/);
   }
 });
+
+test('mock onboarding cannot target a non-loopback admin endpoint', async () => {
+  await assert.rejects(prepareSyntheticOnboarding({
+    operator: { subject: 'synthetic-operator' },
+    adminBase: 'https://www.jaredlikes.com',
+    fetchImpl: async () => { throw new Error('must not fetch'); },
+  }), /synthetic_mint_uncertain/);
+});

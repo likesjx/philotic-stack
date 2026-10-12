@@ -7,10 +7,10 @@
   "files": {
     "services/personal-mcp/issuer-fixture/src/lib/auth/personal-oauth/policy.ts": "e75b8d3869c97764e0057ddababc5d339c1db7254f36298f8d13fbc7eaf1506a",
     "services/personal-mcp/issuer-fixture/src/lib/auth/personal-oauth/http.ts": "648357b8e17945d61201ab7a11c59aecdfc7d8025c6605010525a9437bf9192f",
-    "services/personal-mcp/issuer-fixture/tests/personal-oauth.test.ts": "2765fc38316446bc4c0b231031cbea028d3cd1f99e6c36f96b76c43c6967b502",
-    "services/personal-mcp/gateway.mjs": "275acb1d92abf32a8295b44c91a841e5f8a9964223e3d48458a8d5a743ce702c",
+    "services/personal-mcp/issuer-fixture/tests/personal-oauth.test.ts": "2027030601a87273db582b0b7a875ca5a414a24bbbdd574c8209b6068d9fc6ef",
+    "services/personal-mcp/gateway.mjs": "126dc4426b880d06f64c18e656ef9268c96e47782b613506e046b0bab2d1ee3f",
     "services/personal-mcp/vault.mjs": "13469581477a55729ce34273ad60e07ab9f2c2549f7379ea91bbc1a6e749df27",
-    "services/personal-mcp/server.mjs": "f8e962fbce014de0cfd2b5bb89d443512a016154b2c8184901a82caab8e6fafe"
+    "services/personal-mcp/server.mjs": "2a2ab94eea69540e2e6325e137682c0309193402a72bf65fa57da17b0d666579"
   },
   "gateway_local_changes": {
     "services/personal-mcp/server.mjs": "Active composition narrowed to synthetic vault, explicit client policies, fixed broker-only credentials, literal loopback unary /mcp; core gateway and issuer snapshots unchanged"

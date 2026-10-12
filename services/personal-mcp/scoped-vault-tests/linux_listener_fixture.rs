@@ -88,7 +88,7 @@ fn main() {
         record: Record {
             secret_ref: "secret://hotel/default/percival-muninn-observe/synthetic".into(),
             secret_kind: "percival-muninn-observe".into(),
-            scope: "percival_synthetic_recall_acceptance".into(),
+            scope: "percival_connection_test".into(),
             allowed_roles: vec![ROLE.into()],
             allowed_guests: vec![GUEST.into()],
             nonce_b64: nonce,

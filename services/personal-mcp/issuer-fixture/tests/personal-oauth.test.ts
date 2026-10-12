@@ -128,12 +128,12 @@ test('both issuer clients interoperate with the pinned gateway and revoke indepe
     tokens.set(client, (await f.auth.exchange(e)).access_token);
   }
   let calls = 0;
-  const server = await createPersonalMcp({ resource: config.resource, muninnVault: 'percival_synthetic_recall_acceptance', enabledTools: ['muninn_recall'],
+  const server = await createPersonalMcp({ resource: config.resource, muninnVault: 'percival_connection_test', enabledTools: ['muninn_recall'],
     clock: () => new Date('2026-10-05T12:00:01Z').getTime(), allowedSubjects: new Set(['stable-internal-subject']), allowedClients: new Set(['dot', 'claude']),
-    clientPolicies: ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['stable-internal-subject'], scopes: ['memory:recall'], vault: 'percival_synthetic_recall_acceptance' })),
+    clientPolicies: ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['stable-internal-subject'], scopes: ['memory:recall'], vault: 'percival_connection_test' })),
     issuer: { issuer: config.issuer, ready: async () => f.auth.metadata(), inspect: (token: string) => f.auth.introspect(token) },
     upstream: { list: async (name: string) => ({ name }), call: async (_name: string, args: { vault: string; read_only: boolean }) => {
-      assert.equal(args.vault, 'percival_synthetic_recall_acceptance'); assert.equal(args.read_only, true); calls++;
+      assert.equal(args.vault, 'percival_connection_test'); assert.equal(args.read_only, true); calls++;
       return { content: [{ type: 'text', text: 'synthetic connection packet' }] };
     } } });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));

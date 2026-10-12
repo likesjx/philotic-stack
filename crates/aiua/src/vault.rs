@@ -180,7 +180,7 @@ fn resolve_secret_with_acl(
         };
         if secret.secret_ref != secret_ref
             || secret.secret_kind != expected_kind
-            || secret.scope != "percival_synthetic_recall_acceptance"
+            || secret.scope != "percival_connection_test"
         {
             bail!("credential_unavailable");
         }

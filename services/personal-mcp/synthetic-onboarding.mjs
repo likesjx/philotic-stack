@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { createPersonalMcp } from './gateway.mjs';
 
-export const RESERVED_SYNTHETIC_VAULT = 'percival_synthetic_recall_acceptance';
+export const RESERVED_SYNTHETIC_VAULT = 'percival_connection_test';
 export const CLAUDE_HOSTED_CLIENT_ID = 'claude_hosted';
 export const CLAUDE_HOSTED_CALLBACK = 'https://claude.ai/api/mcp/auth_callback';
 export const CLAUDE_HOSTED_SCOPE = 'memory:recall';
@@ -52,6 +52,9 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+// Local mock harness only. This is intentionally not a trusted provisioner and
+// must not be used as evidence that real keys, grants, vaults, or admissions
+// were created.
 export async function withSyntheticMuninnAdmin(t, { uncertain = false } = {}) {
   const minted = new Map();
   const revoked = [];
@@ -96,8 +99,12 @@ export async function withSyntheticMuninnAdmin(t, { uncertain = false } = {}) {
 }
 
 async function mintObserveKey(adminBase, fetchImpl) {
+  const base = new URL(adminBase);
+  if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname) || base.username || base.password) {
+    throw new Error('local_mock_admin_required');
+  }
   const signal = AbortSignal.timeout(1000);
-  const response = await fetchImpl(`${adminBase}/api/admin/keys`, {
+  const response = await fetchImpl(`${base.origin}/api/admin/keys`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
@@ -192,7 +199,7 @@ export async function runSyntheticDryRun({ adminBase, token = 'synthetic-access-
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'muninn_recall', arguments: { context: ['synthetic'] } } }),
     });
     if (response.status !== 200) throw new Error('synthetic_gateway_failed');
-    return { ...prepared, gatewayStatus: response.status };
+    return { mode: 'local_mock_dry_run', ...prepared, gatewayStatus: response.status };
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

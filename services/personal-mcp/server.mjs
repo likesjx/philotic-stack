@@ -24,7 +24,7 @@ export async function start(config, env = process.env) {
   const native = config.upstreams?.muninn_recall;
   let nativeUrl;
   try { nativeUrl = new URL(native?.url); } catch { throw new Error('Synthetic-only native profile required'); }
-  if (config.muninnVault !== 'percival_synthetic_recall_acceptance' || enabledTools.length !== 1 || enabledTools[0] !== 'muninn_recall' ||
+  if (config.muninnVault !== 'percival_connection_test' || enabledTools.length !== 1 || enabledTools[0] !== 'muninn_recall' ||
       !Array.isArray(config.clientPolicies) || native?.backendProtocol !== 'muninn-unary-json' ||
       nativeUrl.protocol !== 'http:' || nativeUrl.hostname !== '127.0.0.1' || nativeUrl.pathname !== '/mcp' ||
       nativeUrl.username || nativeUrl.password || nativeUrl.search || nativeUrl.hash ||
