@@ -78,7 +78,9 @@ def policy():
 
 def start(work,enabled='1',metadata=True,extra=False,wrong_pid=False,test=False,smoke=False,uid=999):
     (work/'guest-probe.json').unlink(missing_ok=True)
-    env=dict(ENV,PHILOTIC_LOG_DIR=str(work/'logs'))
+    # PERIMETER_ENFORCEMENT P1: a hotel binds only an explicit socket (or one in
+    # its profile dir); pin the same path seed() wrote into the hotel record.
+    env=dict(ENV,PHILOTIC_LOG_DIR=str(work/'logs'),PHILOTIC_HOTEL_SOCKET=str(work/'general.sock'))
     if enabled is None: env.pop('PHILOTIC_SCOPED_VAULT_ENABLED')
     else: env['PHILOTIC_SCOPED_VAULT_ENABLED']=enabled
     if smoke: env['PHILOTIC_SMOKE_MODE']='1'
