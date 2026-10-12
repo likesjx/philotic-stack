@@ -918,9 +918,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: local_node_id(),
-                target_role: origin_role,
+                target_role: origin_role.clone(),
                 target_guest_id: None,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &origin_role,
+                    "probe",
+                )?,
             })
             .await?;
 
@@ -2747,9 +2752,14 @@ impl AgentRuntime {
                 self.ipc_client
                     .send_request(IpcRequest::EmitTask {
                         target_node,
-                        target_role,
+                        target_role: target_role.clone(),
                         target_guest_id,
-                        task_json: serde_json::to_string(&model_req)?,
+                        task_json: model_attempt_task_json(
+                            &model_req,
+                            self.sessions.get(&session_id),
+                            &target_role,
+                            "initial",
+                        )?,
                     })
                     .await?;
 
@@ -2873,18 +2883,11 @@ impl AgentRuntime {
             oracle_agreement: None,
         };
 
-        if debug_model_requests_enabled() {
-            match serde_json::to_string_pretty(&model_req) {
-                Ok(json) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS philote retry model request session={} turn={}:\n{}",
-                    session_id, model_req.turn_id, json
-                ),
-                Err(err) => warn!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS could not serialize retry model request: {}",
-                    err
-                ),
-            }
-        }
+        info!(
+            user_bytes = model_req.user_content.len(),
+            projected_tools = model_req.tools_for_model.len(),
+            "Philote model request assembly (metadata only)"
+        );
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
@@ -2903,9 +2906,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node,
-                target_role,
+                target_role: target_role.clone(),
                 target_guest_id,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "retry",
+                )?,
             })
             .await?;
 
@@ -3163,9 +3171,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node,
-                target_role,
+                target_role: target_role.clone(),
                 target_guest_id,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &target_role,
+                    "initial",
+                )?,
             })
             .await?;
 
@@ -3599,9 +3612,14 @@ impl AgentRuntime {
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: local_node_id(),
-                target_role: next_role,
+                target_role: next_role.clone(),
                 target_guest_id: None,
-                task_json: serde_json::to_string(&model_req)?,
+                task_json: model_attempt_task_json(
+                    &model_req,
+                    self.sessions.get(&session_id),
+                    &next_role,
+                    "fallback",
+                )?,
             })
             .await?;
 

@@ -46,6 +46,7 @@ impl MemgraphCypherProvider {
     }
 
     async fn connect(&self, db_override: Option<&str>) -> Result<Graph> {
+        datasource::memgraph_enrollment::require_memgraph_enrollment()?;
         let mut builder = ConfigBuilder::default()
             .uri(self.config.uri.as_str())
             .user(self.config.user.as_str())
@@ -117,6 +118,7 @@ impl DatasourceProvider for MemgraphCypherProvider {
     }
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        datasource::memgraph_enrollment::require_memgraph_enrollment()?;
         match &task.kind {
             TaskKind::CreatePartition => {
                 info!("Memgraph partition create is logical; physical database is Bolt endpoint");

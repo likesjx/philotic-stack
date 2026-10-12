@@ -481,6 +481,10 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         | "mesh_event_undecodable"
         | "mesh_gossip_undecodable"
         | "mesh_task_dropped"
+        // L2 (DEF-192): the hotel-state roster nears or exceeds the UDP
+        // datagram budget, or a roster broadcast failed to send.
+        | "hotel_state_budget"
+        | "hotel_state_send_failed"
         // A tier fallback that SUCCEEDED still means a provider tier is down
         // (2026-07-20: gemini schema 400s were invisible because the ladder
         // kept answering) — no restart fixes a provider; surface a work item.
@@ -1192,6 +1196,8 @@ mod tests {
             crate::mesh_alarm::MESH_EVENT_UNDECODABLE_TAG,
             crate::mesh_alarm::MESH_GOSSIP_UNDECODABLE_TAG,
             crate::mesh_alarm::MESH_TASK_DROPPED_TAG,
+            crate::heartbeat::HOTEL_STATE_BUDGET_TAG,
+            crate::heartbeat::HOTEL_STATE_SEND_FAILED_TAG,
         ] {
             assert_eq!(heal_action_for_pattern_tag(tag), "escalate", "{tag}");
         }

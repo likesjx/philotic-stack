@@ -101,6 +101,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "libc",
  "memory-core",
  "parakeet-runner",
  "perimeter-core",
@@ -113,6 +114,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "signal-hook-registry",
  "tokio",
  "tower-http 0.5.2",
  "tracing",
@@ -1183,11 +1185,13 @@ dependencies = [
  "chrono-tz",
  "datasource",
  "futures",
+ "libc",
  "neo4rs",
  "philotic-client",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3035,8 +3039,6 @@ dependencies = [
 [[package]]
 name = "neo4rs"
 version = "0.9.0-rc.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fcca27768ef44617115648b7a9797d9e11fa76feee3900895d0eade165d2bc1"
 dependencies = [
  "backon",
  "bytes",

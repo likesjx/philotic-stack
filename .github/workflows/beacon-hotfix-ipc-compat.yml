@@ -1,0 +1,59 @@
+name: Beacon hotfix IPC compatibility
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - '.github/workflows/beacon-hotfix-ipc-compat.yml'
+      - 'scripts/beacon-ipc-compat/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beacon-hotfix-ipc-compat-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-ipc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+    steps:
+      - name: Checkout reviewed harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          path: harness
+      - name: Checkout pinned old hotel
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: likesjx/philotic-stack
+          ref: 57b13ba0087722a2de062ff86710ae64a510d445
+          persist-credentials: false
+          path: old-hotel
+      - name: Checkout pinned candidate controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: likesjx/philotic-stack
+          ref: 8e21074a7e400762e3e0eedbc887106db99ce9b9
+          persist-credentials: false
+          path: new-controller
+      - name: Install public build dependencies on disposable runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config libssl-dev
+      - name: Pinned Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: '1.94.0'
+      - name: Validate harness and exercise cross-version IPC
+        run: |
+          python3 harness/scripts/beacon-ipc-compat/check_contract.py
+          python3 harness/scripts/beacon-ipc-compat/run.py old-hotel new-controller

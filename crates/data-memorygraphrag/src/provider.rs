@@ -463,6 +463,7 @@ impl LifeGraphProvider {
     /// use. Reused across every task/observation; a build failure is not cached,
     /// so a transient Memgraph outage at first use is retried on the next call.
     async fn connect(&self) -> Result<Graph> {
+        datasource::memgraph_enrollment::require_memgraph_enrollment()?;
         LIFE_GRAPH_POOL
             .get_or_try_init(|| async { self.build_graph() })
             .await
@@ -666,6 +667,7 @@ impl DatasourceProvider for LifeGraphProvider {
     }
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        datasource::memgraph_enrollment::require_memgraph_enrollment()?;
         let mut output = match task.kind.as_str() {
             "life.observe" => self.handle_observe(task).await,
             "life.observe.batch" => self.handle_observe_batch(task).await,

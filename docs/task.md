@@ -22,6 +22,43 @@
 
 ## Current Work Item Split
 
+### CarPlay voice conversation foundation
+
+Branch: `codex/carplay-foundation`; updated base: remote `develop`
+`3144e42930d575532249e0133dc15e10b45afb58`. Original `3f8ce9e6` preserved on
+`codex/carplay-foundation-before-update`.
+Contract: [CarPlay foundation](../apps/philotic-apple/CARPLAY.md).
+
+- [x] Verify Apple's iOS 26.4+ category, entitlement and voice-control template requirements; no eligibility/grant assumed.
+- [x] Preserve current voice/provider privacy denial. CarPlay source and phone preparation remain fail-closed; disclosure cannot enable external routing.
+- [x] Integrate exact PCM/session capture leases, pending permission cancellation, transport-scoped preparation, and existing `VoiceTurnGate` invalidation for late replies.
+- [x] Updated-base verification: PhiloticKit 140 tests (one existing skip, zero failures); hosted macOS 55 passed; gated iOS simulator test build passed arm64/x86_64. Exact commands and retained logs are in the CarPlay contract. Default iOS simulator build also passed (feature flag absent).
+- [ ] Execute simulator template tests: earlier attempt failed in Xcode's device-service/lockdown connection after boot. Updated diagnosis is read-only; no service restart/settings change.
+- [x] Independent source review: no blocking findings for dormant foundation after lease/cancellation rechecks for VAD, stream completions and suspended transcript bookkeeping; no runtime/audio eligibility claims.
+- [ ] Install and verify authoritative voice/privacy dispatch and correlated hands-free contracts before any capability activation. Entitlement request is deferred.
+- [ ] Device/live-car verification remains separately approved future work; no real audio, credential or live hotel traffic used in this source slice.
+
+### Apple voice privacy and cancellation
+
+Current remote source integration: `codex/voice-integrated-689bfc7d` is based on verified develop `689bfc7ddce26341cac994bb77d0027bea2ac98a`, preserving the original seven-commit checkpoint. See [integrated source evidence](../crates/philotic-web/src/serve/VOICE_INTEGRATION_CHECKPOINT.md). This integrates voice only; other owners' iPad/privacy/notch deltas remain separate.
+
+Disposition (2026-10-08): **client source slice complete; correlated edge acceptance and mocked cancellation seam complete; full voice blocked**. Branches `codex/apple-voice-privacy` and `codex/voice-backend-contract`; commits `c4c3ff4d`, `46f871d2`, `9da6ba37`. [Proposal](architecture/VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08).
+
+- [x] Require available on-device STT; invalidate stale capture permissions, recognition callbacks and playback callbacks.
+- [x] Add iOS duplex session settings, correlated client interruption/stale-chunk gates, provider preference, installed Apple voice selection and local preview/stop.
+- [x] Disable external audio/transcription entry paths and handsfree until trusted privacy dispatch exists; preferences never grant eligibility.
+- [x] Wire bounded correlated edge admission, accepted request_id echo before generation, pending cancellation seam and stale live/replay filtering; keep the production runtime adapter absent and capability unadvertised.
+- [x] Record source verification: 19 app tests; 134 kit passes/one skipped; Mac source typecheck; generic iOS simulator build; 30 Rust protocol tests, 35 edge aggregate unit tests, ten ledger tests, three synthetic profile tests, 12 fake-hotel WebSocket tests and all-target web compile check. Test-green only, no live audio.
+- [ ] **Blocked — IPC owner:** establish verified server-owned launch/session principal, opaque authority handles and complete immutable source provenance through direct/parked/reparked delivery and SDK. Incoming GuestIdentity is registration metadata, not authentication.
+- [ ] **Blocked — privacy/model runtime owners:** install DispatchPrivacyAuthority/guarded_registry for STT/TTS and every retry/fallback; deny missing/stale/private external context and native-live bypasses. Privacy worker's 55 source tests are separate evidence, not runtime installation.
+- [x] Make managed-turn publication/sealing reliable when broadcast observations are lost; test 300 completions with one active slot, malformed terminal completion and stale output rejection.
+- [ ] **Blocked — voice/backend owner:** authenticated turn_cancel_v1 runtime adapter revoking pending/active provider generation; per-event/chunk barriers. No committed-tool rollback. Do not advertise capability before installation. Lifecycle cleanup now supports more than 256 completed/failed requests, preserves active turns, seals replay sequences and expires terminal metadata. Safe exhaustion of the 4,096 compact request-fingerprint budget still denies; durable epoch/replay authority remains an integration requirement.
+- [ ] Complete eligible ElevenLabs expressive voice profiles/preview and actual same-philote spoken replies after authority; default fail closed, no external fallback.
+- [ ] Implement macOS shared duplex audio engine/AEC; validate iOS/Mac permission denial, fresh session, reconnect, agent switch and audio routes with mocks first, then separately authorized device/live checks.
+- [ ] Coordinate browser membrane parity after core integration; assess iPad without broad redesign.
+
+No push, merge, deployment, restart, live credentials, security grants or real microphone/provider calls were authorized for this closeout. Shared integration belongs to the parent/owners; all edits remain isolated.
+
 ### Desktop hotel sessions
 
 Branch: `codex/desktop-hotel-session`; seam: `operator-session-auth`.
@@ -451,6 +488,7 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
   - [x] L1 loud inbound (2026-10-07, test-green): per-event batch decode, gossip/undecodable/dropped-task heal tags, `DeliveryOutcome`, error reply to the originator of a dropped task. Live chaos check (`mesh_event_undecodable` within one tick) pending deploy.
+  - [x] L2 gossip budget (2026-10-07, test-green): roster-size alarm `hotel_state_budget` (75%/100%), `hotel_state_send_failed`, `hotel_state.last_wire_bytes` persisted. Active-only gossip NOT done: receivers route to dormant guests.
   - [x] L6 option (a) (2026-10-07): dead cron broadcast emitters/handlers/builders deleted (DEF-184, IPC split P-d); behavior-neutral, tests unchanged.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
   - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step (workflow patch 0001, applied 2026-10-07); make blocking after one week).

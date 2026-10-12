@@ -429,8 +429,12 @@ fn peer_uid_permitted(stream: &UnixStream, hotel_uid: u32, policy: PeerUidPolicy
         }
     }
 }
+/// Heal-queue id of the open MuninnDB-outage work item (see
+/// `IpcServer::record_muninn_heal_transition`).
+pub(crate) type MuninnOutageHealId = Arc<std::sync::Mutex<Option<String>>>;
 
 pub struct IpcServer {
+    protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
     socket_path: String,
     local_node_id: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
@@ -460,6 +464,10 @@ pub struct IpcServer {
     /// Tracks whether MuninnDB was reachable on the most recent probe. Shared with the
     /// probe loop and per-connection handlers for inline `RefreshMemoryConfig` probes.
     muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+    /// Heal-queue id of the open "MuninnDB unreachable" work item, if any. Shared
+    /// by the probe loop and the inline `RefreshMemoryConfig` probe so whichever
+    /// one sees the recovery resolves the row the other filed.
+    muninn_outage_heal_id: MuninnOutageHealId,
     /// Per-vault timestamp of the last `HealMemoryToken` mint attempt — the
     /// token self-heal mint budget. A misconfigured MuninnDB must produce one
     /// throttled escalation, not an unbounded mint loop.
@@ -1917,6 +1925,7 @@ impl IpcServer {
     ) -> Self {
         let (network_broadcast, _) = tokio::sync::broadcast::channel(16);
         Self {
+            protected_authority: None,
             socket_path: socket_path.into(),
             local_node_id: local_node_id.into(),
             dispatcher_tx,
@@ -1940,6 +1949,7 @@ impl IpcServer {
             webrtc_signal_tx: None,
             network_broadcast,
             muninn_reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            muninn_outage_heal_id: Arc::new(std::sync::Mutex::new(None)),
             muninn_heal_attempts: Arc::new(Mutex::new(HashMap::new())),
             operator_surface_tx: None,
             perimeter_svc: None,
@@ -1950,6 +1960,16 @@ impl IpcServer {
                 crate::service::resource_registry::ResourceRegistry::new(),
             )),
         }
+    }
+
+    /// Opt-in: one canonical authority shared with supervisor/context/voice.
+    /// Legacy Register remains unauthenticated and cannot issue protected handles.
+    pub fn with_protected_authority(
+        mut self,
+        authority: Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>,
+    ) -> Self {
+        self.protected_authority = Some(authority);
+        self
     }
 
     pub fn with_hotel_state_dirty_tx(mut self, tx: mpsc::Sender<()>) -> Self {
@@ -2086,13 +2106,22 @@ impl IpcServer {
         }
 
         // MuninnDB reachability probe — checks every 60s and broadcasts MuninnStatus on flip.
-        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act.
+        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act,
+        // and resolves that row when it comes back.
         if let Some(cfg) = self.muninn_config.clone() {
             let reachable = self.muninn_reachable.clone();
             let broadcast_tx = self.network_broadcast.clone();
             let heal_queue = self.heal_queue.clone();
+            let outage_heal_id = self.muninn_outage_heal_id.clone();
             tokio::spawn(async move {
-                Self::run_muninn_probe_loop(cfg, reachable, broadcast_tx, heal_queue).await;
+                Self::run_muninn_probe_loop(
+                    cfg,
+                    reachable,
+                    broadcast_tx,
+                    heal_queue,
+                    outage_heal_id,
+                )
+                .await;
             });
         }
 
@@ -2120,6 +2149,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let muninn_reachable = self.muninn_reachable.clone();
+                    let muninn_outage_heal_id = self.muninn_outage_heal_id.clone();
                     let muninn_heal_attempts = self.muninn_heal_attempts.clone();
                     let training_storage = self.training_storage.clone();
                     let heal_queue = self.heal_queue.clone();
@@ -2132,6 +2162,7 @@ impl IpcServer {
                     let egress_gw = self.egress_gw.clone();
                     let hotel_state_dirty_tx = self.hotel_state_dirty_tx.clone();
                     let resource_registry = self.resource_registry.clone();
+                    let protected_authority = self.protected_authority.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2153,6 +2184,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             muninn_reachable,
+                            muninn_outage_heal_id,
                             muninn_heal_attempts,
                             training_storage,
                             heal_queue,
@@ -2165,6 +2197,7 @@ impl IpcServer {
                             egress_gw,
                             hotel_state_dirty_tx,
                             resource_registry,
+                            protected_authority,
                         )
                         .await
                         {
@@ -2204,6 +2237,7 @@ impl IpcServer {
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+        muninn_outage_heal_id: MuninnOutageHealId,
         muninn_heal_attempts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
@@ -2218,6 +2252,7 @@ impl IpcServer {
         egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
         hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
         resource_registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
+        protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -2299,6 +2334,32 @@ impl IpcServer {
                     return Ok(());
                 }
                 Ok(Some(frame)) => match serde_json::from_slice::<IpcRequest>(&frame) {
+                    Ok(IpcRequest::ProtectedAuthority(request)) => {
+                        let request_id = request.request_id();
+                        // Authenticate from THIS socket before blocking SQLite work.
+                        // Claimed guest only selects a supervisor record; it grants no identity.
+                        let proof = protected_authority
+                            .as_ref()
+                            .and_then(|rpc| rpc.authenticate(reader.as_ref(), &request).ok());
+                        let reply = if let (Some(rpc), Some(proof)) =
+                            (protected_authority.clone(), proof)
+                        {
+                            tokio::task::spawn_blocking(move || rpc.handle(&proof, &request))
+                                .await
+                                .unwrap_or_else(|_| {
+                                    ansible_mesh_core::privacy_rpc::ProtectedAuthorityReply::denied(
+                                        request_id,
+                                    )
+                                })
+                        } else {
+                            ansible_mesh_core::privacy_rpc::ProtectedAuthorityReply::denied(
+                                request_id,
+                            )
+                        };
+                        let _ = outbound_tx.send(IpcResponse::ProtectedAuthorityReply {
+                            protected_authority: reply,
+                        });
+                    }
                     Ok(IpcRequest::FetchMemoryConfig) => {
                         // DBs are truth: serve the config live from the Context
                         // Graph so a token rotated after boot (manual resync or
@@ -2333,6 +2394,16 @@ impl IpcServer {
                         let _ = outbound_tx.send(response);
                     }
                     Ok(IpcRequest::RefreshMemoryConfig) => {
+                        // Old guests cannot distinguish the solicited status from a
+                        // broadcast. Refuse explicitly instead of returning that
+                        // ambiguous frame and leaving them waiting indefinitely.
+                        let _ = outbound_tx.send(IpcResponse::error(
+                            "refresh_memory_config",
+                            "MEMORY_REFRESH_PROTOCOL_REQUIRED",
+                            "Upgrade the guest to correlated memory refresh",
+                        ));
+                    }
+                    Ok(IpcRequest::RefreshMemoryConfigCorrelated { request_id }) => {
                         let endpoint = muninn_config
                             .as_deref()
                             .map(|c| c.base_url.clone())
@@ -2353,19 +2424,20 @@ impl IpcServer {
                                 available,
                                 endpoint: endpoint.clone(),
                             });
-                            if !available {
-                                if let Some(hq) = heal_queue.as_deref() {
-                                    let msg = format!(
-                                        "MuninnDB unreachable: connection refused at {endpoint}"
-                                    );
-                                    let _ = hq.push_error("hotel", &msg);
-                                }
-                            }
+                            Self::record_muninn_heal_transition(
+                                heal_queue.as_deref(),
+                                &muninn_outage_heal_id,
+                                available,
+                                &endpoint,
+                            );
                         }
                         info!(available, "RefreshMemoryConfig probe complete");
-                        let _ = outbound_tx.send(IpcResponse::MuninnStatus {
-                            available,
-                            endpoint,
+                        let _ = outbound_tx.send(IpcResponse::MemoryConfigRefreshReply {
+                            memory_config_refresh: philotic_client::MemoryConfigRefresh {
+                                request_id,
+                                available,
+                                endpoint,
+                            },
                         });
                     }
                     Ok(IpcRequest::GetPerimeterStatus) => {
@@ -3983,6 +4055,13 @@ impl IpcServer {
         resource_registry: &Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
     ) -> IpcResponse {
         match req {
+            // This fallback has no peer proof; it must never resolve authority.
+            IpcRequest::ProtectedAuthority(request) => IpcResponse::ProtectedAuthorityReply {
+                protected_authority:
+                    ansible_mesh_core::privacy_rpc::ProtectedAuthorityReply::denied(
+                        request.request_id(),
+                    ),
+            },
             IpcRequest::Register(identity) => {
                 info!(
                     "Guest registered over UDS: [{}] Role: {}",
@@ -7325,6 +7404,7 @@ impl IpcServer {
             // Handled before process_request is called (in handle_client).
             IpcRequest::FetchMemoryConfig
             | IpcRequest::RefreshMemoryConfig
+            | IpcRequest::RefreshMemoryConfigCorrelated { .. }
             | IpcRequest::HealMemoryToken { .. } => IpcResponse::error(
                 "memory",
                 "UNREACHABLE",

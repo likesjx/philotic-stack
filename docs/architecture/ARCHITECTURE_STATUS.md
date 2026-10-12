@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-10-03
+last_updated: 2026-10-10
 tags:
 - source-of-truth
 - current-state
@@ -61,6 +61,10 @@ Use it to answer three questions fast:
 
 This is not the place for full design arguments. For those, follow the linked proposal docs and the graph-backed domain/seam records.
 
+## Apple voice source checkpoint — 2026-10-08
+
+Isolated Apple client commits `c4c3ff4d`/`46f871d2` implement local recognition, playback lifecycle guards, iOS duplex configuration and correlated voice controls. Backend checkpoint `9da6ba37` adds the ledger; the follow-up wires correlated acceptance before generation and mock-tested cancellation admission/delivery barriers, with no production runtime adapter. This is test-green source evidence, not deployed complete voice. Provider cancellation, trusted privacy authority, durable request epoch/replay authority after bounded lifecycle cleanup, ElevenLabs eligibility and macOS AEC remain open. Hotel registration identity is caller-supplied; verified authority must span IPC parked delivery and model dispatch before those capabilities activate. [Disposition and verification](VOICE_MACHINE_PROPOSAL.md#current-slice--apple-voice-2026-10-08); [owner tasks](../task.md#apple-voice-privacy-and-cancellation).
+
 ## How To Read This
 
 - `Implemented` means there is code and test evidence in the repo today.
@@ -70,6 +74,14 @@ This is not the place for full design arguments. For those, follow the linked pr
 - when convenience docs disagree on concrete transport details, current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md) win over stale crate-level prose.
 
 ## Current Architecture Summary
+
+- The Apple CarPlay source foundation is dormant behind `PHILOTIC_CARPLAY`
+  and preserves current trusted voice/provider denial. Phone preparation cannot
+  grant egress. It reuses the voice pipeline with exact capture leases,
+  transport-scoped preparation and correlated reply invalidation; authoritative
+  dispatch and capability activation remain blocked. See the [CarPlay
+  contract](../../apps/philotic-apple/CARPLAY.md) and
+  [native Apple proposal](NATIVE_APPLE_APP_PROPOSAL.md#disposition).
 
 Philotic currently operates as a hotel-centered runtime:
 

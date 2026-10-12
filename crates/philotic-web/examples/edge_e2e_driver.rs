@@ -45,7 +45,7 @@ async fn recv_envelope(ws: &mut WsStream, secs: u64) -> EdgeEnvelope {
             .expect("ws error while waiting for frame");
         match message {
             WsMessage::Text(text) => {
-                return serde_json::from_str(&text).expect("decode edge envelope")
+                return serde_json::from_str(&text).expect("decode edge envelope");
             }
             WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
             other => panic!("unexpected ws frame: {other:?}"),
@@ -88,6 +88,7 @@ async fn hello(base: &str, bearer: &str, node_id: &str, cursor: Option<&str>) ->
         EdgeMessage::HelloAck {
             session_id,
             replay_from,
+            ..
         } => {
             assert_eq!(ack.v, PROTOCOL_VERSION);
             println!(
@@ -166,6 +167,7 @@ async fn main() {
         &mut ws,
         2,
         EdgeMessage::TurnSubmit {
+            request_id: None,
             target_node_id: target_node.clone(),
             target_agent_id: agent_id.clone(),
             conversation_id: Some("conv-edge-e2e".into()),
