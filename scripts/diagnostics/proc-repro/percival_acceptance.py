@@ -102,6 +102,22 @@ def terminal_snapshot(pid, metadata, record):
     raise SnapshotChildExited(pid, metadata)
 
 
+def bounded_terminal_exit_after_executable_loss(pid, anchor, record, attempts=2, delay=0.1):
+    base = PROC_ROOT / str(pid)
+    for _ in range(attempts):
+        time.sleep(delay)
+        try:
+            current = parse_proc_stat((base / "stat").read_text())
+        except FileNotFoundError:
+            require(not base.exists(), "live_process_executable_unavailable")
+            raise ProcessLookupError("process_disappeared") from None
+        require(all(current[key] == anchor[key] for key in ("ppid", "starttime")),
+                "process_identity_race")
+        if current.get("terminal_state") == "Z":
+            terminal_snapshot(pid, current, record)
+    raise RuntimeError("live_process_executable_unavailable")
+
+
 def validate_child_exit(error, main_pid, members=None):
     require(error.pid != main_pid, "hotel_not_live_during_guest_readiness")
     require(error.metadata.get("terminal_state") == "Z" and error.metadata["ppid"] == main_pid,
@@ -135,7 +151,7 @@ def process_identity(pid):
         require(all(after[key] == start[key] for key in ("ppid", "starttime")), "process_identity_race")
         if after.get("terminal_state") == "Z":
             terminal_snapshot(pid, after, result)
-        raise RuntimeError("live_process_executable_unavailable") from None
+        bounded_terminal_exit_after_executable_loss(pid, after, result)
     result["executable"] = [executable.st_dev, executable.st_ino]
     result["executable_class"] = name if name in EXECUTABLE_CLASSES else "unknown"
     after = parse_proc_stat((base / "stat").read_text())

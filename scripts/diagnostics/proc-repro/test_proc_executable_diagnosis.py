@@ -31,9 +31,22 @@ class ExecutableTrace(unittest.TestCase):
         # This trace alone cannot identify which actually happened on the VPS.
         for before, after in (("R", "R"), ("R", "S"), ("S", "S")):
             with self.subTest(before=before, after=after), \
+                 mock.patch.object(a.time, "sleep"), \
                  self.assertRaisesRegex(RuntimeError, "live_process_executable_unavailable"):
-                self.trace([proc_stat(before), proc_stat(after)],
+                self.trace([proc_stat(before), proc_stat(after), proc_stat(after), proc_stat(after)],
                            FileNotFoundError(errno.ENOENT, "synthetic"))
+
+    def test_enoent_then_same_identity_terminal_z_is_validated_child_exit(self):
+        leader = Path("/proc/200/task/200")
+        with mock.patch.object(a, "proc_authority", return_value=AUTHORITY), \
+             mock.patch.object(Path, "iterdir", return_value=iter([leader])), \
+             mock.patch.object(a.time, "sleep"), \
+             mock.patch.object(Path, "read_text", side_effect=[
+                 proc_stat("R"), proc_stat("R"), proc_stat("Z"), proc_stat("Z"), proc_stat("Z")
+             ]), \
+             mock.patch.object(Path, "stat", side_effect=FileNotFoundError(errno.ENOENT, "synthetic")):
+            with self.assertRaises(a.SnapshotChildExited):
+                a.process_identity(200)
 
     def test_permission_denial_is_not_missing_executable(self):
         with self.assertRaises(PermissionError):
