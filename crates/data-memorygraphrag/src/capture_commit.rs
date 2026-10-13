@@ -211,7 +211,11 @@ pub async fn commit_capture(
         Err(error) => {
             let rollback = tx.rollback().await;
             drop(lease.hold);
-            rollback?;
+            if let Err(rollback_error) = rollback {
+                return Err(error.context(format!(
+                    "rollback failed after commit_capture error: {rollback_error}"
+                )));
+            }
             Err(error)
         }
     }
