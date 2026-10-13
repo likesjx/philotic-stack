@@ -182,6 +182,24 @@ impl GraphTransaction for MemgraphTransaction {
             Disposition::Review { .. } => (None, "review"),
         };
         if let Some(root) = &root {
+            if let Some(role_id) = &w.role_id {
+                let rows = self
+                    .rows(
+                        query(
+                            "MATCH (r {id:$root}), (role:Role {id:$role}) \
+                             MERGE (r)-[s:SCOPED_TO]->(role) \
+                             ON CREATE SET s.source_policy_manifest=$sources \
+                             RETURN role.id AS role",
+                        )
+                        .param("root", root.as_str())
+                        .param("role", role_id.clone())
+                        .param("sources", w.sources_json.clone()),
+                    )
+                    .await?;
+                if rows.len() != 1 {
+                    bail!("role anchor missing/ambiguous");
+                }
+            }
             for id in &w.evidence_ids {
                 let target = if kind == "extension" {
                     "MATCH (r:LifeCaptureExtension {key:$target})"

@@ -1,0 +1,116 @@
+name: LifeGraph capture Memgraph acceptance
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'crates/data-memorygraphrag/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'crates/datasource/**'
+      - 'vendor/neo4rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/lifegraph-capture-memgraph-acceptance.yml'
+  push:
+    branches: [develop]
+    paths:
+      - 'crates/data-memorygraphrag/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'crates/datasource/**'
+      - 'vendor/neo4rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/lifegraph-capture-memgraph-acceptance.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lifegraph-capture-memgraph-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  MEMGRAPH_IMAGE: memgraph/memgraph@sha256:bd01a159023283b56b807943ed28225c8f662920b64317f26da7d9f0f5b19de4
+
+jobs:
+  capture-memgraph:
+    name: synthetic capture real Memgraph (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+
+      - name: Restore cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lifegraph-capture-memgraph-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lifegraph-capture-memgraph-
+
+      - name: Start disposable empty Memgraph
+        run: |
+          set -euo pipefail
+          docker run -d --name lifegraph-capture-memgraph \
+            --publish 127.0.0.1:17687:7687 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --memory 1g \
+            --cpus 1 \
+            --pids-limit 128 \
+            --tmpfs /var/lib/memgraph:rw,uid=101,gid=103 \
+            --tmpfs /var/log/memgraph:rw,uid=101,gid=103 \
+            "$MEMGRAPH_IMAGE" \
+            --log-level=WARNING \
+            --storage-wal-enabled=false \
+            --storage-snapshot-interval-sec=0 \
+            --telemetry-enabled=false
+
+          ready=false
+          for _ in {1..60}; do
+            if docker exec -i lifegraph-capture-memgraph mgconsole --host 127.0.0.1 --port 7687 <<< 'RETURN 1;' >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          "$ready" || { docker logs lifegraph-capture-memgraph; exit 1; }
+
+      - name: Capture adapter, role edge, replay and operator close acceptance
+        env:
+          PHILOTIC_SYNTHETIC_CAPTURE_MEMGRAPH_ACCEPTANCE: '1'
+        run: |
+          cargo test --locked -p data-memorygraphrag \
+            --test capture_memgraph_acceptance \
+            capture_memgraph_then_explicit_operator_close_acceptance \
+            -- --ignored --exact --test-threads=1
+
+      - name: Stop disposable Memgraph
+        if: always()
+        run: docker rm -f lifegraph-capture-memgraph >/dev/null 2>&1 || true
+
+      - name: Save cargo cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lifegraph-capture-memgraph-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}

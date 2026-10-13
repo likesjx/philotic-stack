@@ -19,6 +19,7 @@ pub struct CaptureBody {
     pub details: Option<String>,
     pub source_ids: Vec<String>,
     pub evidence_ids: BTreeSet<String>,
+    pub role_id: Option<String>,
 }
 
 pub struct CommitPayload {
@@ -39,6 +40,10 @@ impl CommitPayload {
             || body.source_ids != pending.sources
             || body.evidence_ids.is_empty()
             || body.evidence_ids.len() > 256
+            || body
+                .role_id
+                .as_deref()
+                .is_some_and(|id| !id.starts_with("life:role:") || RootId::parse(id).is_err())
         {
             bail!("invalid or incomplete capture body/manifest");
         }
@@ -104,6 +109,7 @@ pub struct GraphWrite {
     pub sources_json: String,
     pub digest: String,
     pub evidence_ids: Vec<String>,
+    pub role_id: Option<String>,
     pub disposition: Disposition,
     pub root_label: String,
 }
@@ -163,6 +169,12 @@ pub async fn commit_capture(
     if plan(capture, Some(authority)).map_err(|e| anyhow!("planning denied: {e:?}"))? != *planned {
         bail!("stale or forged plan");
     }
+    if let Some(role_id) = &payload.body.role_id {
+        let role = RootId::parse(role_id).map_err(|_| anyhow!("invalid role anchor"))?;
+        if !authority.can_read_root(&role) {
+            bail!("role anchor denied");
+        }
+    }
     let anchor = match &capture.anchor {
         RootAnchor::ExactId(id) => json!({"id":id.as_str()}),
         RootAnchor::VerifiedKey { namespace, value } => json!({"key":[namespace,value]}),
@@ -182,6 +194,7 @@ pub async fn commit_capture(
         sources_json: serde_json::to_string(&payload.pending.sources)?,
         digest: capture.payload_digest.clone(),
         evidence_ids: capture.evidence_ids.iter().cloned().collect(),
+        role_id: payload.body.role_id.clone(),
         disposition: planned.disposition.clone(),
         root_label: capture.root_type.ontology_label().into(),
     };
