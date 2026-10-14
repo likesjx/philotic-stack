@@ -63,11 +63,16 @@ required. A graph owner must establish that the catalog covers existing roots;
 an empty new catalog must not enable duplicate roots. No schema installation or
 backfill is included or executed.
 
-The adapter requires transactional storage, current-database SNAPSHOT_ISOLATION
-and an explicit snapshot session setting; missing/unknown metadata denies. The
-owner must exclude NEXT isolation overrides and concurrent schema/configuration
-changes during captures, or provide a stronger versioned schema guard. It does
-not silently substitute older metadata queries. See official [constraints](https://memgraph.com/docs/fundamentals/constraints),
+The adapter requires transactional storage, global SNAPSHOT_ISOLATION and an
+explicit snapshot session setting. It sets the session snapshot level and verifies
+Memgraph3.10.1 `SHOW STORAGE INFO` fields `storage_mode`,
+`global_isolation_level` and `session_isolation_level` before `BEGIN` on the same
+write-capable physical connection; missing, duplicate, null or malformed metadata
+denies. Constraint metadata and the `LifeCaptureSchema` readiness marker remain
+inside the capture transaction with resolution and writes. The owner must exclude
+NEXT isolation overrides and concurrent schema/configuration changes during
+captures, or provide a stronger versioned schema guard. It does not silently
+substitute older metadata queries. See official [constraints](https://memgraph.com/docs/fundamentals/constraints),
 [transactions](https://memgraph.com/docs/fundamentals/transactions) and
 [server stats](https://memgraph.com/docs/database-management/server-stats).
 

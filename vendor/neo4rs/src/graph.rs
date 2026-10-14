@@ -229,7 +229,25 @@ impl Graph {
     where
         F: FnOnce(&[crate::Row]) -> Result<()>,
     {
-        let operation = Operation::Read;
+        self.start_txn_with_verified_session_as(Operation::Read, setup, verification, verify)
+            .await
+    }
+
+    /// Performs session setup and bounded metadata verification, then BEGIN
+    /// with the requested operation mode, without returning the physical
+    /// connection to the pool between steps.
+    /// No operation is retried. Any failure must be treated as uncertain by
+    /// the caller; this API does not establish rollback or remote quiescence.
+    pub async fn start_txn_with_verified_session_as<F>(
+        &self,
+        operation: Operation,
+        setup: Query,
+        verification: Query,
+        verify: F,
+    ) -> Result<Txn>
+    where
+        F: FnOnce(&[crate::Row]) -> Result<()>,
+    {
         let db = self.config.db.clone();
         let imp_user = self.config.imp_user.clone();
         let mut connection = self

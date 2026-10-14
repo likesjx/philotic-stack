@@ -4,26 +4,59 @@ use super::capture_commit::*;
 use super::resolve_plan::*;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use neo4rs::{Graph, Query, Row, Txn, query};
+use neo4rs::{Graph, Operation, Query, Row, Txn, query};
 use std::collections::BTreeSet;
 
 pub struct MemgraphLifeGraph(pub Graph);
 struct MemgraphTransaction(Option<Txn>);
-fn info_value(rows: &[Row], field: &str) -> Option<String> {
+
+fn storage_field(row: &Row) -> neo4rs::Result<Option<(&'static str, String)>> {
+    let key: String = row.get("storage info")?;
+    let field = match key.as_str() {
+        "storage_mode" => "storage_mode",
+        "global_isolation_level" => "global_isolation_level",
+        "session_isolation_level" => "session_isolation_level",
+        _ => return Ok(None),
+    };
+    let value: String = row.get("value")?;
+    Ok(Some((field, value)))
+}
+
+fn verify_capture_storage_info(rows: &[Row]) -> neo4rs::Result<()> {
+    let mut storage_mode = None;
+    let mut global_isolation_level = None;
+    let mut session_isolation_level = None;
     for row in rows {
-        if let Ok(value) = row.get::<String>(field) {
-            return Some(value);
-        }
-        for column in ["storage info", "name", "key"] {
-            if row.get::<String>(column).is_ok_and(|key| key == field)
-                && let Ok(value) = row.get::<String>("value")
-            {
-                return Some(value);
-            }
+        let Some((field, value)) = storage_field(row)? else {
+            continue;
+        };
+        let slot = match field {
+            "storage_mode" => &mut storage_mode,
+            "global_isolation_level" => &mut global_isolation_level,
+            "session_isolation_level" => &mut session_isolation_level,
+            _ => unreachable!("storage_field only returns allowlisted fields"),
+        };
+        if slot.replace(value).is_some() {
+            return Err(neo4rs::Error::InvalidConfig);
         }
     }
-    None
+    let storage_mode = storage_mode.ok_or(neo4rs::Error::InvalidConfig)?;
+    let global_isolation_level = global_isolation_level.ok_or(neo4rs::Error::InvalidConfig)?;
+    let session_isolation_level = session_isolation_level.ok_or(neo4rs::Error::InvalidConfig)?;
+    if !matches!(
+        storage_mode.as_str(),
+        "IN_MEMORY_TRANSACTIONAL" | "ON_DISK_TRANSACTIONAL"
+    ) {
+        return Err(neo4rs::Error::InvalidConfig);
+    }
+    if global_isolation_level != "SNAPSHOT_ISOLATION"
+        || session_isolation_level != "SNAPSHOT_ISOLATION"
+    {
+        return Err(neo4rs::Error::InvalidConfig);
+    }
+    Ok(())
 }
+
 impl MemgraphTransaction {
     async fn rows(&mut self, q: Query) -> Result<Vec<Row>> {
         let tx = self
@@ -46,7 +79,14 @@ impl MemgraphTransaction {
 impl AtomicLifeGraph for MemgraphLifeGraph {
     async fn begin(&self) -> Result<Box<dyn GraphTransaction>> {
         Ok(Box::new(MemgraphTransaction(Some(
-            self.0.start_txn().await?,
+            self.0
+                .start_txn_with_verified_session_as(
+                    Operation::Write,
+                    query("SET SESSION TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION"),
+                    query("SHOW STORAGE INFO"),
+                    verify_capture_storage_info,
+                )
+                .await?,
         ))))
     }
 }
@@ -66,27 +106,13 @@ impl GraphTransaction for MemgraphTransaction {
                 }
             }
         }
-        let info = self
-            .rows(query("SHOW STORAGE INFO ON CURRENT DATABASE"))
-            .await?;
-        let mode = info_value(&info, "storage_mode");
-        let isolation = info_value(&info, "storage_isolation_level");
-        // Require the session's explicit snapshot setting too. Unknown/null
-        // session metadata denies; database defaults cannot rule out overrides.
-        let session = self.rows(query("SHOW STORAGE INFO")).await?;
-        let session_isolation = info_value(&session, "session_isolation_level");
-        let transactional = matches!(
-            mode.as_deref(),
-            Some("IN_MEMORY_TRANSACTIONAL" | "ON_DISK_TRANSACTIONAL")
-        ) && isolation.as_deref() == Some("SNAPSHOT_ISOLATION")
-            && session_isolation.as_deref() == Some("SNAPSHOT_ISOLATION");
         let ready = self.rows(query("MATCH (s:LifeCaptureSchema {key:$key}) RETURN s.version AS version, s.backfill_complete AS ready")
             .param("key", "resolve-before-create-v1")).await?;
         let catalog_ready = ready.len() == 1
             && ready[0].get::<i64>("version")? == 1
             && ready[0].get::<bool>("ready")?;
         Ok(SchemaState {
-            transactional,
+            transactional: true,
             catalog_ready,
             unique,
         })
@@ -238,5 +264,92 @@ impl GraphTransaction for MemgraphTransaction {
             .rollback()
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(key: &str, value: neo4rs::BoltType) -> Row {
+        Row::new(
+            neo4rs::BoltList {
+                value: vec!["storage info".into(), "value".into()],
+            },
+            neo4rs::BoltList {
+                value: vec![key.into(), value],
+            },
+        )
+    }
+
+    fn good_rows() -> Vec<Row> {
+        vec![
+            row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+            row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+            row("session_isolation_level", "SNAPSHOT_ISOLATION".into()),
+            row("vertex_count", 11_i64.into()),
+        ]
+    }
+
+    #[test]
+    fn capture_storage_metadata_accepts_snapshot_transactional_mode() {
+        assert!(verify_capture_storage_info(&good_rows()).is_ok());
+    }
+
+    #[test]
+    fn capture_storage_metadata_fails_closed_on_missing_duplicate_or_bad_values() {
+        assert!(verify_capture_storage_info(&[]).is_err());
+        assert!(
+            verify_capture_storage_info(&good_rows()[..2]).is_err(),
+            "missing session metadata must deny"
+        );
+        let mut duplicate = good_rows();
+        duplicate.push(row("session_isolation_level", "SNAPSHOT_ISOLATION".into()));
+        assert!(
+            verify_capture_storage_info(&duplicate).is_err(),
+            "duplicate allowlisted metadata must deny"
+        );
+        assert!(
+            verify_capture_storage_info(&[
+                row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+                row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+                row("session_isolation_level", "READ_COMMITTED".into()),
+            ])
+            .is_err(),
+            "non-snapshot session metadata must deny"
+        );
+        assert!(
+            verify_capture_storage_info(&[
+                row("storage_mode", "IN_MEMORY_ANALYTICAL".into()),
+                row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+                row("session_isolation_level", "SNAPSHOT_ISOLATION".into()),
+            ])
+            .is_err(),
+            "non-transactional storage must deny"
+        );
+    }
+
+    #[test]
+    fn capture_storage_metadata_fails_closed_on_malformed_or_null_rows() {
+        let malformed = Row::new(
+            neo4rs::BoltList {
+                value: vec!["name".into(), "value".into()],
+            },
+            neo4rs::BoltList {
+                value: vec!["storage_mode".into(), "IN_MEMORY_TRANSACTIONAL".into()],
+            },
+        );
+        assert!(verify_capture_storage_info(&[malformed]).is_err());
+        assert!(
+            verify_capture_storage_info(&[
+                row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+                row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+                row(
+                    "session_isolation_level",
+                    neo4rs::BoltType::Null(neo4rs::BoltNull)
+                ),
+            ])
+            .is_err()
+        );
     }
 }
