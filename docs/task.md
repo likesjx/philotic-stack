@@ -22,6 +22,15 @@
 
 ## Current Work Item Split
 
+### LifeGraph capture Memgraph compatibility — runtime off (PR #668)
+
+- [x] Preflight storage and constraint metadata before BEGIN on one reserved connection; retain strict snapshot checks and carry the constraint set into that transaction.
+- [x] Keep readiness, resolution and writes transactional; require owner exclusion of schema/configuration/NEXT changes from the first metadata read through commit/rollback.
+- [x] Add parser and Bolt sequencing regressions plus disposable-Memgraph missing-constraint/readiness rollback checks.
+- [ ] Confirm pinned Memgraph acceptance on the exact follow-up commit before release. Runtime exports, grants, authenticated issuer installation and context DB permissions are outside this change.
+
+See [capture integration contract](../crates/data-memorygraphrag/CAPTURE_COMMIT_INTEGRATION.md).
+
 ### CarPlay voice conversation foundation
 
 Branch: `codex/carplay-foundation`; updated base: remote `develop`

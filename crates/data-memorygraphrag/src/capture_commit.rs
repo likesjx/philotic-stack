@@ -120,7 +120,11 @@ pub struct CommitResult {
     pub replay: bool,
 }
 
-/// Every read/check/write belongs to this same canonical graph transaction.
+/// Graph reads and writes belong to this same canonical transaction. The adapter
+/// may preflight server metadata on its reserved connection before BEGIN when
+/// the server forbids transactional inspection. The owner must exclude schema,
+/// configuration and NEXT isolation changes from the first metadata read until
+/// commit/rollback; this trait does not issue or enforce that owner authority.
 #[async_trait]
 pub trait GraphTransaction: Send {
     async fn schema(&mut self) -> Result<SchemaState>;

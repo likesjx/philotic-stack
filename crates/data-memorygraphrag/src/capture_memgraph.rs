@@ -8,7 +8,34 @@ use neo4rs::{Graph, Operation, Query, Row, Txn, query};
 use std::collections::BTreeSet;
 
 pub struct MemgraphLifeGraph(pub Graph);
-struct MemgraphTransaction(Option<Txn>);
+struct MemgraphTransaction {
+    txn: Option<Txn>,
+    unique: BTreeSet<(String, String)>,
+}
+
+fn parse_constraints(rows: &[Row]) -> neo4rs::Result<BTreeSet<(String, String)>> {
+    let mut unique = BTreeSet::new();
+    for row in rows {
+        let kind: String = row.get("constraint type")?;
+        let label: String = row.get("label")?;
+        let props = row
+            .get::<Vec<String>>("properties")
+            .or_else(|_| row.get::<String>("properties").map(|p| vec![p]))?;
+        if label.is_empty() || props.is_empty() || props.iter().any(String::is_empty) {
+            return Err(neo4rs::Error::InvalidConfig);
+        }
+        match kind.as_str() {
+            "unique" if props.len() == 1 => {
+                if !unique.insert((label, props[0].clone())) {
+                    return Err(neo4rs::Error::InvalidConfig);
+                }
+            }
+            "unique" | "exists" | "data_type" => {}
+            _ => return Err(neo4rs::Error::InvalidConfig),
+        }
+    }
+    Ok(unique)
+}
 
 fn storage_field(row: &Row) -> neo4rs::Result<Option<(&'static str, String)>> {
     let key: String = row.get("storage info")?;
@@ -60,7 +87,7 @@ fn verify_capture_storage_info(rows: &[Row]) -> neo4rs::Result<()> {
 impl MemgraphTransaction {
     async fn rows(&mut self, q: Query) -> Result<Vec<Row>> {
         let tx = self
-            .0
+            .txn
             .as_mut()
             .ok_or_else(|| anyhow!("closed transaction"))?;
         let mut stream = tx.execute(q).await?;
@@ -78,34 +105,27 @@ impl MemgraphTransaction {
 #[async_trait]
 impl AtomicLifeGraph for MemgraphLifeGraph {
     async fn begin(&self) -> Result<Box<dyn GraphTransaction>> {
-        Ok(Box::new(MemgraphTransaction(Some(
-            self.0
-                .start_txn_with_verified_session_as(
-                    Operation::Write,
-                    query("SET SESSION TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION"),
-                    query("SHOW STORAGE INFO"),
-                    verify_capture_storage_info,
-                )
-                .await?,
-        ))))
+        let (txn, unique) = self
+            .0
+            .start_txn_with_verified_metadata(
+                Operation::Write,
+                query("SET SESSION TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION"),
+                [query("SHOW STORAGE INFO"), query("SHOW CONSTRAINT INFO")],
+                |[storage, constraints]| {
+                    verify_capture_storage_info(storage)?;
+                    parse_constraints(constraints)
+                },
+            )
+            .await?;
+        Ok(Box::new(MemgraphTransaction {
+            txn: Some(txn),
+            unique,
+        }))
     }
 }
 #[async_trait]
 impl GraphTransaction for MemgraphTransaction {
     async fn schema(&mut self) -> Result<SchemaState> {
-        let mut unique = BTreeSet::new();
-        for row in self.rows(query("SHOW CONSTRAINT INFO")).await? {
-            let kind: String = row.get("constraint type")?;
-            if kind.eq_ignore_ascii_case("unique") {
-                let label: String = row.get("label")?;
-                let props = row
-                    .get::<Vec<String>>("properties")
-                    .or_else(|_| row.get::<String>("properties").map(|p| vec![p]))?;
-                if props.len() == 1 {
-                    unique.insert((label, props[0].clone()));
-                }
-            }
-        }
         let ready = self.rows(query("MATCH (s:LifeCaptureSchema {key:$key}) RETURN s.version AS version, s.backfill_complete AS ready")
             .param("key", "resolve-before-create-v1")).await?;
         let catalog_ready = ready.len() == 1
@@ -114,7 +134,7 @@ impl GraphTransaction for MemgraphTransaction {
         Ok(SchemaState {
             transactional: true,
             catalog_ready,
-            unique,
+            unique: self.unique.clone(),
         })
     }
     async fn receipt(&mut self, key: &str) -> Result<Option<StoredReceipt>> {
@@ -250,7 +270,7 @@ impl GraphTransaction for MemgraphTransaction {
         })
     }
     async fn commit(mut self: Box<Self>) -> Result<()> {
-        self.0
+        self.txn
             .take()
             .ok_or_else(|| anyhow!("closed transaction"))?
             .commit()
@@ -258,7 +278,7 @@ impl GraphTransaction for MemgraphTransaction {
         Ok(())
     }
     async fn rollback(mut self: Box<Self>) -> Result<()> {
-        self.0
+        self.txn
             .take()
             .ok_or_else(|| anyhow!("closed transaction"))?
             .rollback()
@@ -294,6 +314,19 @@ mod tests {
     #[test]
     fn capture_storage_metadata_accepts_snapshot_transactional_mode() {
         assert!(verify_capture_storage_info(&good_rows()).is_ok());
+        let mut disk = good_rows();
+        disk[0] = row("storage_mode", "ON_DISK_TRANSACTIONAL".into());
+        assert!(verify_capture_storage_info(&disk).is_ok());
+        for (field, value) in [
+            ("storage_mode", "UNKNOWN"),
+            ("global_isolation_level", "READ_COMMITTED"),
+            ("global_isolation_level", "READ_UNCOMMITTED"),
+        ] {
+            let mut bad = good_rows();
+            let index = usize::from(field != "storage_mode");
+            bad[index] = row(field, value.into());
+            assert!(verify_capture_storage_info(&bad).is_err());
+        }
     }
 
     #[test]
@@ -348,6 +381,67 @@ mod tests {
                     "session_isolation_level",
                     neo4rs::BoltType::Null(neo4rs::BoltNull)
                 ),
+            ])
+            .is_err()
+        );
+    }
+
+    fn constraint(kind: &str, label: &str, props: neo4rs::BoltType) -> Row {
+        Row::new(
+            neo4rs::BoltList {
+                value: vec![
+                    "constraint type".into(),
+                    "label".into(),
+                    "properties".into(),
+                ],
+            },
+            neo4rs::BoltList {
+                value: vec![kind.into(), label.into(), props],
+            },
+        )
+    }
+
+    #[test]
+    fn constraints_only_accept_single_property_uniqueness() {
+        let parsed = parse_constraints(&[
+            constraint("unique", "OpenLoop", vec!["id"].into()),
+            constraint("unique", "LifeRootBinding", "key".into()),
+            constraint("unique", "Composite", vec!["a", "b"].into()),
+            constraint("exists", "Other", "id".into()),
+            constraint("data_type", "Other", "id".into()),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            BTreeSet::from([
+                ("OpenLoop".into(), "id".into()),
+                ("LifeRootBinding".into(), "key".into()),
+            ])
+        );
+        assert!(parse_constraints(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn constraints_fail_closed_on_malformed_metadata() {
+        for bad in [
+            constraint(
+                "unique",
+                "OpenLoop",
+                neo4rs::BoltType::Null(neo4rs::BoltNull),
+            ),
+            constraint("unique", "OpenLoop", 1_i64.into()),
+            constraint("unique", "", "id".into()),
+            constraint("unique", "OpenLoop", "".into()),
+            constraint("unique", "OpenLoop", Vec::<String>::new().into()),
+            constraint("unknown", "OpenLoop", "id".into()),
+            row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+        ] {
+            assert!(parse_constraints(&[bad]).is_err());
+        }
+        assert!(
+            parse_constraints(&[
+                constraint("unique", "OpenLoop", "id".into()),
+                constraint("unique", "OpenLoop", vec!["id"].into()),
             ])
             .is_err()
         );

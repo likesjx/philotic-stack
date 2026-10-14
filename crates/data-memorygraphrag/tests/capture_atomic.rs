@@ -205,6 +205,7 @@ struct Fixture {
     path: PathBuf,
     state: Arc<tokio::sync::Mutex<State>>,
     fail_after_writes: bool,
+    fail_rollback: bool,
     ready: bool,
     hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
@@ -219,6 +220,7 @@ impl Fixture {
             path,
             state: Arc::new(tokio::sync::Mutex::new(state)),
             fail_after_writes: false,
+            fail_rollback: false,
             ready: true,
             hook: Mutex::new(None),
         }
@@ -232,6 +234,7 @@ struct Tx {
     guard: tokio::sync::OwnedMutexGuard<State>,
     working: State,
     fail: bool,
+    fail_rollback: bool,
     ready: bool,
     hook: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -245,6 +248,7 @@ impl AtomicLifeGraph for Fixture {
             guard,
             working,
             fail: self.fail_after_writes,
+            fail_rollback: self.fail_rollback,
             ready: self.ready,
             hook: self.hook.lock().unwrap().clone(),
         }))
@@ -399,6 +403,9 @@ impl GraphTransaction for Tx {
         Ok(())
     }
     async fn rollback(self: Box<Self>) -> Result<()> {
+        if self.fail_rollback {
+            bail!("injected rollback failure");
+        }
         Ok(())
     }
 }
@@ -821,6 +828,30 @@ async fn late_failure_rolls_back_every_record_and_missing_catalog_denies() {
     // Error path dropped the policy reservation as well as graph mutations.
     store.revoke_creator(&owner(), "source").unwrap();
     assert!(store.load_pending(&actor(), "synthetic", "one").is_err());
+}
+
+#[tokio::test]
+async fn rollback_failure_preserves_original_error_and_releases_policy() {
+    let (dir, store, _) = setup();
+    let mut graph = Fixture::open(dir.join("graph.json"));
+    graph.fail_after_writes = true;
+    graph.fail_rollback = true;
+    let authority = Authority {
+        store: store.clone(),
+        lookup: Lookup::Absent,
+        denied_roots: BTreeSet::new(),
+    };
+    let (capture, payload) = capture(&store, "rollback-error", Meaning::Distinct);
+    let error = run(&graph, &authority, &capture, &payload)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected rollback failure"));
+    assert_eq!(
+        error.root_cause().to_string(),
+        "injected failure after all writes"
+    );
+    assert_no_capture_writes(&graph.state().await);
+    store.revoke_creator(&owner(), "source").unwrap();
 }
 
 #[tokio::test]

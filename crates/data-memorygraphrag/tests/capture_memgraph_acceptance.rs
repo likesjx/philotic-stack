@@ -301,6 +301,23 @@ async fn capture_memgraph_then_explicit_operator_close_acceptance() -> Result<()
         };
         let planned = plan(&capture, Some(&authority))
             .map_err(|e| anyhow!("planning denied: {e:?}"))?;
+
+        // Both failures must roll back without writes. Constraint metadata is
+        // preflighted, while catalog readiness is read inside the transaction.
+        let before = rows_count(&graph, "MATCH (n) RETURN count(n) AS count").await?;
+        graph.run(query("MATCH (s:LifeCaptureSchema) SET s.backfill_complete=false")).await?;
+        let denied = commit_capture(&adapter, Some(&authority), &capture, &planned, &payload)
+            .await.unwrap_err();
+        assert!(denied.to_string().contains("backfill prerequisites"), "{denied:#}");
+        assert_eq!(rows_count(&graph, "MATCH (n) RETURN count(n) AS count").await?, before);
+        graph.run(query("MATCH (s:LifeCaptureSchema) SET s.backfill_complete=true")).await?;
+        graph.run(query("DROP CONSTRAINT ON (n:LifeRootBinding) ASSERT n.key IS UNIQUE")).await?;
+        let denied = commit_capture(&adapter, Some(&authority), &capture, &planned, &payload)
+            .await.unwrap_err();
+        assert!(denied.to_string().contains("backfill prerequisites"), "{denied:#}");
+        assert_eq!(rows_count(&graph, "MATCH (n) RETURN count(n) AS count").await?, before);
+        graph.run(query("CREATE CONSTRAINT ON (n:LifeRootBinding) ASSERT n.key IS UNIQUE")).await?;
+
         let created = commit_capture(&adapter, Some(&authority), &capture, &planned, &payload)
             .await?;
         let root = created.root.clone().ok_or_else(|| anyhow!("missing root"))?;
