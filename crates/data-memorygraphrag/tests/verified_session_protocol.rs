@@ -197,3 +197,62 @@ async fn metadata_over_128_rows_never_begins() {
 async fn second_metadata_failure_never_retries_or_begins() {
     exercise(Case::SecondQueryFailure).await;
 }
+
+#[tokio::test]
+async fn stale_loop_action_releases_single_connection_before_replay_lookup() {
+    use data_memorygraphrag::loop_action::{Action, FIELDS, LoopAction, apply};
+    timeout(LIMIT, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0; 20];
+            socket.read_exact(&mut handshake).await.unwrap();
+            socket.write_all(&[0, 0, 1, 4]).await.unwrap();
+            expect(&mut socket, 0x01).await;
+            success(&mut socket).await;
+            for (index, statement) in [
+                "MATCH (a:LifeLoopAction",
+                "MATCH (n {id:",
+                "MATCH (a:LifeLoopAction",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index > 0 {
+                    expect(&mut socket, 0x0f).await; // pool checkout recycles the released connection
+                    success(&mut socket).await;
+                }
+                metadata(&mut socket, statement, 0).await;
+            }
+        });
+        let graph = Graph::connect(
+            ConfigBuilder::default()
+                .uri(format!("bolt://{address}"))
+                .user("test")
+                .password("test")
+                .max_connections(1)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        let input = LoopAction {
+            id: "life:open-loop:synthetic".into(),
+            actor: "synthetic-operator".into(),
+            request_id: "a".repeat(32),
+            action: Action::Close,
+            before: FIELDS
+                .iter()
+                .map(|field| ((*field).into(), serde_json::Value::Null))
+                .collect(),
+            note: "synthetic close".into(),
+        };
+        assert_eq!(
+            apply(&graph, &input, "2026-10-14T00:00:00Z").await.unwrap()["status"],
+            "conflict"
+        );
+        server.await.unwrap();
+    })
+    .await
+    .expect("stale action retained the sole pooled connection");
+}

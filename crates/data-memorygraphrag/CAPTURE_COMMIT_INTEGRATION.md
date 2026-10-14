@@ -13,6 +13,10 @@ metadata queries are forbidden inside explicit transactions. The compatibility
 follow-up preflights those queries on the reserved connection. Local parser and
 scripted Bolt tests prove validation and sequencing only; the disposable Memgraph
 CI acceptance must pass on the exact follow-up commit before installation.
+The real-engine path also exposed a stale replay plan in its fixture and a
+completed loop-action stream holding the only pooled connection during replay
+lookup. The fixture now re-plans under current authority; the action releases
+its completed stream before that lookup. Pool size and retry behavior are unchanged.
 
 ## Implemented writes and replay
 

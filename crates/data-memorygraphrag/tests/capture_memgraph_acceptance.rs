@@ -287,8 +287,13 @@ async fn cleanup(graph: &Graph) {
 #[tokio::test]
 #[ignore = "requires empty disposable Memgraph on 127.0.0.1:17687 and PHILOTIC_SYNTHETIC_CAPTURE_MEMGRAPH_ACCEPTANCE=1"]
 async fn capture_memgraph_then_explicit_operator_close_acceptance() -> Result<()> {
-    let graph = connect_disposable_graph().await?;
-    let result = async {
+    let graph = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        connect_disposable_graph(),
+    )
+    .await
+    .map_err(|_| anyhow!("disposable graph connection exceeded 15 seconds"))??;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         install_schema(&graph).await?;
         let store = setup_policy()?;
         let adapter = MemgraphLifeGraph(graph.clone());
@@ -385,8 +390,9 @@ async fn capture_memgraph_then_explicit_operator_close_acceptance() -> Result<()
             before_missing
         );
         Ok(())
-    }
-    .await;
-    cleanup(&graph).await;
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("capture acceptance exceeded 60 seconds")));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup(&graph)).await;
     result
 }
