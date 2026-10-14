@@ -229,7 +229,51 @@ impl Graph {
     where
         F: FnOnce(&[crate::Row]) -> Result<()>,
     {
-        let operation = Operation::Read;
+        self.start_txn_with_verified_session_as(Operation::Read, setup, verification, verify)
+            .await
+    }
+
+    /// Performs session setup and bounded metadata verification, then BEGIN
+    /// with the requested operation mode, without returning the physical
+    /// connection to the pool between steps.
+    /// No operation is retried. Any failure must be treated as uncertain by
+    /// the caller; this API does not establish rollback or remote quiescence.
+    pub async fn start_txn_with_verified_session_as<F>(
+        &self,
+        operation: Operation,
+        setup: Query,
+        verification: Query,
+        verify: F,
+    ) -> Result<Txn>
+    where
+        F: FnOnce(&[crate::Row]) -> Result<()>,
+    {
+        let (txn, ()) = self
+            .start_txn_with_verified_metadata(operation, setup, [verification], |rows| {
+                verify(&rows[0])
+            })
+            .await?;
+        Ok(txn)
+    }
+
+    /// Runs one or two bounded metadata queries before BEGIN on the same
+    /// physical connection. Returns the validator's value with that transaction.
+    /// No query is retried and the connection is not returned to the pool between
+    /// setup, metadata reads and BEGIN. This does not lock server configuration:
+    /// callers must exclude changes from the first metadata read through completion.
+    pub async fn start_txn_with_verified_metadata<const N: usize, T, F>(
+        &self,
+        operation: Operation,
+        setup: Query,
+        verification: [Query; N],
+        verify: F,
+    ) -> Result<(Txn, T)>
+    where
+        F: FnOnce(&[Vec<crate::Row>; N]) -> Result<T>,
+    {
+        if N == 0 || N > 2 {
+            return Err(crate::Error::InvalidConfig);
+        }
         let db = self.config.db.clone();
         let imp_user = self.config.imp_user.clone();
         let mut connection = self
@@ -237,25 +281,29 @@ impl Graph {
             .get(Some(operation), db.clone(), imp_user.clone(), &[])
             .await?;
         let mut setup = setup.imp_user(imp_user.clone());
-        let mut verification = verification.imp_user(imp_user.clone());
         if let Some(database) = db.as_ref() {
             setup = setup.extra("db", database.to_string());
-            verification = verification.extra("db", database.to_string());
         }
         setup.run(&mut connection).await?;
-        let mut stream = verification.execute_mut(32, &mut connection).await?;
-        let mut rows = Vec::new();
-        while let Some(row) = stream.next(&mut connection).await? {
-            if rows.len() >= 128 {
-                return Err(crate::Error::ListTooLong);
+        let mut metadata = std::array::from_fn(|_| Vec::new());
+        for (query, rows) in verification.into_iter().zip(&mut metadata) {
+            let mut query = query.imp_user(imp_user.clone());
+            if let Some(database) = db.as_ref() {
+                query = query.extra("db", database.to_string());
             }
-            rows.push(row);
+            let mut stream = query.execute_mut(32, &mut connection).await?;
+            while let Some(row) = stream.next(&mut connection).await? {
+                if rows.len() >= 128 {
+                    return Err(crate::Error::ListTooLong);
+                }
+                rows.push(row);
+            }
         }
-        verify(&rows)?;
+        let verified = verify(&metadata)?;
         #[cfg(not(feature = "unstable-bolt-protocol-impl-v2"))]
-        return Txn::new(db, self.config.fetch_size, connection, operation, imp_user).await;
+        let txn = Txn::new(db, self.config.fetch_size, connection, operation, imp_user).await?;
         #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
-        return Txn::new(
+        let txn = Txn::new(
             db,
             self.config.fetch_size,
             connection,
@@ -263,7 +311,8 @@ impl Graph {
             imp_user,
             &[],
         )
-        .await;
+        .await?;
+        Ok((txn, verified))
     }
 
     /// Runs a query on the configured database using a connection from the connection pool,

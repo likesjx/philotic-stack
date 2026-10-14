@@ -4,30 +4,90 @@ use super::capture_commit::*;
 use super::resolve_plan::*;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use neo4rs::{Graph, Query, Row, Txn, query};
+use neo4rs::{Graph, Operation, Query, Row, Txn, query};
 use std::collections::BTreeSet;
 
 pub struct MemgraphLifeGraph(pub Graph);
-struct MemgraphTransaction(Option<Txn>);
-fn info_value(rows: &[Row], field: &str) -> Option<String> {
+struct MemgraphTransaction {
+    txn: Option<Txn>,
+    unique: BTreeSet<(String, String)>,
+}
+
+fn parse_constraints(rows: &[Row]) -> neo4rs::Result<BTreeSet<(String, String)>> {
+    let mut unique = BTreeSet::new();
     for row in rows {
-        if let Ok(value) = row.get::<String>(field) {
-            return Some(value);
+        let kind: String = row.get("constraint type")?;
+        let label: String = row.get("label")?;
+        let props = row
+            .get::<Vec<String>>("properties")
+            .or_else(|_| row.get::<String>("properties").map(|p| vec![p]))?;
+        if label.is_empty() || props.is_empty() || props.iter().any(String::is_empty) {
+            return Err(neo4rs::Error::InvalidConfig);
         }
-        for column in ["storage info", "name", "key"] {
-            if row.get::<String>(column).is_ok_and(|key| key == field)
-                && let Ok(value) = row.get::<String>("value")
-            {
-                return Some(value);
+        match kind.as_str() {
+            "unique" if props.len() == 1 => {
+                if !unique.insert((label, props[0].clone())) {
+                    return Err(neo4rs::Error::InvalidConfig);
+                }
             }
+            "unique" | "exists" | "data_type" => {}
+            _ => return Err(neo4rs::Error::InvalidConfig),
         }
     }
-    None
+    Ok(unique)
 }
+
+fn storage_field(row: &Row) -> neo4rs::Result<Option<(&'static str, String)>> {
+    let key: String = row.get("storage info")?;
+    let field = match key.as_str() {
+        "storage_mode" => "storage_mode",
+        "global_isolation_level" => "global_isolation_level",
+        "session_isolation_level" => "session_isolation_level",
+        _ => return Ok(None),
+    };
+    let value: String = row.get("value")?;
+    Ok(Some((field, value)))
+}
+
+fn verify_capture_storage_info(rows: &[Row]) -> neo4rs::Result<()> {
+    let mut storage_mode = None;
+    let mut global_isolation_level = None;
+    let mut session_isolation_level = None;
+    for row in rows {
+        let Some((field, value)) = storage_field(row)? else {
+            continue;
+        };
+        let slot = match field {
+            "storage_mode" => &mut storage_mode,
+            "global_isolation_level" => &mut global_isolation_level,
+            "session_isolation_level" => &mut session_isolation_level,
+            _ => unreachable!("storage_field only returns allowlisted fields"),
+        };
+        if slot.replace(value).is_some() {
+            return Err(neo4rs::Error::InvalidConfig);
+        }
+    }
+    let storage_mode = storage_mode.ok_or(neo4rs::Error::InvalidConfig)?;
+    let global_isolation_level = global_isolation_level.ok_or(neo4rs::Error::InvalidConfig)?;
+    let session_isolation_level = session_isolation_level.ok_or(neo4rs::Error::InvalidConfig)?;
+    if !matches!(
+        storage_mode.as_str(),
+        "IN_MEMORY_TRANSACTIONAL" | "ON_DISK_TRANSACTIONAL"
+    ) {
+        return Err(neo4rs::Error::InvalidConfig);
+    }
+    if global_isolation_level != "SNAPSHOT_ISOLATION"
+        || session_isolation_level != "SNAPSHOT_ISOLATION"
+    {
+        return Err(neo4rs::Error::InvalidConfig);
+    }
+    Ok(())
+}
+
 impl MemgraphTransaction {
     async fn rows(&mut self, q: Query) -> Result<Vec<Row>> {
         let tx = self
-            .0
+            .txn
             .as_mut()
             .ok_or_else(|| anyhow!("closed transaction"))?;
         let mut stream = tx.execute(q).await?;
@@ -45,50 +105,36 @@ impl MemgraphTransaction {
 #[async_trait]
 impl AtomicLifeGraph for MemgraphLifeGraph {
     async fn begin(&self) -> Result<Box<dyn GraphTransaction>> {
-        Ok(Box::new(MemgraphTransaction(Some(
-            self.0.start_txn().await?,
-        ))))
+        let (txn, unique) = self
+            .0
+            .start_txn_with_verified_metadata(
+                Operation::Write,
+                query("SET SESSION TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION"),
+                [query("SHOW STORAGE INFO"), query("SHOW CONSTRAINT INFO")],
+                |[storage, constraints]| {
+                    verify_capture_storage_info(storage)?;
+                    parse_constraints(constraints)
+                },
+            )
+            .await?;
+        Ok(Box::new(MemgraphTransaction {
+            txn: Some(txn),
+            unique,
+        }))
     }
 }
 #[async_trait]
 impl GraphTransaction for MemgraphTransaction {
     async fn schema(&mut self) -> Result<SchemaState> {
-        let mut unique = BTreeSet::new();
-        for row in self.rows(query("SHOW CONSTRAINT INFO")).await? {
-            let kind: String = row.get("constraint type")?;
-            if kind.eq_ignore_ascii_case("unique") {
-                let label: String = row.get("label")?;
-                let props = row
-                    .get::<Vec<String>>("properties")
-                    .or_else(|_| row.get::<String>("properties").map(|p| vec![p]))?;
-                if props.len() == 1 {
-                    unique.insert((label, props[0].clone()));
-                }
-            }
-        }
-        let info = self
-            .rows(query("SHOW STORAGE INFO ON CURRENT DATABASE"))
-            .await?;
-        let mode = info_value(&info, "storage_mode");
-        let isolation = info_value(&info, "storage_isolation_level");
-        // Require the session's explicit snapshot setting too. Unknown/null
-        // session metadata denies; database defaults cannot rule out overrides.
-        let session = self.rows(query("SHOW STORAGE INFO")).await?;
-        let session_isolation = info_value(&session, "session_isolation_level");
-        let transactional = matches!(
-            mode.as_deref(),
-            Some("IN_MEMORY_TRANSACTIONAL" | "ON_DISK_TRANSACTIONAL")
-        ) && isolation.as_deref() == Some("SNAPSHOT_ISOLATION")
-            && session_isolation.as_deref() == Some("SNAPSHOT_ISOLATION");
         let ready = self.rows(query("MATCH (s:LifeCaptureSchema {key:$key}) RETURN s.version AS version, s.backfill_complete AS ready")
             .param("key", "resolve-before-create-v1")).await?;
         let catalog_ready = ready.len() == 1
             && ready[0].get::<i64>("version")? == 1
             && ready[0].get::<bool>("ready")?;
         Ok(SchemaState {
-            transactional,
+            transactional: true,
             catalog_ready,
-            unique,
+            unique: self.unique.clone(),
         })
     }
     async fn receipt(&mut self, key: &str) -> Result<Option<StoredReceipt>> {
@@ -182,6 +228,24 @@ impl GraphTransaction for MemgraphTransaction {
             Disposition::Review { .. } => (None, "review"),
         };
         if let Some(root) = &root {
+            if let Some(role_id) = &w.role_id {
+                let rows = self
+                    .rows(
+                        query(
+                            "MATCH (r {id:$root}), (role:Role {id:$role}) \
+                             MERGE (r)-[s:SCOPED_TO]->(role) \
+                             ON CREATE SET s.source_policy_manifest=$sources \
+                             RETURN role.id AS role",
+                        )
+                        .param("root", root.as_str())
+                        .param("role", role_id.clone())
+                        .param("sources", w.sources_json.clone()),
+                    )
+                    .await?;
+                if rows.len() != 1 {
+                    bail!("role anchor missing/ambiguous");
+                }
+            }
             for id in &w.evidence_ids {
                 let target = if kind == "extension" {
                     "MATCH (r:LifeCaptureExtension {key:$target})"
@@ -206,7 +270,7 @@ impl GraphTransaction for MemgraphTransaction {
         })
     }
     async fn commit(mut self: Box<Self>) -> Result<()> {
-        self.0
+        self.txn
             .take()
             .ok_or_else(|| anyhow!("closed transaction"))?
             .commit()
@@ -214,11 +278,172 @@ impl GraphTransaction for MemgraphTransaction {
         Ok(())
     }
     async fn rollback(mut self: Box<Self>) -> Result<()> {
-        self.0
+        self.txn
             .take()
             .ok_or_else(|| anyhow!("closed transaction"))?
             .rollback()
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(key: &str, value: neo4rs::BoltType) -> Row {
+        Row::new(
+            neo4rs::BoltList {
+                value: vec!["storage info".into(), "value".into()],
+            },
+            neo4rs::BoltList {
+                value: vec![key.into(), value],
+            },
+        )
+    }
+
+    fn good_rows() -> Vec<Row> {
+        vec![
+            row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+            row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+            row("session_isolation_level", "SNAPSHOT_ISOLATION".into()),
+            row("vertex_count", 11_i64.into()),
+        ]
+    }
+
+    #[test]
+    fn capture_storage_metadata_accepts_snapshot_transactional_mode() {
+        assert!(verify_capture_storage_info(&good_rows()).is_ok());
+        let mut disk = good_rows();
+        disk[0] = row("storage_mode", "ON_DISK_TRANSACTIONAL".into());
+        assert!(verify_capture_storage_info(&disk).is_ok());
+        for (field, value) in [
+            ("storage_mode", "UNKNOWN"),
+            ("global_isolation_level", "READ_COMMITTED"),
+            ("global_isolation_level", "READ_UNCOMMITTED"),
+        ] {
+            let mut bad = good_rows();
+            let index = usize::from(field != "storage_mode");
+            bad[index] = row(field, value.into());
+            assert!(verify_capture_storage_info(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn capture_storage_metadata_fails_closed_on_missing_duplicate_or_bad_values() {
+        assert!(verify_capture_storage_info(&[]).is_err());
+        assert!(
+            verify_capture_storage_info(&good_rows()[..2]).is_err(),
+            "missing session metadata must deny"
+        );
+        let mut duplicate = good_rows();
+        duplicate.push(row("session_isolation_level", "SNAPSHOT_ISOLATION".into()));
+        assert!(
+            verify_capture_storage_info(&duplicate).is_err(),
+            "duplicate allowlisted metadata must deny"
+        );
+        assert!(
+            verify_capture_storage_info(&[
+                row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+                row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+                row("session_isolation_level", "READ_COMMITTED".into()),
+            ])
+            .is_err(),
+            "non-snapshot session metadata must deny"
+        );
+        assert!(
+            verify_capture_storage_info(&[
+                row("storage_mode", "IN_MEMORY_ANALYTICAL".into()),
+                row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+                row("session_isolation_level", "SNAPSHOT_ISOLATION".into()),
+            ])
+            .is_err(),
+            "non-transactional storage must deny"
+        );
+    }
+
+    #[test]
+    fn capture_storage_metadata_fails_closed_on_malformed_or_null_rows() {
+        let malformed = Row::new(
+            neo4rs::BoltList {
+                value: vec!["name".into(), "value".into()],
+            },
+            neo4rs::BoltList {
+                value: vec!["storage_mode".into(), "IN_MEMORY_TRANSACTIONAL".into()],
+            },
+        );
+        assert!(verify_capture_storage_info(&[malformed]).is_err());
+        assert!(
+            verify_capture_storage_info(&[
+                row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+                row("global_isolation_level", "SNAPSHOT_ISOLATION".into()),
+                row(
+                    "session_isolation_level",
+                    neo4rs::BoltType::Null(neo4rs::BoltNull)
+                ),
+            ])
+            .is_err()
+        );
+    }
+
+    fn constraint(kind: &str, label: &str, props: neo4rs::BoltType) -> Row {
+        Row::new(
+            neo4rs::BoltList {
+                value: vec![
+                    "constraint type".into(),
+                    "label".into(),
+                    "properties".into(),
+                ],
+            },
+            neo4rs::BoltList {
+                value: vec![kind.into(), label.into(), props],
+            },
+        )
+    }
+
+    #[test]
+    fn constraints_only_accept_single_property_uniqueness() {
+        let parsed = parse_constraints(&[
+            constraint("unique", "OpenLoop", vec!["id"].into()),
+            constraint("unique", "LifeRootBinding", "key".into()),
+            constraint("unique", "Composite", vec!["a", "b"].into()),
+            constraint("exists", "Other", "id".into()),
+            constraint("data_type", "Other", "id".into()),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            BTreeSet::from([
+                ("OpenLoop".into(), "id".into()),
+                ("LifeRootBinding".into(), "key".into()),
+            ])
+        );
+        assert!(parse_constraints(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn constraints_fail_closed_on_malformed_metadata() {
+        for bad in [
+            constraint(
+                "unique",
+                "OpenLoop",
+                neo4rs::BoltType::Null(neo4rs::BoltNull),
+            ),
+            constraint("unique", "OpenLoop", 1_i64.into()),
+            constraint("unique", "", "id".into()),
+            constraint("unique", "OpenLoop", "".into()),
+            constraint("unique", "OpenLoop", Vec::<String>::new().into()),
+            constraint("unknown", "OpenLoop", "id".into()),
+            row("storage_mode", "IN_MEMORY_TRANSACTIONAL".into()),
+        ] {
+            assert!(parse_constraints(&[bad]).is_err());
+        }
+        assert!(
+            parse_constraints(&[
+                constraint("unique", "OpenLoop", "id".into()),
+                constraint("unique", "OpenLoop", vec!["id"].into()),
+            ])
+            .is_err()
+        );
     }
 }

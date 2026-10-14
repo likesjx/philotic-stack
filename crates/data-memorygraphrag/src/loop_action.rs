@@ -203,6 +203,7 @@ pub async fn apply(graph: &Graph, input: &LoopAction, now: &str) -> Result<Value
         .await?;
     let saved = rows.next().await?.is_some();
     while rows.next().await?.is_some() {} // commit completion precedes receipt
+    drop(rows); // Release this connection before a possible replay lookup.
     if saved {
         return Ok(
             json!({"status":"saved", "node_id":input.id, "audit_id":audit_id, "request_id":input.request_id, "action":input.action, "replayed":false}),

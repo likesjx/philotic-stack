@@ -8,10 +8,15 @@ path, v1 consumer API and exact uninstalled hotel/SDK boundaries.
 `resolve_plan.rs`, `capture_commit.rs` and `capture_memgraph.rs` remain unexported.
 The commit orchestrator is exercised end to end: authenticated synthetic source
 policy → SQLite inbox enqueue/reopen/load → validated plan → durable fixture graph
-transaction. The actual neo4rs/Memgraph adapter compiles through the shadow test;
-no Memgraph instance was contacted. Its Cypher, metadata-result format, SHOW query
-support inside an explicit transaction, isolation and constraint behavior require
-validation against a disposable Memgraph instance before installation.
+transaction. Pinned Memgraph3.10.1 CI exposed that both storage and constraint
+metadata queries are forbidden inside explicit transactions. The compatibility
+follow-up preflights those queries on the reserved connection. Local parser and
+scripted Bolt tests prove validation and sequencing only; the disposable Memgraph
+CI acceptance must pass on the exact follow-up commit before installation.
+The real-engine path also exposed a stale replay plan in its fixture and a
+completed loop-action stream holding the only pooled connection during replay
+lookup. The fixture now re-plans under current authority; the action releases
+its completed stream before that lookup. Pool size and retry behavior are unchanged.
 
 ## Implemented writes and replay
 
@@ -57,17 +62,29 @@ Runtime is off until that issuer is installed.
 Require unique `id` on the selected ontology label, and unique `key` on
 LifeRootBinding, LifeCaptureReceipt, LifeCaptureEvidence and LifeCaptureExtension;
 alias resolution also requires LifeRootAlias.key uniqueness. The adapter checks
-constraint metadata in the transaction. A single existing LifeCaptureSchema node
+constraint metadata before BEGIN on the transaction's reserved connection.
+A single existing LifeCaptureSchema node
 with key `resolve-before-create-v1`, version 1 and backfill_complete true is
 required. A graph owner must establish that the catalog covers existing roots;
 an empty new catalog must not enable duplicate roots. No schema installation or
 backfill is included or executed.
 
-The adapter requires transactional storage, current-database SNAPSHOT_ISOLATION
-and an explicit snapshot session setting; missing/unknown metadata denies. The
-owner must exclude NEXT isolation overrides and concurrent schema/configuration
-changes during captures, or provide a stronger versioned schema guard. It does
-not silently substitute older metadata queries. See official [constraints](https://memgraph.com/docs/fundamentals/constraints),
+The adapter requires transactional storage, global SNAPSHOT_ISOLATION and an
+explicit snapshot session setting. It sets the session snapshot level and verifies
+Memgraph3.10.1 `SHOW STORAGE INFO` fields `storage_mode`,
+`global_isolation_level` and `session_isolation_level` before `BEGIN` on the same
+write-capable physical connection; missing, duplicate, null or malformed metadata
+denies. Memgraph3.10.1 also rejects `SHOW CONSTRAINT INFO` inside explicit
+transactions. That second bounded metadata query runs on the same checkout
+before BEGIN; its parsed uniqueness set belongs only to the resulting transaction.
+Both queries are fully consumed and validated before BEGIN, with no retries or
+pool return between them. The `LifeCaptureSchema` readiness marker remains
+inside the capture transaction with resolution and writes. The owner must exclude
+NEXT isolation overrides and concurrent schema/configuration changes from the
+FIRST metadata read through commit or rollback, or provide a stronger versioned
+schema guard. This is an existing owner obligation, not an adapter-enforced guard.
+The adapter does not silently
+substitute older metadata queries. See official [constraints](https://memgraph.com/docs/fundamentals/constraints),
 [transactions](https://memgraph.com/docs/fundamentals/transactions) and
 [server stats](https://memgraph.com/docs/database-management/server-stats).
 
@@ -81,10 +98,10 @@ review, missing prerequisites, and both revocation orderings. This fixture's
 serialization/durability does not prove Memgraph conflict/isolation behavior.
 The separate-connection barrier test is actual SQLite evidence, not a mocked lock.
 
-No Memgraph executable is installed. Docker inventory failed with permission
-denied on `/Users/jaredlikes/.docker/run/docker.sock`; no disposable graph endpoint
-was supplied. No dependencies were added or installed, no live graph records were
-accessed, and no service was started/restarted.
+For the compatibility follow-up, local Docker is unavailable (`docker` is not on
+PATH). Real-engine acceptance therefore runs in the pinned Linux CI fixture.
+No dependencies were added or installed, no live graph records were accessed,
+and no production service was started/restarted.
 
 IPC ownership blocks runtime installation, not this source/test slice.
 `philotic-client::IpcResponse::InboundTask` has only source_node/task_id/task_json.
