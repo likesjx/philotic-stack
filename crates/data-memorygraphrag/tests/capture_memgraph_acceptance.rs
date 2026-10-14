@@ -328,7 +328,11 @@ async fn capture_memgraph_then_explicit_operator_close_acceptance() -> Result<()
             store: store.clone(),
             lookup: Lookup::Unique(root.clone()),
         };
-        let replay = commit_capture(&adapter, Some(&replay_authority), &capture, &planned, &payload)
+        // Re-delivery revalidates the plan under current authority. The durable
+        // receipt identity is unchanged even though resolution now finds a root.
+        let replay_plan = plan(&capture, Some(&replay_authority))
+            .map_err(|e| anyhow!("replay planning denied: {e:?}"))?;
+        let replay = commit_capture(&adapter, Some(&replay_authority), &capture, &replay_plan, &payload)
             .await?;
         assert!(replay.replay);
         assert_eq!(replay.root, Some(root.clone()));
@@ -336,6 +340,8 @@ async fn capture_memgraph_then_explicit_operator_close_acceptance() -> Result<()
         let mut rows = graph.execute(query("MATCH (:OpenLoop {id:$root})-[:SCOPED_TO]->(:Role {id:$role}) RETURN count(*) AS count")
             .param("root", root.as_str()).param("role", role)).await?;
         assert_eq!(rows.next().await?.unwrap().get::<i64>("count")?, 1);
+        assert!(rows.next().await?.is_none());
+        drop(rows); // Return the fixture's sole pooled connection before snapshot.
 
         let before_close = snapshot(&graph, root.as_str()).await?;
         let close = close_command(root.as_str(), before_close.clone(), &"c".repeat(32));
