@@ -320,7 +320,7 @@ async fn dispatch_for_target(
             src_node: local_node_id.to_string(),
             dest_node: target_node_id.to_string(),
             msg_type: MsgType::ExecutionEventBatch,
-            seq: event.seq as u32,
+            seq: event.seq,
             total: 1,
             payload: payload.into(),
             timestamp: ts,

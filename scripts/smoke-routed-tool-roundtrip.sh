@@ -50,7 +50,7 @@ TOOL_RUNNER_BIN="${ROOT_DIR}/target/debug/tool-runner"
 echo "Starting aiua in ${TMP_DIR}..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 "${AIUA_BIN}" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
+  PHILOTIC_SMOKE_MODE=1 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" "${AIUA_BIN}" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 

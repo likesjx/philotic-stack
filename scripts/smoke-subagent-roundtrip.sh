@@ -36,7 +36,7 @@ echo "Starting aiua (smoke mode) in ${TMP_DIR}…"
 (
   cd "${TMP_DIR}"
   PHILOTIC_SMOKE_MODE=1 \
-    "${ROOT_DIR}/target/debug/aiua" --hotel "${HOTEL_NAME}" \
+    PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" "${ROOT_DIR}/target/debug/aiua" --hotel "${HOTEL_NAME}" \
     >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!

@@ -570,3 +570,385 @@ pub(in crate::service) fn handle_set_skill_state(
         skill_state: state_str,
     }
 }
+
+impl IpcServer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_register_skill_request(
+        skill_name: String,
+        description: String,
+        subagent_kind: String,
+        goal: String,
+        allowed_tools: Vec<String>,
+        allowed_classes: Vec<String>,
+        allowed_skills: Vec<String>,
+        origin: Option<String>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        handle_register_skill_with_origin(
+            current_identity.as_ref(),
+            graph,
+            skill_name,
+            description,
+            subagent_kind,
+            goal,
+            allowed_tools,
+            allowed_classes,
+            allowed_skills,
+            origin,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_set_skill_state_request(
+        skill_name: String,
+        state: String,
+        reason: Option<String>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        handle_set_skill_state(current_identity.as_ref(), graph, skill_name, state, reason)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_list_skill_audits(
+        skill_name: Option<String>,
+        limit: Option<u32>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        if let Err(response) = require_skill_admin(
+            current_identity.as_ref(),
+            "list_skill_audits",
+            "LIST_SKILL_AUDITS",
+            "reading the skill audit trail",
+        ) {
+            return response;
+        }
+        let audits = match graph.list_skill_registration_audits() {
+            Ok(audits) => audits,
+            Err(e) => {
+                return IpcResponse::error(
+                    "list_skill_audits",
+                    "LIST_SKILL_AUDITS_FAILED",
+                    format!("failed to list skill audits: {e}"),
+                );
+            }
+        };
+        let limit = limit.unwrap_or(100) as usize;
+        let skill_audits: Vec<serde_json::Value> = audits
+            .iter()
+            .filter(|audit| {
+                skill_name
+                    .as_deref()
+                    .is_none_or(|name| audit.skill_name == name)
+            })
+            .rev()
+            .take(limit)
+            .map(|audit| {
+                serde_json::json!({
+                    "audit_id": audit.audit_id,
+                    "skill_name": audit.skill_name,
+                    "action": audit.action,
+                    "by": audit.registered_by,
+                    "by_role": audit.registered_by_role,
+                    "validation_state": audit.validation_state,
+                    "at": audit.registered_at,
+                    "detail": audit.detail,
+                })
+            })
+            .collect();
+        IpcResponse::SkillAuditList { skill_audits }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_assign_skill(
+        agent_id: String,
+        role_name: String,
+        skill_name: String,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        let identity = match require_skill_admin(
+            current_identity.as_ref(),
+            "assign_skill",
+            "ASSIGN",
+            "assigning skills",
+        ) {
+            Ok(identity) => identity,
+            Err(response) => return response,
+        };
+        let is_management = identity.role == "management";
+        if !is_management && !guest_owns_agent(&identity.guest_id, &agent_id) {
+            return IpcResponse::error(
+                "assign_skill",
+                "ASSIGN_FORBIDDEN",
+                "orchestrator guests may only assign skills for their own agent identity",
+            );
+        }
+        // Verify the skill exists in the catalog.
+        match graph.get_abstract_skill(&skill_name) {
+            Ok(None) => {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "SKILL_NOT_FOUND",
+                    format!("skill [{}] not found in catalog", skill_name),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "SKILL_LOOKUP_FAILED",
+                    format!("failed to look up skill: {e}"),
+                );
+            }
+            Ok(Some(_)) => {}
+        }
+        // Load the role incarnation record.
+        let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "ROLE_NOT_FOUND",
+                    format!(
+                        "role [{}] not configured for agent [{}]",
+                        role_name, agent_id
+                    ),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "ROLE_LOOKUP_FAILED",
+                    format!("failed to look up role: {e}"),
+                );
+            }
+        };
+        // Load the toolset profile.
+        let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "PROFILE_NOT_FOUND",
+                    format!(
+                        "toolset profile [{}] not found",
+                        role_record.toolset_profile
+                    ),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "PROFILE_LOOKUP_FAILED",
+                    format!("failed to look up toolset profile: {e}"),
+                );
+            }
+        };
+        // Idempotent: if already assigned, return success.
+        if !profile.allowed_skills.contains(&skill_name) {
+            // Fail-closed audit before the mutation.
+            if let Err(response) = record_skill_admin_audit(
+                graph,
+                identity,
+                "assign_skill",
+                "assign",
+                &skill_name,
+                "",
+                Some(format!(
+                    "agent={agent_id} role={role_name} profile={}",
+                    profile.profile_name
+                )),
+            ) {
+                return response;
+            }
+            profile.allowed_skills.push(skill_name.clone());
+            if let Err(e) = graph.upsert_toolset_profile(&profile) {
+                return IpcResponse::error(
+                    "assign_skill",
+                    "PROFILE_PERSIST_FAILED",
+                    format!("failed to persist toolset profile: {e}"),
+                );
+            }
+        }
+        info!(role_name = %role_name, skill_name = %skill_name, "Skill assigned to role via IPC");
+        IpcResponse::SkillAssigned {
+            role_name,
+            skill_name,
+            operation: "assigned".into(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_revoke_skill(
+        agent_id: String,
+        role_name: String,
+        skill_name: String,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        let identity = match require_skill_admin(
+            current_identity.as_ref(),
+            "revoke_skill",
+            "REVOKE",
+            "revoking skills",
+        ) {
+            Ok(identity) => identity,
+            Err(response) => return response,
+        };
+        let is_management = identity.role == "management";
+        if !is_management && !guest_owns_agent(&identity.guest_id, &agent_id) {
+            return IpcResponse::error(
+                "revoke_skill",
+                "REVOKE_FORBIDDEN",
+                "orchestrator guests may only revoke skills for their own agent identity",
+            );
+        }
+        // Load the role incarnation record.
+        let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "revoke_skill",
+                    "ROLE_NOT_FOUND",
+                    format!(
+                        "role [{}] not configured for agent [{}]",
+                        role_name, agent_id
+                    ),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error(
+                    "revoke_skill",
+                    "ROLE_LOOKUP_FAILED",
+                    format!("failed to look up role: {e}"),
+                );
+            }
+        };
+        // Load the toolset profile.
+        let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "revoke_skill",
+                    "PROFILE_NOT_FOUND",
+                    format!(
+                        "toolset profile [{}] not found",
+                        role_record.toolset_profile
+                    ),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error(
+                    "revoke_skill",
+                    "PROFILE_LOOKUP_FAILED",
+                    format!("failed to look up toolset profile: {e}"),
+                );
+            }
+        };
+        // Idempotent: if not present, return success.
+        if profile.allowed_skills.contains(&skill_name) {
+            // Fail-closed audit before the mutation.
+            if let Err(response) = record_skill_admin_audit(
+                graph,
+                identity,
+                "revoke_skill",
+                "revoke",
+                &skill_name,
+                "",
+                Some(format!(
+                    "agent={agent_id} role={role_name} profile={}",
+                    profile.profile_name
+                )),
+            ) {
+                return response;
+            }
+            profile.allowed_skills.retain(|s| s != &skill_name);
+            if let Err(e) = graph.upsert_toolset_profile(&profile) {
+                return IpcResponse::error(
+                    "revoke_skill",
+                    "PROFILE_PERSIST_FAILED",
+                    format!("failed to persist toolset profile: {e}"),
+                );
+            }
+        }
+        info!(role_name = %role_name, skill_name = %skill_name, "Skill revoked from role via IPC");
+        IpcResponse::SkillAssigned {
+            role_name,
+            skill_name,
+            operation: "revoked".into(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_list_skills(
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        // The catalog names every tool a skill can project; require at
+        // least a registered guest identity before enumerating it.
+        if current_identity.is_none() {
+            return IpcResponse::error(
+                "list_skills",
+                "LIST_SKILLS_UNREGISTERED",
+                "guest must register before listing skills",
+            );
+        }
+        let skills = match graph.list_abstract_skills() {
+            Ok(s) => s,
+            Err(e) => {
+                return IpcResponse::error(
+                    "list_skills",
+                    "LIST_SKILLS_FAILED",
+                    format!("failed to list skills: {e}"),
+                );
+            }
+        };
+        let json_skills: Vec<serde_json::Value> = skills
+            .iter()
+            .map(|s| {
+                let (state_str, _) = skill_state_label(&s.validation_state);
+                serde_json::json!({
+                    "skill_name": s.skill_name,
+                    "description": s.description,
+                    "implied_tools": s.implied_tools,
+                    "implied_classes": s.implied_classes,
+                    "allowed_skills": s.allowed_skills,
+                    "subagent_kind": s.subagent_kind,
+                    "goal_template": s.goal_template,
+                    "validation_state": state_str,
+                })
+            })
+            .collect();
+        IpcResponse::SkillList {
+            skills: json_skills,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_get_toolset_profile(
+        profile_name: String,
+        graph: &GraphDomain,
+    ) -> IpcResponse {
+        match graph.get_toolset_profile(&profile_name) {
+            Ok(Some(p)) => IpcResponse::success(
+                "toolset_profile",
+                Some(serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)),
+            ),
+            Ok(None) => IpcResponse::success("toolset_profile", None),
+            Err(e) => IpcResponse::error("toolset_profile", "PROFILE_ERROR", e.to_string()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_list_toolset_profiles(graph: &GraphDomain) -> IpcResponse {
+        match graph.list_toolset_profiles() {
+            Ok(profiles) => IpcResponse::success(
+                "list_toolset_profiles",
+                Some(serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![]))),
+            ),
+            Err(e) => IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string()),
+        }
+    }
+}

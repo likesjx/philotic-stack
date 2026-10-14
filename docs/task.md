@@ -499,6 +499,7 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
   - [x] L1 loud inbound (2026-10-07, test-green): per-event batch decode, gossip/undecodable/dropped-task heal tags, `DeliveryOutcome`, error reply to the originator of a dropped task. Live chaos check (`mesh_event_undecodable` within one tick) pending deploy.
   - [x] L2 gossip budget (2026-10-07, test-green): roster-size alarm `hotel_state_budget` (75%/100%), `hotel_state_send_failed`, `hotel_state.last_wire_bytes` persisted. Active-only gossip NOT done: receivers route to dormant guests.
+  - [x] L3 doctor checks (2026-10-07): `mesh.ledger-backlog`, `mesh.hotel-state-budget`, `mesh.dead-letters`, `mesh.nonce-store`; live on mac-jane (found mbp-jane 2,195-row backlog and DEF-224 misaddressed rows; DEF-185 nonce proof green). vps-jane/mbp-jane runs owed.
   - [x] L6 option (a) (2026-10-07): dead cron broadcast emitters/handlers/builders deleted (DEF-184, IPC split P-d); behavior-neutral, tests unchanged.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
   - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step (workflow patch 0001, applied 2026-10-07); make blocking after one week).
@@ -509,6 +510,7 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
   - [x] S0 skeleton (2026-10-07): `service/ipc/mod.rs` + `ipc/tests.rs`, orphan doc removed, `await_holding_lock` denied outside tests; aiua tests 654 → 654 (PR #626).
   - [x] S1 pure free functions (2026-10-07): `tool_assembly`, `cron`, `surfaces`, `procedures`, `skills`, `agent_context` — verbatim, double-checked per commit; aiua tests 654 → 654.
   - [x] S2 small leaf families (2026-10-07): `components`, `memory`, `media_setup` (method moves); `cron`, `surfaces`, `hotel_status` arms → handlers; rule-4 test added; aiua tests 654 → 655.
+  - [x] S3a (2026-10-12): skills/procedures arms, heal_autonomy, routing_policy, integrations, mcp_upstream, config_vault, mesh_invite; mod.rs 14,244 → 10,495. S3b (mcp_endpoint, session_snapshot, agent_bundle, remote_handoff, subagents, leases) open.
 - [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
   - [x] R0 runbook ([process/RELEASE.md](process/RELEASE.md)); `release/packages.toml` + `scripts/release-packages.sh`; `scripts/release-manifest.py`; R4 `just vps-deploy-release` + ansible release/rollback tasks; R5 `scripts/install-release-mac.sh`; R6/R7 `just rollback`, `just verify-release` (2026-10-07, validated locally: actionlint, shellcheck, ansible syntax + fake-tarball runs, 16 unit tests).
   - [x] R3 workflow changes: patches 0002 + 0003 applied 2026-10-07 (manifest package list re-verified identical: 16 `-p` flags after merging develop @ `36466d8b`).
@@ -517,7 +519,8 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 - [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
   - [x] P1 step 4: provisioning scripts register as `operator` via shared `scripts/philotic_ipc.py` (also DEF-209).
   - [x] P7 firewall: nftables `inet philotic` hotel-port filter (on for jane-vps, validated with `nft -c`); ONNX ufw allow narrowed to tailnet; dead `PHILOTIC_MESH_PSK` removed.
-  - [ ] P1–P6 Rust slices; P7 mesh-config plaintext scrub (Rust `aiua load`), DEF-089, blob quota.
+  - [x] P1 Rust (2026-10-07, test-green): socket 0600 + peer-uid check, no /tmp fallback, MCP owner refuses unregistered, `seq` u64, exec-plane accept allowlist. Live proof owed after deploy.
+  - [ ] P2–P6 Rust slices; P7 mesh-config plaintext scrub (Rust `aiua load`), DEF-089, blob quota.
 - [ ] Agent frontdoor next slices (F1–F7): [AGENT_FRONTDOOR_PROPOSAL.md § Next slices](architecture/AGENT_FRONTDOOR_PROPOSAL.md). DEF-211 rest, DEF-209, caller tags, schemas, rotation.
   - [x] F2 DEF-209 script framing fix; F5 schema export/import in `provision-agent-frontdoor.py` (2026-10-07). Live re-provision pairs with the F6 rotation drill.
   - [ ] F1, F3, F6 (Rust/doctor); F4 operator decision; F7 after F1+F6.

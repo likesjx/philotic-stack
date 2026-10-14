@@ -146,7 +146,7 @@ if [[ -f "${ROOT_DIR}/mesh-config.json" ]]; then
     --file "${ROOT_DIR}/mesh-config.json" \
     --hotel "${HOTEL_NAME}" \
     >>"${TMP_DIR}/aiua.log" 2>&1
-  "${ROOT_DIR}/target/debug/aiua" \
+  PHILOTIC_HOTEL_SOCKET="/tmp/philotic-${HOTEL_NAME}.sock" "${ROOT_DIR}/target/debug/aiua" \
     --hotel "${HOTEL_NAME}" \
     --test text-roundtrip \
     --test-text "ping from mlx smoke" \

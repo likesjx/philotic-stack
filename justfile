@@ -162,7 +162,7 @@ sync-config:
 # Start the Hotel Manager (Aiua Host Daemon)
 start-aiua hotel:
     cargo build --workspace
-    cargo run -p aiua -- --hotel {{hotel}}
+    if [ -z "${PHILOTIC_PROFILE:-}" ] && [ -z "${PHILOTIC_HOTEL_SOCKET:-}" ]; then export PHILOTIC_HOTEL_SOCKET=/tmp/philotic-{{hotel}}.sock; fi; cargo run -p aiua -- --hotel {{hotel}}
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
@@ -209,7 +209,7 @@ clear-aiua:
 start-aiua-clean hotel:
     just build-runtime
     just kill-local-stack
-    cargo run -p aiua -- --hotel {{hotel}}
+    if [ -z "${PHILOTIC_PROFILE:-}" ] && [ -z "${PHILOTIC_HOTEL_SOCKET:-}" ]; then export PHILOTIC_HOTEL_SOCKET=/tmp/philotic-{{hotel}}.sock; fi; cargo run -p aiua -- --hotel {{hotel}}
 
 # Wait for the hotel socket then start philotic-web serve.
 # Usage: just start-serve local-telegram   (run in a second terminal after start-aiua-clean)
@@ -252,7 +252,7 @@ uat worktree="":
     fi
     echo "Starting UAT stack on hotel 'local-telegram'..."
     echo "Only one Telegram poller should be running for this bot token."
-    cargo run -p aiua -- --hotel local-telegram
+    if [ -z "${PHILOTIC_PROFILE:-}" ] && [ -z "${PHILOTIC_HOTEL_SOCKET:-}" ]; then export PHILOTIC_HOTEL_SOCKET=/tmp/philotic-local-telegram.sock; fi; cargo run -p aiua -- --hotel local-telegram
 
 # (legacy alias)
 start-aiua-uat:

@@ -33,6 +33,45 @@ pub(crate) const MAX_EXECUTION_FRAME_BYTES: u32 = 32 * 1024 * 1024;
 /// this at once is a flood or a stuck peer.
 const MAX_INBOUND_CONNECTIONS: usize = 64;
 
+/// How often the accept loop re-reads the known hotels' `mesh_host` IPs.
+const KNOWN_PEER_REFRESH: Duration = Duration::from_secs(60);
+
+/// The `mesh_host` of every hotel this one knows, where it is an IP literal.
+fn known_peer_ips(graph: &GraphDomain) -> Vec<std::net::IpAddr> {
+    graph
+        .list_hotels()
+        .map(|hotels| {
+            hotels
+                .iter()
+                .filter_map(|h| h.mesh_host.as_deref()?.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// May this source address open an execution-plane connection
+/// (PERIMETER_ENFORCEMENT P1, DEF-175)? The listener binds every interface, and
+/// a frame is buffered before it is authenticated, so only the tailnet,
+/// loopback and known peer hosts get that far. Tailscale addresses are
+/// `100.64.0.0/10` (IPv4) and `fd7a:115c:a1e0::/48` (IPv6).
+fn execution_peer_allowed(ip: std::net::IpAddr, known_peers: &[std::net::IpAddr]) -> bool {
+    use std::net::IpAddr;
+    let ip = ip.to_canonical();
+    if ip.is_loopback() || known_peers.iter().any(|k| k.to_canonical() == ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..=127).contains(&b)
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
 pub async fn serve_execution_plane(
     addr: &str,
     local_capabilities: NodeCapabilities,
@@ -54,6 +93,7 @@ pub async fn serve_execution_plane(
     }
 
     let permits = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
+    let mut known_peers = (std::time::Instant::now(), known_peer_ips(graph.as_ref()));
     loop {
         // A transient accept error (fd exhaustion, an aborted connection) used
         // to end this function with `?` and switch cross-hotel delivery off
@@ -66,6 +106,17 @@ pub async fn serve_execution_plane(
                 continue;
             }
         };
+        if known_peers.0.elapsed() >= KNOWN_PEER_REFRESH {
+            known_peers = (std::time::Instant::now(), known_peer_ips(graph.as_ref()));
+        }
+        if !execution_peer_allowed(peer_addr.ip(), &known_peers.1) {
+            warn!(
+                peer = %peer_addr,
+                "Execution transport refusing a connection from outside the tailnet and the \
+                 known mesh hosts (PERIMETER_ENFORCEMENT P1)"
+            );
+            continue;
+        }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             warn!(
                 "Execution transport at its {MAX_INBOUND_CONNECTIONS}-connection cap; refusing {peer_addr}"
@@ -211,13 +262,7 @@ fn validate_execution_message(
         let auth_key = mesh_auth_key_for_node(graph, local_node_id, &msg.src_node)?
             .ok_or_else(|| anyhow::anyhow!("no mesh auth key for node {}", msg.src_node))?;
         let auth = MeshAuth::new(auth_key);
-        auth.validate(
-            &msg.msg_id,
-            msg.seq as u64,
-            &msg.payload,
-            msg.timestamp,
-            &msg.hmac,
-        )?;
+        auth.validate(&msg.msg_id, msg.seq, &msg.payload, msg.timestamp, &msg.hmac)?;
         // The process-wide in-memory window — not a SQLite connection opened
         // against the live hotel DB for every inbound message.
         NonceTracker::shared().assert_and_record_nonce(&msg.msg_id)?;
@@ -326,5 +371,79 @@ mod transport_tests {
     fn large_frames_get_proportionally_more_write_time() {
         assert_eq!(write_timeout_for(1_000), Duration::from_secs(5));
         assert_eq!(write_timeout_for(11_000_000), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn a_seq_past_u32_survives_the_wire_and_validates() {
+        // PERIMETER_ENFORCEMENT P1: `seq` used to be sent `as u32` while the
+        // HMAC covered the u64, so every batch failed once a ledger passed 2^32.
+        let seq = (1u64 << 32) + 1;
+        let auth = MeshAuth::new("pair-key");
+        let msg_id = uuid::Uuid::new_v4();
+        let payload = b"[]".to_vec();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let hmac = auth.sign(&msg_id, seq, &payload, timestamp);
+        let msg = BeaconMessage {
+            version: 1,
+            msg_id,
+            src_node: "mac-jane-aiua-01".into(),
+            dest_node: "vps-jane-aiua-01".into(),
+            msg_type: MsgType::ExecutionEventBatch,
+            seq,
+            total: 1,
+            payload: payload.into(),
+            timestamp,
+            hmac: hmac.into(),
+        };
+        let wire = serde_json::to_vec(&msg).unwrap();
+        let back: BeaconMessage = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(back.seq, seq);
+        auth.validate(
+            &back.msg_id,
+            back.seq,
+            &back.payload,
+            back.timestamp,
+            &back.hmac,
+        )
+        .expect("a u64 seq must round-trip through sign and validate");
+    }
+
+    #[test]
+    fn execution_accept_allowlist() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let known = [ip("192.168.1.20")];
+        // Loopback, the tailnet (mbp-jane is 100.79.x), and known peer hosts.
+        for ok in [
+            "127.0.0.1",
+            "::1",
+            "100.64.212.8",
+            "100.79.239.64",
+            "100.127.255.1",
+            "fd7a:115c:a1e0::1",
+            "192.168.1.20",
+            "::ffff:100.64.230.106",
+        ] {
+            assert!(
+                execution_peer_allowed(ip(ok), &known),
+                "{ok} must be allowed"
+            );
+        }
+        // The public internet and other private ranges get nothing.
+        for bad in [
+            "31.97.130.98",
+            "100.63.255.255",
+            "100.128.0.1",
+            "10.0.0.5",
+            "192.168.1.21",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !execution_peer_allowed(ip(bad), &known),
+                "{bad} must be refused"
+            );
+        }
     }
 }

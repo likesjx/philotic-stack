@@ -372,6 +372,63 @@ pub(super) enum AgentRouteResolution {
     Park { guest_id: String },
 }
 
+/// Decides whether a peer uid may use the hotel socket: `(peer_uid, hotel_uid)`.
+pub(crate) type PeerUidPolicy = fn(u32, u32) -> bool;
+
+/// Production policy: only processes running as the hotel's own OS user.
+/// Every guest is spawned as that user; on vps-jane operators reach the socket
+/// with `sudo -u philotic` / `runuser -u philotic`.
+pub(crate) fn same_uid_only(peer_uid: u32, hotel_uid: u32) -> bool {
+    peer_uid == hotel_uid
+}
+
+/// Owner-only access to the hotel socket (PERIMETER_ENFORCEMENT P1, DEF-173).
+///
+/// The socket becomes `0600`. Its directory becomes `0700` only when this
+/// user owns it and it is not a sticky shared directory such as `/tmp`, so a
+/// test or an operator-chosen socket path never has someone else's directory
+/// chmodded. Returns the socket owner's uid, which is this process's
+/// effective uid and the uid peers must match.
+fn harden_socket_permissions(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let hotel_uid = std::fs::metadata(path)?.uid();
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(meta) = std::fs::metadata(dir) {
+            let sticky = meta.mode() & 0o1000 != 0;
+            if meta.uid() == hotel_uid && !sticky && meta.mode() & 0o777 != 0o700 {
+                if let Err(err) =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                {
+                    warn!(dir = %dir.display(), "could not restrict hotel socket directory to 0700: {err}");
+                }
+            }
+        }
+    }
+    Ok(hotel_uid)
+}
+
+/// Check the connecting process's uid (SO_PEERCRED on Linux, getpeereid on
+/// macOS). Fails closed: a connection whose credentials cannot be read is
+/// refused.
+fn peer_uid_permitted(stream: &UnixStream, hotel_uid: u32, policy: PeerUidPolicy) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) if policy(cred.uid(), hotel_uid) => true,
+        Ok(cred) => {
+            warn!(
+                peer_uid = cred.uid(),
+                peer_pid = ?cred.pid(),
+                hotel_uid,
+                "IPC: refusing a connection from another OS user (PERIMETER_ENFORCEMENT P1)"
+            );
+            false
+        }
+        Err(err) => {
+            warn!("IPC: refusing a connection whose peer credentials are unreadable: {err}");
+            false
+        }
+    }
+}
 /// Heal-queue id of the open MuninnDB-outage work item (see
 /// `IpcServer::record_muninn_heal_transition`).
 pub(crate) type MuninnOutageHealId = Arc<std::sync::Mutex<Option<String>>>;
@@ -426,6 +483,10 @@ pub struct IpcServer {
     /// Signal channel: send `()` to trigger a hotel-state broadcast to all backbone peers.
     /// Fired on guest register/deregister so peers stay in sync.
     hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
+    /// Which peer uids may connect (PERIMETER_ENFORCEMENT P1). Production:
+    /// only the hotel's own uid. Injectable so a test can simulate a foreign
+    /// user, which CI cannot create.
+    peer_uid_policy: PeerUidPolicy,
     /// Agent-resource-broker registry (agent-resource-broker seam). Records
     /// resource grants/denials and answers routing-table queries. Inert this
     /// slice: it does NOT materialize or tear down guests — that stays with the
@@ -1894,6 +1955,7 @@ impl IpcServer {
             perimeter_svc: None,
             egress_gw: None,
             hotel_state_dirty_tx: None,
+            peer_uid_policy: same_uid_only,
             resource_registry: Arc::new(Mutex::new(
                 crate::service::resource_registry::ResourceRegistry::new(),
             )),
@@ -1912,6 +1974,13 @@ impl IpcServer {
 
     pub fn with_hotel_state_dirty_tx(mut self, tx: mpsc::Sender<()>) -> Self {
         self.hotel_state_dirty_tx = Some(tx);
+        self
+    }
+
+    /// Replace the peer-uid policy (tests only: simulates a foreign user).
+    #[cfg(test)]
+    pub(crate) fn with_peer_uid_policy(mut self, policy: PeerUidPolicy) -> Self {
+        self.peer_uid_policy = policy;
         self
     }
 
@@ -2018,6 +2087,7 @@ impl IpcServer {
         }
 
         let listener = UnixListener::bind(path)?;
+        let hotel_uid = harden_socket_permissions(path)?;
         info!("Hotel Front Desk (UDS) listening on: {}", self.socket_path);
 
         // Golgi pipeline TTL watchdog — evicts entries that never received a capability reply.
@@ -2058,6 +2128,9 @@ impl IpcServer {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    if !peer_uid_permitted(&stream, hotel_uid, self.peer_uid_policy) {
+                        continue;
+                    }
                     let dispatcher = self.dispatcher_tx.clone();
                     let local_node_id = self.local_node_id.clone();
                     let graph = self.graph.clone();
@@ -3679,15 +3752,14 @@ impl IpcServer {
     ///
     /// Philotes register as `<agent_id>` or `<agent_id>:<role>`; both forms
     /// bind. Admin-class roles may act on any agent's behalf. An unregistered
-    /// connection (local ops tooling speaking raw IPC) is treated as
-    /// admin-equivalent — holding the hotel socket is already root-equivalent
-    /// for the hotel, which is the documented residual risk.
-    fn mcp_owner_identity_ok(
+    /// connection is refused (PERIMETER_ENFORCEMENT P1): ops tooling
+    /// registers as `role: "operator"` (scripts/philotic_ipc.py, DEF-209).
+    pub(crate) fn mcp_owner_identity_ok(
         current_identity: &Option<GuestIdentity>,
         owner_agent_id: &str,
     ) -> bool {
         let Some(identity) = current_identity.as_ref() else {
-            return true;
+            return false;
         };
         if matches!(
             identity.role.as_str(),
@@ -3700,257 +3772,6 @@ impl IpcServer {
                 .guest_id
                 .strip_prefix(owner_agent_id)
                 .is_some_and(|rest| rest.starts_with(':'))
-    }
-
-    /// Resolve a binding's exit policy against the live mesh registry and map
-    /// the policy hotel identity to its concrete node id.
-    async fn integration_binding_entry(
-        binding: ansible_mesh_core::integration::IntegrationBinding,
-        registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &GraphDomain,
-        local_node_id: &str,
-    ) -> philotic_client::IntegrationBindingEntry {
-        use ansible_mesh_core::integration::{
-            EgressPlacementDecision, EgressPlacementPolicy, decide_egress_placement,
-        };
-
-        let requested_hotel = match &binding.placement {
-            EgressPlacementPolicy::PreferHotel { hotel_id, .. }
-            | EgressPlacementPolicy::RequireHotel { hotel_id } => Some(hotel_id.as_str()),
-            EgressPlacementPolicy::Local | EgressPlacementPolicy::Deny => None,
-        };
-        let local_hotel = Self::local_hotel_name(graph, local_node_id);
-        let mut exit_node_id = None;
-        let mut exit_hotel_reachable = requested_hotel.is_none();
-
-        if let Some(hotel_id) = requested_hotel {
-            if hotel_id == local_node_id || local_hotel.as_deref() == Some(hotel_id) {
-                exit_node_id = Some(local_node_id.to_string());
-                exit_hotel_reachable = true;
-            } else {
-                let guard = registry.read().await;
-                if let Some(status) = guard.active_nodes().find(|status| {
-                    status.capabilities.node_id == hotel_id
-                        || Self::target_hotel_name(
-                            graph,
-                            status,
-                            local_hotel.as_deref().unwrap_or_default(),
-                        ) == hotel_id
-                }) {
-                    let node_id = status.capabilities.node_id.clone();
-                    exit_hotel_reachable =
-                        status.execution_reachability.is_some() && guard.is_node_healthy(&node_id);
-                    exit_node_id = Some(node_id);
-                }
-            }
-        }
-
-        let placement = decide_egress_placement(&binding.placement, exit_hotel_reachable);
-        let execution_node_id = match &placement {
-            EgressPlacementDecision::ExecuteLocal { .. } => Some(local_node_id.to_string()),
-            EgressPlacementDecision::ExecuteAtHotel { .. } => exit_node_id,
-            EgressPlacementDecision::Deny { .. } => None,
-        };
-        philotic_client::IntegrationBindingEntry {
-            binding,
-            placement,
-            execution_node_id,
-            exit_hotel_reachable,
-        }
-    }
-
-    async fn materialize_integration_runner(
-        entry: &philotic_client::IntegrationBindingEntry,
-        registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &GraphDomain,
-        materialization_requester: Option<&dyn GuestMaterializationRequester>,
-        local_node_id: &str,
-    ) -> Option<String> {
-        let target_node_id = entry.execution_node_id.as_deref()?;
-        let target_hotel = if target_node_id == local_node_id {
-            Self::local_hotel_name(graph, local_node_id)?
-        } else {
-            let guard = registry.read().await;
-            let status = guard.get_node(target_node_id)?;
-            Self::target_hotel_name(
-                graph,
-                status,
-                Self::local_hotel_name(graph, local_node_id)
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-        };
-        let guest_id = format!("{target_hotel}:egress-http");
-
-        let response = Self::handle_operator_target_request(
-            IpcRequest::SetOperatorTargetComponentActive {
-                target_node_id: target_node_id.to_string(),
-                guest_id,
-                active: true,
-            },
-            registry,
-            graph,
-            materialization_requester,
-            local_node_id,
-        )
-        .await;
-        match response {
-            IpcResponse::OperatorTargetComponentMutationAckView {
-                operator_target_component_mutation,
-            } if operator_target_component_mutation.ok => Some(target_node_id.to_string()),
-            IpcResponse::Standard { ok: true, .. } => Some(target_node_id.to_string()),
-            other => {
-                warn!(
-                    binding_id = entry.binding.binding_id,
-                    target_node_id,
-                    ?other,
-                    "integration binding persisted but runner materialization did not complete"
-                );
-                None
-            }
-        }
-    }
-
-    async fn exchange_operator_oidc(
-        socket_path: &str,
-        local_node_id: &str,
-        graph: &GraphDomain,
-        provider: &str,
-        authorization_code: String,
-        code_verifier: String,
-        redirect_uri: String,
-    ) -> anyhow::Result<ansible_mesh_core::integration::OidcExchangeResponse> {
-        use ansible_mesh_core::integration::{
-            EgressPlacementPolicy, EgressTrafficClass, HttpNetworkScope, IntegrationBinding,
-            IntegrationTarget, OidcExchangeRequest, OidcIntegrationTarget,
-        };
-
-        let provider = provider.trim().to_ascii_lowercase();
-        let (client_id_key, client_secret_ref_key, default_token_url, default_userinfo_url) =
-            match provider.as_str() {
-                "google" => (
-                    "oidc_google_client_id",
-                    "oidc_google_client_secret_ref",
-                    "https://oauth2.googleapis.com/token",
-                    "https://openidconnect.googleapis.com/v1/userinfo",
-                ),
-                "github" => (
-                    "oidc_github_client_id",
-                    "oidc_github_client_secret_ref",
-                    "https://github.com/login/oauth/access_token",
-                    "https://api.github.com/user",
-                ),
-                _ => anyhow::bail!("unsupported operator OIDC provider '{provider}'"),
-            };
-        let read_config_string = |key: &str| -> anyhow::Result<Option<String>> {
-            Ok(graph
-                .get_config_value(key)?
-                .and_then(|value| serde_json::from_str::<String>(&value).ok())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()))
-        };
-        let client_id = read_config_string(client_id_key)?
-            .ok_or_else(|| anyhow::anyhow!("{client_id_key} is not configured"))?;
-        let client_secret_ref = read_config_string(client_secret_ref_key)?
-            .ok_or_else(|| anyhow::anyhow!("{client_secret_ref_key} is not configured"))?;
-        let smoke_mode = std::env::var("PHILOTIC_SMOKE_MODE").as_deref() == Ok("1");
-        let token_url = if smoke_mode {
-            read_config_string(&format!("smoke_oidc_{provider}_token_url"))?
-                .unwrap_or_else(|| default_token_url.into())
-        } else {
-            default_token_url.into()
-        };
-        let userinfo_url = if smoke_mode {
-            read_config_string(&format!("smoke_oidc_{provider}_userinfo_url"))?
-                .unwrap_or_else(|| default_userinfo_url.into())
-        } else {
-            default_userinfo_url.into()
-        };
-        let endpoint_is_loopback = |raw: &str| -> anyhow::Result<bool> {
-            let url = reqwest::Url::parse(raw).context("operator OIDC endpoint URL is invalid")?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("operator OIDC endpoint URL has no host"))?;
-            Ok(host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback()))
-        };
-        let token_is_loopback = endpoint_is_loopback(&token_url)?;
-        let userinfo_is_loopback = endpoint_is_loopback(&userinfo_url)?;
-        if token_is_loopback != userinfo_is_loopback {
-            anyhow::bail!(
-                "operator OIDC token and userinfo endpoints must share one network scope"
-            );
-        }
-        let network_scope = if token_is_loopback {
-            HttpNetworkScope::Loopback
-        } else {
-            HttpNetworkScope::Public
-        };
-
-        let redirect =
-            reqwest::Url::parse(&redirect_uri).context("operator OIDC redirect_uri is invalid")?;
-        if !redirect.username().is_empty() || redirect.password().is_some() {
-            anyhow::bail!("operator OIDC redirect_uri must not contain userinfo");
-        }
-        let expected_path = format!("/auth/oidc/{provider}/callback");
-        if redirect.path() != expected_path {
-            anyhow::bail!(
-                "operator OIDC redirect_uri path '{}' does not match '{}'",
-                redirect.path(),
-                expected_path
-            );
-        }
-        if redirect.scheme() != "https"
-            && !(redirect.scheme() == "http"
-                && redirect
-                    .host_str()
-                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1")))
-        {
-            anyhow::bail!("operator OIDC redirect_uri must use HTTPS or HTTP loopback");
-        }
-
-        let binding_id = format!("operator-oidc-{provider}");
-        let binding = IntegrationBinding {
-            binding_id: binding_id.clone(),
-            owner_agent_id: "operator-auth-egress".into(),
-            display_name: Some(format!("{provider} operator OIDC exchange")),
-            target: IntegrationTarget::Oidc(OidcIntegrationTarget {
-                provider_id: provider,
-                client_id,
-                client_secret_ref: Some(client_secret_ref),
-                token_url,
-                userinfo_url,
-                redirect_uri: redirect.to_string(),
-                network_scope,
-                timeout_secs: 15,
-                max_response_bytes: 64 * 1024,
-            }),
-            grant_agents: Vec::new(),
-            grant_skills: Vec::new(),
-            traffic_class: EgressTrafficClass::GeneralApi,
-            placement: EgressPlacementPolicy::Local,
-            requires_approval: false,
-            enabled: true,
-            updated_at: unix_ts(),
-        };
-        crate::service::governed_http::GovernedHttpService {
-            socket_path: socket_path.to_string(),
-            local_node_id: local_node_id.to_string(),
-            guest_id: "operator-auth-egress".into(),
-            role: "operator-auth-egress".into(),
-        }
-        .execute_oidc(
-            binding,
-            OidcExchangeRequest {
-                binding_id,
-                authorization_code,
-                code_verifier,
-            },
-            "operator OIDC exchange",
-        )
-        .await
     }
 
     async fn process_request(
@@ -4079,267 +3900,34 @@ impl IpcServer {
                 IpcResponse::success("reg", None)
             }
             IpcRequest::GetConfig { key } => {
-                info!("GetConfig requested: {}", key);
-                if key == "__mesh_registry__" {
-                    let snapshot = Self::compose_mesh_registry_snapshot(registry).await;
-                    return IpcResponse::ConfigData {
-                        key,
-                        value_json: Some(snapshot.to_string()),
-                    };
-                }
-                // Read-only operator surface for the self-heal circuit's filed
-                // work items (finding F8, `phil heal list`). A serialization
-                // failure degrades to an empty list rather than erroring — this
-                // is a visibility read for the resilience system.
-                if key == "__heal_work_items__" {
-                    let items = graph.list_heal_work_items().unwrap_or_default();
-                    let value_json = serde_json::to_string(&items).ok();
-                    return IpcResponse::ConfigData { key, value_json };
-                }
-                // Read-only operator surface for the Autopoiesis Slice A9
-                // trust ledger (`phil autonomy status`). `__autonomy_status__`
-                // reports every granted lane; `__autonomy_status__:{lane}`
-                // scopes to one.
-                if key == "__autonomy_status__" {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    return Self::handle_query_autonomy_status(graph, None, now);
-                }
-                if let Some(lane) = key.strip_prefix("__autonomy_status__:") {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    return Self::handle_query_autonomy_status(graph, Some(lane), now);
-                }
-                // Read-only operator surface for the A9 outcome-stamping
-                // follow-up slice (`phil autonomy pending`): every audit
-                // record across all lanes still awaiting an operator
-                // outcome. Companion to `__autonomy_status__` — status
-                // reports the trust-ledger counters, this reports the raw
-                // review backlog those counters are waiting on.
-                if key == "__autonomy_pending__" {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    return Self::handle_query_autonomy_pending(graph, now);
-                }
-                // Read-only operator/steward surface for the Memory
-                // Transparency Slice M3 delta digest (`memory.delta_digest`
-                // philote tool). `__memory_delta_digest__` uses the default
-                // 24h window; `__memory_delta_digest__:{hours}` overrides it.
-                // A query, not a write — no autonomy grant is consulted (the
-                // Autonomy Contract governs autonomous actions, not reads
-                // that render already-durable state).
-                if key == "__memory_delta_digest__" {
-                    return Self::handle_memory_delta_digest(
-                        graph,
-                        local_node_id,
-                        crate::memory_delta_digest::DEFAULT_WINDOW_HOURS,
-                    )
-                    .await;
-                }
-                if let Some(hours_str) = key.strip_prefix("__memory_delta_digest__:") {
-                    let window_hours = hours_str
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|h| *h > 0)
-                        .unwrap_or(crate::memory_delta_digest::DEFAULT_WINDOW_HOURS);
-                    return Self::handle_memory_delta_digest(graph, local_node_id, window_hours)
-                        .await;
-                }
-                // Returns a JSON array of memory_type strings for all session apartments
-                // belonging to the given agent — used by philote at startup for stale-turn sweep.
-                // Key format: `__session_apartments__:{agent_id}`
-                if let Some(agent_id) = key.strip_prefix("__session_apartments__:") {
-                    let memory_types: Vec<String> = graph
-                        .list_apartments(agent_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|mt| mt.starts_with("short_session:"))
-                        .collect();
-                    let json = serde_json::to_string(&memory_types).unwrap_or_else(|_| "[]".into());
-                    return IpcResponse::ConfigData {
-                        key,
-                        value_json: Some(json),
-                    };
-                }
-
-                if let Some(rest) = key.strip_prefix("__session_snapshot__:") {
-                    // Format: `{session_id}` (orchestrator) or `{session_id}@{role_name}` (role process)
-                    let (session_id, role_name) = match rest.split_once('@') {
-                        Some((sess, role)) => (sess, Some(role)),
-                        None => (rest, None),
-                    };
-                    match Self::compose_session_snapshot(
-                        graph,
-                        inboxes,
-                        registry,
-                        local_node_id,
-                        session_id,
-                        role_name,
-                    )
-                    .await
-                    {
-                        Ok(value) => {
-                            return IpcResponse::ConfigData {
-                                key,
-                                value_json: value.map(|v| v.to_string()),
-                            };
-                        }
-                        Err(e) => {
-                            error!("Failed to compose session snapshot: {}", e);
-                            return IpcResponse::error("config", "CONFIG_ERROR", e.to_string());
-                        }
-                    }
-                }
-                if let Some((agent_id, memory_type)) = key
-                    .strip_prefix("__apartment__:")
-                    .and_then(|rest| rest.split_once(':'))
-                {
-                    match graph.get_apartment(agent_id, memory_type) {
-                        Ok(value) => {
-                            return IpcResponse::ConfigData {
-                                key,
-                                value_json: value.map(|v| v.to_string()),
-                            };
-                        }
-                        Err(e) => {
-                            error!("Failed to load apartment from GraphStorage: {}", e);
-                            return IpcResponse::error("config", "CONFIG_ERROR", e.to_string());
-                        }
-                    }
-                }
-                if let Some(agent_id) = key.strip_prefix("__agent_bundle__:") {
-                    match graph.get_agent_identity(agent_id) {
-                        Ok(Some(identity)) => {
-                            return IpcResponse::ConfigData {
-                                key,
-                                value_json: Some(identity.bundle_json.to_string()),
-                            };
-                        }
-                        Ok(None) => {
-                            return IpcResponse::ConfigData {
-                                key,
-                                value_json: None,
-                            };
-                        }
-                        Err(e) => {
-                            error!("Failed to load agent bundle from GraphStorage: {}", e);
-                            return IpcResponse::error("config", "CONFIG_ERROR", e.to_string());
-                        }
-                    }
-                }
-                match graph.get_config_value(&key) {
-                    Ok(value_json) => IpcResponse::ConfigData { key, value_json },
-                    Err(e) => {
-                        error!("Failed to load config key from GraphStorage: {}", e);
-                        IpcResponse::error("config", "CONFIG_ERROR", e.to_string())
-                    }
-                }
+                Self::handle_get_config(key, local_node_id, graph, inboxes, registry).await
             }
             IpcRequest::GetSecret { secret_ref } => {
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "secret",
-                        "SECRET_UNREGISTERED",
-                        "guest must register before requesting vault secrets",
-                    );
-                };
-
-                match resolve_secret(
-                    graph,
-                    &secret_ref,
-                    &SecretAccess {
-                        role: identity.role.clone(),
-                        guest_id: identity.guest_id.clone(),
-                    },
-                ) {
-                    Ok(value_json) => IpcResponse::SecretData {
-                        secret_ref,
-                        value_json: value_json.map(|value| serde_json::to_string(&value).unwrap()),
-                    },
-                    Err(err) => {
-                        error!("Failed to resolve vault secret [{}]: {}", secret_ref, err);
-                        IpcResponse::error("secret", "SECRET_ERROR", err.to_string())
-                    }
-                }
+                Self::handle_get_secret(secret_ref, graph, current_identity)
             }
             IpcRequest::GetToolsetProfile { profile_name } => {
-                match graph.get_toolset_profile(&profile_name) {
-                    Ok(Some(p)) => IpcResponse::success(
-                        "toolset_profile",
-                        Some(serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)),
-                    ),
-                    Ok(None) => IpcResponse::success("toolset_profile", None),
-                    Err(e) => IpcResponse::error("toolset_profile", "PROFILE_ERROR", e.to_string()),
-                }
+                Self::handle_get_toolset_profile(profile_name, graph)
             }
-            IpcRequest::ListToolsetProfiles {} => match graph.list_toolset_profiles() {
-                Ok(profiles) => IpcResponse::success(
-                    "list_toolset_profiles",
-                    Some(
-                        serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![])),
-                    ),
-                ),
-                Err(e) => {
-                    IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string())
-                }
-            },
+            IpcRequest::ListToolsetProfiles {} => Self::handle_list_toolset_profiles(graph),
             IpcRequest::SetConfig { key, value_json } => {
-                info!("SetConfig requested: {}", key);
-                // Reserved prefix: MCP endpoint/route/preapproval state changes
-                // only through their dedicated, validated handlers — the generic
-                // config writer must not be a side door around identity checks.
-                if key.starts_with("__mcp_") {
-                    return IpcResponse::error(
-                        "config",
-                        "RESERVED_KEY",
-                        format!(
-                            "config key '{key}' uses the reserved __mcp_ prefix; \
-                             use the dedicated MCP provisioning IPC instead"
-                        ),
-                    );
-                }
-                match graph.set_config_value(&key, &value_json) {
-                    Ok(()) => IpcResponse::success("config", None),
-                    Err(e) => IpcResponse::error("config", "CONFIG_ERROR", e.to_string()),
-                }
+                Self::handle_set_config(key, value_json, graph)
             }
             IpcRequest::RotateSecret {
                 secret_ref,
                 plaintext,
-            } => {
-                info!("RotateSecret requested for ref: {}", secret_ref);
-                match crate::vault::rotate_secret(graph, &secret_ref, &plaintext) {
-                    Ok(()) => IpcResponse::success("secret", None),
-                    Err(e) => IpcResponse::error("secret", "SECRET_ERROR", e.to_string()),
-                }
-            }
+            } => Self::handle_rotate_secret(secret_ref, plaintext, graph),
             IpcRequest::AddVaultEntry {
                 vault_name,
                 plaintext,
                 allowed_roles,
                 secret_kind,
-            } => {
-                info!("AddVaultEntry requested: {}", vault_name);
-                match Self::handle_add_vault_entry(
-                    graph,
-                    vault_name,
-                    plaintext,
-                    allowed_roles,
-                    secret_kind,
-                ) {
-                    Ok(secret_ref) => IpcResponse::success(
-                        "vault",
-                        Some(serde_json::json!({ "secret_ref": secret_ref })),
-                    ),
-                    Err(e) => IpcResponse::error("vault", "VAULT_ERROR", e.to_string()),
-                }
-            }
+            } => Self::handle_add_vault_entry_request(
+                vault_name,
+                plaintext,
+                allowed_roles,
+                secret_kind,
+                graph,
+            ),
             IpcRequest::CreateMeshInvite {
                 hotel_name,
                 mesh_host,
@@ -6615,9 +6203,7 @@ impl IpcServer {
                 failure_route: _,
                 idle_behavior: _,
                 lease_terms: _,
-            } => handle_register_skill_with_origin(
-                current_identity.as_ref(),
-                graph,
+            } => Self::handle_register_skill_request(
                 skill_name,
                 description,
                 subagent_kind,
@@ -6626,57 +6212,22 @@ impl IpcServer {
                 allowed_classes,
                 allowed_skills,
                 origin,
+                graph,
+                current_identity,
             ),
             IpcRequest::SetSkillState {
                 skill_name,
                 state,
                 reason,
-            } => {
-                handle_set_skill_state(current_identity.as_ref(), graph, skill_name, state, reason)
-            }
+            } => Self::handle_set_skill_state_request(
+                skill_name,
+                state,
+                reason,
+                graph,
+                current_identity,
+            ),
             IpcRequest::ListSkillAudits { skill_name, limit } => {
-                if let Err(response) = require_skill_admin(
-                    current_identity.as_ref(),
-                    "list_skill_audits",
-                    "LIST_SKILL_AUDITS",
-                    "reading the skill audit trail",
-                ) {
-                    return response;
-                }
-                let audits = match graph.list_skill_registration_audits() {
-                    Ok(audits) => audits,
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "list_skill_audits",
-                            "LIST_SKILL_AUDITS_FAILED",
-                            format!("failed to list skill audits: {e}"),
-                        );
-                    }
-                };
-                let limit = limit.unwrap_or(100) as usize;
-                let skill_audits: Vec<serde_json::Value> = audits
-                    .iter()
-                    .filter(|audit| {
-                        skill_name
-                            .as_deref()
-                            .is_none_or(|name| audit.skill_name == name)
-                    })
-                    .rev()
-                    .take(limit)
-                    .map(|audit| {
-                        serde_json::json!({
-                            "audit_id": audit.audit_id,
-                            "skill_name": audit.skill_name,
-                            "action": audit.action,
-                            "by": audit.registered_by,
-                            "by_role": audit.registered_by_role,
-                            "validation_state": audit.validation_state,
-                            "at": audit.registered_at,
-                            "detail": audit.detail,
-                        })
-                    })
-                    .collect();
-                IpcResponse::SkillAuditList { skill_audits }
+                Self::handle_list_skill_audits(skill_name, limit, graph, current_identity)
             }
             IpcRequest::PatchAgentBundle {
                 agent_id,
@@ -6876,228 +6427,21 @@ impl IpcServer {
                 role_name,
                 skill_name,
             } => {
-                let identity = match require_skill_admin(
-                    current_identity.as_ref(),
-                    "assign_skill",
-                    "ASSIGN",
-                    "assigning skills",
-                ) {
-                    Ok(identity) => identity,
-                    Err(response) => return response,
-                };
-                let is_management = identity.role == "management";
-                if !is_management && !guest_owns_agent(&identity.guest_id, &agent_id) {
-                    return IpcResponse::error(
-                        "assign_skill",
-                        "ASSIGN_FORBIDDEN",
-                        "orchestrator guests may only assign skills for their own agent identity",
-                    );
-                }
-                // Verify the skill exists in the catalog.
-                match graph.get_abstract_skill(&skill_name) {
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "SKILL_NOT_FOUND",
-                            format!("skill [{}] not found in catalog", skill_name),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "SKILL_LOOKUP_FAILED",
-                            format!("failed to look up skill: {e}"),
-                        );
-                    }
-                    Ok(Some(_)) => {}
-                }
-                // Load the role incarnation record.
-                let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "ROLE_NOT_FOUND",
-                            format!(
-                                "role [{}] not configured for agent [{}]",
-                                role_name, agent_id
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "ROLE_LOOKUP_FAILED",
-                            format!("failed to look up role: {e}"),
-                        );
-                    }
-                };
-                // Load the toolset profile.
-                let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "PROFILE_NOT_FOUND",
-                            format!(
-                                "toolset profile [{}] not found",
-                                role_record.toolset_profile
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "PROFILE_LOOKUP_FAILED",
-                            format!("failed to look up toolset profile: {e}"),
-                        );
-                    }
-                };
-                // Idempotent: if already assigned, return success.
-                if !profile.allowed_skills.contains(&skill_name) {
-                    // Fail-closed audit before the mutation.
-                    if let Err(response) = record_skill_admin_audit(
-                        graph,
-                        identity,
-                        "assign_skill",
-                        "assign",
-                        &skill_name,
-                        "",
-                        Some(format!(
-                            "agent={agent_id} role={role_name} profile={}",
-                            profile.profile_name
-                        )),
-                    ) {
-                        return response;
-                    }
-                    profile.allowed_skills.push(skill_name.clone());
-                    if let Err(e) = graph.upsert_toolset_profile(&profile) {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "PROFILE_PERSIST_FAILED",
-                            format!("failed to persist toolset profile: {e}"),
-                        );
-                    }
-                }
-                info!(role_name = %role_name, skill_name = %skill_name, "Skill assigned to role via IPC");
-                IpcResponse::SkillAssigned {
-                    role_name,
-                    skill_name,
-                    operation: "assigned".into(),
-                }
+                Self::handle_assign_skill(agent_id, role_name, skill_name, graph, current_identity)
             }
             IpcRequest::RevokeSkill {
                 agent_id,
                 role_name,
                 skill_name,
             } => {
-                let identity = match require_skill_admin(
-                    current_identity.as_ref(),
-                    "revoke_skill",
-                    "REVOKE",
-                    "revoking skills",
-                ) {
-                    Ok(identity) => identity,
-                    Err(response) => return response,
-                };
-                let is_management = identity.role == "management";
-                if !is_management && !guest_owns_agent(&identity.guest_id, &agent_id) {
-                    return IpcResponse::error(
-                        "revoke_skill",
-                        "REVOKE_FORBIDDEN",
-                        "orchestrator guests may only revoke skills for their own agent identity",
-                    );
-                }
-                // Load the role incarnation record.
-                let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "ROLE_NOT_FOUND",
-                            format!(
-                                "role [{}] not configured for agent [{}]",
-                                role_name, agent_id
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "ROLE_LOOKUP_FAILED",
-                            format!("failed to look up role: {e}"),
-                        );
-                    }
-                };
-                // Load the toolset profile.
-                let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "PROFILE_NOT_FOUND",
-                            format!(
-                                "toolset profile [{}] not found",
-                                role_record.toolset_profile
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "PROFILE_LOOKUP_FAILED",
-                            format!("failed to look up toolset profile: {e}"),
-                        );
-                    }
-                };
-                // Idempotent: if not present, return success.
-                if profile.allowed_skills.contains(&skill_name) {
-                    // Fail-closed audit before the mutation.
-                    if let Err(response) = record_skill_admin_audit(
-                        graph,
-                        identity,
-                        "revoke_skill",
-                        "revoke",
-                        &skill_name,
-                        "",
-                        Some(format!(
-                            "agent={agent_id} role={role_name} profile={}",
-                            profile.profile_name
-                        )),
-                    ) {
-                        return response;
-                    }
-                    profile.allowed_skills.retain(|s| s != &skill_name);
-                    if let Err(e) = graph.upsert_toolset_profile(&profile) {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "PROFILE_PERSIST_FAILED",
-                            format!("failed to persist toolset profile: {e}"),
-                        );
-                    }
-                }
-                info!(role_name = %role_name, skill_name = %skill_name, "Skill revoked from role via IPC");
-                IpcResponse::SkillAssigned {
-                    role_name,
-                    skill_name,
-                    operation: "revoked".into(),
-                }
+                Self::handle_revoke_skill(agent_id, role_name, skill_name, graph, current_identity)
             }
             IpcRequest::RegisterProcedure { procedure, origin } => {
-                handle_register_procedure(current_identity.as_ref(), graph, procedure, origin)
+                Self::handle_register_procedure_request(procedure, origin, graph, current_identity)
             }
-            IpcRequest::GetProcedure { procedure_id } => match graph.get_procedure(&procedure_id) {
-                Ok(Some(p)) => IpcResponse::success(
-                    "get_procedure",
-                    Some(serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)),
-                ),
-                Ok(None) => IpcResponse::error(
-                    "get_procedure",
-                    "PROCEDURE_NOT_FOUND",
-                    format!("no procedure named {procedure_id}"),
-                ),
-                Err(e) => IpcResponse::error("get_procedure", "PROCEDURE_ERROR", e.to_string()),
-            },
+            IpcRequest::GetProcedure { procedure_id } => {
+                Self::handle_get_procedure(procedure_id, graph)
+            }
             IpcRequest::ApplySurfaceMessages {
                 surface_id,
                 messages,
@@ -7129,187 +6473,46 @@ impl IpcServer {
                 limit,
                 graph,
             ),
-            IpcRequest::ListProcedures {} => match graph.list_procedures() {
-                Ok(list) => IpcResponse::success(
-                    "list_procedures",
-                    Some(serde_json::json!({ "procedures": list })),
-                ),
-                Err(e) => IpcResponse::error("list_procedures", "PROCEDURE_ERROR", e.to_string()),
-            },
+            IpcRequest::ListProcedures {} => Self::handle_list_procedures(graph),
             IpcRequest::RecordProcedureRun { run } => {
-                // The ledger is the refiner's evidence and the trial gate's
-                // score source; an unregistered peer must not be able to
-                // write either.
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "record_procedure_run",
-                        "PROCEDURE_RUN_UNREGISTERED",
-                        "guest must register before recording procedure runs",
-                    );
-                };
-                let mut run: ProcedureRunRecord = match serde_json::from_value(run) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "record_procedure_run",
-                            "PROCEDURE_RUN_INVALID",
-                            format!("malformed run record: {e}"),
-                        );
-                    }
-                };
-                if run.run_id.trim().is_empty() || run.procedure_id.trim().is_empty() {
-                    return IpcResponse::error(
-                        "record_procedure_run",
-                        "PROCEDURE_RUN_INVALID",
-                        "run_id and procedure_id are required",
-                    );
-                }
-                if run.agent_id.trim().is_empty() {
-                    run.agent_id = identity.guest_id.clone();
-                }
-                if run.recorded_at == 0 {
-                    run.recorded_at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                }
-                // The score is derived, never trusted from the wire.
-                run.score = ProcedureRunRecord::score_for(&run.verdict, &run.basis);
-                match graph.record_procedure_run(&run) {
-                    Ok(()) => {
-                        // P4: every run may close a trial window.
-                        let trials = evaluate_procedure_trials(graph, &run.procedure_id);
-                        IpcResponse::success(
-                            "record_procedure_run",
-                            Some(serde_json::json!({
-                                "run_id": run.run_id,
-                                "procedure_id": run.procedure_id,
-                                "graph_version": run.graph_version,
-                                "score": run.score,
-                                "trials_decided": trials,
-                            })),
-                        )
-                    }
-                    Err(e) => IpcResponse::error(
-                        "record_procedure_run",
-                        "PROCEDURE_RUN_ERROR",
-                        e.to_string(),
-                    ),
-                }
+                Self::handle_record_procedure_run(run, graph, current_identity)
             }
             IpcRequest::ListProcedureRuns {
                 procedure_id,
                 graph_version,
                 limit,
-            } => match graph.list_procedure_runs(
-                &procedure_id,
-                graph_version,
-                limit.unwrap_or(20).clamp(1, 200),
-            ) {
-                Ok(runs) => IpcResponse::success(
-                    "list_procedure_runs",
-                    Some(serde_json::json!({ "procedure_id": procedure_id, "runs": runs })),
-                ),
-                Err(e) => {
-                    IpcResponse::error("list_procedure_runs", "PROCEDURE_RUN_ERROR", e.to_string())
-                }
-            },
+            } => Self::handle_list_procedure_runs(procedure_id, graph_version, limit, graph),
             IpcRequest::ProposeProcedurePatch {
                 procedure_id,
                 ops,
                 rationale,
                 evidence_run_ids,
                 origin,
-            } => handle_propose_procedure_patch(
-                current_identity.as_ref(),
-                graph,
+            } => Self::handle_propose_procedure_patch_request(
                 procedure_id,
                 ops,
                 rationale,
                 evidence_run_ids,
                 origin,
+                graph,
+                current_identity,
             ),
             IpcRequest::ListProcedurePatches {
                 procedure_id,
                 status,
-            } => {
-                let status = match status.as_deref() {
-                    None => None,
-                    Some("pending") => Some(ProcedurePatchStatus::Pending),
-                    Some("trial") => Some(ProcedurePatchStatus::Trial),
-                    Some("accepted") => Some(ProcedurePatchStatus::Accepted),
-                    Some("rejected") => Some(ProcedurePatchStatus::Rejected),
-                    Some(other) => {
-                        return IpcResponse::error(
-                            "list_procedure_patches",
-                            "PROCEDURE_PATCH_INVALID",
-                            format!("unknown status filter {other:?}"),
-                        );
-                    }
-                };
-                match graph.list_procedure_patches(procedure_id.as_deref(), status) {
-                    Ok(patches) => IpcResponse::success(
-                        "list_procedure_patches",
-                        Some(serde_json::json!({ "patches": patches })),
-                    ),
-                    Err(e) => IpcResponse::error(
-                        "list_procedure_patches",
-                        "PROCEDURE_PATCH_ERROR",
-                        e.to_string(),
-                    ),
-                }
-            }
+            } => Self::handle_list_procedure_patches(procedure_id, status, graph),
             IpcRequest::DecideProcedurePatch {
                 patch_id,
                 decision,
                 reason,
-            } => handle_decide_procedure_patch(
-                current_identity.as_ref(),
-                graph,
+            } => Self::handle_decide_procedure_patch_request(
                 patch_id,
                 decision,
                 reason,
+                graph,
+                current_identity,
             ),
-            IpcRequest::ListSkills {} => {
-                // The catalog names every tool a skill can project; require at
-                // least a registered guest identity before enumerating it.
-                if current_identity.is_none() {
-                    return IpcResponse::error(
-                        "list_skills",
-                        "LIST_SKILLS_UNREGISTERED",
-                        "guest must register before listing skills",
-                    );
-                }
-                let skills = match graph.list_abstract_skills() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "list_skills",
-                            "LIST_SKILLS_FAILED",
-                            format!("failed to list skills: {e}"),
-                        );
-                    }
-                };
-                let json_skills: Vec<serde_json::Value> = skills
-                    .iter()
-                    .map(|s| {
-                        let (state_str, _) = skill_state_label(&s.validation_state);
-                        serde_json::json!({
-                            "skill_name": s.skill_name,
-                            "description": s.description,
-                            "implied_tools": s.implied_tools,
-                            "implied_classes": s.implied_classes,
-                            "allowed_skills": s.allowed_skills,
-                            "subagent_kind": s.subagent_kind,
-                            "goal_template": s.goal_template,
-                            "validation_state": state_str,
-                        })
-                    })
-                    .collect();
-                IpcResponse::SkillList {
-                    skills: json_skills,
-                }
-            }
+            IpcRequest::ListSkills {} => Self::handle_list_skills(graph, current_identity),
             IpcRequest::AbortSubagentSpawn { subagent_guest_id } => {
                 // Persona cancels before the worker has connected.
                 // Release the lease and clean up hooks; worker spawn is no-op if it arrives late.
@@ -7374,57 +6577,12 @@ impl IpcServer {
             IpcRequest::RegisterGraphInstance {
                 graph_id,
                 instance_id,
-            } => {
-                use ansible_mesh_core::storage::GraphRunnerInstanceRecord;
-                let record = GraphRunnerInstanceRecord {
-                    graph_id: graph_id.clone(),
-                    instance_id: instance_id.clone(),
-                    registered_at: unix_ts(),
-                };
-                match graph.upsert_graph_runner_instance(&record) {
-                    Ok(()) => {
-                        info!(
-                            graph_id = %graph_id,
-                            instance_id = %instance_id,
-                            "Graph runner instance registered"
-                        );
-                        IpcResponse::GraphInstanceRegistered { graph_id }
-                    }
-                    Err(err) => {
-                        error!("Failed to register graph runner instance: {err}");
-                        IpcResponse::error(
-                            "register_graph_instance",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
-            }
+            } => Self::handle_register_graph_instance(graph_id, instance_id, graph),
             IpcRequest::ProposeRule {
                 agent_id,
                 description,
                 rationale,
-            } => {
-                use ansible_mesh_core::graph::RuleRecord;
-                let rule_id = Uuid::new_v4().to_string();
-                let record = RuleRecord {
-                    rule_id: rule_id.clone(),
-                    agent_id: agent_id.clone(),
-                    description,
-                    rationale,
-                    created_at: unix_ts(),
-                };
-                match graph.upsert_rule(&record) {
-                    Ok(()) => {
-                        info!(agent_id = %agent_id, rule_id = %rule_id, "Rule stored via IPC");
-                        IpcResponse::RuleProposed { rule_id }
-                    }
-                    Err(err) => {
-                        error!("Failed to store rule: {err}");
-                        IpcResponse::error("propose_rule", "STORAGE_ERROR", err.to_string())
-                    }
-                }
-            }
+            } => Self::handle_propose_rule(agent_id, description, rationale, graph),
             IpcRequest::RecordRoutingPolicyProposal {
                 agent_id,
                 problem,
@@ -7433,287 +6591,48 @@ impl IpcServer {
                 affected_stage,
                 affected_capability,
                 learned_reflex_preference_key,
-            } => {
-                use ansible_mesh_core::graph::{
-                    RoutingPolicyDispositionRecord, RoutingPolicyEvaluationRecord,
-                    RoutingPolicyRecord,
-                };
-                let proposal_id = Uuid::new_v4().to_string();
-                let created_at = unix_ts();
-                let record = RoutingPolicyRecord {
-                    proposal_id: proposal_id.clone(),
-                    agent_id: agent_id.clone(),
-                    problem,
-                    proposed_change,
-                    evidence,
-                    affected_stage,
-                    affected_capability,
-                    learned_reflex_preference_key,
-                    operator_disposition: RoutingPolicyDispositionRecord {
-                        state: "approved".into(),
-                        reason: "Approved via operator-gated routing.policy.propose execution."
-                            .into(),
-                        decided_at: created_at,
-                    },
-                    evaluations: vec![RoutingPolicyEvaluationRecord {
-                        evaluation_kind: "operator_disposition".into(),
-                        decision: "approved".into(),
-                        reason: "routing.policy.propose executed after operator approval.".into(),
-                        created_at,
-                        source_tool: Some("routing.policy.propose".into()),
-                    }],
-                    created_at,
-                };
-                match graph.upsert_routing_policy(&record) {
-                    Ok(()) => {
-                        info!(
-                            agent_id = %agent_id,
-                            proposal_id = %proposal_id,
-                            "Routing policy proposal stored via IPC"
-                        );
-                        IpcResponse::RoutingPolicyRecorded { proposal_id }
-                    }
-                    Err(err) => {
-                        error!("Failed to store routing policy proposal: {err}");
-                        IpcResponse::error(
-                            "record_routing_policy_proposal",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
+            } => Self::handle_record_routing_policy_proposal(
+                agent_id,
+                problem,
+                proposed_change,
+                evidence,
+                affected_stage,
+                affected_capability,
+                learned_reflex_preference_key,
+                graph,
+            ),
+            IpcRequest::ListRoutingPolicies { agent_id } => {
+                Self::handle_list_routing_policies(agent_id, graph)
             }
-            IpcRequest::ListRoutingPolicies { agent_id } => match graph
-                .list_routing_policies(&agent_id)
-            {
-                Ok(policies) => {
-                    let json_policies: Vec<serde_json::Value> = policies
-                        .into_iter()
-                        .map(|policy| {
-                            serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
-                        })
-                        .collect();
-                    IpcResponse::RoutingPolicyList {
-                        policies: json_policies,
-                    }
-                }
-                Err(err) => {
-                    error!("Failed to list routing policies: {err}");
-                    IpcResponse::error("list_routing_policies", "STORAGE_ERROR", err.to_string())
-                }
-            },
-            IpcRequest::ListRules { agent_id } => match graph.list_rules(&agent_id) {
-                Ok(rules) => {
-                    let json_rules: Vec<serde_json::Value> = rules
-                        .iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "rule_id": r.rule_id,
-                                "agent_id": r.agent_id,
-                                "description": r.description,
-                                "rationale": r.rationale,
-                                "created_at": r.created_at,
-                            })
-                        })
-                        .collect();
-                    IpcResponse::RuleList { rules: json_rules }
-                }
-                Err(err) => {
-                    error!("Failed to list rules: {err}");
-                    IpcResponse::error("list_rules", "STORAGE_ERROR", err.to_string())
-                }
-            },
+            IpcRequest::ListRules { agent_id } => Self::handle_list_rules(agent_id, graph),
             IpcRequest::UpsertAgentReflexPreference {
                 agent_id,
                 preference_key,
                 precedence,
                 reflexes_json,
                 config_json,
-            } => {
-                use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
-                let path = agent_graph_db_path(&agent_id);
-                let result = (|| -> anyhow::Result<()> {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
-                    storage.upsert_reflex_preference(&AgentReflexPreference {
-                        agent_id: agent_id.clone(),
-                        preference_key: preference_key.clone(),
-                        precedence,
-                        reflexes_json,
-                        config_json,
-                        updated_at: 0,
-                    })?;
-                    Ok(())
-                })();
-                match result {
-                    Ok(()) => IpcResponse::success(
-                        "agent_reflex_preference",
-                        Some(serde_json::json!({
-                            "message": format!("Stored learned reflex preference '{preference_key}'.")
-                        })),
-                    ),
-                    Err(err) => {
-                        error!("Failed to store learned reflex preference: {err}");
-                        IpcResponse::error(
-                            "upsert_agent_reflex_preference",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
-            }
+            } => Self::handle_upsert_agent_reflex_preference(
+                agent_id,
+                preference_key,
+                precedence,
+                reflexes_json,
+                config_json,
+            ),
             IpcRequest::GetAgentReflexPreferences {
                 agent_id,
                 preference_key,
-            } => {
-                let path = agent_graph_db_path(&agent_id);
-                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
-                    if !path.exists() {
-                        return Ok(vec![]);
-                    }
-                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
-                    let preferences = if let Some(key) = preference_key {
-                        storage
-                            .get_reflex_preference(&key)?
-                            .map(|r| vec![r])
-                            .unwrap_or_default()
-                    } else {
-                        storage.list_reflex_preferences()?
-                    };
-                    Ok(preferences
-                        .into_iter()
-                        .map(|p| {
-                            serde_json::json!({
-                                "agent_id": p.agent_id,
-                                "preference_key": p.preference_key,
-                                "precedence": p.precedence,
-                                "reflexes": p.reflexes_json,
-                                "config": p.config_json,
-                                "updated_at": p.updated_at,
-                            })
-                        })
-                        .collect())
-                })();
-                match result {
-                    Ok(rows) => IpcResponse::AgentReflexPreferences { rows },
-                    Err(err) => {
-                        error!("Failed to read reflex preferences: {err}");
-                        IpcResponse::error(
-                            "get_agent_reflex_preferences",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
-            }
+            } => Self::handle_get_agent_reflex_preferences(agent_id, preference_key),
             // ── routing pipeline rule CRUD ───────────────────────────────────
             IpcRequest::UpsertRoutingPipelineRule {
                 agent_id,
                 rule_id,
                 rule_json,
-            } => {
-                use ansible_mesh_core::agent_graph_storage::RoutingPipelineRule;
-                let path = agent_graph_db_path(&agent_id);
-                let result = (|| -> anyhow::Result<()> {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
-                    storage.upsert_pipeline_rule(&RoutingPipelineRule {
-                        agent_id: agent_id.clone(),
-                        rule_id: rule_id.clone(),
-                        rule_json,
-                        updated_at: 0,
-                    })?;
-                    Ok(())
-                })();
-                match result {
-                    Ok(()) => IpcResponse::success(
-                        "routing_pipeline_rule",
-                        Some(serde_json::json!({
-                            "message": format!("Routing pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
-                        })),
-                    ),
-                    Err(err) => {
-                        error!("Failed to store routing pipeline rule: {err}");
-                        IpcResponse::error(
-                            "upsert_routing_pipeline_rule",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
-            }
+            } => Self::handle_upsert_routing_pipeline_rule(agent_id, rule_id, rule_json),
             IpcRequest::RemoveRoutingPipelineRule { agent_id, rule_id } => {
-                let path = agent_graph_db_path(&agent_id);
-                let result = (|| -> anyhow::Result<bool> {
-                    if !path.exists() {
-                        return Ok(false);
-                    }
-                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
-                    storage.remove_pipeline_rule(&rule_id)
-                })();
-                match result {
-                    Ok(deleted) => IpcResponse::success(
-                        "routing_pipeline_rule",
-                        Some(serde_json::json!({
-                            "message": if deleted {
-                                format!("Routing pipeline rule '{rule_id}' removed.")
-                            } else {
-                                format!("Routing pipeline rule '{rule_id}' not found.")
-                            }
-                        })),
-                    ),
-                    Err(err) => {
-                        error!("Failed to remove routing pipeline rule: {err}");
-                        IpcResponse::error(
-                            "remove_routing_pipeline_rule",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
+                Self::handle_remove_routing_pipeline_rule(agent_id, rule_id)
             }
             IpcRequest::GetRoutingPipelineRules { agent_id, rule_id } => {
-                let path = agent_graph_db_path(&agent_id);
-                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
-                    if !path.exists() {
-                        return Ok(vec![]);
-                    }
-                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
-                    let rules = if let Some(id) = rule_id {
-                        storage
-                            .get_pipeline_rule(&id)?
-                            .map(|r| vec![r])
-                            .unwrap_or_default()
-                    } else {
-                        storage.list_pipeline_rules()?
-                    };
-                    Ok(rules
-                        .into_iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "agent_id": r.agent_id,
-                                "rule_id": r.rule_id,
-                                "rule": r.rule_json,
-                                "updated_at": r.updated_at,
-                            })
-                        })
-                        .collect())
-                })();
-                match result {
-                    Ok(pipeline_rules) => IpcResponse::RoutingPipelineRules { pipeline_rules },
-                    Err(err) => {
-                        error!("Failed to read routing pipeline rules: {err}");
-                        IpcResponse::error(
-                            "get_routing_pipeline_rules",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
+                Self::handle_get_routing_pipeline_rules(agent_id, rule_id)
             }
 
             IpcRequest::RecordRoleHandoffReflexEvidence {
@@ -7721,294 +6640,39 @@ impl IpcServer {
                 role_name,
                 legacy_trigger_class,
                 source_turn,
-            } => {
-                use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
-                let path = agent_graph_db_path(&agent_id);
-                let result = (|| -> anyhow::Result<serde_json::Value> {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
-                    let role_record = graph.get_role_incarnation(&agent_id, &role_name)?;
-                    let toolset_profile = role_record
-                        .as_ref()
-                        .map(|role| role.toolset_profile.clone());
-                    let toolset_record = toolset_profile.as_deref().and_then(|profile_name| {
-                        graph.get_toolset_profile(profile_name).ok().flatten()
-                    });
-                    let preference_key = format!("same-self-role-handoff:{role_name}");
-                    let existing = storage.get_reflex_preference(&preference_key)?;
-                    let previous_count = existing
-                        .as_ref()
-                        .and_then(|pref| pref.config_json.get("success_count"))
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    let success_count = previous_count + 1;
-                    let reinforced = success_count >= 2;
-                    let existing_precedence =
-                        existing.as_ref().map(|pref| pref.precedence).unwrap_or(70);
-                    let updated_at = existing.as_ref().map(|pref| pref.updated_at).unwrap_or(0);
-                    let existing_config = existing
-                        .as_ref()
-                        .map(|pref| pref.config_json.clone())
-                        .unwrap_or_default();
-                    let toolset_profile = toolset_profile.or_else(|| {
-                        existing_config
-                            .get("toolset_profile")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-                    let toolset_description = toolset_record
-                        .as_ref()
-                        .and_then(|profile| profile.description.clone())
-                        .or_else(|| {
-                            existing_config
-                                .get("toolset_description")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                        });
-                    let allowed_skills = toolset_record
-                        .as_ref()
-                        .map(|profile| profile.allowed_skills.clone())
-                        .filter(|skills| !skills.is_empty())
-                        .or_else(|| {
-                            existing_config
-                                .get("allowed_skills")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|skills| {
-                                    skills
-                                        .iter()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(str::to_string)
-                                        .collect::<Vec<_>>()
-                                })
-                                .filter(|skills| !skills.is_empty())
-                        })
-                        .unwrap_or_default();
-                    let role_identity_addendum = role_record
-                        .as_ref()
-                        .and_then(|role| role.role_identity_addendum.clone())
-                        .or_else(|| {
-                            existing_config
-                                .get("role_identity_addendum")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                        });
-                    let role_manifest_excerpt = role_record
-                        .as_ref()
-                        .and_then(|role| role.role_manifest.as_deref())
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                        .map(|text| text.chars().take(180).collect::<String>())
-                        .or_else(|| {
-                            existing_config
-                                .get("role_manifest_excerpt")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                        });
-                    let manifest_instructed = role_record
-                        .as_ref()
-                        .and_then(|role| role.role_manifest.as_ref())
-                        .is_some()
-                        || existing_config
-                            .get("manifest_instructed")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                    let manifest_markers = {
-                        let mut sources = Vec::new();
-                        sources.push(role_name.as_str());
-                        if let Some(text) = role_identity_addendum.as_deref() {
-                            sources.push(text);
-                        }
-                        if let Some(text) = role_manifest_excerpt.as_deref() {
-                            sources.push(text);
-                        }
-                        let collected = collect_role_receptor_markers(&sources);
-                        if collected.is_empty() {
-                            existing_config
-                                .get("manifest_markers")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(str::to_string)
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            collected
-                        }
-                    };
-                    let skill_markers = if !allowed_skills.is_empty() {
-                        collect_role_receptor_markers(
-                            &allowed_skills
-                                .iter()
-                                .map(String::as_str)
-                                .collect::<Vec<_>>(),
-                        )
-                    } else {
-                        existing_config
-                            .get("skill_markers")
-                            .and_then(serde_json::Value::as_array)
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .filter_map(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    };
-                    let toolset_markers = {
-                        let mut sources = Vec::new();
-                        if let Some(text) = toolset_profile.as_deref() {
-                            sources.push(text);
-                        }
-                        if let Some(text) = toolset_description.as_deref() {
-                            sources.push(text);
-                        }
-                        let collected = collect_role_receptor_markers(&sources);
-                        if collected.is_empty() {
-                            existing_config
-                                .get("toolset_markers")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(str::to_string)
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            collected
-                        }
-                    };
-
-                    storage.upsert_reflex_preference(&AgentReflexPreference {
-                        agent_id: agent_id.clone(),
-                        preference_key: preference_key.clone(),
-                        precedence: existing_precedence,
-                        reflexes_json: serde_json::json!({
-                            "role_handoff_reflex": {
-                                "target_role": role_name,
-                                "trigger_class": legacy_trigger_class,
-                                "source": "successful_same_self_handoff",
-                                "tool_name": "handoff.to_role",
-                            }
-                        }),
-                        config_json: serde_json::json!({
-                            "reason": format!("remembered successful same-self handoff to role '{role_name}'"),
-                            "role_name": role_name,
-                            "trigger_class": legacy_trigger_class,
-                            "source_tool": "handoff.to_role",
-                            "source_turn": source_turn,
-                            "toolset_profile": toolset_profile,
-                            "toolset_description": toolset_description,
-                            "allowed_skills": allowed_skills,
-                            "role_identity_addendum": role_identity_addendum,
-                            "role_manifest_excerpt": role_manifest_excerpt,
-                            "manifest_markers": manifest_markers,
-                            "skill_markers": skill_markers,
-                            "toolset_markers": toolset_markers,
-                            "workflow_skill": "handoff.to_role",
-                            "manifest_instructed": manifest_instructed,
-                            "success_count": success_count,
-                            "habit_state": if reinforced { "reinforced" } else { "candidate" },
-                        }),
-                        updated_at,
-                    })?;
-                    Ok(serde_json::json!({
-                        "preference_key": preference_key,
-                        "success_count": success_count,
-                        "habit_state": if reinforced { "reinforced" } else { "candidate" },
-                    }))
-                })();
-                match result {
-                    Ok(payload) => {
-                        IpcResponse::success("role_handoff_reflex_evidence", Some(payload))
-                    }
-                    Err(err) => {
-                        error!("Failed to record role handoff reflex evidence: {err}");
-                        IpcResponse::error(
-                            "record_role_handoff_reflex_evidence",
-                            "STORAGE_ERROR",
-                            err.to_string(),
-                        )
-                    }
-                }
-            }
+            } => Self::handle_record_role_handoff_reflex_evidence(
+                agent_id,
+                role_name,
+                legacy_trigger_class,
+                source_turn,
+                graph,
+            ),
             IpcRequest::AppendRoutingPolicyEvaluation {
                 proposal_id,
                 evaluation_kind,
                 decision,
                 reason,
                 source_tool,
-            } => match graph.append_routing_policy_evaluation(
-                &proposal_id,
-                ansible_mesh_core::graph::RoutingPolicyEvaluationRecord {
-                    evaluation_kind,
-                    decision,
-                    reason,
-                    created_at: unix_ts(),
-                    source_tool,
-                },
-            ) {
-                Ok(true) => IpcResponse::success(
-                    "routing_policy_evaluation",
-                    Some(serde_json::json!({
-                        "proposal_id": proposal_id,
-                    })),
-                ),
-                Ok(false) => IpcResponse::error(
-                    "routing_policy_evaluation",
-                    "NOT_FOUND",
-                    format!("unknown routing policy proposal '{}'", proposal_id),
-                ),
-                Err(err) => {
-                    error!("Failed to append routing policy evaluation: {err}");
-                    IpcResponse::error(
-                        "routing_policy_evaluation",
-                        "STORAGE_ERROR",
-                        err.to_string(),
-                    )
-                }
-            },
+            } => Self::handle_append_routing_policy_evaluation(
+                proposal_id,
+                evaluation_kind,
+                decision,
+                reason,
+                source_tool,
+                graph,
+            ),
             IpcRequest::SetRoutingPolicyDisposition {
                 proposal_id,
                 state,
                 reason,
                 source_tool,
-            } => match graph.set_routing_policy_disposition(
-                &proposal_id,
-                state.clone(),
-                reason.clone(),
-                unix_ts(),
+            } => Self::handle_set_routing_policy_disposition(
+                proposal_id,
+                state,
+                reason,
                 source_tool,
-            ) {
-                Ok(true) => IpcResponse::success(
-                    "routing_policy_disposition",
-                    Some(serde_json::json!({
-                        "proposal_id": proposal_id,
-                        "state": state,
-                        "reason": reason,
-                    })),
-                ),
-                Ok(false) => IpcResponse::error(
-                    "routing_policy_disposition",
-                    "NOT_FOUND",
-                    format!("unknown routing policy proposal '{}'", proposal_id),
-                ),
-                Err(err) => {
-                    error!("Failed to set routing policy disposition: {err}");
-                    IpcResponse::error(
-                        "routing_policy_disposition",
-                        "STORAGE_ERROR",
-                        err.to_string(),
-                    )
-                }
-            },
+                graph,
+            ),
             // Resource broker seam (agent-resource-broker). The registry records
             // grants/denials and answers routing-table queries; it does NOT
             // materialize or tear down guests this slice (that stays with the
@@ -8051,24 +6715,7 @@ impl IpcServer {
             IpcRequest::RegisterComponent { manifest } => {
                 Self::handle_register_component(graph, materialization_requester, manifest).await
             }
-            IpcRequest::ListGraphInstances {} => match graph.get_graph_runner_registry() {
-                Ok(records) => {
-                    let instances: Vec<serde_json::Value> = records
-                        .into_iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "graph_id": r.graph_id,
-                                "instance_id": r.instance_id,
-                                "registered_at": r.registered_at,
-                            })
-                        })
-                        .collect();
-                    IpcResponse::GraphInstanceList { instances }
-                }
-                Err(e) => {
-                    IpcResponse::error("list_graph_instances", "STORAGE_ERROR", e.to_string())
-                }
-            },
+            IpcRequest::ListGraphInstances {} => Self::handle_list_graph_instances(graph),
             IpcRequest::ListComponents {} => Self::handle_list_components(graph, local_node_id),
             IpcRequest::SetComponentActive { guest_id, active } => {
                 Self::handle_set_component_active(
@@ -8599,45 +7246,7 @@ impl IpcServer {
             IpcRequest::GetHotelLogs { lines } => Self::handle_get_hotel_logs(lines),
 
             IpcRequest::GetRouterStats { window_secs } => {
-                use ansible_mesh_core::router_trace::{
-                    RouterTraceStorage, SqliteRouterTraceStorage,
-                };
-                use std::time::{SystemTime, UNIX_EPOCH};
-
-                let trace_db_path = {
-                    let profile = std::env::var("PHILOTIC_PROFILE")
-                        .ok()
-                        .filter(|s| !s.is_empty());
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    match profile {
-                        Some(p) => format!("{home}/.philotic/{p}/router_traces.db"),
-                        None => format!("{home}/.philotic/router_traces.db"),
-                    }
-                };
-
-                let generated_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                match SqliteRouterTraceStorage::open(&trace_db_path) {
-                    Ok(store) => match store.provider_stats(window_secs) {
-                        Ok(stats) => IpcResponse::RouterStats {
-                            stats,
-                            generated_at,
-                        },
-                        Err(e) => IpcResponse::error(
-                            "router_stats",
-                            "STATS_QUERY_FAILED",
-                            &format!("failed to compute router stats: {e}"),
-                        ),
-                    },
-                    Err(e) => IpcResponse::error(
-                        "router_stats",
-                        "TRACE_DB_UNAVAILABLE",
-                        &format!("router trace DB not available at {trace_db_path}: {e}"),
-                    ),
-                }
+                Self::handle_get_router_stats(window_secs)
             }
 
             // ── MCP membrane lease ─────────────────────────────────────────
@@ -9458,199 +8067,29 @@ impl IpcServer {
 
             // ── Governed outbound integration registry ───────────────────────
             IpcRequest::RegisterIntegrationBinding { binding } => {
-                use ansible_mesh_core::integration::{IntegrationBinding, IntegrationTarget};
-
-                let binding_id = binding.binding_id.clone();
-                if !Self::mcp_owner_identity_ok(current_identity, &binding.owner_agent_id) {
-                    return IpcResponse::error(
-                        "integration_binding",
-                        "FORBIDDEN",
-                        format!(
-                            "owner_agent_id '{}' does not match the registered guest identity",
-                            binding.owner_agent_id
-                        ),
-                    );
-                }
-                if let Err(message) = binding.validate() {
-                    return IpcResponse::error("integration_binding", "INVALID_BINDING", message);
-                }
-                if let IntegrationTarget::Mcp { upstream_id } = &binding.target {
-                    let upstreams: std::collections::HashMap<
-                        String,
-                        ansible_mesh_core::mcp_upstream::McpUpstreamConfig,
-                    > = graph
-                        .get_config_value("__mcp_upstreams__")
-                        .ok()
-                        .flatten()
-                        .and_then(|value| serde_json::from_str(&value).ok())
-                        .unwrap_or_default();
-                    if !upstreams.contains_key(upstream_id) {
-                        return IpcResponse::error(
-                            "integration_binding",
-                            "MCP_UPSTREAM_NOT_FOUND",
-                            format!("no MCP upstream is registered as '{upstream_id}'"),
-                        );
-                    }
-                }
-
-                let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
-                    .get_config_value("__integration_bindings__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                if let Some(existing) = bindings.get(&binding_id) {
-                    if existing.owner_agent_id != binding.owner_agent_id {
-                        return IpcResponse::error(
-                            "integration_binding",
-                            "FORBIDDEN",
-                            format!(
-                                "binding '{binding_id}' is owned by '{}'",
-                                existing.owner_agent_id
-                            ),
-                        );
-                    }
-                    if binding.updated_at < existing.updated_at {
-                        return IpcResponse::error(
-                            "integration_binding",
-                            "STALE_UPDATE",
-                            format!(
-                                "binding update timestamp {} predates current {}",
-                                binding.updated_at, existing.updated_at
-                            ),
-                        );
-                    }
-                }
-                bindings.insert(binding_id.clone(), binding.clone());
-                let serialized = match serde_json::to_string(&bindings) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return IpcResponse::error(
-                            "integration_binding",
-                            "SERIALIZE_ERROR",
-                            error.to_string(),
-                        );
-                    }
-                };
-                if let Err(error) = graph.set_config_value("__integration_bindings__", &serialized)
-                {
-                    return IpcResponse::error(
-                        "integration_binding",
-                        "CONFIG_STORE_ERROR",
-                        error.to_string(),
-                    );
-                }
-
-                let entry =
-                    Self::integration_binding_entry(binding, registry, graph, local_node_id).await;
-                let materialized_node_id = if matches!(
-                    entry.binding.target,
-                    IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
-                ) && !matches!(
-                    entry.placement,
-                    ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
-                ) {
-                    Self::materialize_integration_runner(
-                        &entry,
-                        registry,
-                        graph,
-                        materialization_requester,
-                        local_node_id,
-                    )
-                    .await
-                } else {
-                    None
-                };
-                info!(
-                    binding_id,
-                    execution_node_id = ?entry.execution_node_id,
-                    materialized_node_id = ?materialized_node_id,
-                    "outbound integration binding registered"
-                );
-                IpcResponse::IntegrationBindingRegistered {
-                    binding_id,
-                    materialized_node_id,
-                }
+                Self::handle_register_integration_binding(
+                    binding,
+                    local_node_id,
+                    graph,
+                    materialization_requester,
+                    registry,
+                    current_identity,
+                )
+                .await
             }
 
             IpcRequest::RevokeIntegrationBinding {
                 binding_id,
                 owner_agent_id,
-            } => {
-                use ansible_mesh_core::integration::IntegrationBinding;
-                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
-                    return IpcResponse::error(
-                        "integration_binding",
-                        "FORBIDDEN",
-                        format!(
-                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
-                        ),
-                    );
-                }
-                let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
-                    .get_config_value("__integration_bindings__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                match bindings.get(&binding_id) {
-                    Some(binding) if binding.owner_agent_id == owner_agent_id => {}
-                    Some(binding) => {
-                        return IpcResponse::error(
-                            "integration_binding",
-                            "FORBIDDEN",
-                            format!(
-                                "binding '{binding_id}' is owned by '{}'",
-                                binding.owner_agent_id
-                            ),
-                        );
-                    }
-                    None => {
-                        return IpcResponse::error(
-                            "integration_binding",
-                            "NOT_FOUND",
-                            format!("no integration binding is registered as '{binding_id}'"),
-                        );
-                    }
-                }
-                bindings.remove(&binding_id);
-                if let Err(error) = graph.set_config_value(
-                    "__integration_bindings__",
-                    &serde_json::to_string(&bindings).unwrap_or_else(|_| "{}".into()),
-                ) {
-                    return IpcResponse::error(
-                        "integration_binding",
-                        "CONFIG_STORE_ERROR",
-                        error.to_string(),
-                    );
-                }
-                info!(binding_id, "outbound integration binding revoked");
-                IpcResponse::IntegrationBindingRegistered {
-                    binding_id,
-                    materialized_node_id: None,
-                }
-            }
+            } => Self::handle_revoke_integration_binding(
+                binding_id,
+                owner_agent_id,
+                graph,
+                current_identity,
+            ),
 
             IpcRequest::GetIntegrationBindings {} => {
-                use ansible_mesh_core::integration::IntegrationBinding;
-                let bindings: std::collections::HashMap<String, IntegrationBinding> = graph
-                    .get_config_value("__integration_bindings__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                let mut entries = Vec::with_capacity(bindings.len());
-                for binding in bindings.into_values() {
-                    entries.push(
-                        Self::integration_binding_entry(binding, registry, graph, local_node_id)
-                            .await,
-                    );
-                }
-                entries
-                    .sort_by(|left, right| left.binding.binding_id.cmp(&right.binding.binding_id));
-                IpcResponse::IntegrationBindingsState {
-                    integration_bindings: entries,
-                }
+                Self::handle_get_integration_bindings(local_node_id, graph, registry).await
             }
 
             IpcRequest::ExchangeOperatorOidc {
@@ -9659,131 +8098,25 @@ impl IpcServer {
                 code_verifier,
                 redirect_uri,
             } => {
-                let authorized = current_identity.as_ref().is_some_and(|identity| {
-                    identity.role == "management" && identity.guest_id == "philotic-web-oidc"
-                });
-                if !authorized {
-                    return IpcResponse::error(
-                        "operator_oidc",
-                        "FORBIDDEN",
-                        "operator OIDC exchange requires the philotic-web-oidc management identity",
-                    );
-                }
-                match Self::exchange_operator_oidc(
-                    socket_path,
-                    local_node_id,
-                    graph,
-                    &provider,
+                Self::handle_exchange_operator_oidc(
+                    provider,
                     authorization_code,
                     code_verifier,
                     redirect_uri,
+                    local_node_id,
+                    socket_path,
+                    graph,
+                    current_identity,
                 )
                 .await
-                {
-                    Ok(response) => IpcResponse::success(
-                        "operator_oidc",
-                        Some(
-                            serde_json::to_value(response)
-                                .unwrap_or_else(|_| serde_json::json!({})),
-                        ),
-                    ),
-                    Err(error) => {
-                        error!(provider, %error, "governed operator OIDC exchange failed");
-                        IpcResponse::error(
-                            "operator_oidc",
-                            "OIDC_EXCHANGE_FAILED",
-                            error.to_string(),
-                        )
-                    }
-                }
             }
 
             IpcRequest::RecordIntegrationAudit { audit } => {
-                let authorized = current_identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.role == "egress-http-runner");
-                if !authorized {
-                    return IpcResponse::error(
-                        "integration_audit",
-                        "FORBIDDEN",
-                        "only the egress-http-runner role may append integration audits",
-                    );
-                }
-                if audit.finished_at_ms < audit.started_at_ms
-                    || audit.binding_id.is_empty()
-                    || audit.tool_name.is_empty()
-                    || audit.agent_id.is_empty()
-                    || audit.caller_role.is_empty()
-                    || audit.session_id.is_empty()
-                    || audit.turn_id.is_empty()
-                    || audit.correlation_id.is_empty()
-                    || audit.executor_node_id.is_empty()
-                    || (audit.outcome == "failed" && audit.failure_code.is_none())
-                {
-                    return IpcResponse::error(
-                        "integration_audit",
-                        "INVALID_AUDIT",
-                        "audit identity and time range are invalid",
-                    );
-                }
-                let mut audits: Vec<ansible_mesh_core::integration::HttpIntegrationAudit> = graph
-                    .get_config_value("__integration_audits__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                audits.push(audit);
-                if audits.len() > 2_000 {
-                    let remove = audits.len() - 2_000;
-                    audits.drain(..remove);
-                }
-                match serde_json::to_string(&audits)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|value| graph.set_config_value("__integration_audits__", &value))
-                {
-                    Ok(()) => IpcResponse::success("integration_audit", None),
-                    Err(error) => IpcResponse::error(
-                        "integration_audit",
-                        "CONFIG_STORE_ERROR",
-                        error.to_string(),
-                    ),
-                }
+                Self::handle_record_integration_audit(audit, graph, current_identity)
             }
 
             IpcRequest::GetIntegrationAudit { binding_id, limit } => {
-                let authorized = current_identity.as_ref().is_none_or(|identity| {
-                    matches!(
-                        identity.role.as_str(),
-                        "operator" | "admin" | "management" | "desktop-membrane"
-                    )
-                });
-                if !authorized {
-                    return IpcResponse::error(
-                        "integration_audit",
-                        "FORBIDDEN",
-                        "integration audit reads require an operator identity",
-                    );
-                }
-                let audits: Vec<ansible_mesh_core::integration::HttpIntegrationAudit> = graph
-                    .get_config_value("__integration_audits__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                let mut selected: Vec<_> = audits
-                    .into_iter()
-                    .rev()
-                    .filter(|audit| {
-                        binding_id
-                            .as_ref()
-                            .is_none_or(|binding_id| audit.binding_id == *binding_id)
-                    })
-                    .take(limit.unwrap_or(100).clamp(1, 500) as usize)
-                    .collect();
-                selected.sort_by(|left, right| right.finished_at_ms.cmp(&left.finished_at_ms));
-                IpcResponse::IntegrationAuditState {
-                    integration_audits: selected,
-                }
+                Self::handle_get_integration_audit(binding_id, limit, graph, current_identity)
             }
 
             IpcRequest::ProvisionIntegrationCredential {
@@ -9791,637 +8124,54 @@ impl IpcServer {
                 owner_agent_id,
                 credential,
             } => {
-                use ansible_mesh_core::integration::{IntegrationBinding, IntegrationTarget};
-                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
-                    return IpcResponse::error(
-                        "integration_credential",
-                        "FORBIDDEN",
-                        format!(
-                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
-                        ),
-                    );
-                }
-                if credential.trim().is_empty() {
-                    return IpcResponse::error(
-                        "integration_credential",
-                        "EMPTY_CREDENTIAL",
-                        "credential must be non-empty",
-                    );
-                }
-                let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
-                    .get_config_value("__integration_bindings__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                let Some(snapshot) = bindings.get(&binding_id).cloned() else {
-                    return IpcResponse::error(
-                        "integration_credential",
-                        "NOT_FOUND",
-                        format!("no integration binding is registered as '{binding_id}'"),
-                    );
-                };
-                if snapshot.owner_agent_id != owner_agent_id {
-                    return IpcResponse::error(
-                        "integration_credential",
-                        "FORBIDDEN",
-                        format!("binding '{binding_id}' is not owned by '{owner_agent_id}'"),
-                    );
-                }
-                let entry = Self::integration_binding_entry(
-                    snapshot.clone(),
-                    registry,
-                    graph,
-                    local_node_id,
-                )
-                .await;
-                let Some(execution_node_id) = entry.execution_node_id.clone() else {
-                    return IpcResponse::error(
-                        "integration_credential",
-                        "PLACEMENT_DENIED",
-                        match entry.placement {
-                            ansible_mesh_core::integration::EgressPlacementDecision::Deny {
-                                reason,
-                            } => reason,
-                            _ => "binding has no executable placement".into(),
-                        },
-                    );
-                };
-                let existing_ref = match &snapshot.target {
-                    IntegrationTarget::Http(target) => target
-                        .credential
-                        .as_ref()
-                        .map(|binding| binding.secret_ref.clone()),
-                    IntegrationTarget::Oidc(target) => target.client_secret_ref.clone(),
-                    IntegrationTarget::Mcp { .. } => {
-                        return IpcResponse::error(
-                            "integration_credential",
-                            "USE_MCP_CREDENTIAL_SURFACE",
-                            "MCP bindings use ProvisionMcpUpstreamCredential",
-                        );
-                    }
-                };
-
-                let (vault_ref, rotated) = if execution_node_id == local_node_id {
-                    match existing_ref {
-                        Some(secret_ref)
-                            if graph.get_secret(&secret_ref).ok().flatten().is_some() =>
-                        {
-                            if let Err(error) =
-                                crate::vault::rotate_secret(graph, &secret_ref, &credential)
-                            {
-                                return IpcResponse::error(
-                                    "integration_credential",
-                                    "VAULT_ERROR",
-                                    error.to_string(),
-                                );
-                            }
-                            (secret_ref, true)
-                        }
-                        _ => match store_secret(
-                            graph,
-                            SecretInput {
-                                secret_kind: "integration_http_credential".into(),
-                                scope: "hotel".into(),
-                                allowed_roles: vec!["egress-http-runner".into()],
-                                allowed_guests: Vec::new(),
-                                plaintext: credential,
-                            },
-                        ) {
-                            Ok(secret_ref) => (secret_ref, false),
-                            Err(error) => {
-                                return IpcResponse::error(
-                                    "integration_credential",
-                                    "VAULT_ERROR",
-                                    error.to_string(),
-                                );
-                            }
-                        },
-                    }
-                } else {
-                    let request = match existing_ref {
-                        Some(secret_ref) if !secret_ref.starts_with("pending:") => {
-                            IpcRequest::RotateOperatorTargetSecret {
-                                target_node_id: execution_node_id.clone(),
-                                secret_ref,
-                                plaintext: credential,
-                            }
-                        }
-                        _ => IpcRequest::AddOperatorTargetVaultEntry {
-                            target_node_id: execution_node_id.clone(),
-                            vault_name: format!("integration/{binding_id}"),
-                            plaintext: credential,
-                            allowed_roles: vec!["egress-http-runner".into()],
-                        },
-                    };
-                    let response = Self::handle_operator_target_request(
-                        request,
-                        registry,
-                        graph,
-                        materialization_requester,
-                        local_node_id,
-                    )
-                    .await;
-                    match response {
-                        IpcResponse::OperatorTargetSecretMutationAckView {
-                            operator_target_secret_mutation,
-                        } if operator_target_secret_mutation.ok => {
-                            let Some(secret_ref) = operator_target_secret_mutation.secret_ref
-                            else {
-                                return IpcResponse::error(
-                                    "integration_credential",
-                                    "REMOTE_VAULT_ERROR",
-                                    "remote vault mutation returned no secret_ref",
-                                );
-                            };
-                            (
-                                secret_ref,
-                                operator_target_secret_mutation.operation == "rotate",
-                            )
-                        }
-                        other => {
-                            return IpcResponse::error(
-                                "integration_credential",
-                                "REMOTE_VAULT_ERROR",
-                                format!("remote vault mutation failed: {other:?}"),
-                            );
-                        }
-                    }
-                };
-
-                let binding = bindings
-                    .get_mut(&binding_id)
-                    .expect("binding snapshot came from this registry");
-                match &mut binding.target {
-                    IntegrationTarget::Http(target) => match &mut target.credential {
-                        Some(credential_binding) => {
-                            credential_binding.secret_ref = vault_ref.clone()
-                        }
-                        None => {
-                            return IpcResponse::error(
-                                "integration_credential",
-                                "MISSING_CREDENTIAL_INJECTION",
-                                "binding must declare credential header and format before provisioning",
-                            );
-                        }
-                    },
-                    IntegrationTarget::Oidc(target) => {
-                        target.client_secret_ref = Some(vault_ref.clone());
-                    }
-                    IntegrationTarget::Mcp { .. } => unreachable!("MCP target returned above"),
-                }
-                binding.updated_at = unix_ts();
-                if let Err(error) = graph.set_config_value(
-                    "__integration_bindings__",
-                    &serde_json::to_string(&bindings).unwrap_or_else(|_| "{}".into()),
-                ) {
-                    return IpcResponse::error(
-                        "integration_credential",
-                        "CONFIG_STORE_ERROR",
-                        error.to_string(),
-                    );
-                }
-                info!(
+                Self::handle_provision_integration_credential(
                     binding_id,
-                    execution_node_id,
-                    rotated,
-                    "integration credential provisioned at execution hotel"
-                );
-                IpcResponse::success(
-                    "integration_credential",
-                    Some(serde_json::json!({
-                        "binding_id": binding_id,
-                        "vault_ref": vault_ref,
-                        "execution_node_id": execution_node_id,
-                        "rotated": rotated,
-                    })),
+                    owner_agent_id,
+                    credential,
+                    local_node_id,
+                    graph,
+                    materialization_requester,
+                    registry,
+                    current_identity,
                 )
+                .await
             }
 
             // ── MCP upstream (client fabric) registry ─────────────────────────
             IpcRequest::RegisterMcpUpstream { config } => {
-                use ansible_mesh_core::mcp_upstream::{
-                    McpEgressPolicy, McpUpstreamConfig, McpUpstreamTransport, host_from_http_url,
-                };
-                let upstream_id = config.upstream_id.clone();
-
-                // Owner claim must match the registered guest identity on this
-                // connection (hardening S4 pattern).
-                if !Self::mcp_owner_identity_ok(current_identity, &config.owner_agent_id) {
-                    return IpcResponse::error(
-                        "mcp_upstream",
-                        "FORBIDDEN",
-                        format!(
-                            "owner_agent_id '{}' does not match the registered guest identity",
-                            config.owner_agent_id
-                        ),
-                    );
-                }
-
-                // Transport fence, by kind:
-                // - HTTP: egress policy on the target host (loopback + tailnet
-                //   by default; operator widens via `mcp_egress_policy`).
-                // - Stdio: fail-closed command allowlist (operator widens via
-                //   `mcp_stdio_allowlist` / `phil mcp allow-command`). The
-                //   guest additionally spawns the child with a scrubbed env.
-                match &config.transport {
-                    McpUpstreamTransport::Stdio { command, args } => {
-                        use ansible_mesh_core::mcp_upstream::McpStdioAllowlist;
-                        let allowlist: McpStdioAllowlist = graph
-                            .get_config_value("mcp_stdio_allowlist")
-                            .ok()
-                            .flatten()
-                            .and_then(|j| serde_json::from_str(&j).ok())
-                            .unwrap_or_default();
-                        if !allowlist.command_allowed(command, args) {
-                            return IpcResponse::error(
-                                "mcp_upstream",
-                                "STDIO_NOT_ALLOWED",
-                                format!(
-                                    "stdio command '{command}' (args {args:?}) is not on the \
-                                     operator allowlist; an operator must add it via \
-                                     `phil mcp allow-command` (config node mcp_stdio_allowlist)"
-                                ),
-                            );
-                        }
-                    }
-                    McpUpstreamTransport::Http { url } => {
-                        let url = url.clone();
-                        // Egress fence: the target host must be loopback,
-                        // tailnet, or explicitly allowlisted.
-                        let policy: McpEgressPolicy = graph
-                            .get_config_value("mcp_egress_policy")
-                            .ok()
-                            .flatten()
-                            .and_then(|j| serde_json::from_str(&j).ok())
-                            .unwrap_or_default();
-                        match host_from_http_url(&url) {
-                            Some(host) if policy.host_allowed(&host) => {}
-                            Some(host) => {
-                                return IpcResponse::error(
-                                    "mcp_upstream",
-                                    "EGRESS_DENIED",
-                                    format!(
-                                        "host '{host}' is outside the egress policy (loopback + \
-                                         tailnet by default); an operator must add it to the \
-                                         mcp_egress_policy config node"
-                                    ),
-                                );
-                            }
-                            None => {
-                                return IpcResponse::error(
-                                    "mcp_upstream",
-                                    "INVALID_URL",
-                                    format!("'{url}' is not a valid http(s) URL"),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Ownership: an existing registration may only be updated by
-                // its owner.
-                let mut upstream_registry: std::collections::HashMap<String, McpUpstreamConfig> =
-                    graph
-                        .get_config_value("__mcp_upstreams__")
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default();
-                if let Some(existing) = upstream_registry.get(&upstream_id) {
-                    if existing.owner_agent_id != config.owner_agent_id {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "FORBIDDEN",
-                            format!(
-                                "upstream {upstream_id} is owned by {}",
-                                existing.owner_agent_id
-                            ),
-                        );
-                    }
-                }
-                upstream_registry.insert(upstream_id.clone(), config.clone());
-                match serde_json::to_string(&upstream_registry) {
-                    Ok(json) => {
-                        if let Err(e) = graph.set_config_value("__mcp_upstreams__", &json) {
-                            return IpcResponse::error(
-                                "mcp_upstream",
-                                "CONFIG_STORE_ERROR",
-                                e.to_string(),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "SERIALIZE_ERROR",
-                            e.to_string(),
-                        );
-                    }
-                }
-
-                // Mirror MCP HTTP transport into the canonical integration
-                // registry. The mcp-client keeps protocol/session ownership;
-                // this binding only selects and materializes the hotel that
-                // performs its network I/O through egress-http-runner.
-                if matches!(config.transport, McpUpstreamTransport::Http { .. }) {
-                    use ansible_mesh_core::integration::{
-                        EgressTrafficClass, IntegrationBinding, IntegrationTarget,
-                    };
-                    let binding = IntegrationBinding {
-                        binding_id: format!("mcp:{upstream_id}"),
-                        owner_agent_id: config.owner_agent_id.clone(),
-                        display_name: Some(format!("MCP upstream {upstream_id}")),
-                        target: IntegrationTarget::Mcp {
-                            upstream_id: upstream_id.clone(),
-                        },
-                        grant_agents: config.grant_agents.clone(),
-                        grant_skills: vec![],
-                        traffic_class: EgressTrafficClass::Mcp,
-                        placement: config.placement.clone(),
-                        requires_approval: true,
-                        enabled: true,
-                        updated_at: config.updated_at,
-                    };
-                    let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
-                        .get_config_value("__integration_bindings__")
-                        .ok()
-                        .flatten()
-                        .and_then(|value| serde_json::from_str(&value).ok())
-                        .unwrap_or_default();
-                    bindings.insert(binding.binding_id.clone(), binding.clone());
-                    if let Ok(serialized) = serde_json::to_string(&bindings) {
-                        if let Err(error) =
-                            graph.set_config_value("__integration_bindings__", &serialized)
-                        {
-                            warn!(
-                                upstream_id,
-                                %error,
-                                "failed to persist MCP transport integration binding"
-                            );
-                        }
-                    }
-                    let entry =
-                        Self::integration_binding_entry(binding, registry, graph, local_node_id)
-                            .await;
-                    let _ = Self::materialize_integration_runner(
-                        &entry,
-                        registry,
-                        graph,
-                        materialization_requester,
-                        local_node_id,
-                    )
-                    .await;
-                }
-
-                // Fan out the config to the mcp-client guest inbox.
-                let task_json = serde_json::json!({
-                    "action": "update_mcp_upstream",
-                    "config": config,
-                })
-                .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
+                Self::handle_register_mcp_upstream(
+                    config,
                     local_node_id,
-                    "mcp-client-runner",
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    registry,
+                    current_identity,
                 )
-                .await;
-
-                // Materialize the single mcp-client guest on first use.
-                let materialized = if let Some(hotel_name) =
-                    Self::local_hotel_name(graph, local_node_id)
-                {
-                    let socket_path = graph
-                        .list_hotels()
-                        .ok()
-                        .and_then(|hs| {
-                            hs.into_iter()
-                                .find(|h| h.capabilities.node_id == local_node_id)
-                                .map(|h| h.ipc_socket_path)
-                        })
-                        .unwrap_or_default();
-                    let client_config = serde_json::json!({
-                        "command": "membrane-mcp-client",
-                        "args": [],
-                        "env": {
-                            "PHILOTIC_HOTEL_SOCKET": socket_path,
-                            "PHILOTIC_GUEST_ID": "mcp-client",
-                            "PHILOTIC_NODE_ID": local_node_id,
-                        }
-                    });
-                    let record = ansible_mesh_core::storage::GuestRecord {
-                        hotel_name: hotel_name.clone(),
-                        guest_id: "mcp-client".into(),
-                        role: "mcp-client-runner".into(),
-                        config_json: client_config.to_string(),
-                        is_active: true,
-                        active_pid: None,
-                        last_active_at: None,
-                    };
-                    match graph.upsert_guest(&record) {
-                        Err(e) => {
-                            warn!("RegisterMcpUpstream: failed to upsert mcp-client guest: {e}");
-                            false
-                        }
-                        Ok(()) => {
-                            if let Some(requester) = materialization_requester {
-                                match requester.ensure_guest_active("mcp-client").await {
-                                    Ok(spawned) => spawned,
-                                    Err(e) => {
-                                        warn!("mcp-client guest materialization error: {e}");
-                                        false
-                                    }
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                    }
-                } else {
-                    warn!(
-                        "RegisterMcpUpstream: hotel name not found for node [{}]; skipping guest spawn.",
-                        local_node_id
-                    );
-                    false
-                };
-
-                info!(upstream_id, "MCP upstream registered and fanned out.");
-                IpcResponse::McpUpstreamRegistered {
-                    mcp_upstream_id: upstream_id,
-                    mcp_upstream_materialized: materialized,
-                }
+                .await
             }
 
             IpcRequest::RevokeMcpUpstream {
                 upstream_id,
                 owner_agent_id,
             } => {
-                use ansible_mesh_core::mcp_upstream::McpUpstreamConfig;
-                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
-                    return IpcResponse::error(
-                        "mcp_upstream",
-                        "FORBIDDEN",
-                        format!(
-                            "owner_agent_id '{owner_agent_id}' does not match the registered \
-                             guest identity"
-                        ),
-                    );
-                }
-                let mut upstreams: std::collections::HashMap<String, McpUpstreamConfig> = graph
-                    .get_config_value("__mcp_upstreams__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                match upstreams.get(&upstream_id) {
-                    Some(existing) if existing.owner_agent_id != owner_agent_id => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "FORBIDDEN",
-                            format!("upstream {upstream_id} is not owned by {owner_agent_id}"),
-                        );
-                    }
-                    None => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "NOT_FOUND",
-                            format!("no upstream registered as {upstream_id}"),
-                        );
-                    }
-                    Some(_) => {}
-                }
-                upstreams.remove(&upstream_id);
-                if let Ok(json) = serde_json::to_string(&upstreams) {
-                    let _ = graph.set_config_value("__mcp_upstreams__", &json);
-                }
-                let mut integration_bindings: std::collections::HashMap<
-                    String,
-                    ansible_mesh_core::integration::IntegrationBinding,
-                > = graph
-                    .get_config_value("__integration_bindings__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                integration_bindings.remove(&format!("mcp:{upstream_id}"));
-                if let Ok(json) = serde_json::to_string(&integration_bindings) {
-                    let _ = graph.set_config_value("__integration_bindings__", &json);
-                }
-                // Drop the stored catalog too.
-                let mut catalogs: std::collections::HashMap<String, serde_json::Value> = graph
-                    .get_config_value("__mcp_upstream_catalogs__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                catalogs.remove(&upstream_id);
-                if let Ok(json) = serde_json::to_string(&catalogs) {
-                    let _ = graph.set_config_value("__mcp_upstream_catalogs__", &json);
-                }
-
-                let task_json = serde_json::json!({
-                    "action": "revoke_mcp_upstream",
-                    "upstream_id": upstream_id,
-                })
-                .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
+                Self::handle_revoke_mcp_upstream(
+                    upstream_id,
+                    owner_agent_id,
                     local_node_id,
-                    "mcp-client-runner",
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
+                    graph,
+                    inboxes,
+                    current_identity,
                 )
-                .await;
-
-                info!(upstream_id, "MCP upstream revoked.");
-                IpcResponse::McpUpstreamRegistered {
-                    mcp_upstream_id: upstream_id,
-                    mcp_upstream_materialized: false,
-                }
+                .await
             }
 
-            IpcRequest::GetToolCatalog {} => match graph.list_abstract_tools() {
-                Ok(tool_catalog) => IpcResponse::ToolCatalogState { tool_catalog },
-                Err(err) => IpcResponse::Standard {
-                    ok: false,
-                    code: "tool_catalog_read_failed".into(),
-                    message: format!("tool catalog read failed: {err}"),
-                    corr_id: String::new(),
-                    data: None,
-                },
-            },
+            IpcRequest::GetToolCatalog {} => Self::handle_get_tool_catalog(graph),
 
-            IpcRequest::GetMcpUpstreams {} => {
-                use ansible_mesh_core::mcp_upstream::{McpUpstreamCatalog, McpUpstreamConfig};
-                let registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
-                    .get_config_value("__mcp_upstreams__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                let mut catalogs: std::collections::HashMap<String, McpUpstreamCatalog> = graph
-                    .get_config_value("__mcp_upstream_catalogs__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                let mut entries: Vec<philotic_client::McpUpstreamEntry> = registry
-                    .into_values()
-                    .map(|config| {
-                        let catalog = catalogs.remove(&config.upstream_id);
-                        philotic_client::McpUpstreamEntry { config, catalog }
-                    })
-                    .collect();
-                entries.sort_by(|a, b| a.config.upstream_id.cmp(&b.config.upstream_id));
-                IpcResponse::McpUpstreamsState {
-                    mcp_upstreams: entries,
-                }
-            }
+            IpcRequest::GetMcpUpstreams {} => Self::handle_get_mcp_upstreams(graph),
 
             IpcRequest::ReportMcpUpstreamCatalog { catalog } => {
-                let upstream_id = catalog.upstream_id.clone();
-                let mut catalogs: std::collections::HashMap<String, serde_json::Value> = graph
-                    .get_config_value("__mcp_upstream_catalogs__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                match serde_json::to_value(&catalog) {
-                    Ok(v) => {
-                        catalogs.insert(upstream_id.clone(), v);
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "SERIALIZE_ERROR",
-                            e.to_string(),
-                        );
-                    }
-                }
-                if let Err(e) = graph.set_config_value("__mcp_upstream_catalogs__", &{
-                    match serde_json::to_string(&catalogs) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            return IpcResponse::error(
-                                "mcp_upstream",
-                                "SERIALIZE_ERROR",
-                                e.to_string(),
-                            );
-                        }
-                    }
-                }) {
-                    return IpcResponse::error("mcp_upstream", "CONFIG_STORE_ERROR", e.to_string());
-                }
-                info!(
-                    upstream_id,
-                    tool_count = catalog.tools.len(),
-                    "MCP upstream catalog reported."
-                );
-                IpcResponse::success("mcp_upstream_catalog", None)
+                Self::handle_report_mcp_upstream_catalog(catalog, graph)
             }
 
             IpcRequest::ProvisionMcpUpstreamCredential {
@@ -10429,254 +8179,18 @@ impl IpcServer {
                 owner_agent_id,
                 credential,
             } => {
-                use ansible_mesh_core::mcp_upstream::McpUpstreamConfig;
-
-                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
-                    return IpcResponse::error(
-                        "mcp_upstream_credential",
-                        "FORBIDDEN",
-                        format!(
-                            "owner_agent_id '{owner_agent_id}' does not match the registered \
-                             guest identity"
-                        ),
-                    );
-                }
-                if credential.trim().is_empty() {
-                    return IpcResponse::error(
-                        "mcp_upstream_credential",
-                        "EMPTY_CREDENTIAL",
-                        "credential must be non-empty",
-                    );
-                }
-
-                let mut upstreams: std::collections::HashMap<String, McpUpstreamConfig> = graph
-                    .get_config_value("__mcp_upstreams__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                let Some(config_snapshot) = upstreams.get(&upstream_id).cloned() else {
-                    return IpcResponse::error(
-                        "mcp_upstream_credential",
-                        "NOT_FOUND",
-                        format!("no upstream registered as {upstream_id}"),
-                    );
-                };
-                if config_snapshot.owner_agent_id != owner_agent_id {
-                    return IpcResponse::error(
-                        "mcp_upstream_credential",
-                        "FORBIDDEN",
-                        format!("upstream {upstream_id} is not owned by {owner_agent_id}"),
-                    );
-                }
-
-                let binding_id = format!("mcp:{upstream_id}");
-                let integration_bindings: std::collections::HashMap<
-                    String,
-                    ansible_mesh_core::integration::IntegrationBinding,
-                > = graph
-                    .get_config_value("__integration_bindings__")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or_default();
-                let (execution_node_id, placement) = if let Some(binding) =
-                    integration_bindings.get(&binding_id).cloned()
-                {
-                    let entry =
-                        Self::integration_binding_entry(binding, registry, graph, local_node_id)
-                            .await;
-                    (entry.execution_node_id, entry.placement)
-                } else {
-                    (
-                        Some(local_node_id.to_string()),
-                        ansible_mesh_core::integration::EgressPlacementDecision::ExecuteLocal {
-                            audit_fallback: false,
-                        },
-                    )
-                };
-                let Some(execution_node_id) = execution_node_id else {
-                    return IpcResponse::error(
-                        "mcp_upstream_credential",
-                        "PLACEMENT_DENIED",
-                        match placement {
-                            ansible_mesh_core::integration::EgressPlacementDecision::Deny {
-                                reason,
-                            } => reason,
-                            _ => "MCP transport has no execution node".into(),
-                        },
-                    );
-                };
-
-                let (vault_ref, rotated) = if execution_node_id == local_node_id {
-                    match config_snapshot.credential_ref.clone() {
-                        Some(existing_ref)
-                            if graph.get_secret(&existing_ref).ok().flatten().is_some() =>
-                        {
-                            if let Err(error) =
-                                crate::vault::rotate_secret(graph, &existing_ref, &credential)
-                            {
-                                return IpcResponse::error(
-                                    "mcp_upstream_credential",
-                                    "VAULT_ERROR",
-                                    error.to_string(),
-                                );
-                            }
-                            (existing_ref, true)
-                        }
-                        _ => match store_secret(
-                            graph,
-                            SecretInput {
-                                secret_kind: "mcp_upstream_credential".into(),
-                                scope: "hotel".into(),
-                                allowed_roles: vec![
-                                    "egress-http-runner".into(),
-                                    "mcp-client-runner".into(),
-                                ],
-                                allowed_guests: Vec::new(),
-                                plaintext: credential,
-                            },
-                        ) {
-                            Ok(secret_ref) => (secret_ref, false),
-                            Err(error) => {
-                                return IpcResponse::error(
-                                    "mcp_upstream_credential",
-                                    "VAULT_ERROR",
-                                    error.to_string(),
-                                );
-                            }
-                        },
-                    }
-                } else {
-                    let remote_request = match config_snapshot.credential_ref.clone() {
-                        Some(secret_ref) => IpcRequest::RotateOperatorTargetSecret {
-                            target_node_id: execution_node_id.clone(),
-                            secret_ref,
-                            plaintext: credential.clone(),
-                        },
-                        None => IpcRequest::AddOperatorTargetVaultEntry {
-                            target_node_id: execution_node_id.clone(),
-                            vault_name: format!("mcp/{upstream_id}"),
-                            plaintext: credential.clone(),
-                            allowed_roles: vec!["egress-http-runner".into()],
-                        },
-                    };
-                    let mut response = Self::handle_operator_target_request(
-                        remote_request,
-                        registry,
-                        graph,
-                        materialization_requester,
-                        local_node_id,
-                    )
-                    .await;
-                    // A placement move leaves the old hotel's ref behind. If
-                    // rotating that ref on the new exit fails, create a new
-                    // execution-hotel secret instead of copying old material.
-                    if !matches!(
-                        response,
-                        IpcResponse::OperatorTargetSecretMutationAckView {
-                            ref operator_target_secret_mutation
-                        } if operator_target_secret_mutation.ok
-                    ) && config_snapshot.credential_ref.is_some()
-                    {
-                        response = Self::handle_operator_target_request(
-                            IpcRequest::AddOperatorTargetVaultEntry {
-                                target_node_id: execution_node_id.clone(),
-                                vault_name: format!("mcp/{upstream_id}"),
-                                plaintext: credential,
-                                allowed_roles: vec!["egress-http-runner".into()],
-                            },
-                            registry,
-                            graph,
-                            materialization_requester,
-                            local_node_id,
-                        )
-                        .await;
-                    }
-                    match response {
-                        IpcResponse::OperatorTargetSecretMutationAckView {
-                            operator_target_secret_mutation,
-                        } if operator_target_secret_mutation.ok => {
-                            let Some(secret_ref) = operator_target_secret_mutation.secret_ref
-                            else {
-                                return IpcResponse::error(
-                                    "mcp_upstream_credential",
-                                    "REMOTE_VAULT_ERROR",
-                                    "remote vault mutation returned no secret_ref",
-                                );
-                            };
-                            (
-                                secret_ref,
-                                operator_target_secret_mutation.operation == "rotate",
-                            )
-                        }
-                        other => {
-                            return IpcResponse::error(
-                                "mcp_upstream_credential",
-                                "REMOTE_VAULT_ERROR",
-                                format!("remote vault mutation failed: {other:?}"),
-                            );
-                        }
-                    }
-                };
-                let config = upstreams
-                    .get_mut(&upstream_id)
-                    .expect("config snapshot came from this registry");
-                config.credential_ref = Some(vault_ref.clone());
-                config.updated_at = unix_ts();
-                let config_snapshot = config.clone();
-
-                match serde_json::to_string(&upstreams) {
-                    Ok(json) => {
-                        if let Err(e) = graph.set_config_value("__mcp_upstreams__", &json) {
-                            return IpcResponse::error(
-                                "mcp_upstream_credential",
-                                "CONFIG_STORE_ERROR",
-                                e.to_string(),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "mcp_upstream_credential",
-                            "SERIALIZE_ERROR",
-                            e.to_string(),
-                        );
-                    }
-                }
-
-                // Fan out so the MCP manager reconnects; the actual secret is
-                // resolved later by egress-http-runner at the execution hotel.
-                let task_json = serde_json::json!({
-                    "action": "update_mcp_upstream",
-                    "config": config_snapshot,
-                })
-                .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
-                    local_node_id,
-                    "mcp-client-runner",
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
-                )
-                .await;
-
-                info!(
+                Self::handle_provision_mcp_upstream_credential(
                     upstream_id,
-                    execution_node_id,
-                    rotated,
-                    "MCP upstream credential provisioned at transport execution hotel"
-                );
-                IpcResponse::success(
-                    "mcp_upstream_credential",
-                    Some(serde_json::json!({
-                        "upstream_id": upstream_id,
-                        "vault_ref": vault_ref,
-                        "rotated": rotated,
-                        "execution_node_id": execution_node_id,
-                    })),
+                    owner_agent_id,
+                    credential,
+                    local_node_id,
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    registry,
+                    current_identity,
                 )
+                .await
             }
 
             // ── User Task Engine ──────────────────────────────────────────────
@@ -10818,19 +8332,9 @@ impl IpcServer {
                 Err(e) => IpcResponse::error("list_user_tasks", "STORAGE_ERROR", format!("{e}")),
             },
 
-            IpcRequest::PushHealEntry { guest_id, raw_text } => match heal_queue.as_deref() {
-                Some(hq) => match hq.push_error(&guest_id, &raw_text) {
-                    Ok(id) => IpcResponse::HealEntryPushed { id },
-                    Err(e) => {
-                        IpcResponse::error("push_heal_entry", "STORAGE_ERROR", format!("{e}"))
-                    }
-                },
-                None => IpcResponse::error(
-                    "push_heal_entry",
-                    "UNAVAILABLE",
-                    "heal_queue not configured".to_string(),
-                ),
-            },
+            IpcRequest::PushHealEntry { guest_id, raw_text } => {
+                Self::handle_push_heal_entry(guest_id, raw_text, heal_queue)
+            }
 
             IpcRequest::PushHealEvent {
                 guest_id,
@@ -10845,61 +8349,19 @@ impl IpcServer {
                 &detail,
             ),
 
-            IpcRequest::GetHealQueuePending { limit } => match heal_queue.as_deref() {
-                Some(hq) => match hq.pending_errors(limit) {
-                    Ok(rows) => IpcResponse::HealQueuePending { rows },
-                    Err(e) => IpcResponse::error(
-                        "get_heal_queue_pending",
-                        "STORAGE_ERROR",
-                        format!("{e}"),
-                    ),
-                },
-                None => IpcResponse::HealQueuePending { rows: vec![] },
-            },
+            IpcRequest::GetHealQueuePending { limit } => {
+                Self::handle_get_heal_queue_pending(limit, heal_queue)
+            }
 
             IpcRequest::TriageHealEntry {
                 id,
                 severity,
                 pattern_tag,
                 heal_action,
-            } => match heal_queue.as_deref() {
-                Some(hq) => match hq.update_triage(&id, &severity, &pattern_tag, &heal_action) {
-                    Ok(()) => IpcResponse::success("triage_heal_entry", None),
-                    Err(e) => {
-                        IpcResponse::error("triage_heal_entry", "STORAGE_ERROR", format!("{e}"))
-                    }
-                },
-                None => IpcResponse::error(
-                    "triage_heal_entry",
-                    "UNAVAILABLE",
-                    "heal_queue not configured".to_string(),
-                ),
-            },
+            } => Self::handle_triage_heal_entry(id, severity, pattern_tag, heal_action, heal_queue),
 
             IpcRequest::ResolveHealEntry { id, outcome } => {
-                // Agent-originated calls (heal.resolve steward tool) require
-                // operational admin authority; the heal-dispatcher and CLI
-                // paths pass through unchanged.
-                if let Err(refusal) =
-                    steward_agent_admin_gate(graph, current_identity.as_ref(), "resolve_heal_entry")
-                {
-                    return refusal;
-                }
-                match heal_queue.as_deref() {
-                    Some(hq) => match hq.resolve(&id, &outcome) {
-                        Ok(()) => IpcResponse::success("resolve_heal_entry", None),
-                        Err(e) => IpcResponse::error(
-                            "resolve_heal_entry",
-                            "STORAGE_ERROR",
-                            format!("{e}"),
-                        ),
-                    },
-                    None => IpcResponse::error(
-                        "resolve_heal_entry",
-                        "UNAVAILABLE",
-                        "heal_queue not configured".to_string(),
-                    ),
-                }
+                Self::handle_resolve_heal_entry(id, outcome, graph, heal_queue, current_identity)
             }
 
             IpcRequest::FileHealWorkItem {
@@ -10927,39 +8389,7 @@ impl IpcServer {
             }
 
             IpcRequest::CloseHealWorkItem { work_item_id } => {
-                // Agent-originated calls (heal.close_work_item steward tool)
-                // require operational admin authority; the autonomy-lane loop
-                // and `phil heal close` CLI paths pass through unchanged.
-                if let Err(refusal) = steward_agent_admin_gate(
-                    graph,
-                    current_identity.as_ref(),
-                    "close_heal_work_item",
-                ) {
-                    return refusal;
-                }
-                // Closure path for a filed heal work item (finding F8). Wired
-                // straight to the unit-tested domain method; closing a missing
-                // id returns closed=false, and closing an already-closed item
-                // returns closed=true (idempotent) so the autonomy-lane loop can
-                // retry safely.
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                match graph.close_heal_work_item(&work_item_id, now) {
-                    Ok(closed) => IpcResponse::success(
-                        "close_heal_work_item",
-                        Some(serde_json::json!({
-                            "closed": closed,
-                            "work_item_id": work_item_id,
-                        })),
-                    ),
-                    Err(e) => IpcResponse::error(
-                        "close_heal_work_item",
-                        "STORAGE_ERROR",
-                        format!("{e:#}"),
-                    ),
-                }
+                Self::handle_close_heal_work_item(work_item_id, graph, current_identity)
             }
 
             IpcRequest::ConsumeAutonomyAction {
@@ -11062,780 +8492,7 @@ impl IpcServer {
         }
     }
 
-    /// Handle [`IpcRequest::QueryModelRoute`] — the routing oracle's IPC face.
-    ///
-    /// Ranks the local hotel's live model profiles against the caller's need
-    /// (pure `model_oracle::rank_models_with`), maps providers onto controller
-    /// roles, and keeps only roles backed by a live guest — the same
-    /// reachability rule `validate_fallback_ladders` enforces at config time.
-    /// When the query carries `exclude_providers` (a failure-driven reroute),
-    /// the switch is logged and pushed to the heal queue as an
-    /// `oracle_reroute` info entry so reroute patterns surface in dev briefs.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn handle_query_model_route(
-        graph: &GraphDomain,
-        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
-        local_node_id: &str,
-        request_class: &str,
-        needs_tools: bool,
-        needs_structured: bool,
-        approx_context_tokens: u32,
-        latency_class: &str,
-        trust_ceiling: &str,
-        exclude_providers: &[String],
-        now_secs: u64,
-    ) -> IpcResponse {
-        use ansible_mesh_core::model_oracle as oracle;
-
-        const CORR: &str = "query_model_route";
-
-        if oracle::routing_oracle_disabled() {
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({ "ranked": [], "disabled": true })),
-            );
-        }
-
-        let profiles = match graph.list_model_profiles() {
-            Ok(p) => p,
-            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-        };
-        // Prefer profiles observed on this node; fall back to the full mesh
-        // view when the local node has no profiles yet (fresh hotel).
-        let local: Vec<_> = profiles
-            .iter()
-            .filter(|p| p.node_id == local_node_id)
-            .cloned()
-            .collect();
-        let candidates = if local.is_empty() { profiles } else { local };
-
-        let need = oracle::RouteNeed {
-            request_class: request_class.to_string(),
-            needs_tools,
-            needs_structured,
-            approx_context_tokens,
-            latency_class: oracle::LatencyClass::parse(latency_class),
-            trust_ceiling: trust_ceiling.to_string(),
-        };
-        let ranked = oracle::rank_models_with(
-            &candidates,
-            &need,
-            now_secs,
-            oracle::degrade_cooloff_secs_from_env(),
-        );
-
-        // A tier is reachable iff a live guest serves its role — same rule as
-        // validate_fallback_ladders.
-        let active_roles: std::collections::BTreeSet<String> =
-            Self::local_hotel_name(graph, local_node_id)
-                .and_then(|hotel| graph.list_guests(&hotel, true).ok())
-                .map(|guests| guests.into_iter().map(|g| g.role).collect())
-                .unwrap_or_default();
-
-        let mut seen_roles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let entries: Vec<serde_json::Value> = ranked
-            .iter()
-            .filter(|r| !exclude_providers.iter().any(|x| x == &r.provider))
-            .filter_map(|r| {
-                let role = oracle::controller_role_for_provider(&r.provider);
-                if !active_roles.contains(&role) || !seen_roles.insert(role.clone()) {
-                    return None;
-                }
-                Some(serde_json::json!({
-                    "role": role,
-                    "provider": r.provider,
-                    "model_ref": r.model_ref,
-                    "score": r.score,
-                    "reasons": r.reasons,
-                }))
-            })
-            .take(3)
-            .collect();
-
-        // Observability: a non-empty exclude list means a provider just
-        // failed and the oracle is rerouting around it.
-        if !exclude_providers.is_empty() {
-            if let Some(first) = entries.first() {
-                let provider_from = exclude_providers.join(",");
-                let provider_to = first
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                info!(
-                    provider_from = %provider_from,
-                    provider_to = %provider_to,
-                    reason = "fallback_ladder_exhausted",
-                    "Routing oracle reroute"
-                );
-                if let Some(hq) = heal_queue {
-                    let raw_text = format!(
-                        "[model-oracle] reroute {provider_from} -> {provider_to} (fallback ladder exhausted, request_class={request_class})"
-                    );
-                    match hq.push_error("model-oracle", &raw_text) {
-                        Ok(id) => {
-                            if let Err(e) =
-                                hq.update_triage(&id, "info", "oracle_reroute", "oracle_reroute")
-                            {
-                                warn!("oracle_reroute heal entry triage failed: {e}");
-                            }
-                        }
-                        Err(e) => warn!("oracle_reroute heal entry push failed: {e}"),
-                    }
-                }
-            }
-        }
-
-        IpcResponse::success(
-            CORR,
-            Some(serde_json::json!({ "ranked": entries, "disabled": false })),
-        )
-    }
-
-    /// Turn-failure heal intake (self-heal): classify a FailTask's
-    /// `error_code`/`reason` and, when it carries provider/model failure
-    /// markers (`kind=provider_failure | component=model-router | provider=X`
-    /// or a bare `MODEL_EMPTY_RESPONSE`), push a pre-triaged heal-queue entry
-    /// so the heal-dispatcher and A3 recurrence counter see turn-level
-    /// failures. Best-effort: never affects the FailTask response.
-    ///
-    /// Entry shape:
-    /// - `guest_id`: `model-controller-{provider}` when the provider marker is
-    ///   present (the model-controller guest naming convention), else
-    ///   `turn:{caller_guest_id}`.
-    /// - `severity`/`pattern_tag`: from the shared classifier
-    ///   (`provider_4xx:{provider}`, `provider_timeout:{provider}`,
-    ///   `model_empty_response`, …) so the dispatcher aggregates without
-    ///   re-classifying.
-    /// - `raw_text`: `[{error_code}] {reason}` capped to 2 KB.
-    ///
-    /// Flood control lives in `push_classified`: the same
-    /// `(guest_id, pattern_tag)` within the flood window collapses.
-    pub(crate) fn push_turn_failure_heal_entry(
-        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
-        caller_guest_id: Option<&str>,
-        error_code: &str,
-        reason: &str,
-    ) {
-        use ansible_mesh_core::heal_queue::{cap_turn_failure_text, classify_turn_failure};
-
-        let Some(hq) = heal_queue else {
-            return;
-        };
-        // Classify on the full line (markers may sit at the end), then cap
-        // what gets stored.
-        let full_line = format!("[{error_code}] {reason}");
-        let Some(class) = classify_turn_failure(&full_line) else {
-            return;
-        };
-        let line = cap_turn_failure_text(&full_line);
-        let guest_id = match class.provider.as_deref() {
-            Some(provider) => format!("model-controller-{provider}"),
-            None => format!("turn:{}", caller_guest_id.unwrap_or("unknown")),
-        };
-        match hq.push_classified(&guest_id, &line, &class.severity, &class.pattern_tag) {
-            Ok(Some(id)) => info!(
-                id = %id,
-                guest_id = %guest_id,
-                pattern_tag = %class.pattern_tag,
-                "turn failure pushed to heal queue"
-            ),
-            Ok(None) => debug!(
-                guest_id = %guest_id,
-                pattern_tag = %class.pattern_tag,
-                "turn failure collapsed into recent heal entry (flood window)"
-            ),
-            Err(e) => warn!("turn failure heal push failed: {e}"),
-        }
-    }
-
-    /// Handle [`IpcRequest::PushHealEvent`] — a guest-reported, pre-classified
-    /// turn-level failure (philote watchdog evictions, fallback-ladder
-    /// exhaustion, paracrine budget breaches). Stored pre-triaged; flood
-    /// control collapses the same `(guest_id, pattern_tag)` within the window.
-    pub(crate) fn handle_push_heal_event(
-        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
-        guest_id: &str,
-        severity: &str,
-        pattern_tag: &str,
-        detail: &str,
-    ) -> IpcResponse {
-        use ansible_mesh_core::heal_queue::cap_turn_failure_text;
-
-        const CORR: &str = "push_heal_event";
-        let Some(hq) = heal_queue else {
-            return IpcResponse::error(
-                CORR,
-                "UNAVAILABLE",
-                "heal_queue not configured".to_string(),
-            );
-        };
-        let detail = cap_turn_failure_text(detail);
-        match hq.push_classified(guest_id, &detail, severity, pattern_tag) {
-            Ok(Some(id)) => {
-                info!(
-                    id = %id,
-                    guest_id = %guest_id,
-                    pattern_tag = %pattern_tag,
-                    "guest heal event pushed to heal queue"
-                );
-                IpcResponse::success(
-                    CORR,
-                    Some(serde_json::json!({ "collapsed": false, "id": id })),
-                )
-            }
-            Ok(None) => IpcResponse::success(CORR, Some(serde_json::json!({ "collapsed": true }))),
-            Err(e) => IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e}")),
-        }
-    }
-
-    pub(crate) fn handle_file_heal_work_item(
-        graph: &GraphDomain,
-        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
-        pattern_tag: &str,
-        guest_id: &str,
-        occurrence_count: u32,
-        window_secs: u64,
-        evidence_lines: &[String],
-        now: u64,
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> IpcResponse {
-        use ansible_mesh_core::autonomy::{
-            AutonomyAuditRecord, AutonomyLane, LANE_FLEET_HEAL_SLICES, lane_enabled,
-            try_consume_daily_action,
-        };
-        use ansible_mesh_core::heal_queue::{
-            HEAL_WORK_ITEM_STATUS_OPEN, HealWorkItemRecord, cap_evidence_lines,
-        };
-        use ansible_mesh_core::provenance::{ProvenanceEnvelope, TrustTier};
-
-        const CORR: &str = "file_heal_work_item";
-        let lane = AutonomyLane::new(LANE_FLEET_HEAL_SLICES);
-
-        // 1. Kill switch overrides everything, always (Autonomy Contract rule 3).
-        if !lane_enabled(&lane, env) {
-            debug!(
-                pattern_tag,
-                guest_id, "heal work item filing skipped: lane kill switch set"
-            );
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({
-                    "filed": false, "deduped": false, "reason": "lane_disabled"
-                })),
-            );
-        }
-
-        // 2. Dedup: one OPEN work item per (pattern_tag, guest_id). A re-breach
-        // while open bumps count + last_seen — no budget consumed, no new audit.
-        match graph.find_open_heal_work_item(pattern_tag, guest_id) {
-            Ok(Some(mut item)) => {
-                item.count = item.count.saturating_add(occurrence_count);
-                item.last_seen = now;
-                if let Err(e) = graph.upsert_heal_work_item(&item) {
-                    return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-                }
-                info!(
-                    pattern_tag,
-                    guest_id,
-                    work_item_id = %item.work_item_id,
-                    count = item.count,
-                    "heal work item re-breach: bumped open item"
-                );
-                return IpcResponse::success(
-                    CORR,
-                    Some(serde_json::json!({
-                        "filed": false, "deduped": true,
-                        "work_item_id": item.work_item_id,
-                    })),
-                );
-            }
-            Ok(None) => {}
-            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-        }
-
-        // 3. Grant + budget: frozen lanes and exhausted daily budgets refuse.
-        let mut grant = match graph.get_or_create_autonomy_grant(LANE_FLEET_HEAL_SLICES, now) {
-            Ok(grant) => grant,
-            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-        };
-        if !try_consume_daily_action(&mut grant, now) {
-            let reason = if grant.frozen_until_operator_review {
-                "lane_frozen"
-            } else {
-                "daily_budget_exhausted"
-            };
-            debug!(
-                pattern_tag,
-                guest_id, reason, "heal work item filing refused by autonomy grant"
-            );
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({
-                    "filed": false, "deduped": false, "reason": reason
-                })),
-            );
-        }
-        if let Err(e) = graph.upsert_autonomy_grant(&grant) {
-            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-        }
-
-        // 4. File: audit record first (the ledger), then the work item node.
-        let evidence = cap_evidence_lines(evidence_lines);
-        let work_item_id = Uuid::new_v4().to_string();
-        let audit_id = format!("heal_filing:{work_item_id}");
-        // Memory Transparency Slice M1: component-authored provenance for
-        // the A3 heal filing — evidence pointers are the same evidence
-        // lines already captured on the work item, so no new plumbing.
-        let provenance = ProvenanceEnvelope::from_component("heal-dispatcher")
-            .with_source(pattern_tag)
-            .with_trust(TrustTier::Observed)
-            .with_evidence(evidence.clone())
-            .with_reversal(format!(
-                "close_heal_work_item({work_item_id}) via GraphDomain::close_heal_work_item"
-            ));
-        let audit = AutonomyAuditRecord::new(
-            audit_id.clone(),
-            lane,
-            format!(
-                "filed heal work item {work_item_id}: pattern '{pattern_tag}' on guest \
-                 '{guest_id}' recurred {occurrence_count}x within {window_secs}s"
-            ),
-            &evidence.join("\n"),
-            "close the work item (GraphDomain::close_heal_work_item)",
-            grant.posture,
-            now,
-        )
-        .with_provenance(provenance);
-        if let Err(e) = graph.record_autonomy_audit(&audit) {
-            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-        }
-        let item = HealWorkItemRecord {
-            work_item_id: work_item_id.clone(),
-            pattern_tag: pattern_tag.to_string(),
-            guest_id: guest_id.to_string(),
-            count: occurrence_count,
-            window_secs,
-            evidence,
-            status: HEAL_WORK_ITEM_STATUS_OPEN.to_string(),
-            filed_by: "heal-dispatcher".to_string(),
-            audit_id: Some(audit_id.clone()),
-            created_at: now,
-            last_seen: now,
-        };
-        if let Err(e) = graph.upsert_heal_work_item(&item) {
-            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-        }
-
-        // 5. Operator visibility: one resolved info entry in the heal queue so
-        // the filing surfaces in existing monitoring. Best-effort — the graph
-        // nodes above are the durable record.
-        if let Some(hq) = heal_queue {
-            match hq.push_error(
-                guest_id,
-                &format!(
-                    "work_item_filed: recurring pattern '{pattern_tag}' on {guest_id} \
-                     ({occurrence_count}x/{window_secs}s) -> heal_work_item {work_item_id}"
-                ),
-            ) {
-                Ok(entry_id) => {
-                    if let Err(e) =
-                        hq.update_triage(&entry_id, "info", pattern_tag, "work_item_filed")
-                    {
-                        warn!("heal work item info entry triage failed: {e:#}");
-                    }
-                    if let Err(e) = hq.resolve(&entry_id, "work_item_filed") {
-                        warn!("heal work item info entry resolve failed: {e:#}");
-                    }
-                }
-                Err(e) => warn!("heal work item info entry push failed: {e:#}"),
-            }
-
-            // 6. A9 Piece 3: an UNRESOLVED, throttled pending-outcome
-            // notice — deliberately distinct from the `work_item_filed`
-            // entry above, which is immediately `.resolve()`d and would
-            // make a poor "still awaiting review" breadcrumb. Best-effort;
-            // the audit record above is the durable one. Throttled per
-            // (lane, pattern_tag) by `push_classified`'s own flood window.
-            let notice = ansible_mesh_core::autonomy::pending_outcome_notice(
-                &audit_id,
-                LANE_FLEET_HEAL_SLICES,
-                &audit.action_summary,
-            );
-            match hq.push_classified(
-                LANE_FLEET_HEAL_SLICES,
-                &notice,
-                "info",
-                "autonomy_outcome_pending",
-            ) {
-                Ok(Some(id)) => info!(
-                    id,
-                    audit_id = %audit_id,
-                    "heal work item filing: pending-outcome notice pushed to heal queue"
-                ),
-                Ok(None) => debug!(
-                    audit_id = %audit_id,
-                    "heal work item filing: pending-outcome notice collapsed (flood window)"
-                ),
-                Err(e) => warn!("heal work item filing: pending-outcome notice push failed: {e:#}"),
-            }
-        }
-
-        info!(
-            pattern_tag,
-            guest_id,
-            work_item_id = %work_item_id,
-            occurrence_count,
-            window_secs,
-            "heal work item filed via fleet.heal_slices lane"
-        );
-        IpcResponse::success(
-            CORR,
-            Some(serde_json::json!({
-                "filed": true, "deduped": false,
-                "work_item_id": work_item_id,
-                "audit_id": audit_id,
-            })),
-        )
-    }
-
     // ── Autonomy lane consult (Autopoiesis Slice A2) ──────────────────────────
-
-    /// Handle [`IpcRequest::ConsumeAutonomyAction`] — a guest asking to take
-    /// one autonomous action on `lane` (first consumer: the life-graph
-    /// runner's feedback-to-action loop, lane `graph.bridge_edges`).
-    ///
-    /// Pipeline mirrors A3's `handle_file_heal_work_item`: lane kill switch →
-    /// grant posture → daily budget (`try_consume_daily_action`, which also
-    /// enforces the freeze flag) → Pending `autonomy_audit` record.
-    ///
-    /// Decision table (`data` in the Standard response):
-    /// - kill switch set → `{allowed:false, reason:"lane_disabled"}`
-    /// - posture ProposalOnly → `{allowed:false, posture:"proposal_only",
-    ///   reason:"posture_proposal_only"}` — no budget, no audit; the caller
-    ///   stays prose-only. This is every fresh lane's day-one answer.
-    /// - frozen / budget exhausted → `{allowed:false, reason:...}`
-    /// - posture ConfirmFirst → `{allowed:false, posture:"confirm_first",
-    ///   audit_id}` — the caller files a ready-to-apply spec awaiting
-    ///   operator confirmation.
-    /// - posture AutoWithAudit → `{allowed:true, posture:"auto_with_audit",
-    ///   audit_id}` — the caller acts now; the audit record is the ledger.
-    ///
-    /// Clock (`now`) and env reader are injected so tests run without
-    /// wall-clock time or process environment.
-    #[cfg(test)]
-    pub(crate) fn handle_consume_autonomy_action(
-        graph: &GraphDomain,
-        lane: &str,
-        action_summary: &str,
-        evidence: &str,
-        reversal_hint: &str,
-        now: u64,
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> IpcResponse {
-        Self::handle_consume_autonomy_action_ext(
-            graph,
-            lane,
-            action_summary,
-            evidence,
-            reversal_hint,
-            false,
-            now,
-            env,
-        )
-    }
-
-    /// [`Self::handle_consume_autonomy_action`] with the `filing` flag.
-    ///
-    /// A filing (a Draft skill, a proposal record) is what `ProposalOnly`
-    /// *means* a lane may do, so `filing = true` is permitted at every
-    /// posture — still kill-switch-gated, still budgeted, still audited
-    /// `Pending` so the operator's outcome stamp trains the lane. `filing =
-    /// false` keeps the original decision table (ProposalOnly refuses).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn handle_consume_autonomy_action_ext(
-        graph: &GraphDomain,
-        lane: &str,
-        action_summary: &str,
-        evidence: &str,
-        reversal_hint: &str,
-        filing: bool,
-        now: u64,
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> IpcResponse {
-        use ansible_mesh_core::autonomy::{
-            AutonomyAuditRecord, AutonomyLane, AutonomyPosture, lane_enabled,
-            try_consume_daily_action,
-        };
-
-        const CORR: &str = "consume_autonomy_action";
-        if lane.trim().is_empty() {
-            return IpcResponse::error(CORR, "INVALID_LANE", "lane must not be empty");
-        }
-        let lane_id = AutonomyLane::new(lane);
-
-        // 1. Kill switch overrides everything, always (Autonomy Contract rule 3).
-        if !lane_enabled(&lane_id, env) {
-            debug!(lane, "autonomy action refused: lane kill switch set");
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({
-                    "allowed": false, "reason": "lane_disabled"
-                })),
-            );
-        }
-
-        // 2. Grant posture. ProposalOnly consumes nothing — the lane has not
-        // earned filing actions yet, so the caller stays prose-only.
-        let mut grant = match graph.get_or_create_autonomy_grant(lane, now) {
-            Ok(grant) => grant,
-            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-        };
-        if grant.posture == AutonomyPosture::ProposalOnly && !filing {
-            debug!(lane, "autonomy action refused: posture proposal_only");
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({
-                    "allowed": false,
-                    "posture": "proposal_only",
-                    "reason": "posture_proposal_only",
-                })),
-            );
-        }
-
-        // 3. Budget: frozen lanes and exhausted daily budgets refuse.
-        if !try_consume_daily_action(&mut grant, now) {
-            let reason = if grant.frozen_until_operator_review {
-                "lane_frozen"
-            } else {
-                "daily_budget_exhausted"
-            };
-            debug!(lane, reason, "autonomy action refused by grant");
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({
-                    "allowed": false,
-                    "posture": posture_str(grant.posture),
-                    "reason": reason,
-                })),
-            );
-        }
-        if let Err(e) = graph.upsert_autonomy_grant(&grant) {
-            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-        }
-
-        // 4. Audit record first (the ledger) — Pending until the operator
-        // confirms or reverses via RecordAutonomyOutcome.
-        let audit_id = format!("autonomy:{}:{}", lane, Uuid::new_v4());
-        let audit = AutonomyAuditRecord::new(
-            audit_id.clone(),
-            lane_id,
-            action_summary,
-            evidence,
-            reversal_hint,
-            grant.posture,
-            now,
-        );
-        if let Err(e) = graph.record_autonomy_audit(&audit) {
-            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-        }
-
-        let allowed = filing || grant.posture == AutonomyPosture::AutoWithAudit;
-        info!(
-            lane,
-            audit_id = %audit_id,
-            posture = posture_str(grant.posture),
-            allowed,
-            filing,
-            "autonomy action consulted"
-        );
-        IpcResponse::success(
-            CORR,
-            Some(serde_json::json!({
-                "allowed": allowed,
-                "posture": posture_str(grant.posture),
-                "audit_id": audit_id,
-            })),
-        )
-    }
-
-    /// Handle [`IpcRequest::RecordAutonomyOutcome`] — the operator/steward
-    /// reporting the reviewed outcome of an audited autonomous action
-    /// (Autopoiesis Slice A9 — `trust-ledger`).
-    ///
-    /// `outcome`: `"confirmed_good"` → audit `ConfirmedGood` + grant
-    /// `Outcome::ConfirmedGood` (counts toward promotion); `"reversed"` →
-    /// audit `Reversed` + grant `Outcome::OperatorReversal` (demotes one
-    /// posture level); `"neutral"` → audit `Neutral` only — the grant's
-    /// earn/demote counters are untouched (a wash, not a signal). Idempotent
-    /// per audit id: an already-reviewed audit refuses with
-    /// `reason:"already_recorded"` so a double-confirm never double-counts
-    /// toward promotion.
-    pub(crate) fn handle_record_autonomy_outcome(
-        graph: &GraphDomain,
-        audit_id: &str,
-        outcome: &str,
-        now: u64,
-    ) -> IpcResponse {
-        use ansible_mesh_core::autonomy::{AuditOutcome, Outcome, Transition};
-
-        const CORR: &str = "record_autonomy_outcome";
-        let (audit_outcome, grant_outcome): (AuditOutcome, Option<Outcome>) = match outcome {
-            "confirmed_good" => (AuditOutcome::ConfirmedGood, Some(Outcome::ConfirmedGood)),
-            "reversed" => (AuditOutcome::Reversed, Some(Outcome::OperatorReversal)),
-            "neutral" => (AuditOutcome::Neutral, None),
-            other => {
-                return IpcResponse::error(
-                    CORR,
-                    "INVALID_OUTCOME",
-                    format!(
-                        "unknown outcome '{other}' (expected confirmed_good | reversed | neutral)"
-                    ),
-                );
-            }
-        };
-
-        let audit = match graph.get_autonomy_audit(audit_id) {
-            Ok(Some(audit)) => audit,
-            Ok(None) => {
-                return IpcResponse::error(
-                    CORR,
-                    "AUDIT_NOT_FOUND",
-                    format!("no autonomy_audit record with id '{audit_id}'"),
-                );
-            }
-            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-        };
-        if audit.outcome != AuditOutcome::Pending {
-            return IpcResponse::success(
-                CORR,
-                Some(serde_json::json!({
-                    "recorded": false,
-                    "reason": "already_recorded",
-                    "lane": audit.lane.as_str(),
-                })),
-            );
-        }
-
-        if let Err(e) = graph.set_autonomy_audit_outcome(audit_id, audit_outcome, now) {
-            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
-        }
-        // Neutral carries no grant_outcome — it stamps the audit record and
-        // stops there (see AuditOutcome::Neutral doc).
-        let transition = match grant_outcome {
-            Some(grant_outcome) => {
-                match graph.record_autonomy_outcome(audit.lane.as_str(), grant_outcome, now) {
-                    Ok(transition) => transition,
-                    Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-                }
-            }
-            None => Transition::NoChange,
-        };
-        let transition_str = match transition {
-            Transition::NoChange => "no_change",
-            Transition::Promoted { .. } => "promoted",
-            Transition::Demoted { .. } => "demoted",
-            Transition::Frozen => "frozen",
-        };
-        let posture = graph
-            .get_autonomy_grant(audit.lane.as_str())
-            .ok()
-            .flatten()
-            .map(|g| posture_str(g.posture));
-
-        info!(
-            audit_id,
-            lane = audit.lane.as_str(),
-            outcome,
-            transition = transition_str,
-            "autonomy outcome recorded"
-        );
-        IpcResponse::success(
-            CORR,
-            Some(serde_json::json!({
-                "recorded": true,
-                "lane": audit.lane.as_str(),
-                "transition": transition_str,
-                "posture": posture,
-            })),
-        )
-    }
-
-    /// Handle `GetConfig("__autonomy_status__")` /
-    /// `GetConfig("__autonomy_status__:{lane}")` — the per-lane trust-ledger
-    /// report `phil autonomy status` reads (Autopoiesis Slice A9). Read-only:
-    /// computed straight from the persisted [`AutonomyGrant`](ansible_mesh_core::autonomy::AutonomyGrant)s
-    /// via [`ansible_mesh_core::autonomy::lane_status_report`], no new state.
-    ///
-    /// `lane = None` → JSON array of every granted lane's report (lanes
-    /// never consulted have no grant yet and are omitted — there is nothing
-    /// to report). `lane = Some(l)` → JSON of that lane's report, or JSON
-    /// `null` if lane `l` has no grant yet.
-    pub(crate) fn handle_query_autonomy_status(
-        graph: &GraphDomain,
-        lane: Option<&str>,
-        now: u64,
-    ) -> IpcResponse {
-        use ansible_mesh_core::autonomy::lane_status_report;
-
-        let key = match lane {
-            Some(lane) => format!("__autonomy_status__:{lane}"),
-            None => "__autonomy_status__".to_string(),
-        };
-        let value_json = match lane {
-            Some(lane) => {
-                let report = graph
-                    .get_autonomy_grant(lane)
-                    .unwrap_or(None)
-                    .map(|g| lane_status_report(&g, now));
-                serde_json::to_string(&report).ok()
-            }
-            None => {
-                let reports: Vec<_> = graph
-                    .list_autonomy_grants()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|g| lane_status_report(g, now))
-                    .collect();
-                serde_json::to_string(&reports).ok()
-            }
-        };
-        IpcResponse::ConfigData { key, value_json }
-    }
-
-    /// Handle `GetConfig("__autonomy_pending__")` — the A9 outcome-stamping
-    /// follow-up slice's `phil autonomy pending` surface: every
-    /// `autonomy_audit` record across all lanes still `Pending` an operator
-    /// outcome, oldest first. Read-only, computed straight from
-    /// [`ansible_mesh_core::domain::GraphDomain::list_all_autonomy_audits`] —
-    /// no new state, and no autonomy grant is consulted (a read, not an
-    /// action). Each entry carries `audit_id`, `lane`, `action_summary`,
-    /// `created_at`, and `age_secs` (as of `now`) so an operator can eyeball
-    /// how stale the backlog is before the timeout-to-Neutral sweep
-    /// (`crate::autonomy_sweep`) catches up to it.
-    pub(crate) fn handle_query_autonomy_pending(graph: &GraphDomain, now: u64) -> IpcResponse {
-        use ansible_mesh_core::autonomy::AuditOutcome;
-
-        const KEY: &str = "__autonomy_pending__";
-        let records = graph.list_all_autonomy_audits().unwrap_or_default();
-        let pending: Vec<_> = records
-            .into_iter()
-            .filter(|r| r.outcome == AuditOutcome::Pending)
-            .map(|r| {
-                serde_json::json!({
-                    "audit_id": r.audit_id,
-                    "lane": r.lane.as_str(),
-                    "action_summary": r.action_summary,
-                    "created_at": r.created_at,
-                    "age_secs": now.saturating_sub(r.created_at),
-                })
-            })
-            .collect();
-        let value_json = serde_json::to_string(&pending).ok();
-        IpcResponse::ConfigData {
-            key: KEY.to_string(),
-            value_json,
-        }
-    }
 
     // ── Agent migration ───────────────────────────────────────────────────────
 
@@ -12317,345 +8974,6 @@ impl IpcServer {
 
         graph.upsert_agent_identity(&identity)?;
         Ok(Self::desktop_membrane_agent_view(identity))
-    }
-
-    pub(super) fn handle_add_vault_entry(
-        graph: &GraphDomain,
-        vault_name: String,
-        plaintext: String,
-        allowed_roles: Vec<String>,
-        secret_kind: Option<String>,
-    ) -> anyhow::Result<String> {
-        // Store the encrypted secret. The kind defaults to the caller's
-        // vault_name (e.g. `gemini_api_key`), not a generic label: the kind is
-        // embedded in the secret_ref, and a `phil keys configure` entry stored
-        // as `vault-token` is indistinguishable from an MCP token grant when
-        // debugging ACL failures (2026-07-20 vps-jane provider-key incident).
-        //
-        // An explicit kind is required for vaults whose consumer filters on it
-        // — `muninn_vault_token` is the only such kind today
-        // (`memory::load_muninn_config` skips every registry entry that does
-        // not carry it).
-        let secret_kind = secret_kind.unwrap_or_else(|| vault_name.clone());
-        let secret_ref = store_secret(
-            graph,
-            SecretInput {
-                secret_kind,
-                scope: "hotel".to_string(),
-                allowed_roles,
-                allowed_guests: Vec::new(),
-                plaintext,
-            },
-        )?;
-
-        // Append new entry to vault_registry in node_config.
-        let mut registry: Vec<serde_json::Value> = graph
-            .get_config_value("vault_registry")
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        registry.push(serde_json::json!({ "vault_name": vault_name, "secret_ref": secret_ref }));
-        graph.set_config_value("vault_registry", &serde_json::to_string(&registry)?)?;
-
-        Ok(secret_ref)
-    }
-
-    fn mesh_private_key_ref_config_key(hotel_name: &str) -> String {
-        format!("mesh_identity_private_key_ref:{hotel_name}")
-    }
-
-    fn mesh_public_key_config_key(hotel_name: &str) -> String {
-        format!("mesh_identity_public_key:{hotel_name}")
-    }
-
-    fn mesh_transport_private_key_ref_config_key(hotel_name: &str) -> String {
-        format!("mesh_transport_private_key_ref:{hotel_name}")
-    }
-
-    fn mesh_transport_public_key_config_key(hotel_name: &str) -> String {
-        format!("mesh_transport_public_key:{hotel_name}")
-    }
-
-    fn mesh_pending_invite_config_key(nonce: &str) -> String {
-        format!("mesh_pending_invite:{nonce}")
-    }
-
-    fn mesh_auth_key_config_key(node_id: &str) -> String {
-        format!("mesh_auth_key:{node_id}")
-    }
-
-    fn read_string_config(graph: &GraphDomain, key: &str) -> anyhow::Result<Option<String>> {
-        Ok(graph
-            .get_config_value(key)?
-            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()))
-    }
-
-    fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> anyhow::Result<String> {
-        resolve_secret(
-            graph,
-            secret_ref,
-            &SecretAccess {
-                role: "hotel.internal".into(),
-                guest_id: "aiua".into(),
-            },
-        )?
-        .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
-    }
-
-    fn ensure_mesh_identity(
-        graph: &GraphDomain,
-        hotel_name: &str,
-    ) -> anyhow::Result<(SigningKey, String, String)> {
-        let private_ref_key = Self::mesh_private_key_ref_config_key(hotel_name);
-        let public_key_key = Self::mesh_public_key_config_key(hotel_name);
-
-        if let (Some(secret_ref), Some(public_key_b64)) = (
-            Self::read_string_config(graph, &private_ref_key)?,
-            Self::read_string_config(graph, &public_key_key)?,
-        ) {
-            let private_key_hex = Self::resolve_internal_secret(graph, &secret_ref)?;
-            let signing_key = signing_key_from_hex(&private_key_hex)?;
-            let fingerprint = fingerprint_from_base64url(&public_key_b64)?;
-            return Ok((signing_key, public_key_b64, fingerprint));
-        }
-
-        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-        let public_key_b64 = verifying_key_to_base64url(&signing_key.verifying_key());
-        let fingerprint = fingerprint_from_base64url(&public_key_b64)?;
-        let secret_ref = store_secret(
-            graph,
-            SecretInput {
-                secret_kind: "mesh-hotel-ed25519-private-key".into(),
-                scope: format!("hotel:{hotel_name}"),
-                allowed_roles: vec!["hotel.internal".into()],
-                allowed_guests: Vec::new(),
-                plaintext: hex::encode(signing_key.to_bytes()),
-            },
-        )?;
-        graph.set_config_value(&private_ref_key, &serde_json::to_string(&secret_ref)?)?;
-        graph.set_config_value(&public_key_key, &serde_json::to_string(&public_key_b64)?)?;
-        Ok((signing_key, public_key_b64, fingerprint))
-    }
-
-    fn ensure_mesh_transport_identity(
-        graph: &GraphDomain,
-        hotel_name: &str,
-    ) -> anyhow::Result<(String, String)> {
-        let private_ref_key = Self::mesh_transport_private_key_ref_config_key(hotel_name);
-        let public_key_key = Self::mesh_transport_public_key_config_key(hotel_name);
-
-        if let (Some(secret_ref), Some(public_key_b64)) = (
-            Self::read_string_config(graph, &private_ref_key)?,
-            Self::read_string_config(graph, &public_key_key)?,
-        ) {
-            let private_key_hex = Self::resolve_internal_secret(graph, &secret_ref)?;
-            return Ok((private_key_hex, public_key_b64));
-        }
-
-        let (private_key_hex, public_key_b64) = generate_transport_keypair();
-        let secret_ref = store_secret(
-            graph,
-            SecretInput {
-                secret_kind: "mesh-hotel-x25519-private-key".into(),
-                scope: format!("hotel:{hotel_name}"),
-                allowed_roles: vec!["hotel.internal".into()],
-                allowed_guests: Vec::new(),
-                plaintext: private_key_hex.clone(),
-            },
-        )?;
-        graph.set_config_value(&private_ref_key, &serde_json::to_string(&secret_ref)?)?;
-        graph.set_config_value(&public_key_key, &serde_json::to_string(&public_key_b64)?)?;
-        Ok((private_key_hex, public_key_b64))
-    }
-
-    fn local_hotel_record(graph: &GraphDomain, local_node_id: &str) -> anyhow::Result<HotelRecord> {
-        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
-            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
-        })?;
-        graph
-            .get_hotel(&hotel_name)?
-            .ok_or_else(|| anyhow::anyhow!("hotel record missing for hotel [{hotel_name}]"))
-    }
-
-    fn persist_hotel_mesh_host(
-        graph: &GraphDomain,
-        hotel_name: &str,
-        mesh_host: &str,
-    ) -> anyhow::Result<HotelRecord> {
-        let mut hotel = graph
-            .get_hotel(hotel_name)?
-            .ok_or_else(|| anyhow::anyhow!("hotel '{hotel_name}' not found"))?;
-        hotel.mesh_host = Some(mesh_host.to_string());
-        graph.upsert_hotel(&hotel)?;
-        Ok(hotel)
-    }
-
-    async fn handle_create_mesh_invite(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        hotel_name: String,
-        mesh_host: String,
-        ttl_secs: Option<u64>,
-    ) -> anyhow::Result<serde_json::Value> {
-        let local_hotel = Self::local_hotel_record(graph, local_node_id)?;
-        if local_hotel.hotel_name != hotel_name {
-            bail!(
-                "mesh invites may only be created by the active local hotel [{}], not [{}]",
-                local_hotel.hotel_name,
-                hotel_name
-            );
-        }
-
-        let hotel = Self::persist_hotel_mesh_host(graph, &hotel_name, &mesh_host)?;
-        let (signing_key, public_key_b64, fingerprint) =
-            Self::ensure_mesh_identity(graph, &hotel_name)?;
-        let (_transport_private_key_hex, transport_public_key_b64) =
-            Self::ensure_mesh_transport_identity(graph, &hotel_name)?;
-        let now = now_epoch_secs();
-        let nonce = generate_nonce();
-        let expires_at = now + ttl_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
-
-        let invite = sign_invite(
-            MeshInvitePayload {
-                version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
-                hotel_name: hotel.hotel_name.clone(),
-                capabilities: hotel.capabilities.clone(),
-                mesh_host: hotel
-                    .mesh_host
-                    .clone()
-                    .unwrap_or_else(|| "127.0.0.1".into()),
-                mesh_port: hotel.mesh_port,
-                blob_port: hotel.blob_port,
-                execution_port: hotel.execution_port,
-                inviter_pubkey_b64: public_key_b64,
-                inviter_fingerprint: fingerprint.clone(),
-                inviter_transport_pubkey_b64: transport_public_key_b64,
-                nonce: nonce.clone(),
-                created_at: now,
-                expires_at,
-            },
-            &signing_key,
-        )?;
-
-        graph.set_config_value(
-            &Self::mesh_pending_invite_config_key(&nonce),
-            &serde_json::json!({
-                "hotel_name": hotel.hotel_name,
-                "created_at": now,
-                "expires_at": expires_at,
-                "status": "pending"
-            })
-            .to_string(),
-        )?;
-
-        Ok(serde_json::json!({
-            "invite_json": serde_json::to_string_pretty(&invite)?,
-            "fingerprint": fingerprint,
-            "expires_at": expires_at,
-            "nonce": nonce
-        }))
-    }
-
-    async fn handle_accept_mesh_invite(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        hotel_name: String,
-        mesh_host: String,
-        invite_json: String,
-    ) -> anyhow::Result<serde_json::Value> {
-        let local_hotel = Self::local_hotel_record(graph, local_node_id)?;
-        if local_hotel.hotel_name != hotel_name {
-            bail!(
-                "mesh invites may only be accepted by the active local hotel [{}], not [{}]",
-                local_hotel.hotel_name,
-                hotel_name
-            );
-        }
-
-        let invite: MeshInvite =
-            serde_json::from_str(&invite_json).context("parse signed mesh invite JSON")?;
-        verify_invite(&invite, now_epoch_secs())?;
-
-        let persisted_local_hotel = Self::persist_hotel_mesh_host(graph, &hotel_name, &mesh_host)?;
-        let inviter_hotel = HotelRecord {
-            hotel_name: invite.payload.hotel_name.clone(),
-            capabilities: invite.payload.capabilities.clone(),
-            mesh_host: Some(invite.payload.mesh_host.clone()),
-            mesh_port: invite.payload.mesh_port,
-            blob_port: invite.payload.blob_port,
-            execution_port: invite.payload.execution_port,
-            ipc_socket_path: String::new(),
-            active_pid: None,
-        };
-        graph.upsert_hotel(&inviter_hotel)?;
-
-        let (signing_key, public_key_b64, fingerprint) =
-            Self::ensure_mesh_identity(graph, &hotel_name)?;
-        let (transport_private_key_hex, transport_public_key_b64) =
-            Self::ensure_mesh_transport_identity(graph, &hotel_name)?;
-        let session_key = derive_transport_session_key(
-            &invite.payload.nonce,
-            &transport_private_key_hex,
-            &invite.payload.inviter_transport_pubkey_b64,
-        )?;
-        graph.set_config_value(
-            &Self::mesh_auth_key_config_key(&invite.payload.capabilities.node_id),
-            &serde_json::to_string(&session_key)?,
-        )?;
-        let join_request = sign_join_request(
-            MeshJoinRequestPayload {
-                version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
-                invite_nonce: invite.payload.nonce.clone(),
-                hotel_name: persisted_local_hotel.hotel_name.clone(),
-                capabilities: persisted_local_hotel.capabilities.clone(),
-                mesh_host: persisted_local_hotel
-                    .mesh_host
-                    .clone()
-                    .unwrap_or_else(|| "127.0.0.1".into()),
-                mesh_port: persisted_local_hotel.mesh_port,
-                blob_port: persisted_local_hotel.blob_port,
-                execution_port: persisted_local_hotel.execution_port,
-                joiner_pubkey_b64: public_key_b64,
-                joiner_fingerprint: fingerprint,
-                joiner_transport_pubkey_b64: transport_public_key_b64,
-                requested_at: now_epoch_secs(),
-            },
-            &signing_key,
-        )?;
-
-        let payload = serde_json::to_vec(&join_request)?;
-        let msg_id = Uuid::new_v4();
-        let timestamp = now_epoch_secs();
-        let packet = ansible_mesh_core::BeaconMessage {
-            version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
-            msg_id,
-            src_node: persisted_local_hotel.capabilities.node_id.clone(),
-            dest_node: invite.payload.capabilities.node_id.clone(),
-            msg_type: ansible_mesh_core::MsgType::MeshMembershipAccept,
-            seq: 0,
-            total: 1,
-            payload: payload.into(),
-            timestamp,
-            hmac: ansible_mesh_core::BeaconPayload::default(),
-        };
-
-        let target_addr = format!("{}:{}", invite.payload.mesh_host, invite.payload.mesh_port);
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("bind local UDP socket for mesh join request")?;
-        socket
-            .send_to(&serde_json::to_vec(&packet)?, &target_addr)
-            .await
-            .with_context(|| format!("send mesh join request to {target_addr}"))?;
-
-        Ok(serde_json::json!({
-            "inviter_hotel": invite.payload.hotel_name,
-            "target_addr": target_addr,
-            "nonce": invite.payload.nonce
-        }))
     }
 
     fn upsert_tool_runner_registry_entry(
@@ -14232,6 +10550,18 @@ mod memory;
 mod media_setup;
 
 mod hotel_status;
+
+mod heal_autonomy;
+
+mod routing_policy;
+
+mod integrations;
+
+mod mcp_upstream;
+
+mod config_vault;
+
+mod mesh_invite;
 
 #[cfg(test)]
 pub(crate) mod tests;
