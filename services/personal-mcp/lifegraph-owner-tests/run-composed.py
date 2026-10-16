@@ -37,6 +37,7 @@ parser.add_argument('--cargo-registry', type=pathlib.Path, required=True, help='
 parser.add_argument('--temporary-parent', type=pathlib.Path, help='Disposable scratch parent with space for a fresh build')
 parser.add_argument('--issuer-source', type=pathlib.Path, required=True)
 parser.add_argument('--issuer-head', required=True, help='Exact reviewed issuer commit implementing life:recall')
+parser.add_argument('--authority-split', action='store_true', help='Website outside supervisor; real mTLS authority child executes mutations')
 args = parser.parse_args()
 assert os.uname().sysname == 'Linux'
 source_head = run('git','-C',str(ROOT),'rev-parse','HEAD')
@@ -79,6 +80,14 @@ with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-',dir=args
         '--banner:js=import {createRequire} from "node:module"; const require=createRequire(import.meta.url);', '--outfile='+str(bundle),
         env={**os.environ,'NODE_PATH':str(issuer/'node_modules')})
     bundle.chmod(0o444)
+    if args.authority_split:
+        pki=work/'pki';pki.mkdir(mode=0o700)
+        run('openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout','ca.key','-out','ca.crt','-subj','/CN=Synthetic CA','-days','1',cwd=pki)
+        for name in ['server','website','management']:
+            run('openssl','req','-new','-newkey','rsa:2048','-nodes','-keyout',name+'.key','-out',name+'.csr','-subj','/CN='+name,cwd=pki)
+            (pki/(name+'.ext')).write_text('subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\n' if name=='server' else 'extendedKeyUsage=clientAuth\n')
+            run('openssl','x509','-req','-in',name+'.csr','-CA','ca.crt','-CAkey','ca.key','-CAcreateserial','-out',name+'.crt','-days','1','-extfile',name+'.ext',cwd=pki)
+        for path in pki.iterdir():path.chmod(0o400)
     assert run('git','-C',str(issuer),'rev-parse','HEAD') == args.issuer_head
     assert not run('git','-C',str(issuer),'status','--porcelain')
     try:
@@ -117,7 +126,8 @@ with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-',dir=args
             '-v',str(supervisor)+':/fixture-supervisor:ro','-v',str(fixture/'composed-exercise.py')+':/fixture-test.py:ro',
             'python@sha256:5560e9ab8709f459489e5b8aa696eda8a07ef821e14bb122be62d91234bfa98b',
             'python3','/fixture-test.py','--work',str(work),'--supervisor','/fixture-supervisor',
-            '--graph-ip',graph_ip,'--mongo-ip',mongo_ip,'--issuer-head',args.issuer_head)
+            '--graph-ip',graph_ip,'--mongo-ip',mongo_ip,'--issuer-head',args.issuer_head,
+            *(['--authority-split'] if args.authority_split else []))
         receipt=json.loads(output.splitlines()[-1])
         receipt.update(source_head=source_head,supervisor_built_from_exact_commit=True,rust_image=RUST)
         print(output,flush=True);print(json.dumps(receipt),flush=True)
