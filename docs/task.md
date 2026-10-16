@@ -2481,3 +2481,15 @@ Branch `codex/cron-turn-policy`; decision on `doc:distributed-cron-proposal` (gr
 - [ ] mbp-jane: deploy (offline on the tailnet since 2026-10-05) and migrate Aria `58baebb2…` (bash.exec) with `phil cron policy`.
 - [ ] Slice 2: agent REQUESTS a policy → job held disabled/pending → operator approval card; the tap must land on an operator-only hotel IPC (not a philote claim). Plus a sub-hour schedule floor for agent-created jobs (Gemini/Ariel 15-min poll incident, 2026-10-02).
 - [ ] Later: per-job model tier + iteration cap; explicit approval chat on the job instead of payload `chat_id`.
+
+
+## Synthetic broker standalone build preparation (2026-10-16)
+
+- [x] Prepare isolated, checksum-locked build-only Actions workflow and reviewed helper sources; publication withheld pending exact approval.
+- [x] Prepare inert private tmpfs key-delivery adapter with public input tests; no live key inspection.
+- [x] Integrate separate private FD forwarding and hash-bound Linux acceptance gate; 85 activation Python tests pass locally.
+- [ ] Approve branch publication/build/public Linux fixture, verify artifact and private mount/UID/cleanup receipt before any real-key handoff or activation.
+
+See services/personal-mcp/synthetic-broker-build/README.md. Test-green locally is not Linux runtime acceptance. No additional hotel restart or persistent key file is authorized.
+
+- Independent public review: deployment integration copies removed; root-through-exec bootstrap addresses same-UID /proc exposure at source level, with adversarial public dummy fixtures and generic inherited labels. Linux execution acceptance and recreation atop the exact inspected remote base remain unverified; real-key use and publication remain blocked.
