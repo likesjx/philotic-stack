@@ -5,7 +5,9 @@ import { createServer } from 'node:http';
 import { existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { MongoClient } from 'mongodb';
-import { mongoStore, ensureIndexes, changePersonalLifeGraphAdmission, changePersonalAdmission, revokeProviderSessions } from '__ISSUER__/src/lib/auth/personal-oauth/mongo';
+import { X509Certificate } from 'node:crypto';
+import { createAuthorityServer } from '__ISSUER__/src/lib/auth/personal-oauth/authority-service';
+import { mongoStore, ensureIndexes, changePersonalLifeGraphAdmission, changePersonalAdmission, revokeProviderSessions, changeWebsiteAdminRole } from '__ISSUER__/src/lib/auth/personal-oauth/mongo';
 import { PersonalOAuth, challenge, hash } from '__ISSUER__/src/lib/auth/personal-oauth/policy';
 import { handlers } from '__ISSUER__/src/lib/auth/personal-oauth/handlers';
 import { withLifeGraphIssuerChange } from '__ISSUER__/src/lib/auth/personal-oauth/lifegraph-coordination';
@@ -16,6 +18,7 @@ import { createLifeGraphOwnedStorage } from '../lifegraph-owned-storage.mjs';
 import { createLifeGraphIdentityAuthority } from '../lifegraph-identity.mjs';
 import { lifeGraphContentDigest } from '../lifegraph-memgraph.mjs';
 const dir=process.env.SYNTHETIC_DIR!, role=process.env.SYNTHETIC_ROLE!;
+const split=process.env.SYNTHETIC_AUTHORITY_SPLIT==='1',pki=process.env.SYNTHETIC_PKI!;
 process.on('uncaughtException',error=>{writeFileSync(`${dir}/fixture-error-${role}`,String(error.stack),{mode:0o600});process.exit(1);});
 process.on('unhandledRejection',error=>{writeFileSync(`${dir}/fixture-error-${role}`,String(error),{mode:0o600});process.exit(1);});
 let markerSequence=0;
@@ -26,10 +29,35 @@ const put=(name:string,value:any='synthetic')=>{
 };
 const wait=async(name:string)=>{for(let i=0;i<1000;i++){if(existsSync(`${dir}/${name}`))return;await new Promise(r=>setTimeout(r,5));}throw Error('synthetic deadline');};
 const resource='https://synthetic.example/life/mcp', issuerUrl='https://synthetic-issuer.example';
-if(role==='issuer'){
+if(split && role==='issuer'){
+ const client=await new MongoClient(process.env.SYNTHETIC_MONGO_URI!).connect(),db=client.db(process.env.SYNTHETIC_DATABASE!);
+ const originalCollection=db.collection.bind(db),collections=new Map();
+ for(const name of ['personal_oauth_resource_admissions','personal_oauth_admissions']){
+  const c=originalCollection(name),original=c.findOneAndUpdate.bind(c);
+  c.findOneAndUpdate=(async(...args:any[])=>{
+   put('first-mongo-write');if(existsSync(`${dir}/hold-mongo`)){put('issuer-held');await wait('finish-issuer');}
+   const result=await original(...args as any);
+   if(existsSync(`${dir}/unknown-mongo`))throw Error('synthetic unknown commit acknowledgement');
+   return result;
+  }) as any;collections.set(name,c);
+ }
+ db.collection=((name:string,...args:any[])=>collections.get(name)??originalCollection(name,...args)) as any;
+ const read=(name:string)=>readFileSync(`${pki}/${name}`);
+ const server=createAuthorityServer(db,{ca:read('ca.crt'),cert:read('server.crt'),key:read('server.key')},
+  ['website','management'].map(role=>({role:role as 'website'|'management',fingerprint:new X509Certificate(read(role+'.crt')).fingerprint256.replaceAll(':','').toLowerCase()})));
+ await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));put('authority.json',{port:(server.address() as any).port});
+}else if(role==='issuer'||role==='website'){
+ if(split){
+  assert.equal(process.env.PERSONAL_OAUTH_LIFEGRAPH_COORDINATION,undefined);
+  await wait('authority.json');const {port}=JSON.parse(readFileSync(`${dir}/authority.json`,'utf8'));
+  Object.assign(process.env,{PERSONAL_OAUTH_AUTHORITY_MODE:'required',PERSONAL_OAUTH_AUTHORITY_URL:`https://localhost:${port}/v1/mutate`,
+   PERSONAL_OAUTH_AUTHORITY_SERVER_SHA256:new X509Certificate(readFileSync(`${pki}/server.crt`)).fingerprint256.replaceAll(':','').toLowerCase(),
+   PERSONAL_OAUTH_AUTHORITY_CA_FILE:`${pki}/ca.crt`,PERSONAL_OAUTH_AUTHORITY_WEBSITE_CERT_FILE:`${pki}/website.crt`,PERSONAL_OAUTH_AUTHORITY_WEBSITE_KEY_FILE:`${pki}/website.key`,
+   PERSONAL_OAUTH_AUTHORITY_MANAGEMENT_CERT_FILE:`${pki}/management.crt`,PERSONAL_OAUTH_AUTHORITY_MANAGEMENT_KEY_FILE:`${pki}/management.key`});
+ }
  const client=await new MongoClient(process.env.SYNTHETIC_MONGO_URI!).connect(),db=client.db(process.env.SYNTHETIC_DATABASE!);
  await ensureIndexes(db);const store=mongoStore(db),identity={provider:'google',providerId:'synthetic-composed'};
- await db.collection('users').insertOne({...identity,roles:['admin']});const subject=await store.resolve(identity);
+ await db.collection('users').insertOne({...identity,email:'synthetic@example.test',roles:['admin']});const subject=await store.resolve(identity);
  await db.collection('personal_oauth_admissions').insertOne({subject,enabled:true,version:0});
  await db.collection('personal_oauth_client_admissions').insertMany(['dot','claude'].map(clientId=>({subject,clientId,enabled:true,version:0})));
  await db.collection('personal_oauth_resource_admissions').insertMany(['dot','claude'].map(clientId=>({subject,clientId,resource,scope:'life:recall',enabled:true,version:0,binding:{agentId:'agent-'+clientId,roles:['reader']}})));
@@ -51,7 +79,7 @@ if(role==='issuer'){
   const life=await mintToken(clientId,true),memory=await mintToken(clientId,false);tokens.set(clientId,life);
   return {cap:life.access_token,memory:memory.access_token};
  }
- const minted=Object.fromEntries(await Promise.all(['dot','claude'].map(async c=>[c,await mint(c)])));
+ const minted:any={};for(const c of ['dot','claude'])minted[c]=await mint(c);
  async function inspect(presented:string){
   const response=await h.introspect(new Request(issuerUrl+'/oauth/introspect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded',Authorization:'Basic '+Buffer.from('synthetic-gateway:'+'s'.repeat(43)).toString('base64')},body:new URLSearchParams({token:presented})}));
   return response.json();
@@ -81,9 +109,13 @@ if(role==='issuer'){
    else if(operation==='mint')result=await mint(clientId);
    else if(operation==='global')await changePersonalAdmission(db,subject,false);
    else if(operation==='logout')await revokeProviderSessions(db,identity.provider,identity.providerId);
+   else if(operation==='admin-remove'||operation==='admin-restore')await changeWebsiteAdminRole(db,'synthetic@example.test',operation==='admin-restore');
    else if(operation==='token-revoke')await auth.revoke(tokens.get(clientId).access_token,clientId);
    else if(operation==='role-revoke')await changePersonalLifeGraphAdmission(db,subject,clientId,resource,true,{agentId:'agent-'+clientId,roles:[]});
-   else if(operation==='unknown')await withLifeGraphIssuerChange(async()=>{await db.collection('personal_oauth_resource_admissions').updateOne({subject,clientId,resource,scope:'life:recall'},{$inc:{version:1}});throw Error('synthetic unknown commit acknowledgement');});
+   else if(operation==='unknown'){
+    if(split){put('unknown-mongo');await changePersonalLifeGraphAdmission(db,subject,clientId,resource,false);}
+    else await withLifeGraphIssuerChange(async()=>{await db.collection('personal_oauth_resource_admissions').updateOne({subject,clientId,resource,scope:'life:recall'},{$inc:{version:1}});throw Error('synthetic unknown commit acknowledgement');});
+   }
    else throw Error('unknown test operation');
    result??={done:true};
   }else throw Error('unknown fixture path');

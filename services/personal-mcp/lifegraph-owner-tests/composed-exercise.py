@@ -32,12 +32,13 @@ p.add_argument('--supervisor',type=pathlib.Path,required=True)
 p.add_argument('--graph-ip',required=True)
 p.add_argument('--mongo-ip',required=True)
 p.add_argument('--issuer-head',required=True)
+p.add_argument('--authority-split',action='store_true')
 a=p.parse_args()
 work=a.work;supervisor=a.supervisor;node=work/'node';bundle=work/'worker.mjs'
 graph_ip=a.graph_ip;mongo_ip=a.mongo_ip
 results=[]
 def exercise():
-    for case in ['production-composition','privacy','handoff','before-final','issuer-first','creator-revoked','role-revoked','global','logout','token-revoke','unknown']:
+    for case in ['production-composition','privacy','handoff','before-final','issuer-first','creator-revoked','role-revoked','global','logout','token-revoke','unknown'] + (['admin-role'] if a.authority_split else []):
         d=work/case;d.mkdir(mode=0o700)
         def put(name, value='synthetic'):
             p=d/name;p.write_text(value if isinstance(value,str) else json.dumps(value));p.chmod(0o600)
@@ -46,12 +47,17 @@ def exercise():
             'executable':{'path':str(node),'sha256':digest(node)},'artifacts':[{'path':str(bundle),'sha256':digest(bundle)}],
             'directory':str(d),'arguments':[str(bundle)],'environment':{'SYNTHETIC_DIR':str(d),'SYNTHETIC_ROLE':role,
                 'SYNTHETIC_MONGO_URI':'mongodb://'+mongo_ip+':27017','SYNTHETIC_DATABASE':'synthetic_'+case.replace('-','_'),
-                'SYNTHETIC_PRODUCTION_COMPOSITION':'1' if case=='production-composition' else '0'}}
+                'SYNTHETIC_PRODUCTION_COMPOSITION':'1' if case=='production-composition' else '0',
+                'SYNTHETIC_AUTHORITY_SPLIT':'1' if a.authority_split else '0','SYNTHETIC_PKI':str(work/'pki')}}
         manifest={'version':1,'hotel':'synthetic-hotel','owner':'synthetic-owner','uid':os.geteuid(),'socket':str(d/'owner.sock'),
             'journal':str(d/'journal'),'graph_connection_file':str(d/'connection.json'),'workers':[worker('issuer'),worker('gateway')]}
         put('manifest.json',manifest)
         launch=lambda:subprocess.Popen([str(supervisor),'--config',str(d/'manifest.json')],env={},stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
-        child=launch();restart=None
+        child=launch();restart=None;website=None
+        if a.authority_split:
+            # Deliberately outside supervisor: no owner socket identity or lease.
+            website_env=worker('website')['environment']
+            website=subprocess.Popen([str(node),str(bundle)],env=website_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         contention=threading.Condition(); arrivals=[0]
         def observe():
             for line in child.stderr:
@@ -87,6 +93,7 @@ def exercise():
                     assert gateway.get('productionComposition') is True
                     assert control('revoke-client')[0]==200
                     assert recall()[0]==401 and recall('claude')[0]==200
+                    assert json.loads(http(base+'/inspect?token='+data['minted']['dot']['memory'])[1])['active'] is True
                     assert control('reenable')[0]==200 and recall()[0]==401
                     minted=control('mint');assert minted[0]==200;data['minted']['dot']=json.loads(minted[1])
                     visible(recall())
@@ -124,6 +131,14 @@ def exercise():
                     result=recall();assert result[0]==200,result
                     packet=json.loads(json.loads(result[1])['result']['content'][0]['text'])
                     assert {p['id'] for p in packet['packets']}=={'goal:synthetic-root','openloop:synthetic'} and packet['edges']==[],result
+                elif case=='admin-role':
+                    assert control('admin-remove')[0]==200 and recall()[0]==401
+                    assert control('admin-restore')[0]==200 and recall()[0]==401
+                    assert recall('claude')[0]==401
+                    assert json.loads(http(base+'/inspect?token='+data['minted']['dot']['memory'])[1])['active'] is False
+                    minted=control('mint');assert minted[0]==200;data['minted']['dot']=json.loads(minted[1])
+                    visible(recall())
+                    assert json.loads(http(base+'/inspect?token='+data['minted']['dot']['memory'])[1])['active'] is True
                 elif case in ['global','logout','token-revoke']:
                     assert control(case)[0]==200 and recall()[0]==401
                     assert recall('claude')[0]==(200 if case=='token-revoke' else 401)
@@ -141,9 +156,9 @@ def exercise():
             else: assert child.returncode==0 and (d/'journal').read_text()=='clean\n'
             results.append({'case':case,'passed':True});print(case+': passed',flush=True)
         finally:
-            for process in [child,restart]:
+            for process in [website,child,restart]:
                 if process is not None and process.poll() is None: process.kill();process.wait(timeout=10)
     print(json.dumps({'issuer_head':a.issuer_head,'supervisor_sha256':digest(supervisor),'worker_sha256':digest(bundle),'cases':results,
-        'scope_gate':'actual separate issuer-issued life:recall and memory:recall tokens','production_access':False}),flush=True)
+        'scope_gate':'actual separate issuer-issued life:recall and memory:recall tokens','authority_split':a.authority_split,'production_access':False}),flush=True)
 
 exercise()
