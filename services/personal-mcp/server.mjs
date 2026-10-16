@@ -6,7 +6,7 @@ import { vaultCredential, brokerCredential } from './vault.mjs';
 import { pathToFileURL } from 'node:url';
 import { createPersonalMcp, issuerAdapter, frontdoorAdapter, createDiscoveryBootstrap, selectedTools } from './gateway.mjs';
 
-export async function start(config, env = process.env) {
+export async function start(config, env = process.env, { resolveLifeGraphBinding } = {}) {
   const secret = name => {
     if (typeof name !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(name) || typeof env[name] !== 'string' || !env[name]) throw new Error('Required secret environment reference unavailable');
     return env[name];
@@ -20,6 +20,21 @@ export async function start(config, env = process.env) {
     return server;
   }
   if (!Array.isArray(config.allowedSubjects) || !Array.isArray(config.allowedClients)) throw new Error('Explicit operator/client arrays required');
+  if (config.lifeGraph !== undefined) {
+    if (config.lifeGraph.enabled !== true || enabledTools.length !== 1 || enabledTools[0] !== 'life.recall' ||
+        config.upstreams !== undefined || config.clientPolicies !== undefined || config.muninnVault !== undefined ||
+        config.issuer.clientSecretEnv !== undefined || config.issuer.clientSecret !== undefined)
+      throw new Error('Explicit separate LifeGraph composition required');
+    const { createApprovedLifeGraphGateway } = await import('./lifegraph-production.mjs');
+    const issuer = issuerAdapter({ ...config.issuer, credential: brokerCredential({ socketPath: config.issuer.credentialBrokerSocketPath, kind: 'introspection' }) });
+    const server = await createApprovedLifeGraphGateway({ config: { ...config.lifeGraph,
+      resource: config.resource, allowedSubjects: config.allowedSubjects, allowedClients: config.allowedClients }, issuer,
+      resolveBinding: resolveLifeGraphBinding });
+    try {
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
+      return server;
+    } catch (error) { server.close(); throw error; }
+  }
   const credential = async value => {
     const choices = [value.credentialEnv, value.credentialSecretRef, value.credentialSecretRefFile, value.credentialBrokerSocketPath].filter(v => v !== undefined);
     if (choices.length !== 1) throw new Error('Exactly one credential source required');

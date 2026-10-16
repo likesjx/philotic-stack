@@ -1,8 +1,8 @@
 # Synthetic composed acceptance
 
 This fixture depends on the reviewed PR658 supervisor source inherited by this
-branch and the separately reviewed PR20
-issuer source head `bc97105557c30a17b9f966c1e1d0453c66c6f3ef`. It never installs
+branch and an explicitly pinned reviewed issuer commit implementing the
+read-only LifeGraph contract. It never installs
 services or reads configured databases. The runner exports the supplied exact
 clean source commit and builds its supervisor with the pinned Rust image,
 locked dependencies, a fresh target directory and networking disabled. It does
@@ -14,7 +14,8 @@ python3 services/personal-mcp/lifegraph-owner-tests/run-composed.py \
   --approved-fixture-run --source-head "$(git rev-parse HEAD)" \
   --cargo-registry /ABSOLUTE/PUBLIC/CARGO/registry \
   --temporary-parent /ABSOLUTE/DISPOSABLE/SCRATCH \
-  --issuer-source /ABSOLUTE/EXACT/ISSUER/CHECKOUT
+  --issuer-source /ABSOLUTE/EXACT/ISSUER/CHECKOUT \
+  --issuer-head EXACT_REVIEWED_40_CHARACTER_ISSUER_COMMIT
 ```
 
 Linux, Docker, Node 24+ and the issuer checkout's esbuild are required. The runner
@@ -27,13 +28,13 @@ canonical SQLite v2 schema/inode, catalog digests, owner transport and actual
 HTTP recall. Child environments are explicit; inherited production configuration
 is never loaded. All created containers/network and temporary files are removed.
 
-Actual PR20 authorize/consent/token/introspection handlers issue and check distinct
-dot/Claude **memory-only** tokens. Those tokens fail LifeGraph dispatch. Separately
-labeled test-only `synthetic-life-*` capabilities exercise LifeGraph mechanics:
-their fixture issuer checks the actual memory family's current Mongo validity
-and versions before presenting synthetic LifeGraph claims. They are not evidence
-of an issued LifeGraph OAuth grant, and none of that fixture projection is
-imported by production code.
+Actual authorize/consent/token/introspection handlers issue distinct dot/Claude
+LifeGraph and memory tokens for separate audiences and separately provisioned
+disposable resource grants. Memory tokens fail LifeGraph dispatch. No token or
+claim is relabeled: the gateway receives the exact opaque LifeGraph access token
+and issuer-produced scope/version claims. The gateway uses approved catalogs
+with synthetic content. This updated fixture requires a new Linux acceptance
+run; previous fixture results do not validate the new issuer contract.
 
 Assertions cover creator access, independent role access and revocation, private
 records/ancestors/incident edges, external inference denial, canonical-root
@@ -57,6 +58,10 @@ subject/client/current grant version plus the canonical agent ID and current
 roles. It must be read-only, fail closed on missing/ambiguous/revoked bindings,
 and participate in the same authority-writer exclusion contract. It must never
 invoke a mutation-based identity upsert while holding the release fence.
+The issuer's confidential binding endpoint now supplies this contract from the
+existing versioned resource grant. The fixture seeds synthetic delegated bindings
+there and removes roles using the same fenced/versioned helper. Old tokens must
+be denied after role removal; newly issued tokens see only the remaining roles.
 
 Final admission re-introspects exact issuer/audience/life-only scope, validates
 bounded token lifetime, refreshes bindings, and binds expiry to synchronous HTTP
@@ -64,8 +69,7 @@ handoff verification and response cancellation. Production composition must use
 this authority and its response hooks. Earlier synthetic authorities' optional
 hooks do not establish equivalent production admission.
 
-PR20 still rejects `life:recall`. Its production scope/grant-version contract,
-approved subject-to-agent/role provider, catalog/policy identity and complete
+The approved subject-to-agent/role provider, catalog/policy identity and complete
 writer coverage remain explicit admission gates. Actual host topology, UID
 isolation, immutable dependency manifests, paths/modes, credential-file references
 and recovery ownership require host evidence and exact action-time approval.

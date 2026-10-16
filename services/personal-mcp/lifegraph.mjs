@@ -1,6 +1,10 @@
-// Source-only synthetic LifeGraph admission boundary. No database, credential,
+// Bounded read-only LifeGraph admission boundary. No database, credential,
 // HTTP, embedding, model, write or grant implementation belongs in this module.
 import { createHash } from 'node:crypto';
+export const lifeGraphProfile = profile => ['synthetic-read-only-v1', 'approved-read-only-v1'].includes(profile);
+export const lifeGraphNamespace = (profile, namespace) => typeof namespace === 'string' &&
+  (profile === 'synthetic-read-only-v1' ? /^synthetic_[A-Za-z0-9_-]{1,100}$/ :
+    profile === 'approved-read-only-v1' ? /^approved_[a-z0-9_]{1,64}$/ : /$a/).test(namespace);
 const kinds = new Set(['Goal', 'Idea', 'OpenLoop', 'Person', 'Place', 'Thing']);
 const text = (v, max = 128) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
 const strings = (v, max = 32) => Array.isArray(v) && v.length <= max && v.every(x => text(x)) && new Set(v).size === v.length;
@@ -100,10 +104,10 @@ function project(snapshot, records, actor, args, check) {
 
 // authenticate(request) MUST be server-owned OAuth introspection + identity/RBAC
 // mapping, not parsed arguments or model hints. snapshot MUST be an immutable,
-// transactionally consistent synthetic namespace export with monotonic revision.
+// transactionally consistent approved namespace export with monotonic revision.
 export function createLifeGraphAdapter({ profile, resource, clientPolicies, authenticate, snapshot, authorizeRelease, requestDeadlineMs = 5000 }) {
   const url = new URL(resource);
-  if (profile !== 'synthetic-read-only-v1' || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
+  if (!lifeGraphProfile(profile) || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
       !url.pathname.endsWith('/mcp') || typeof authenticate !== 'function' || typeof snapshot !== 'function' || typeof authorizeRelease !== 'function' ||
       !Number.isInteger(requestDeadlineMs) || requestDeadlineMs < 1 || requestDeadlineMs > 45000 ||
       !Array.isArray(clientPolicies) || !clientPolicies.length || clientPolicies.length > 16) fail();
@@ -111,7 +115,7 @@ export function createLifeGraphAdapter({ profile, resource, clientPolicies, auth
   const clients = new Set(), namespaces = new Set();
   for (const p of policies) {
     if (!exact(p, ['clientId', 'subjects', 'namespace', 'scopes']) || !text(p.clientId) || clients.has(p.clientId) ||
-        !strings(p.subjects, 16) || !p.subjects.length || !/^synthetic_[A-Za-z0-9_-]{1,100}$/.test(p.namespace) ||
+        !strings(p.subjects, 16) || !p.subjects.length || !lifeGraphNamespace(profile, p.namespace) ||
         namespaces.has(p.namespace) || !Array.isArray(p.scopes) || p.scopes.length !== 1 || p.scopes[0] !== 'life:recall') fail();
     clients.add(p.clientId); namespaces.add(p.namespace);
   }
@@ -123,7 +127,8 @@ export function createLifeGraphAdapter({ profile, resource, clientPolicies, auth
     return { actor: a, policy: p };
   }
   return Object.freeze({
-    descriptor: () => structuredClone(lifeGraphDescriptor),
+    descriptor: () => ({ ...structuredClone(lifeGraphDescriptor), description: profile === 'approved-read-only-v1'
+      ? 'Read explicitly approved LifeGraph context. No writes or semantic deduplication.' : lifeGraphDescriptor.description }),
     async recall(request, args, { signal: parentSignal } = {}) {
       const deadline = performance.now() + requestDeadlineMs;
       const signal = parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(requestDeadlineMs)]) : AbortSignal.timeout(requestDeadlineMs);

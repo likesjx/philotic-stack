@@ -51,6 +51,7 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev libopus-dev python3
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:

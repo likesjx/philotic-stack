@@ -2,6 +2,7 @@
 // catalog is an exact ID/content/source binding, not a graph namespace property
 // or an ACL supplied by the graph. Missing/legacy bindings fail closed.
 import { createHash } from 'node:crypto';
+import { lifeGraphProfile, lifeGraphNamespace } from './lifegraph.mjs';
 const kindLabels = Object.freeze({ Goal: ['Goal'], Idea: ['GrowthHypothesis'],
   OpenLoop: ['OpenLoop'], Person: ['Person'], Place: ['Place'], Thing: ['Asset', 'CreativeWork'] });
 export const LIFEGRAPH_NODE_QUERY = 'MATCH (n) WHERE n.id IN $ids RETURN n.id AS id, labels(n) AS labels, n.claim_summary AS summary, n.source_policy_manifest AS sources LIMIT 2049';
@@ -19,11 +20,11 @@ const manifest = value => {
   if (!Array.isArray(sources) || sources.length > 128 || !sources.every(text) || new Set(sources).size !== sources.length) fail();
   return sources;
 };
-export function createLifeGraphMemgraphReader({ transport, catalogs }) {
-  if (typeof transport?.readTransaction !== 'function' || !Array.isArray(catalogs) || catalogs.length < 1 || catalogs.length > 32) fail();
+export function createLifeGraphMemgraphReader({ transport, catalogs, profile = 'synthetic-read-only-v1' }) {
+  if (!lifeGraphProfile(profile) || typeof transport?.readTransaction !== 'function' || !Array.isArray(catalogs) || catalogs.length < 1 || catalogs.length > 32) fail();
   const catalog = new Map();
   for (const value of structuredClone(catalogs)) {
-    if (!/^synthetic_[a-z0-9_]{1,64}$/.test(value.namespace) || catalog.has(value.namespace) ||
+    if (!(profile === 'synthetic-read-only-v1' ? /^synthetic_[a-z0-9_]{1,64}$/.test(value.namespace) : lifeGraphNamespace(profile, value.namespace)) || catalog.has(value.namespace) ||
         !Array.isArray(value.nodes) || value.nodes.length > 2048 || !Array.isArray(value.edges) || value.edges.length > 4096) fail();
     const ids = new Set();
     for (const n of value.nodes) {

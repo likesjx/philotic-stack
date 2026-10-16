@@ -7,7 +7,6 @@ Requires explicit compiled artifact and exact issuer source checkout arguments.
 import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, signal
 import subprocess, tempfile, time, threading, urllib.request, urllib.error, uuid
 
-ISSUER_HEAD = 'bc97105557c30a17b9f966c1e1d0453c66c6f3ef'
 MONGO = 'mongo@sha256:d0d926f94df099bff534b7ee5b5986458131a22489dfff8664509af0c1e2ca9c'
 GRAPH = 'memgraph/memgraph@sha256:bd01a159023283b56b807943ed28225c8f662920b64317f26da7d9f0f5b19de4'
 
@@ -32,12 +31,13 @@ p.add_argument('--work',type=pathlib.Path,required=True)
 p.add_argument('--supervisor',type=pathlib.Path,required=True)
 p.add_argument('--graph-ip',required=True)
 p.add_argument('--mongo-ip',required=True)
+p.add_argument('--issuer-head',required=True)
 a=p.parse_args()
 work=a.work;supervisor=a.supervisor;node=work/'node';bundle=work/'worker.mjs'
 graph_ip=a.graph_ip;mongo_ip=a.mongo_ip
 results=[]
 def exercise():
-    for case in ['privacy','handoff','before-final','issuer-first','creator-revoked','role-revoked','global','logout','token-revoke','unknown']:
+    for case in ['production-composition','privacy','handoff','before-final','issuer-first','creator-revoked','role-revoked','global','logout','token-revoke','unknown']:
         d=work/case;d.mkdir(mode=0o700)
         def put(name, value='synthetic'):
             p=d/name;p.write_text(value if isinstance(value,str) else json.dumps(value));p.chmod(0o600)
@@ -45,7 +45,8 @@ def exercise():
         worker=lambda role:{'guest':role,'agent':'synthetic-'+role,'roles':[],'role':role,'count':1,
             'executable':{'path':str(node),'sha256':digest(node)},'artifacts':[{'path':str(bundle),'sha256':digest(bundle)}],
             'directory':str(d),'arguments':[str(bundle)],'environment':{'SYNTHETIC_DIR':str(d),'SYNTHETIC_ROLE':role,
-                'SYNTHETIC_MONGO_URI':'mongodb://'+mongo_ip+':27017','SYNTHETIC_DATABASE':'synthetic_'+case.replace('-','_')}}
+                'SYNTHETIC_MONGO_URI':'mongodb://'+mongo_ip+':27017','SYNTHETIC_DATABASE':'synthetic_'+case.replace('-','_'),
+                'SYNTHETIC_PRODUCTION_COMPOSITION':'1' if case=='production-composition' else '0'}}
         manifest={'version':1,'hotel':'synthetic-hotel','owner':'synthetic-owner','uid':os.geteuid(),'socket':str(d/'owner.sock'),
             'journal':str(d/'journal'),'graph_connection_file':str(d/'connection.json'),'workers':[worker('issuer'),worker('gateway')]}
         put('manifest.json',manifest)
@@ -82,7 +83,14 @@ def exercise():
             visible(recall());assert recall(memory=True)[0]==401
             claude=recall('claude');assert 'goal:synthetic-other' in claude[1] and 'synthetic-root' not in claude[1],claude
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-                if case=='handoff':
+                if case=='production-composition':
+                    assert gateway.get('productionComposition') is True
+                    assert control('revoke-client')[0]==200
+                    assert recall()[0]==401 and recall('claude')[0]==200
+                    assert control('reenable')[0]==200 and recall()[0]==401
+                    minted=control('mint');assert minted[0]==200;data['minted']['dot']=json.loads(minted[1])
+                    visible(recall())
+                elif case=='handoff':
                     put('pause-handoff');read=pool.submit(recall);wait('handoff-held')
                     # Actual SQLite competing writer must fail during HTTP handoff.
                     script="const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1],{timeout:50});try{db.exec('UPDATE privacy_revision SET revision=revision+1');process.exitCode=1}catch(e){if(!String(e).includes('locked'))throw e}finally{db.close()}"
@@ -111,6 +119,8 @@ def exercise():
                     assert [p['id'] for p in packet['packets']]==['asset:synthetic'] and packet['edges']==[],result
                 elif case=='role-revoked':
                     assert control('role-revoke')[0]==200
+                    assert recall()[0]==401 and recall('claude')[0]==200
+                    minted=control('mint');assert minted[0]==200;data['minted']['dot']=json.loads(minted[1])
                     result=recall();assert result[0]==200,result
                     packet=json.loads(json.loads(result[1])['result']['content'][0]['text'])
                     assert {p['id'] for p in packet['packets']}=={'goal:synthetic-root','openloop:synthetic'} and packet['edges']==[],result
@@ -133,7 +143,7 @@ def exercise():
         finally:
             for process in [child,restart]:
                 if process is not None and process.poll() is None: process.kill();process.wait(timeout=10)
-    print(json.dumps({'issuer_head':ISSUER_HEAD,'supervisor_sha256':digest(supervisor),'worker_sha256':digest(bundle),'cases':results,
-        'scope_gate':'PR20 memory-only; separate test-only synthetic LifeGraph capabilities','production_access':False}),flush=True)
+    print(json.dumps({'issuer_head':a.issuer_head,'supervisor_sha256':digest(supervisor),'worker_sha256':digest(bundle),'cases':results,
+        'scope_gate':'actual separate issuer-issued life:recall and memory:recall tokens','production_access':False}),flush=True)
 
 exercise()

@@ -7,7 +7,6 @@ Builds the supervisor from an exact clean source commit; never accepts a cached 
 import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, signal
 import subprocess, tempfile, time, urllib.request, urllib.error, uuid
 
-ISSUER_HEAD = 'bc97105557c30a17b9f966c1e1d0453c66c6f3ef'
 MONGO = 'mongo@sha256:d0d926f94df099bff534b7ee5b5986458131a22489dfff8664509af0c1e2ca9c'
 GRAPH = 'memgraph/memgraph@sha256:bd01a159023283b56b807943ed28225c8f662920b64317f26da7d9f0f5b19de4'
 RUST = 'rust@sha256:8e0f5926ce10ec99e12703b315c0043e4709d6bdc740dc1d28753e5fb87c766f'
@@ -37,13 +36,15 @@ parser.add_argument('--source-head', required=True)
 parser.add_argument('--cargo-registry', type=pathlib.Path, required=True, help='Existing public dependency registry cache; no Cargo credentials/config loaded')
 parser.add_argument('--temporary-parent', type=pathlib.Path, help='Disposable scratch parent with space for a fresh build')
 parser.add_argument('--issuer-source', type=pathlib.Path, required=True)
+parser.add_argument('--issuer-head', required=True, help='Exact reviewed issuer commit implementing life:recall')
 args = parser.parse_args()
 assert os.uname().sysname == 'Linux'
 source_head = run('git','-C',str(ROOT),'rev-parse','HEAD')
 assert source_head == args.source_head and len(source_head)==40
 assert not run('git','-C',str(ROOT),'status','--porcelain')
 issuer = args.issuer_source.resolve(strict=True)
-assert run('git', '-C', str(issuer), 'rev-parse', 'HEAD') == ISSUER_HEAD
+assert len(args.issuer_head) == 40 and all(c in '0123456789abcdef' for c in args.issuer_head)
+assert run('git', '-C', str(issuer), 'rev-parse', 'HEAD') == args.issuer_head
 assert not run('git', '-C', str(issuer), 'status', '--porcelain')
 node_source = pathlib.Path(shutil.which('node')).resolve(strict=True)
 assert int(run(str(node_source), '-p', 'process.versions.node.split(".")[0]')) >= 24
@@ -78,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-',dir=args
         '--banner:js=import {createRequire} from "node:module"; const require=createRequire(import.meta.url);', '--outfile='+str(bundle),
         env={**os.environ,'NODE_PATH':str(issuer/'node_modules')})
     bundle.chmod(0o444)
-    assert run('git','-C',str(issuer),'rev-parse','HEAD') == ISSUER_HEAD
+    assert run('git','-C',str(issuer),'rev-parse','HEAD') == args.issuer_head
     assert not run('git','-C',str(issuer),'status','--porcelain')
     try:
         run('docker', 'network', 'create', '--internal', network)
@@ -116,7 +117,7 @@ with tempfile.TemporaryDirectory(prefix='synthetic-lifegraph-composed-',dir=args
             '-v',str(supervisor)+':/fixture-supervisor:ro','-v',str(fixture/'composed-exercise.py')+':/fixture-test.py:ro',
             'python@sha256:5560e9ab8709f459489e5b8aa696eda8a07ef821e14bb122be62d91234bfa98b',
             'python3','/fixture-test.py','--work',str(work),'--supervisor','/fixture-supervisor',
-            '--graph-ip',graph_ip,'--mongo-ip',mongo_ip)
+            '--graph-ip',graph_ip,'--mongo-ip',mongo_ip,'--issuer-head',args.issuer_head)
         receipt=json.loads(output.splitlines()[-1])
         receipt.update(source_head=source_head,supervisor_built_from_exact_commit=True,rust_image=RUST)
         print(output,flush=True);print(json.dumps(receipt),flush=True)

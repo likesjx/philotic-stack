@@ -50,10 +50,10 @@ async function boundedJson(response, max = 262144) {
 // The existing identity service is an application login service, not a general
 // OAuth issuer. An established issuer owns consent, code/PKCE, refresh and
 // revocation. No plugin access token is ever forwarded to a Philotic upstream.
-export function issuerAdapter({ issuer, discovery, introspection, clientId, clientSecret, credential, fetchImpl = fetch }) {
+export function issuerAdapter({ issuer, discovery, introspection, binding, clientId, clientSecret, credential, fetchImpl = fetch }) {
   httpsUrl(issuer);
   const authority = issuer; // OAuth issuer identifiers are exact, including trailing slash.
-  for (const endpoint of [discovery, introspection]) {
+  for (const endpoint of [discovery, introspection, ...(binding === undefined ? [] : [binding])]) {
     if (httpsUrl(endpoint).origin !== new URL(authority).origin) throw new Error('Issuer endpoints must share the configured origin');
   }
   if (!clientId || /:/.test(clientId) || (typeof credential !== 'function' && !clientSecret) || (credential && clientSecret)) throw new Error('Confidential introspection client required');
@@ -62,6 +62,14 @@ export function issuerAdapter({ issuer, discovery, introspection, clientId, clie
     return abortable(async () => boundedJson(await fetchImpl(url, {
       ...init, redirect: 'error', signal: bounded,
     })), bounded);
+  };
+  const confidentialRequest = async (endpoint, body, signal) => {
+    const secret = credential ? await abortable(() => credential({ signal }), signal) : clientSecret;
+    if (typeof secret !== 'string' || secret.length < 32 || secret.length > 4096 || /[\x00-\x20\x7f]/.test(secret)) deny(503, 'credential_unavailable');
+    return request(endpoint, { method: 'POST', headers: {
+      Authorization: `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(secret)}`).toString('base64')}`,
+      'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json',
+    }, body: new URLSearchParams(body) }, signal);
   };
   return {
     issuer: authority,
@@ -78,18 +86,14 @@ export function issuerAdapter({ issuer, discovery, introspection, clientId, clie
         else if (name !== 'registration_endpoint') throw new Error('Issuer metadata endpoint missing');
       }
       if (metadata.introspection_endpoint !== introspection) throw new Error('Introspection endpoint differs from pinned configuration');
+      if (binding !== undefined && metadata.lifegraph_binding_endpoint !== binding) throw new Error('LifeGraph binding endpoint differs from pinned configuration');
       return metadata;
     },
     async inspect(token, { signal } = {}) {
-      const secret = credential ? await abortable(() => credential({ signal }), signal) : clientSecret;
-      if (typeof secret !== 'string' || secret.length < 32 || secret.length > 4096 || /[\x00-\x20\x7f]/.test(secret)) deny(503, 'credential_unavailable');
-      return request(introspection, {
-        method: 'POST', headers: {
-          Authorization: `Basic ${Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(secret)}`).toString('base64')}`,
-          'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json',
-        }, body: new URLSearchParams({ token, token_type_hint: 'access_token' }),
-      }, signal);
+      return confidentialRequest(introspection, { token, token_type_hint: 'access_token' }, signal);
     },
+    ...(binding === undefined ? {} : { resolveBinding: ({ subject, clientId: caller, resource, grantVersion, signal }) =>
+      confidentialRequest(binding, { subject, client_id: caller, resource, grant_version: grantVersion }, signal) }),
   };
 }
 
@@ -182,6 +186,10 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
       typeof lifeGraph.identityAuthority?.resolve !== 'function' || typeof lifeGraph.storageAuthority?.snapshot !== 'function' ||
       typeof lifeGraph.storageAuthority?.authorizeRelease !== 'function')) throw new Error('Explicit separate LifeGraph authority required');
   if (lifeOnly) lifeGraph = { ...lifeGraph, clientPolicies: structuredClone(lifeGraph.clientPolicies) };
+  if (lifeOnly && lifeGraph.profile === 'approved-read-only-v1' &&
+      (['resolveCurrent', 'bindResponse', 'verifyResponse'].some(k => typeof lifeGraph.identityAuthority[k] !== 'function') ||
+       ['bindResponse', 'verifyResponse'].some(k => typeof lifeGraph.storageAuthority[k] !== 'function')))
+    throw new Error('LifeGraph production response lifetime authorities required');
   if (!lifeOnly && (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault))) throw new Error('Explicit bounded Muninn vault required');
   // Transitional remote-client milestone: synthetic recall only. No LifeGraph,
   // private vault, operation authority or write projection may be inherited.

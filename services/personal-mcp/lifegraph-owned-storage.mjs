@@ -7,22 +7,23 @@ import { createLifeGraphOwnerTransport } from './lifegraph-owner-transport.mjs';
 import { createLifeGraphMemgraphReader } from './lifegraph-memgraph.mjs';
 import { createLifeGraphReleaseCoordinator } from './lifegraph-release.mjs';
 import { createLifeGraphStorageAuthority } from './lifegraph-storage.mjs';
+import { lifeGraphProfile } from './lifegraph.mjs';
 export function createLifeGraphOwnedStorage({ enabled = false, profile, policyDatabase, storeIdentity,
   catalogFile, catalogDigest, ownerSocket, ownerIdentity, issuerAuthority }) {
   if (enabled === false) return null;
-  if (enabled !== true || profile !== 'synthetic-read-only-v1' || typeof issuerAuthority?.resolveCurrent !== 'function')
+  if (enabled !== true || !lifeGraphProfile(profile) || typeof issuerAuthority?.resolveCurrent !== 'function')
     throw new Error('LifeGraph owner composition unavailable');
   const catalogs = loadLifeGraphCatalog({ catalogFile, expectedDigest: catalogDigest });
   const policyOwner = createLifeGraphCanonicalPolicyOwner({ policyDatabase, storeIdentity });
   let coordinator, storage;
   try {
     const transport = createLifeGraphOwnerTransport({ socketPath: ownerSocket, ownerIdentity });
-    const reader = createLifeGraphMemgraphReader({ transport, catalogs });
+    const reader = createLifeGraphMemgraphReader({ transport, catalogs, profile });
     coordinator = createLifeGraphReleaseCoordinator({ issuerAuthority, policyAuthority: policyOwner,
       graphAuthority: { readSnapshot: c => reader.readSnapshot(c), currentRevision: async c => (await reader.readSnapshot(c)).revision,
         async pinRelease(context) {
           const lease = await transport.pinRelease(context);
-          const pinnedReader = createLifeGraphMemgraphReader({ transport: lease, catalogs });
+          const pinnedReader = createLifeGraphMemgraphReader({ transport: lease, catalogs, profile });
           return Object.freeze({ validate: () => lease.validate(), release: () => lease.release(),
             currentRevision: async c => (await pinnedReader.readSnapshot(c)).revision });
         } } });
