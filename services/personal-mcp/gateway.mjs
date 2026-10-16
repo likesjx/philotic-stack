@@ -182,6 +182,10 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
       typeof lifeGraph.identityAuthority?.resolve !== 'function' || typeof lifeGraph.storageAuthority?.snapshot !== 'function' ||
       typeof lifeGraph.storageAuthority?.authorizeRelease !== 'function')) throw new Error('Explicit separate LifeGraph authority required');
   if (lifeOnly) lifeGraph = { ...lifeGraph, clientPolicies: structuredClone(lifeGraph.clientPolicies) };
+  if (lifeOnly && lifeGraph.profile === 'approved-read-only-v1' &&
+      (['resolveCurrent', 'bindResponse', 'verifyResponse'].some(k => typeof lifeGraph.identityAuthority[k] !== 'function') ||
+       ['bindResponse', 'verifyResponse'].some(k => typeof lifeGraph.storageAuthority[k] !== 'function')))
+    throw new Error('LifeGraph production response lifetime authorities required');
   if (!lifeOnly && (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault))) throw new Error('Explicit bounded Muninn vault required');
   // Transitional remote-client milestone: synthetic recall only. No LifeGraph,
   // private vault, operation authority or write projection may be inherited.

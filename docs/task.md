@@ -1,5 +1,7 @@
 # Ansible Mesh Architecture Separation Task List
 
+- [ ] Release read-only LifeGraph issuer/gateway composition after canonical identity binding, Linux owner acceptance, and issuer Mongo/typecheck gates. Source and local validation: [implementation notes](../services/personal-mcp/LIFEGRAPH_READONLY_IMPLEMENTATION.md).
+
 - [x] Inspect the `openclaw-plugin-ansible` repository and identify the rust port branch.
 - [x] Understand the current architecture of the ansible mesh.
 - [x] Design the separation of the stack into independently addressable units:

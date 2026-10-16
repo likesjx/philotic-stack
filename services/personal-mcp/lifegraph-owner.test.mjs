@@ -91,6 +91,12 @@ test('concrete owned storage loads catalog and canonical policy over actual Unix
   const args={enabled:true,profile:'synthetic-read-only-v1',policyDatabase:f.path,storeIdentity:{device:String(statSync(f.path).dev),inode:String(statSync(f.path).ino)},catalogFile,catalogDigest:createHash('sha256').update(bytes).digest('hex'),ownerSocket:s.path,ownerIdentity:'synthetic-owner',issuerAuthority:{resolveCurrent:async()=>null}};
   const storage=createLifeGraphOwnedStorage(args);t.after(()=>storage.close());
   const snapshot=await storage.snapshot({namespace:'synthetic_dot'});assert.equal(snapshot.nodes[0].policy.creator,'agent-dot');
+  catalog.catalogs[0].namespace='approved_dot';
+  const approvedBytes=JSON.stringify(catalog);await writeFile(catalogFile,approvedBytes,{mode:0o600});
+  const approved=createLifeGraphOwnedStorage({...args,profile:'approved-read-only-v1',catalogDigest:createHash('sha256').update(approvedBytes).digest('hex')});
+  t.after(()=>approved.close());
+  assert.equal((await approved.snapshot({namespace:'approved_dot'})).nodes[0].policy.creator,'agent-dot');
+  await assert.rejects(approved.snapshot({namespace:'synthetic_dot'}),/unavailable/);
   assert.throws(()=>createLifeGraphOwnedStorage({...args,profile:'production'}),/unavailable/);
 });
 

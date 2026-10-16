@@ -7,7 +7,6 @@ Requires explicit compiled artifact and exact issuer source checkout arguments.
 import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, signal
 import subprocess, tempfile, time, threading, urllib.request, urllib.error, uuid
 
-ISSUER_HEAD = 'bc97105557c30a17b9f966c1e1d0453c66c6f3ef'
 MONGO = 'mongo@sha256:d0d926f94df099bff534b7ee5b5986458131a22489dfff8664509af0c1e2ca9c'
 GRAPH = 'memgraph/memgraph@sha256:bd01a159023283b56b807943ed28225c8f662920b64317f26da7d9f0f5b19de4'
 
@@ -32,6 +31,7 @@ p.add_argument('--work',type=pathlib.Path,required=True)
 p.add_argument('--supervisor',type=pathlib.Path,required=True)
 p.add_argument('--graph-ip',required=True)
 p.add_argument('--mongo-ip',required=True)
+p.add_argument('--issuer-head',required=True)
 a=p.parse_args()
 work=a.work;supervisor=a.supervisor;node=work/'node';bundle=work/'worker.mjs'
 graph_ip=a.graph_ip;mongo_ip=a.mongo_ip
@@ -133,7 +133,7 @@ def exercise():
         finally:
             for process in [child,restart]:
                 if process is not None and process.poll() is None: process.kill();process.wait(timeout=10)
-    print(json.dumps({'issuer_head':ISSUER_HEAD,'supervisor_sha256':digest(supervisor),'worker_sha256':digest(bundle),'cases':results,
-        'scope_gate':'PR20 memory-only; separate test-only synthetic LifeGraph capabilities','production_access':False}),flush=True)
+    print(json.dumps({'issuer_head':a.issuer_head,'supervisor_sha256':digest(supervisor),'worker_sha256':digest(bundle),'cases':results,
+        'scope_gate':'actual separate issuer-issued life:recall and memory:recall tokens','production_access':False}),flush=True)
 
 exercise()
