@@ -58,6 +58,10 @@ subject/client/current grant version plus the canonical agent ID and current
 roles. It must be read-only, fail closed on missing/ambiguous/revoked bindings,
 and participate in the same authority-writer exclusion contract. It must never
 invoke a mutation-based identity upsert while holding the release fence.
+The issuer's confidential binding endpoint now supplies this contract from the
+existing versioned resource grant. The fixture seeds synthetic delegated bindings
+there and removes roles using the same fenced/versioned helper. Old tokens must
+be denied after role removal; newly issued tokens see only the remaining roles.
 
 Final admission re-introspects exact issuer/audience/life-only scope, validates
 bounded token lifetime, refreshes bindings, and binds expiry to synchronous HTTP

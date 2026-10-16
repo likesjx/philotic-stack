@@ -30,8 +30,7 @@ if(role==='issuer'){
  await db.collection('users').insertOne({...identity,roles:['admin']});const subject=await store.resolve(identity);
  await db.collection('personal_oauth_admissions').insertOne({subject,enabled:true,version:0});
  await db.collection('personal_oauth_client_admissions').insertMany(['dot','claude'].map(clientId=>({subject,clientId,enabled:true,version:0})));
- await db.collection('personal_oauth_resource_admissions').insertMany(['dot','claude'].map(clientId=>({subject,clientId,resource,scope:'life:recall',enabled:true,version:0})));
- await db.collection('synthetic_life_bindings').insertMany(['dot','claude'].map(clientId=>({subject,clientId,agentId:'agent-'+clientId,roles:['reader']})));
+ await db.collection('personal_oauth_resource_admissions').insertMany(['dot','claude'].map(clientId=>({subject,clientId,resource,scope:'life:recall',enabled:true,version:0,binding:{agentId:'agent-'+clientId,roles:['reader']}})));
  const config={issuer:issuerUrl,resource:'https://synthetic.example/memory/mcp',lifeGraphResource:resource,clients:['dot','claude'].map(clientId=>({clientId,callbacks:[`https://${clientId}.example/callback`]}))};
  const auth=new PersonalOAuth(config,store),session='synthetic-session',credentials={client:'synthetic-gateway',verifier:hash('Basic '+Buffer.from('synthetic-gateway:'+'s'.repeat(43)).toString('base64'))};
  const h=handlers(auth,async()=>({identity,session}),credentials),tokens=new Map<string,any>();
@@ -59,10 +58,10 @@ if(role==='issuer'){
   const url=new URL(req.url!,'http://127.0.0.1');let result:any;
   if(url.pathname==='/inspect')result=await inspect(url.searchParams.get('token')!);
   else if(url.pathname==='/binding'){
-   const clientId=url.searchParams.get('clientId')!,claims=await inspect(tokens.get(clientId)?.access_token??'');
-   const binding=await db.collection('synthetic_life_bindings').findOne({subject,clientId});
-   result=claims.active===true&&binding&&claims.sub===url.searchParams.get('subject')&&claims.grant_version===url.searchParams.get('grantVersion')?
-    {subject,clientId,grantVersion:claims.grant_version,agentId:binding.agentId,roles:binding.roles}:null;
+   const response=await h.lifeGraphBinding(new Request(issuerUrl+'/oauth/lifegraph-binding',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded',Authorization:'Basic '+Buffer.from('synthetic-gateway:'+'s'.repeat(43)).toString('base64')},
+    body:new URLSearchParams({subject:url.searchParams.get('subject')!,client_id:url.searchParams.get('clientId')!,resource,grant_version:url.searchParams.get('grantVersion')!})}));
+   if(response.status!==200)throw Error('binding denied');result=await response.json();
   }else if(url.pathname==='/control'){
    const operation=url.searchParams.get('op')!,clientId=url.searchParams.get('client')??'dot';
    if(operation==='revoke-client'||operation==='hold-revoke'){
@@ -73,7 +72,7 @@ if(role==='issuer'){
    else if(operation==='global')await changePersonalAdmission(db,subject,false);
    else if(operation==='logout')await revokeProviderSessions(db,identity.provider,identity.providerId);
    else if(operation==='token-revoke')await auth.revoke(tokens.get(clientId).access_token,clientId);
-   else if(operation==='role-revoke')await withLifeGraphIssuerChange(async()=>{await db.collection('synthetic_life_bindings').updateOne({subject,clientId},{$set:{roles:[]}});});
+   else if(operation==='role-revoke')await changePersonalLifeGraphAdmission(db,subject,clientId,resource,true,{agentId:'agent-'+clientId,roles:[]});
    else if(operation==='unknown')await withLifeGraphIssuerChange(async()=>{await db.collection('personal_oauth_resource_admissions').updateOne({subject,clientId,resource,scope:'life:recall'},{$inc:{version:1}});throw Error('synthetic unknown commit acknowledgement');});
    else throw Error('unknown test operation');
    result??={done:true};

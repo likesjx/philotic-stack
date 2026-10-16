@@ -11,6 +11,8 @@ test('canonical bindings are refreshed, fenced, client-bound and never upgrade m
   const authority=createLifeGraphIdentityAuthority({issuer:{issuer:claims.iss,inspect:async()=>claims},resource,resolveBinding:async()=>binding});
   const req={headers:{authorization:'Bearer synthetic-token'}}, input={subject:claims.sub,clientId:'dot',grantVersion:'1'};
   const first=await authority.resolveCurrent({request:req}); assert.deepEqual(first.roles,['reader']);
+  claims={...claims,roles:['admin'],agent_id:'forged-agent'};
+  const ignored=await authority.resolveCurrent({request:req});assert.equal(ignored.agentId,'synthetic-dot');assert.deepEqual(ignored.roles,['reader']);
   binding={...binding,roles:[]}; assert.deepEqual((await authority.resolveCurrent({request:req})).roles,[]);
   assert.deepEqual(first.roles,['reader']);
   await assert.rejects(authority.resolve({...input,clientId:'claude'}),/unavailable/);

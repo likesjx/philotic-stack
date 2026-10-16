@@ -111,6 +111,8 @@ def exercise():
                     assert [p['id'] for p in packet['packets']]==['asset:synthetic'] and packet['edges']==[],result
                 elif case=='role-revoked':
                     assert control('role-revoke')[0]==200
+                    assert recall()[0]==401 and recall('claude')[0]==200
+                    minted=control('mint');assert minted[0]==200;data['minted']['dot']=json.loads(minted[1])
                     result=recall();assert result[0]==200,result
                     packet=json.loads(json.loads(result[1])['result']['content'][0]['text'])
                     assert {p['id'] for p in packet['packets']}=={'goal:synthetic-root','openloop:synthetic'} and packet['edges']==[],result
