@@ -6,7 +6,7 @@ use anyhow::{Result,ensure};
 use ansible_mesh_core::{domain::GraphDomain,sqlite_storage::SqliteGraphStorage};
 fn run()->Result<()> {
  let private_start = std::env::args().nth(2).as_deref()==Some("--root-private-start");
- if private_start { private_start::enter()?; }
+ if private_start { private_start::enter()?; private_start::receive_key(std::env::args().nth(3).ok_or_else(||anyhow::anyhow!("channel"))?.parse()?)?; }
  ensure!(std::env::args().nth(1).as_deref()==Some("--apply-scoped-synthetic"),"approval");
  ensure!(std::env::var_os("PHILOTIC_VAULT_MASTER_KEY").is_none(),"env disallowed");
  ensure!(unsafe { libc::geteuid() } == 999,"uid");

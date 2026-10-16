@@ -12,4 +12,35 @@ class Test(unittest.TestCase):
  def test_regular_file_refused(self):
   with tempfile.TemporaryFile() as f:
    with self.assertRaises(ValueError):h.key_line(f.fileno())
+
+class DelayedDelivery(unittest.TestCase):
+ def test_key_withheld_until_exact_ready(self):
+  import socket,threading,select
+  parent,peer=socket.socketpair();r,w=os.pipe();encoded=base64.b64encode(bytes([7])*32);os.write(w,encoded+b'\n');os.close(w)
+  errors=[]
+  def deliver():
+   try:h.deliver_after_ready(parent,r)
+   except Exception as e:errors.append(type(e).__name__)
+  t=threading.Thread(target=deliver);t.start()
+  try:
+   self.assertTrue(select.select([r],[],[],0)[0])
+   self.assertFalse(select.select([peer],[],[],0.05)[0])
+   peer.sendall(b'REA');self.assertFalse(select.select([peer],[],[],0.05)[0]);self.assertTrue(select.select([r],[],[],0)[0])
+   peer.sendall(b'DY\n');data=b''
+   while True:
+    part=peer.recv(130)
+    if not part:break
+    data+=part
+   t.join(2);self.assertFalse(t.is_alive());self.assertEqual(errors,[])
+   self.assertEqual(data,b'PHILOTIC_VAULT_MASTER_KEY='+encoded+b'\n')
+  finally:parent.close();peer.close();os.close(r)
+ def test_invalid_handshake_does_not_consume_key(self):
+  import socket
+  parent,peer=socket.socketpair();r,w=os.pipe();os.write(w,b'public-unread');os.close(w)
+  try:
+   peer.sendall(b'BAD!!\n')
+   with self.assertRaises(ValueError):h.deliver_after_ready(parent,r)
+   self.assertEqual(os.read(r,100),b'public-unread')
+  finally:parent.close();peer.close();os.close(r)
+
 if __name__=='__main__':unittest.main()
