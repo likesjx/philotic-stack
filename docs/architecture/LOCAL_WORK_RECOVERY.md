@@ -14,6 +14,43 @@ task_refs:
 
 # Synthetic local work recovery candidate
 
+## Normal-loop inspection candidate
+
+The local inspection candidate receives `development.inspect_manifest` inside
+`AgentRuntime::run`, after normal startup. It uses no alternate main entrypoint,
+model call or shell. The explicitly opted-in guest authenticates the expected
+hotel peer; the hotel adapter checks the owned incarnation and exact task scope.
+The adapter is opt-in API surface, not installed by production hotel startup.
+
+The supervisor pins at most 16 KiB of `Cargo.toml` and `README.md` snapshot bytes.
+The guest computes lengths/SHA-256 hashes; the adapter validates the result against
+the immutable snapshot. The authoritative receipt is in LocalWork's SQLite file,
+committed with fence and authority revision checks. No second output-file commit
+exists. A receipt survives lost responses; a dispatched operation without a receipt
+blocks as Unknown. Only a recorded pre-dispatch failure permits bounded retry.
+All authority records remain synthetic; prepaid active-work quanta are not measured
+CPU/token usage. The adapter's clock advances monotonically from its supplied base.
+
+This work does not restore ordinary conversational WorkingTurns. Existing startup
+sweeping is unchanged; inspection state lives in Task rather than session apartments.
+Normal configuration requests receive only exact inert fixture responses. Input
+snapshots in the acceptance test are compile-time repository bytes; no live mutable
+repository or symlink traversal is exercised. Fault injection and duplicate delivery
+are test-only. A prior synthetic effect is not inspection evidence.
+
+Reproduction (explicit owned-process test; not run by ordinary cargo test):
+
+```sh
+cargo build --offline -p philote --bin philote
+PHILOTIC_INSPECTION_BINARY=/absolute/path/to/target/debug/philote PHILOTIC_INSPECTION_REVISION=<exact-source-commit> cargo test --offline -p aiua --bin aiua actual_normal_runtime_inspection_recovery -- --ignored --nocapture
+cargo test --offline -p graph-intelligence --test local_work_recovery
+```
+
+Acceptance records the owned `/tmp/nr-*` directory, process IDs and runtime markers.
+Databases and stdout/stderr remain as evidence; owned children and sockets are reaped.
+Verification and independent review are pending for this local candidate. It is not
+published, merged, deployed or production-live-verified.
+
 ## Work contract
 
 Owner: `codex/local-work-recovery`, one builder; parent dot is delivery lead.

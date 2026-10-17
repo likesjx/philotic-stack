@@ -69,6 +69,67 @@ fn evidence() -> Evidence {
 }
 
 #[test]
+fn inspection_receipt_is_fenced_authorized_and_reconciled_after_reopen() {
+    for mode in [
+        "success", "revoked", "changed", "expired", "takeover", "unknown",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inspection.db");
+        let path = path.to_str().unwrap();
+        let mut l = seed(path, 2);
+        let mut s = scope();
+        s.action = "development.inspect_manifest".into();
+        let mut auth = authority();
+        auth.scopes = vec![s.clone()];
+        l.set_authority(AUTH, auth.clone()).unwrap();
+        let f = l.claim(TASK, "synthetic:session:one", 0, 10).unwrap();
+        l.prepare(TASK, &f, 0, "one", s).unwrap();
+        l.dispatch(TASK, &f, 0).unwrap();
+        let receipt = serde_json::json!({"input_digest":"pinned","files":[]});
+        match mode {
+            "revoked" => {
+                auth.revoked = true;
+                l.set_authority(AUTH, auth).unwrap();
+            }
+            "changed" => l.set_authority(AUTH, auth).unwrap(),
+            "takeover" => {
+                LocalWork::open(path)
+                    .unwrap()
+                    .claim(TASK, "synthetic:session:two", 10, 10)
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let now = if mode == "expired" { 10 } else { 0 };
+        if mode == "success" {
+            assert!(l.commit_inspection(TASK, &f, now, &receipt).unwrap());
+            assert!(l.commit_inspection(TASK, &f, now, &receipt).unwrap());
+            assert!(l
+                .commit_inspection(TASK, &f, now, &serde_json::json!({"different":true}))
+                .is_err());
+        } else if mode != "unknown" {
+            assert!(l.commit_inspection(TASK, &f, now, &receipt).is_err());
+        }
+        drop(l);
+        if mode == "success" || mode == "unknown" {
+            let mut l = LocalWork::open(path).unwrap();
+            let f = l.claim(TASK, "synthetic:session:resume", 10, 10).unwrap();
+            let result = l.reconcile_inspection(TASK, &f, 10).unwrap();
+            assert_eq!(
+                result,
+                if mode == "success" {
+                    Some(receipt.clone())
+                } else {
+                    None
+                }
+            );
+            assert!(l.commit_inspection(TASK, &f, 10, &receipt).is_err());
+            assert!(l.retry_prepared(TASK, &f, 10).is_err());
+        }
+    }
+}
+
+#[test]
 fn atomic_claim_expiry_and_takeover_fence_every_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("graph.db");

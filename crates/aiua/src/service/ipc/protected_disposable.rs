@@ -1,5 +1,8 @@
 //! Opt-in synthetic single-operation endpoint. Never installed in production startup.
 //! This is not a grant issuer, task scheduler, or Philote restart implementation.
+pub mod inspection;
+#[cfg(test)]
+mod normal_runtime_tests;
 #[cfg(test)]
 mod recovery_tests;
 use ansible_mesh_core::{
@@ -30,6 +33,7 @@ pub struct DisposableContract {
 }
 
 pub struct ProtectedDisposable {
+    inspection: Option<Arc<inspection::Inspection>>,
     launches: Arc<LocalLaunchRegistry>,
     contract: DisposableContract,
     // Serialize all adapter writes/revocation, then take launch lock, then graph.
@@ -54,6 +58,7 @@ impl ProtectedDisposable {
         );
         serde_json::from_str::<serde_json::Value>(&contract.operation_json)?;
         Ok(Self {
+            inspection: None,
             launches,
             contract,
             revoked: Mutex::new(false),
@@ -68,6 +73,10 @@ impl ProtectedDisposable {
             .lock()
             .map_err(|_| anyhow::anyhow!("poisoned contract"))? = true;
         Ok(())
+    }
+    pub fn with_inspection(mut self, inspection: Arc<inspection::Inspection>) -> Self {
+        self.inspection = Some(inspection);
+        self
     }
     fn handle(
         &self,
@@ -110,6 +119,9 @@ impl ProtectedDisposable {
         proof.with_current_launch(|actor| {
             ensure!(actor.stable_agent_id() == c.agent && actor.roles().contains(&c.role), "principal mismatch");
             ensure!(Instant::now() < c.expires_at, "expired contract");
+            if let Some(inspection) = &self.inspection {
+                return inspection.handle(actor.stable_agent_id(), request);
+            }
             #[cfg(test)]
             if let Some(fixture) = &self.recovery {
                 return fixture.handle(actor.stable_agent_id(), &proof.consumer(), request, c);
@@ -153,6 +165,19 @@ impl ProtectedDisposable {
             ensure!(length <= 65536, "protected frame too large");
             let mut frame = vec![0; length];
             stream.read_exact(&mut frame).await?;
+            let registering = matches!(
+                serde_json::from_slice::<IpcRequest>(&frame),
+                Ok(IpcRequest::Register(_))
+            );
+            #[cfg(test)]
+            let committing = matches!(
+                serde_json::from_slice::<IpcRequest>(&frame),
+                Ok(IpcRequest::EmitTask { .. })
+            );
+            #[cfg(test)]
+            let dispatching = matches!(serde_json::from_slice::<IpcRequest>(&frame),Ok(IpcRequest::GetConfig {key}) if key.ends_with(":dispatch"));
+            #[cfg(test)]
+            let bootstrapping = matches!(serde_json::from_slice::<IpcRequest>(&frame),Ok(IpcRequest::GetConfig {key}) if key == philotic_client::development_inspection::KEY);
             let result = serde_json::from_slice(&frame)
                 .map_err(anyhow::Error::from)
                 .and_then(|request| self.handle(&stream, &mut proof, request, &graph));
@@ -172,7 +197,26 @@ impl ProtectedDisposable {
                     "Disposable contract denied",
                 )
             });
+            #[cfg(test)]
+            if let Some(i) = &self.inspection
+                && ((bootstrapping && i.hold_bootstrap.load(std::sync::atomic::Ordering::SeqCst))
+                    || (committing && i.hold.load(std::sync::atomic::Ordering::SeqCst))
+                    || (dispatching && i.hold_dispatch.load(std::sync::atomic::Ordering::SeqCst)))
+            {
+                i.reached.notify_one();
+                i.release.notified().await;
+            }
             super::IpcServer::write_frame(&mut stream, &serde_json::to_vec(&response)?).await?;
+            if registering
+                && matches!(response, IpcResponse::Standard { ok: true, .. })
+                && let Some(i) = &self.inspection
+            {
+                super::IpcServer::write_frame(&mut stream, &serde_json::to_vec(&i.envelope())?)
+                    .await?;
+                #[cfg(test)]
+                super::IpcServer::write_frame(&mut stream, &serde_json::to_vec(&i.envelope())?)
+                    .await?;
+            }
         }
     }
 }

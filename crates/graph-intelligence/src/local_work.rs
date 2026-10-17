@@ -185,7 +185,9 @@ impl LocalWork {
         graph.transaction(|tx| {
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS synthetic_work_effects (
-                operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL);",
+                operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS local_inspection_receipts (
+                operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, receipt TEXT NOT NULL);",
             )?;
             Ok(())
         })?;
@@ -475,6 +477,82 @@ impl LocalWork {
             let phase = op.phase.clone();
             write(tx, id, NodeKind::Task, &work)?;
             Ok(phase)
+        })
+    }
+
+    /// Commit one bounded inspection result. Caller verifies the result against
+    /// its immutable snapshot; the ledger owns atomic authorization and fencing.
+    pub fn commit_inspection(
+        &mut self,
+        id: &str,
+        fence: &Fence,
+        now: u64,
+        receipt: &serde_json::Value,
+    ) -> Result<bool> {
+        let encoded = serde_json::to_string(receipt)?;
+        ensure!(encoded.len() <= 4096, "receipt too large");
+        ensure!(
+            self.dispatches.contains(&(id.to_owned(), fence.epoch)),
+            "reconcile only"
+        );
+        self.graph.transaction(|tx| {
+            let mut work: Work = read(tx, id, NodeKind::Task)?;
+            valid_fence(&work, fence, now)?;
+            ensure!(work.stopped.is_none(), "work stopped");
+            let op = work.operation.as_ref().context("not prepared")?;
+            ensure!(
+                op.scope.action == "development.inspect_manifest"
+                    && op.phase == Phase::Dispatched
+                    && op.dispatch_epoch == Some(fence.epoch),
+                "inspection dispatch mismatch"
+            );
+            ensure!(
+                authority_chain(tx, &op.authority, &op.scope, now)? == op.authority_chain,
+                "authority changed"
+            );
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT receipt FROM local_inspection_receipts WHERE operation_id=?1",
+                    [&op.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                ensure!(existing == encoded, "conflicting receipt");
+                return Ok(true);
+            }
+            if work.active_ms >= work.budget_ms {
+                work.stopped = Some("active-work budget exhausted".into());
+                write(tx, id, NodeKind::Task, &work)?;
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO local_inspection_receipts VALUES (?1,?2,?3,?4)",
+                params![op.id, id, serde_json::to_string(&op.scope)?, encoded],
+            )?;
+            work.active_ms += 1;
+            write(tx, id, NodeKind::Task, &work)?;
+            Ok(true)
+        })
+    }
+
+    pub fn reconcile_inspection(
+        &mut self,
+        id: &str,
+        fence: &Fence,
+        now: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        self.graph.transaction(|tx| {
+            let mut work: Work = read(tx,id,NodeKind::Task)?;
+            valid_fence(&work,fence,now)?;
+            ensure!(work.stopped.is_none(), "work stopped");
+            let op = work.operation.as_mut().context("not prepared")?;
+            ensure!(op.scope.action == "development.inspect_manifest" && op.phase != Phase::Prepared, "not dispatched inspection");
+            ensure!(authority_chain(tx,&op.authority,&op.scope,now)? == op.authority_chain,"authority changed");
+            let receipt: Option<String> = tx.query_row("SELECT receipt FROM local_inspection_receipts WHERE operation_id=?1 AND task_id=?2 AND scope=?3",params![op.id,id,serde_json::to_string(&op.scope)?],|r|r.get(0)).optional()?;
+            op.phase = if receipt.is_some() { Phase::Succeeded } else { Phase::Unknown };
+            write(tx,id,NodeKind::Task,&work)?;
+            receipt.map(|r|serde_json::from_str(&r).map_err(Into::into)).transpose()
         })
     }
 

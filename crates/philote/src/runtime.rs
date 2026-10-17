@@ -15805,6 +15805,8 @@ mod tests {
     }
 }
 
+#[path = "development_inspection.rs"]
+mod development_inspection;
 #[cfg(feature = "disposable-recovery")]
 #[path = "disposable_recovery.rs"]
 mod disposable_recovery;
