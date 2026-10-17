@@ -44,7 +44,8 @@ fn seed(path: &str) -> LocalWork {
                 role_charter: AUTH.into(),
                 revision: std::env::var("PHILOTIC_DISPOSABLE_REVISION")
                     .unwrap_or_else(|_| "uncommitted-integration".into()),
-                environment: "mbp-jane:disposable-philote".into(),
+                environment: std::env::var("PHILOTIC_DISPOSABLE_ENVIRONMENT")
+                    .unwrap_or_else(|_| "mbp-jane:disposable-philote".into()),
                 fence: None,
                 operation: None,
                 attempts: 0,
@@ -281,6 +282,7 @@ async fn actual_philote_interruption_reconciles_existing_ledger() {
     let directory =
         std::path::PathBuf::from("/tmp").join(format!("pr-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir(&directory).unwrap();
+    println!("ACTUAL_FIXTURE_DIR path={}", directory.display());
     let db = directory.join("work.db");
     let db = db.to_str().unwrap();
     let first = Arc::new(RecoveryFixture::new(seed(db), 0, true));

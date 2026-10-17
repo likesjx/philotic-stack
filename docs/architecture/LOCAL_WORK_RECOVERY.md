@@ -198,3 +198,13 @@ adapter; the children are actual executables. This proves the opt-in local recov
 path, not general production turn restoration, external exactly-once effects,
 production grants, a running hotel integration or live verification. No default
 runtime installation, migration, daemon or grant service is added.
+
+Hosted verification: `.github/workflows/disposable-philote-recovery.yml` runs on
+path-matching PRs, checks out the exact PR head, builds the opt-in executable and
+explicitly invokes the ignored actual-process test. Its read-only job uses no
+secrets, production endpoints or deployment steps. The evidence artifact contains
+revision, hosted environment, toolchain, binary checksum, command/result log and
+synthetic ledgers. A successful run asserts one main recovery effect, no unknown
+outcome effect, and owned-process/socket cleanup. Ordinary workspace CI alone does
+not establish this coverage. The dedicated driver and prepaid accounting limits
+above continue to apply on hosted runners.
