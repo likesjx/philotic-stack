@@ -45,6 +45,32 @@ code. Revocation during recall must withhold the response.
 
 ## Remaining production work
 
+Concrete issuer adapter now implemented in `persistent-issuer-owner.mjs`: uses the
+existing confidential `issuerAdapter` with broker credential callback and real
+metadata/introspection wire format. It validates exact issuer/audience/scope,
+subject/client allowlists and bounded iat/exp on every check. Canonical memory
+introspection already verifies client/global admission versions but does not
+return grant_version. Same-token SHA256 binding is not a fabricated grant epoch;
+revocation authority remains fresh issuer introspection. Seventeen targeted tests
+include composition, inactive token and the negative claims matrix. No issuer
+source edit or live credential request was needed.
+
+Required shared contracts, for coordinator assignment:
+- Issuer owner retains `src/lib/auth/personal-oauth/*`; no request to expose token
+  secrets or duplicate admission storage. Confirm current memory introspection
+  preserves internal version checks during the LifeGraph authority transition.
+- Privacy/storage owner must provide canonical versioned per-record eligibility
+  and filtering for the approved real-memory vaults, binding the exact returned
+  response under revocation/withdrawal fencing through transport completion.
+  The current gateway explicitly has no verified real-record privacy filter.
+  Text heuristics, copied LifeGraph receipts or operator booleans cannot replace it.
+- Lifecycle owner must expose the adopted credential expiry and serving state,
+  and coordinate rotation/withdrawal with in-flight responses. No existing durable
+  implementation was identified; the reference model is not that implementation.
+
+No account-specific ChatGPT callback is included. Observed unsaved-form callback
+persistence remains unverified; production client configuration stays absent.
+
 Actual per-record privacy authority and approved real-memory scope; durable
 admission integration; broker rotation/adoption mechanism; persistent supervised
 service, restart/health/observation implementation; tested rollback bundle; verified

@@ -93,7 +93,9 @@ export function canRecall(state, request, now) {
     request.subject === state.subject && request.resource === state.resource &&
     request.scope === 'memory:recall' && request.tool === 'muninn_recall' && request.readOnly === true &&
     Array.isArray(state.vaults) && state.vaults.includes(request.vault) &&
-    c?.enabled === true && integer(c.version) && request.clientVersion === c.version &&
+    c?.enabled === true && (request.authorizationBinding !== undefined
+      ? typeof c.authorizationBinding === 'string' && /^[a-f0-9]{64}$/.test(c.authorizationBinding) && request.authorizationBinding === c.authorizationBinding
+      : integer(c.version) && request.clientVersion === c.version) &&
     integer(state.activeCredential?.expiresAt) && state.activeCredential.expiresAt > now &&
     integer(state.privacyLeaseExpiresAt) && state.privacyLeaseExpiresAt > now;
 }

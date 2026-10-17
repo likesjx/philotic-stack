@@ -16,10 +16,12 @@ export function createPersistentOwnerBoundary({ resource, clients, issuer, scope
       const query = recallArguments('muninn_recall', structuredClone(args), vault);
       const authorization = await issuer.authorizeRecall({ accessToken, resource, scope: 'memory:recall' });
       if (!authorization || !allowed.has(authorization.clientId) || typeof authorization.subject !== 'string' ||
-          !Number.isSafeInteger(authorization.clientVersion) || authorization.clientVersion < 0)
+          !(typeof authorization.authorizationBinding === 'string' && /^[a-f0-9]{64}$/.test(authorization.authorizationBinding) ||
+            Number.isSafeInteger(authorization.clientVersion) && authorization.clientVersion >= 0))
         throw new Error('authorization denied');
       const bound = Object.freeze({ subject: authorization.subject, clientId: authorization.clientId,
-        clientVersion: authorization.clientVersion, resource, vault, scope:'memory:recall', tool:'muninn_recall', readOnly:true });
+        ...(authorization.authorizationBinding !== undefined ? {authorizationBinding:authorization.authorizationBinding} : {clientVersion:authorization.clientVersion}),
+        resource, vault, scope:'memory:recall', tool:'muninn_recall', readOnly:true });
       const readState = async () => {
         const scope = structuredClone(await scopeOwner.resolve(bound));
         const lifecycle = structuredClone(await lifecycleOwner.read());
@@ -27,12 +29,12 @@ export function createPersistentOwnerBoundary({ resource, clients, issuer, scope
         // an earlier admission. Atomic transport release still needs owner fencing.
         const current = await issuer.authorizeRecall({ accessToken, resource, scope:'memory:recall' });
         if (!current || current.subject !== bound.subject || current.clientId !== bound.clientId ||
-            current.clientVersion !== bound.clientVersion || !Number.isSafeInteger(current.expiresAt) ||
+            current.clientVersion !== bound.clientVersion || current.authorizationBinding !== bound.authorizationBinding || !Number.isSafeInteger(current.expiresAt) ||
             !Number.isSafeInteger(scope.expiresAt)) throw new Error('authorization changed');
         // Scope owner, not request arguments, selects eligible vaults. Lifecycle
         // owner provides the adopted credential's expiry and serving phase.
         return { subject:bound.subject,resource,subjectEnabled:current.enabled === true,
-          clients:{[bound.clientId]:{enabled:current.enabled === true,version:current.clientVersion}},
+          clients:{[bound.clientId]:{enabled:current.enabled === true,version:current.clientVersion,authorizationBinding:current.authorizationBinding}},
           vaults:scope.vaults,privacyLeaseExpiresAt:Math.min(scope.expiresAt,current.expiresAt),
           phase:lifecycle.phase,activeCredential:{expiresAt:lifecycle.credentialExpiresAt} };
       };
