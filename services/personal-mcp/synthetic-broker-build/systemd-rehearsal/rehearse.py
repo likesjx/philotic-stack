@@ -17,6 +17,37 @@ def show(name,*props):
     for p in props:args+=['-p',p]
     return dict(s.split('=',1) for s in run(*args).stdout.splitlines() if '=' in s)
 def digest(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def check(report,label,actual,expected):
+    # Bounded public metadata only, flushed before refusal so missing artifacts
+    # cannot erase the exact failing gate. Never include commands/env/unit bodies.
+    evidence={'check':label,'actual':actual,'expected':expected}
+    report.setdefault('preflight',[]).append(evidence)
+    print(json.dumps(evidence),flush=True)
+    assert actual==expected,label
+def inspect_fresh_unit(report,name):
+    props=('LoadState','ActiveState','SubState','FragmentPath','SourcePath','DropInPaths','ControlGroup','Transient')
+    report['operation']='inspect-fresh-unit:'+name
+    observed=show(name,*props)
+    report.setdefault('unit_metadata',{})[name]=observed
+    print(json.dumps({'unit':name,'metadata':observed}),flush=True)
+    # Diagnostic-only correction: preserve the reviewed freshness assertion.
+    # systemd255 loads fragmentless slices; any semantic replacement of this
+    # assertion requires a separately reviewed collision/ownership contract.
+    check(report,name+':LoadState',observed.get('LoadState'),'not-found')
+def preflight(report):
+    check(report,'root',os.geteuid(),0)
+    check(report,'platform',sys.platform,'linux')
+    check(report,'hosted-runner',{'GITHUB_ACTIONS':os.environ.get('GITHUB_ACTIONS'),
+        'RUNNER_ENVIRONMENT':os.environ.get('RUNNER_ENVIRONMENT')},
+        {'GITHUB_ACTIONS':'true','RUNNER_ENVIRONMENT':'github-hosted'})
+    check(report,'pid1',pathlib.Path('/proc/1/comm').read_text().strip(),'systemd')
+    check(report,'architecture',os.uname().machine,'x86_64')
+    check(report,'systemd-version',run('systemctl','--version').stdout.splitlines()[0].split()[1],'255')
+    check(report,'dump-policy',pathlib.Path('/proc/sys/fs/suid_dumpable').read_text().strip(),'2')
+    check(report,'ptrace-policy',pathlib.Path('/proc/sys/kernel/yama/ptrace_scope').read_text().strip(),'1')
+    check(report,'owned-paths-absent',{str(p):os.path.lexists(p) for p in [BASE,UNITPATH,SLICEPATH]},
+        {str(p):False for p in [BASE,UNITPATH,SLICEPATH]})
+    for name in [UNIT,SLICE]:inspect_fresh_unit(report,name)
 def cgroup_path(value):
     assert value.startswith('/') and '..' not in pathlib.PurePosixPath(value).parts
     return pathlib.Path('/sys/fs/cgroup')/value.lstrip('/')
@@ -108,18 +139,10 @@ def main():
     if sys.argv[1:]!=['--approved-disposable-linux']:
         print('{"plan":true,"live_changes":false}');return
     # No production/VPS execution entry point. No credential or broad env reads.
-    assert os.geteuid()==0 and sys.platform=='linux'
-    assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
-    assert pathlib.Path('/proc/1/comm').read_text().strip()=='systemd'
-    assert os.uname().machine=='x86_64'
-    assert run('systemctl','--version').stdout.splitlines()[0].split()[1]=='255'
-    assert pathlib.Path('/proc/sys/fs/suid_dumpable').read_text().strip()=='2'
-    assert pathlib.Path('/proc/sys/kernel/yama/ptrace_scope').read_text().strip()=='1'
-    assert not any(os.path.lexists(p) for p in [BASE,UNITPATH,SLICEPATH])
-    for name in [UNIT,SLICE]:assert show(name,'LoadState')['LoadState']=='not-found'
     report={'archive_sha256':ARCHIVE_SHA,'run_count':0,'runtime_passed':False,'cleanup_passed':False}
     owned_unit=False;owned_slice=False;cg=None
     try:
+        preflight(report)
         stage()
         with SLICEPATH.open('xb') as f:f.write(SLICE_DATA)
         owned_slice=True;SLICEPATH.chmod(0o644)
@@ -155,9 +178,13 @@ def main():
         assert receipt['production_activation'] is False and receipt['transition_window_retested'] is False
         report['runtime_passed']=True
     except Exception as e:
-        report['error']={'type':type(e).__name__,'detail':str(e)[:2000]}
+        report['error']={'type':type(e).__name__,'check':str(e) if isinstance(e,AssertionError) else 'metadata-or-runtime-operation-failed',
+            'operation':report.get('operation','preflight-or-runtime')}
     finally:
-        cleanup(owned_unit,owned_slice,cg,report)
+        if owned_unit or owned_slice:cleanup(owned_unit,owned_slice,cg,report)
+        else:
+            report['cleanup_passed']=True
+            report['cleanup_not_required']='no unit or slice owned; no systemd mutation attempted'
         # Export only nonsecret dummy results; preserve the root tree until VM disposal.
         out=HERE/'rehearsal-result.json'
         with out.open('x') as f:json.dump(report,f,indent=2);f.write('\n')
