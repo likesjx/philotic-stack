@@ -135,6 +135,19 @@ fn valid_fence(work: &Work, fence: &Fence, now: u64) -> Result<()> {
     Ok(())
 }
 
+fn valid_inspection_receipt(work: &Work, receipt: &serde_json::Value) -> Result<()> {
+    let op = work.operation.as_ref().context("not prepared")?;
+    ensure!(
+        receipt["schema_version"] == 1
+            && receipt["operation_id"] == op.id
+            && receipt["revision"] == work.revision
+            && receipt["environment"] == work.environment
+            && receipt["result"]["input_digest"] == op.scope.resource,
+        "stale inspection receipt"
+    );
+    Ok(())
+}
+
 fn authority_chain(
     tx: &Transaction<'_>,
     id: &str,
@@ -498,6 +511,8 @@ impl LocalWork {
         self.graph.transaction(|tx| {
             let mut work: Work = read(tx, id, NodeKind::Task)?;
             valid_fence(&work, fence, now)?;
+            ensure!(receipt["task_id"] == id, "receipt task mismatch");
+            valid_inspection_receipt(&work, receipt)?;
             ensure!(work.stopped.is_none(), "work stopped");
             let op = work.operation.as_ref().context("not prepared")?;
             ensure!(
@@ -550,7 +565,12 @@ impl LocalWork {
             ensure!(op.scope.action == "development.inspect_manifest" && op.phase != Phase::Prepared, "not dispatched inspection");
             ensure!(authority_chain(tx,&op.authority,&op.scope,now)? == op.authority_chain,"authority changed");
             let receipt: Option<String> = tx.query_row("SELECT receipt FROM local_inspection_receipts WHERE operation_id=?1 AND task_id=?2 AND scope=?3",params![op.id,id,serde_json::to_string(&op.scope)?],|r|r.get(0)).optional()?;
-            op.phase = if receipt.is_some() { Phase::Succeeded } else { Phase::Unknown };
+            if let Some(encoded)=&receipt {
+                let value:serde_json::Value=serde_json::from_str(encoded)?;
+                ensure!(value["task_id"]==id,"receipt task mismatch");
+                valid_inspection_receipt(&work,&value)?;
+            }
+            work.operation.as_mut().context("not prepared")?.phase = if receipt.is_some() { Phase::Succeeded } else { Phase::Unknown };
             write(tx,id,NodeKind::Task,&work)?;
             receipt.map(|r|serde_json::from_str(&r).map_err(Into::into)).transpose()
         })

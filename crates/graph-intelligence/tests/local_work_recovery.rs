@@ -71,7 +71,14 @@ fn evidence() -> Evidence {
 #[test]
 fn inspection_receipt_is_fenced_authorized_and_reconciled_after_reopen() {
     for mode in [
-        "success", "revoked", "changed", "expired", "takeover", "unknown",
+        "success",
+        "revoked",
+        "changed",
+        "expired",
+        "takeover",
+        "unknown",
+        "new-before-commit",
+        "new-before-reconcile",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inspection.db");
@@ -85,8 +92,14 @@ fn inspection_receipt_is_fenced_authorized_and_reconciled_after_reopen() {
         let f = l.claim(TASK, "synthetic:session:one", 0, 10).unwrap();
         l.prepare(TASK, &f, 0, "one", s).unwrap();
         l.dispatch(TASK, &f, 0).unwrap();
-        let receipt = serde_json::json!({"input_digest":"pinned","files":[]});
+        let receipt = serde_json::json!({"schema_version":1,"task_id":TASK,"operation_id":format!("{TASK}:operation"),"revision":"sha256:candidate-1","environment":"mbp-jane:synthetic-v1","result":{"input_digest":"fixture","files":[]}});
         match mode {
+            "new-before-commit" => l.candidate(TASK, &f, 0, "new", "new-env").unwrap(),
+            "new-before-reconcile" => {
+                l.commit_inspection(TASK, &f, 0, &receipt).unwrap();
+                l.candidate(TASK, &f, 0, "new", "new-env").unwrap();
+                assert!(l.reconcile_inspection(TASK, &f, 0).is_err());
+            }
             "revoked" => {
                 auth.revoked = true;
                 l.set_authority(AUTH, auth).unwrap();

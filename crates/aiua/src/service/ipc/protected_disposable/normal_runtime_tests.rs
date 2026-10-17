@@ -160,6 +160,14 @@ async fn marker(path: &Path, text: &str, count: usize) {
         )
     });
 }
+fn receipt_count(db: &Path) -> u64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM local_inspection_receipts", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
 async fn stop(
     child: crate::service::protected_local_guest::ProtectedLocalGuest,
     server: tokio::task::JoinHandle<()>,
@@ -211,8 +219,9 @@ async fn actual_normal_runtime_inspection_recovery() {
     assert_eq!(w.checkpoint.unwrap()["phase"], "complete");
     assert!(w.active_ms >= 5);
     stop(child, server, &dir, "resumed").await;
+    assert_eq!(receipt_count(&db), 1);
 
-    for mode in ["revoked", "stale", "unknown"] {
+    for mode in ["revoked", "changed", "expired", "stale", "unknown"] {
         let db = dir.join(format!("{mode}.db"));
         let i = adapter(seed(&db, 2, 100), 0);
         i.hold_dispatch.store(true, Ordering::SeqCst);
@@ -251,7 +260,16 @@ async fn actual_normal_runtime_inspection_recovery() {
             );
             stop(child, server, &dir, "unknown-resume").await;
         } else {
-            if mode == "revoked" {
+            if mode == "expired" {
+                i.state.lock().unwrap().now = 100_000;
+            } else if mode == "changed" {
+                i.state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .set_authority(AUTH, authority(false))
+                    .unwrap();
+            } else if mode == "revoked" {
                 i.state
                     .lock()
                     .unwrap()
@@ -269,15 +287,22 @@ async fn actual_normal_runtime_inspection_recovery() {
             marker(&out, "NORMAL_INSPECTION_BLOCKED", 2).await;
             stop(child, server, &dir, mode).await;
         }
+        assert_eq!(receipt_count(&db), 0);
     }
     for (label, failures, attempts, budget, success) in [
         ("retry", 1, 2, 100, true),
         ("retry-limit", 3, 2, 100, false),
         ("budget", 0, 2, 1, false),
+        ("quota", 0, 2, 100, false),
     ] {
         let db = dir.join(format!("{label}.db"));
         let i = adapter(seed(&db, attempts, budget), 0);
         i.failures.store(failures, Ordering::SeqCst);
+        if label == "quota" {
+            let mut s = i.state.lock().unwrap();
+            let f = s.fence.clone();
+            assert!(!s.ledger.reserve(TASK, &f, 0, 0, false).unwrap());
+        }
         let i = if label == "retry" {
             i.hold_bootstrap.store(true, Ordering::SeqCst);
             let (child, server, _) = launch(&binary, &dir, "retry-interrupted", i.clone()).await;
@@ -332,6 +357,7 @@ async fn actual_normal_runtime_inspection_recovery() {
         assert_eq!(w.active_ms, w2.active_ms);
         assert_eq!(w.attempts, w2.attempts);
         assert_eq!(w.stopped, w2.stopped);
+        assert_eq!(receipt_count(&db), if success { 1 } else { 0 });
     }
     assert!(
         !std::fs::read_dir(&dir).unwrap().any(|p| p

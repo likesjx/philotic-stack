@@ -48,8 +48,12 @@ cargo test --offline -p graph-intelligence --test local_work_recovery
 
 Acceptance records the owned `/tmp/nr-*` directory, process IDs and runtime markers.
 Databases and stdout/stderr remain as evidence; owned children and sockets are reaped.
-Verification and independent review are pending for this local candidate. It is not
-published, merged, deployed or production-live-verified.
+The first actual-process acceptance run and all 11 ledger regressions passed.
+Focused independent review corrected receipt identity validation inside both ledger
+transactions; candidate changes before commit or reconciliation now refuse stale
+results. Final revision/process receipts accompany local delivery. Revocation after
+snapshot release prevents commit, not computation over bytes already disclosed.
+This candidate is not published, merged, deployed or production-live-verified.
 
 ## Work contract
 
