@@ -22,18 +22,6 @@
 
 ## Current Work Item Split
 
-### Synthetic local work recovery candidate
-
-Contract: [local recovery](architecture/LOCAL_WORK_RECOVERY.md). Branch:
-`codex/local-work-recovery`, base `60ca892d2db85573b953dbddf4f0db7e6803d50f`.
-One builder, one independent review; synthetic local records only.
-
-- [x] Preserve occupied checkout; create isolated worktree from tracking develop.
-- [x] Implement durable claim, checkpoint, reconciliation, authority and evidence contract.
-- [x] Deterministic harness: 9 integration tests and 17 library tests pass; focused Clippy denies warnings.
-- [x] One independent review completed; its takeover-before-reconcile finding is fixed with dispatch-epoch and process-local execution permits plus regression tests.
-- [x] Candidate ready for local commit and retained validation receipt. Publication/merge/deployment are out of scope.
-
 ### CarPlay voice conversation foundation
 
 Branch: `codex/carplay-foundation`; updated base: remote `develop`
@@ -49,6 +37,18 @@ Contract: [CarPlay foundation](../apps/philotic-apple/CARPLAY.md).
 - [x] Independent source review: no blocking findings for dormant foundation after lease/cancellation rechecks for VAD, stream completions and suspended transcript bookkeeping; no runtime/audio eligibility claims.
 - [ ] Install and verify authoritative voice/privacy dispatch and correlated hands-free contracts before any capability activation. Entitlement request is deferred.
 - [ ] Device/live-car verification remains separately approved future work; no real audio, credential or live hotel traffic used in this source slice.
+
+### Synthetic local work recovery candidate
+
+Contract: [local recovery](architecture/LOCAL_WORK_RECOVERY.md). Branch:
+`codex/local-work-recovery`, base `60ca892d2db85573b953dbddf4f0db7e6803d50f`.
+One builder, one independent review; synthetic local records only.
+
+- [x] Preserve occupied checkout; create isolated worktree from tracking develop.
+- [x] Implement durable claim, checkpoint, reconciliation, authority and evidence contract.
+- [x] Deterministic harness: 9 integration tests and 17 library tests pass; focused Clippy denies warnings.
+- [x] One independent review completed; its takeover-before-reconcile finding is fixed with dispatch-epoch and process-local execution permits plus regression tests.
+- [x] Local candidate committed; focused rereview confirms stale-dispatch correction. Draft publication and hosted verification authorized separately; merge/deployment remain out of scope.
 
 ### Apple voice privacy and cancellation
 
