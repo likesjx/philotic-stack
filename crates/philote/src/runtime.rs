@@ -15804,3 +15804,7 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 }
+
+#[cfg(feature = "disposable-recovery")]
+#[path = "disposable_recovery.rs"]
+mod disposable_recovery;

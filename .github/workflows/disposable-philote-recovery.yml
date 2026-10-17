@@ -1,0 +1,124 @@
+name: Disposable Philote recovery
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'crates/aiua/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'crates/graph-intelligence/**'
+      - 'crates/philote/**'
+      - 'crates/philotic-client/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/disposable-philote-recovery.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: disposable-philote-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  actual-executable:
+    name: actual Philote recovery (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      PHILOTIC_DISPOSABLE_REVISION: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Record exact revision and hosted environment
+        run: |
+          mkdir -p recovery-evidence
+          test "$(git rev-parse HEAD)" = "$PHILOTIC_DISPOSABLE_REVISION"
+          git rev-parse HEAD > recovery-evidence/revision.txt
+          uname -a > recovery-evidence/environment.txt
+          printf 'PHILOTIC_DISPOSABLE_ENVIRONMENT=github-actions:%s:%s:ubuntu-24.04\n' "$(uname -s)" "$(uname -m)" >> "$GITHUB_ENV"
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libssl-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: disposable-philote-linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            disposable-philote-linux-
+      - name: Build actual opt-in executable
+        run: |
+          rustc --version > recovery-evidence/toolchain.txt
+          cargo build --locked -p philote --bin philote --features disposable-recovery
+          sha256sum target/debug/philote > recovery-evidence/executable.sha256
+      - name: Run ignored actual-process acceptance explicitly
+        id: actual
+        shell: bash
+        run: |
+          set -o pipefail
+          export PHILOTIC_DISPOSABLE_BINARY="$PWD/target/debug/philote"
+          printf '%s\n' 'cargo test --locked -p aiua --bin aiua actual_philote_interruption_reconciles_existing_ledger -- --ignored --nocapture' > recovery-evidence/command.txt
+          cargo test --locked -p aiua --bin aiua actual_philote_interruption_reconciles_existing_ledger -- --ignored --nocapture 2>&1 | tee recovery-evidence/actual-process.log
+      - name: Check ledger and boundary regressions
+        run: |
+          cargo test --locked -p graph-intelligence --test local_work_recovery
+          cargo test --locked -p aiua --bin aiua protected_boundary
+      - name: Preserve receipts and check successful cleanup
+        if: always()
+        env:
+          ACTUAL_OUTCOME: ${{ steps.actual.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, sqlite3
+          reports = pathlib.Path('recovery-evidence')
+          reports.mkdir(exist_ok=True)
+          log = reports / 'actual-process.log'
+          text = log.read_text() if log.exists() else ''
+          matches = re.findall(r'^ACTUAL_FIXTURE_DIR path=(/tmp/pr-[0-9a-f]{32})$', text, re.M)
+          summary = {'revision': os.environ['PHILOTIC_DISPOSABLE_REVISION'], 'environment': os.environ['PHILOTIC_DISPOSABLE_ENVIRONMENT'], 'actual_outcome': os.environ['ACTUAL_OUTCOME'], 'ledgers': {}}
+          if matches:
+              fixture = pathlib.Path(matches[-1])
+              # Only this test's announced disposable directory; no broad /tmp cleanup.
+              sockets = list(fixture.glob('*.sock'))
+              summary['remaining_sockets'] = [p.name for p in sockets]
+              for socket in sockets:
+                  if socket.is_socket():
+                      socket.unlink()
+              shutil.copytree(fixture, reports / 'fixture', dirs_exist_ok=True)
+              for name in ('work', 'stale', 'unknown'):
+                  path = fixture / (name + '.db')
+                  if not path.exists():
+                      continue
+                  with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
+                      row = db.execute("SELECT properties FROM nodes WHERE id='synthetic:task:actual-philote'").fetchone()
+                      if row:
+                          work = json.loads(row[0])
+                          assert work['revision'] == summary['revision']
+                          assert work['environment'] == summary['environment']
+                          summary['ledgers'][name] = {'work': work, 'effect_count': db.execute('SELECT count(*) FROM synthetic_work_effects').fetchone()[0]}
+          if os.environ['ACTUAL_OUTCOME'] == 'success':
+              assert matches and not summary['remaining_sockets'], 'successful test must remove owned sockets'
+              assert 'all_children_reaped=true' in text
+              assert summary['ledgers']['work']['effect_count'] == 1
+              assert summary['ledgers']['unknown']['effect_count'] == 0
+          summary['log_sha256'] = hashlib.sha256(text.encode()).hexdigest()
+          (reports / 'receipt.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PY
+      - name: Upload verification evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: disposable-philote-evidence-${{ github.event.pull_request.head.sha }}
+          path: recovery-evidence/
+          retention-days: 7

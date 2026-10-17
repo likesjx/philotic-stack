@@ -1,3 +1,4 @@
+pub(crate) mod protected_disposable;
 use super::golgi::{GOLGI_SINK_ROLE, PendingPipelineRegistry};
 use super::lease_handlers::LoggingSubagentLeaseObserver;
 use crate::LedgerCommand;
@@ -434,6 +435,7 @@ fn peer_uid_permitted(stream: &UnixStream, hotel_uid: u32, policy: PeerUidPolicy
 pub(crate) type MuninnOutageHealId = Arc<std::sync::Mutex<Option<String>>>;
 
 pub struct IpcServer {
+    protected_disposable: Option<Arc<protected_disposable::ProtectedDisposable>>,
     protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
     socket_path: String,
     local_node_id: String,
@@ -1925,6 +1927,7 @@ impl IpcServer {
     ) -> Self {
         let (network_broadcast, _) = tokio::sync::broadcast::channel(16);
         Self {
+            protected_disposable: None,
             protected_authority: None,
             socket_path: socket_path.into(),
             local_node_id: local_node_id.into(),
@@ -1960,6 +1963,15 @@ impl IpcServer {
                 crate::service::resource_registry::ResourceRegistry::new(),
             )),
         }
+    }
+
+    /// Dedicated disposable socket: all requests bypass legacy dispatch.
+    pub fn with_protected_disposable(
+        mut self,
+        adapter: Arc<protected_disposable::ProtectedDisposable>,
+    ) -> Self {
+        self.protected_disposable = Some(adapter);
+        self
     }
 
     /// Opt-in: one canonical authority shared with supervisor/context/voice.
@@ -2163,6 +2175,7 @@ impl IpcServer {
                     let hotel_state_dirty_tx = self.hotel_state_dirty_tx.clone();
                     let resource_registry = self.resource_registry.clone();
                     let protected_authority = self.protected_authority.clone();
+                    let protected_disposable = self.protected_disposable.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2198,6 +2211,7 @@ impl IpcServer {
                             hotel_state_dirty_tx,
                             resource_registry,
                             protected_authority,
+                            protected_disposable,
                         )
                         .await
                         {
@@ -2253,7 +2267,11 @@ impl IpcServer {
         hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
         resource_registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
         protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
+        protected_disposable: Option<Arc<protected_disposable::ProtectedDisposable>>,
     ) -> anyhow::Result<()> {
+        if let Some(adapter) = protected_disposable {
+            return adapter.serve(stream, graph).await;
+        }
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
         let (raw_outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<IpcResponse>();

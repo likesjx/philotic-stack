@@ -133,7 +133,9 @@ impl PhiloticClient {
         }
     }
 
-    fn verify_hotel_peer(&mut self, expected: TrustedHotelPeer) -> Result<()> {
+    /// Check the existing connection against a supervisor-supplied hotel peer.
+    /// Mismatch disconnects; caller-provided guest identity is not authority.
+    pub fn verify_hotel_peer(&mut self, expected: TrustedHotelPeer) -> Result<()> {
         self.ensure_connected()?;
         let actual = self
             .stream

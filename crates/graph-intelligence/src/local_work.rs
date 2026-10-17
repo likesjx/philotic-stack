@@ -66,6 +66,8 @@ pub struct Evidence {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Work {
+    #[serde(default)]
+    pub checkpoint: Option<serde_json::Value>,
     pub slice: String,
     pub role_charter: String,
     pub revision: String,
@@ -214,7 +216,8 @@ impl LocalWork {
 
     pub fn create(&mut self, id: &str, work: Work) -> Result<()> {
         ensure!(
-            work.fence.is_none()
+            work.checkpoint.is_none()
+                && work.fence.is_none()
                 && work.operation.is_none()
                 && work.attempts == 0
                 && work.active_ms == 0
@@ -249,6 +252,33 @@ impl LocalWork {
 
     pub fn inspect(&mut self, id: &str) -> Result<Work> {
         self.graph.transaction(|tx| read(tx, id, NodeKind::Task))
+    }
+
+    /// Persist the compact runtime checkpoint in the same fenced task transaction.
+    /// This does not create another execution ledger or authorize an effect.
+    pub fn checkpoint(
+        &mut self,
+        id: &str,
+        fence: &Fence,
+        now: u64,
+        content: serde_json::Value,
+    ) -> Result<()> {
+        ensure!(
+            serde_json::to_vec(&content)?.len() <= 65536,
+            "checkpoint too large"
+        );
+        self.graph.transaction(|tx| {
+            let mut work: Work = read(tx, id, NodeKind::Task)?;
+            valid_fence(&work, fence, now)?;
+            ensure!(work.stopped.is_none(), "work stopped");
+            let op = work.operation.as_ref().context("not prepared")?;
+            ensure!(
+                authority_chain(tx, &op.authority, &op.scope, now)? == op.authority_chain,
+                "authority changed"
+            );
+            work.checkpoint = Some(content);
+            write(tx, id, NodeKind::Task, &work)
+        })
     }
 
     pub fn claim(&mut self, id: &str, session: &str, now: u64, ttl: u64) -> Result<Fence> {
