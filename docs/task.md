@@ -22,6 +22,18 @@
 
 ## Current Work Item Split
 
+### Synthetic local work recovery candidate
+
+Contract: [local recovery](architecture/LOCAL_WORK_RECOVERY.md). Branch:
+`codex/local-work-recovery`, base `60ca892d2db85573b953dbddf4f0db7e6803d50f`.
+One builder, one independent review; synthetic local records only.
+
+- [x] Preserve occupied checkout; create isolated worktree from tracking develop.
+- [x] Implement durable claim, checkpoint, reconciliation, authority and evidence contract.
+- [x] Deterministic harness: 9 integration tests and 17 library tests pass; focused Clippy denies warnings.
+- [x] One independent review completed; its takeover-before-reconcile finding is fixed with dispatch-epoch and process-local execution permits plus regression tests.
+- [x] Candidate ready for local commit and retained validation receipt. Publication/merge/deployment are out of scope.
+
 ### CarPlay voice conversation foundation
 
 Branch: `codex/carplay-foundation`; updated base: remote `develop`
