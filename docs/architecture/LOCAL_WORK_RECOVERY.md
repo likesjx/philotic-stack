@@ -48,7 +48,9 @@ cargo test --offline -p graph-intelligence --test local_work_recovery
 
 Acceptance records the owned `/tmp/nr-*` directory, process IDs and runtime markers.
 Databases and stdout/stderr remain as evidence; owned children and sockets are reaped.
-The first actual-process acceptance run and all 11 ledger regressions passed.
+Actual-process acceptance, all 11 ledger regressions, 3 protected-boundary tests
+and 25 checkpoint regressions passed. The known pre-dispatch failure is injected
+by the test adapter; retry handling and restart occur in actual runtime processes.
 Focused independent review corrected receipt identity validation inside both ledger
 transactions; candidate changes before commit or reconciliation now refuse stale
 results. Final revision/process receipts accompany local delivery. Revocation after

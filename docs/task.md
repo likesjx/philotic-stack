@@ -1,6 +1,6 @@
 # Ansible Mesh Architecture Separation Task List
 
-- [ ] Verify local normal-loop inspection recovery candidate: actual default-path Philote, pinned two-file snapshot, transactional LocalWork receipt, fenced resume and bounded retries. No normal session recovery-policy change; see [contract](architecture/LOCAL_WORK_RECOVERY.md#normal-loop-inspection-candidate).
+- [x] Verify local normal-loop inspection recovery candidate: actual default-path Philote, pinned two-file snapshot, transactional LocalWork receipt, fenced resume and bounded retries. Actual-process acceptance, 11 ledger tests, 3 protected-boundary tests and 25 checkpoint regressions passed; focused review correction resolved. No normal session recovery-policy change or publication; see [contract](architecture/LOCAL_WORK_RECOVERY.md#normal-loop-inspection-candidate).
 
 - [x] Implement opt-in disposable IPC identity/commit boundary; see [contract](architecture/LOCAL_WORK_RECOVERY.md#follow-up-opt-in-disposable-ipc-commit-boundary). Local tests/review only; publication deferred. Feature-gated actual-Philote interruption/reconciliation fixture implemented; default runtime recovery remains unchanged.
 
