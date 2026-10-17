@@ -24,16 +24,26 @@ def check(report,label,actual,expected):
     report.setdefault('preflight',[]).append(evidence)
     print(json.dumps(evidence),flush=True)
     assert actual==expected,label
-def inspect_fresh_unit(report,name):
+def fresh_metadata(name,observed):
+    expected={'ActiveState':'inactive','SubState':'dead','FragmentPath':'','SourcePath':'',
+        'DropInPaths':'','ControlGroup':'','Transient':'no'}
+    return (set(observed)==set(expected)|{'LoadState'} and
+        all(observed[k]==v for k,v in expected.items()) and
+        observed['LoadState'] in (['not-found','loaded'] if name.endswith('.slice') else ['not-found']))
+def inspect_fresh_unit(report,name,paths,jobs):
     props=('LoadState','ActiveState','SubState','FragmentPath','SourcePath','DropInPaths','ControlGroup','Transient')
     report['operation']='inspect-fresh-unit:'+name
     observed=show(name,*props)
     report.setdefault('unit_metadata',{})[name]=observed
     print(json.dumps({'unit':name,'metadata':observed}),flush=True)
-    # Diagnostic-only correction: preserve the reviewed freshness assertion.
-    # systemd255 loads fragmentless slices; any semantic replacement of this
-    # assertion requires a separately reviewed collision/ownership contract.
-    check(report,name+':LoadState',observed.get('LoadState'),'not-found')
+    # Fragmentless slices are implicitly loaded by systemd255. Accept that state
+    # only when inactive/unconfigured/empty, with no exact unit-file collision or
+    # queued job. All fields are mandatory; unknown state is not absence.
+    check(report,name+':unowned-metadata',fresh_metadata(name,observed),True)
+    check(report,name+':queued-job',name in jobs,False)
+    collisions=[str(pathlib.Path(p)/suffix) for p in paths for suffix in [name,name+'.d']
+        if os.path.lexists(pathlib.Path(p)/suffix)]
+    check(report,name+':unit-path-collisions',collisions,[])
 def preflight(report):
     check(report,'root',os.geteuid(),0)
     check(report,'platform',sys.platform,'linux')
@@ -47,7 +57,20 @@ def preflight(report):
     check(report,'ptrace-policy',pathlib.Path('/proc/sys/kernel/yama/ptrace_scope').read_text().strip(),'1')
     check(report,'owned-paths-absent',{str(p):os.path.lexists(p) for p in [BASE,UNITPATH,SLICEPATH]},
         {str(p):False for p in [BASE,UNITPATH,SLICEPATH]})
-    for name in [UNIT,SLICE]:inspect_fresh_unit(report,name)
+    report['operation']='unit-search-paths'
+    paths=run('systemctl','show','--property=UnitPath','--value').stdout.split()
+    check(report,'valid-unit-search-paths',bool(paths) and len(paths)<=64 and all(
+        p.startswith('/') and '..' not in pathlib.PurePosixPath(p).parts for p in paths),True)
+    report['unit_search_paths']=paths
+    report['operation']='queued-job-metadata'
+    jobs=set()
+    for line in run('systemctl','list-jobs','--no-legend','--plain','--no-pager','--full').stdout.splitlines():
+        fields=line.split()
+        check(report,'valid-job-row',len(fields)==4 and fields[0].isdigit(),True)
+        jobs.add(fields[1])
+    # Reject ownership anywhere in the slice hierarchy, not only the leaf.
+    for name in [UNIT,'muninn.slice','muninn-synthetic.slice',SLICE]:
+        inspect_fresh_unit(report,name,paths,jobs)
 def cgroup_path(value):
     assert value.startswith('/') and '..' not in pathlib.PurePosixPath(value).parts
     return pathlib.Path('/sys/fs/cgroup')/value.lstrip('/')
