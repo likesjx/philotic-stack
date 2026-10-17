@@ -176,6 +176,16 @@ impl VerifiedLocalSession {
         self.scope.clone()
     }
     pub fn principal(&self) -> Result<AuthenticatedAgent> {
+        self.with_current_launch(Ok)
+    }
+    /// Serialize a bounded synchronous commit against retirement/replacement.
+    /// The closure must not await, control the child, or re-enter this registry.
+    /// Acquire other reservations before calling; never let a permit escape.
+    /// This fences registry retirement, not an OS exit after liveness validation.
+    pub fn with_current_launch<T>(
+        &self,
+        commit: impl FnOnce(AuthenticatedAgent) -> Result<T>,
+    ) -> Result<T> {
         let launches = self
             .registry
             .launches
@@ -192,7 +202,9 @@ impl VerifiedLocalSession {
         {
             bail!("unverified or replaced local session");
         }
-        AuthenticatedAgent::from_server(&launch.principal).map_err(|_| anyhow!("invalid principal"))
+        let actor = AuthenticatedAgent::from_server(&launch.principal)
+            .map_err(|_| anyhow!("invalid principal"))?;
+        commit(actor)
     }
 }
 
@@ -610,5 +622,87 @@ impl LocalTaskAuthority {
             .ok_or_else(|| anyhow!("unknown protected authority"))?
             .cancelled = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_commit_tests {
+    use super::*;
+    struct FixtureProcess;
+    impl SupervisedProcess for FixtureProcess {
+        fn pid(&self) -> Result<u32> {
+            Ok(42)
+        }
+        fn alive(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+    #[test]
+    fn launch_commit_serializes_retirement_and_releases_on_error() {
+        let registry = Arc::new(LocalLaunchRegistry::default());
+        let generation = registry
+            .attach(
+                "guest",
+                7,
+                LaunchPrincipal {
+                    stable_agent_id: "agent".into(),
+                    roles: BTreeSet::new(),
+                },
+                Arc::new(FixtureProcess),
+            )
+            .unwrap();
+        let proof = Arc::new(VerifiedLocalSession {
+            registry: registry.clone(),
+            scope: registry.target("hotel", "guest").unwrap(),
+            pid: 42,
+            uid: 7,
+        });
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = proof.clone();
+        let commit = std::thread::spawn(move || {
+            worker.with_current_launch(|_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // No sleep or probabilistic scheduling assertion: mutex is held during commit.
+        assert!(registry.launches.try_lock().is_err());
+        let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+        let retiring = registry.clone();
+        let retire = std::thread::spawn(move || {
+            retiring.retire("guest", generation).unwrap();
+            retired_tx.send(()).unwrap();
+        });
+        assert!(retired_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        commit.join().unwrap().unwrap();
+        retired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        retire.join().unwrap();
+        assert!(proof.with_current_launch(|_| Ok(())).is_err());
+        registry
+            .attach(
+                "guest",
+                7,
+                LaunchPrincipal {
+                    stable_agent_id: "agent".into(),
+                    roles: BTreeSet::new(),
+                },
+                Arc::new(FixtureProcess),
+            )
+            .unwrap();
+        let replacement = VerifiedLocalSession {
+            registry: registry.clone(),
+            scope: registry.target("hotel", "guest").unwrap(),
+            pid: 42,
+            uid: 7,
+        };
+        assert!(replacement
+            .with_current_launch::<()>(|_| anyhow::bail!("abort"))
+            .is_err());
+        assert!(registry.launches.try_lock().is_ok());
+        assert!(proof.principal().is_err());
     }
 }

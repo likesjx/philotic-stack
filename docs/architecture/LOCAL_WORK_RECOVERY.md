@@ -108,3 +108,44 @@ Review this local candidate and its retained test receipt. A later separately
 authorized slice could wrap the protocol in a trusted clock/quota/evidence adapter;
 that work must first specify real effect reconciliation and authorization ownership.
 There is intentionally no production scheduling or rollout step in this slice.
+
+## Follow-up: opt-in disposable IPC commit boundary
+
+Local candidate on `codex/philote-local-recovery`, based on merged foundation
+`a178f8adff1fe7d9c681e20fb9a21a519eed351e`. The hotel may explicitly install
+`ProtectedDisposable` on a dedicated disposable socket. Production startup does
+not install it. All requests on that socket bypass generic IPC dispatch, including
+broadcast setup, registration subscriptions, mesh routing and parked-task delivery.
+Only Register, one exact EmitTask and one allowlisted SyncApartment key are accepted.
+Even GetConfig is denied; this is not yet a Philote bootstrap-compatible fixture.
+
+The server-owned contract names guest/principal/role, an exact operation JSON and
+local destination, separate checkpoint and receipt keys, and a monotonic deadline.
+It cannot be supplied or delegated over IPC. Socket kernel credentials authenticate
+against LocalLaunchRegistry. A synthetic contract revocation serializes with commits.
+This is fixture configuration, not a new access-grant service or production policy.
+
+`VerifiedLocalSession::with_current_launch` holds the launch-registry mutex while a
+bounded synchronous closure runs. Retirement/replacement cannot return before an
+already admitted commit finishes; later commits fail. Lock order for the adapter is
+contract mutex, launch registry, graph adapter. There is no async wait, external
+callback, child control, or reverse acquisition inside the commit. Callers of the
+primitive must not re-enter the registry; the API does not make arbitrary closures
+safe. OS exit after the liveness check is distinct from registry retirement.
+
+The synthetic effect is precisely a graph apartment receipt for the fixed operation,
+not an external tool invocation. Exact duplicate delivery reads that receipt without
+rewriting it; a conflicting receipt fails closed. Checkpoints cannot overwrite the
+receipt key. Use only a disposable graph and one adapter owner. This boundary does
+not add durable task epochs, retries, budget accounting or grants: those remain the
+separate `LocalWork` foundation contracts, not inferred from launch authentication.
+
+Tests cover kernel identity mismatch, registration/scope/owner restrictions, expiry,
+revocation, retired/replaced proofs, duplicate receipts, synchronous lock release and
+retirement ordering, plus actual IpcServer socket dispatch bypass. Unit launch records
+use a labelled synthetic process fixture; they do not claim an actual Philote child.
+
+Remaining recovery gap: the real executable's startup sweep discards restored turns.
+No runtime sweep policy, scripted-loop resume, real-child crash demonstration or
+LocalWork-to-IPC recovery adapter is implemented here. Implemented/tested local
+boundary, merged, deployed and live-verified remain separate facts.
