@@ -18,10 +18,23 @@ remains unchanged. No shared website issuer or LifeGraph source is modified.
   positive recall and old-credential denial evidence exist. Expiry and privacy-lease
   expiry deny access. No secret values are handled.
 - A recall guard requiring a trusted privacy authority and rechecking current
-  authorization after upstream work. The authority must filter and bind the exact
+authorization after upstream work. The authority must filter and bind the exact
   response; this module is NOT a record-level privacy implementation.
 
 ## Integration contract for the issuer owner
+
+`persistent-owner-boundary.mjs` composes the guard with injected canonical issuer,
+scope/privacy and lifecycle owners, never a second admission database. It passes
+the opaque OAuth token only to the issuer, forces readOnly upstream, and rechecks
+canonical client version/expiry before response release. Four additional mocked
+owner integration tests cover separate revocation, mid-request revocation,
+withdrawal, unapproved vault and missing owners. These interfaces still need real
+adapters and transport-lifetime coordination; no production HTTP route is enabled.
+The boundary reuses the gateway's existing bounded recall argument validator and
+checks issuer authorization after scope/lifecycle awaits. Six boundary tests plus
+nine policy tests pass. Independent review confirmed fixes for argument propagation
+and revocation during owner reads. Cross-owner fencing and authorization at final
+transport delivery remain explicitly unimplemented.
 
 Do not change global admission when revoking one client. Use the existing canonical
 issuer's versioned client-admission/family mechanisms; do not create a second live
