@@ -35,6 +35,7 @@ fn seed(path: &str, max_attempts: u64) -> LocalWork {
         .create(
             TASK,
             Work {
+                checkpoint: None,
                 slice: "synthetic:slice:recovery".into(),
                 role_charter: AUTH.into(),
                 revision: "sha256:candidate-1".into(),
@@ -425,4 +426,32 @@ fn delegation_can_only_narrow_and_parent_revocation_is_live() {
         }
         assert_eq!(store.effect_count().unwrap(), u64::from(case == "allowed"));
     }
+}
+
+#[test]
+fn runtime_checkpoint_survives_reopen_and_fences_stale_revoked_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.db");
+    let path = path.to_str().unwrap();
+    let mut store = seed(path, 2);
+    let old = store.claim(TASK, "synthetic:session:first", 0, 10).unwrap();
+    store.prepare(TASK, &old, 0, "one", scope()).unwrap();
+    let saved = serde_json::json!({"phase":"prepared","cursor":0});
+    store.checkpoint(TASK, &old, 0, saved.clone()).unwrap();
+    drop(store);
+    let mut store = LocalWork::open(path).unwrap();
+    assert_eq!(store.inspect(TASK).unwrap().checkpoint, Some(saved.clone()));
+    let current = store
+        .claim(TASK, "synthetic:session:replacement", 10, 10)
+        .unwrap();
+    assert!(store
+        .checkpoint(TASK, &old, 10, serde_json::json!({"stale":true}))
+        .is_err());
+    let mut revoked = authority();
+    revoked.revoked = true;
+    store.set_authority(AUTH, revoked).unwrap();
+    assert!(store
+        .checkpoint(TASK, &current, 10, serde_json::json!({"revoked":true}))
+        .is_err());
+    assert_eq!(store.inspect(TASK).unwrap().checkpoint, Some(saved));
 }

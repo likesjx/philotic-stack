@@ -1,5 +1,7 @@
 //! Opt-in synthetic single-operation endpoint. Never installed in production startup.
 //! This is not a grant issuer, task scheduler, or Philote restart implementation.
+#[cfg(test)]
+mod recovery_tests;
 use ansible_mesh_core::{
     domain::GraphDomain,
     privacy_local::{LocalLaunchRegistry, VerifiedLocalSession},
@@ -33,6 +35,8 @@ pub struct ProtectedDisposable {
     // Serialize all adapter writes/revocation, then take launch lock, then graph.
     // No caller acquires these in reverse order or invokes callbacks under them.
     revoked: Mutex<bool>,
+    #[cfg(test)]
+    recovery: Option<Arc<recovery_tests::RecoveryFixture>>,
 }
 impl ProtectedDisposable {
     pub fn new(launches: Arc<LocalLaunchRegistry>, contract: DisposableContract) -> Result<Self> {
@@ -53,6 +57,8 @@ impl ProtectedDisposable {
             launches,
             contract,
             revoked: Mutex::new(false),
+            #[cfg(test)]
+            recovery: None,
         })
     }
     /// Revocation returns only after any previously admitted synchronous commit.
@@ -104,6 +110,10 @@ impl ProtectedDisposable {
         proof.with_current_launch(|actor| {
             ensure!(actor.stable_agent_id() == c.agent && actor.roles().contains(&c.role), "principal mismatch");
             ensure!(Instant::now() < c.expires_at, "expired contract");
+            #[cfg(test)]
+            if let Some(fixture) = &self.recovery {
+                return fixture.handle(actor.stable_agent_id(), &proof.consumer(), request, c);
+            }
             match request {
                 IpcRequest::SyncApartment { agent_id, memory_type, content_json } => {
                     ensure!(agent_id == actor.stable_agent_id() && memory_type == c.checkpoint_key, "apartment mismatch");
@@ -146,6 +156,15 @@ impl ProtectedDisposable {
             let result = serde_json::from_slice(&frame)
                 .map_err(anyhow::Error::from)
                 .and_then(|request| self.handle(&stream, &mut proof, request, &graph));
+            #[cfg(test)]
+            if let Some(fixture) = &self.recovery {
+                if fixture
+                    .hold_response
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    fixture.release_response.notified().await;
+                }
+            }
             let response = result.unwrap_or_else(|_| {
                 IpcResponse::error(
                     "protected",

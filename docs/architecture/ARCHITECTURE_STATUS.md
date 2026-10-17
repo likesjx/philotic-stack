@@ -49,7 +49,8 @@ tracks_domains:
 
 Opt-in disposable IPC now supports kernel-bound registration and retirement-fenced
 local synthetic receipt/checkpoint writes; it is not installed in production and
-does not yet resume Philote turns. See [contract](LOCAL_WORK_RECOVERY.md#follow-up-opt-in-disposable-ipc-commit-boundary).
+has a feature-gated actual-Philote disposable recovery test; default turn restoration
+remains unchanged. See [contract](LOCAL_WORK_RECOVERY.md#follow-up-opt-in-disposable-ipc-commit-boundary).
 
 Local candidate (2026-10-17): [synthetic local work recovery](LOCAL_WORK_RECOVERY.md)
 adds an opt-in graph-intelligence library contract and disposable recovery harness.

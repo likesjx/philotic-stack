@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
     if let Some(ref rn) = role_name {
         runtime.set_role_name(rn.clone());
     }
+    #[cfg(feature = "disposable-recovery")]
+    if std::env::var("PHILOTIC_DISPOSABLE_RECOVERY").as_deref() == Ok("1") {
+        return runtime.run_disposable_recovery().await;
+    }
     runtime.run().await
 }
 

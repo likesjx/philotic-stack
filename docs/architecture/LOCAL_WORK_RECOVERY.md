@@ -145,7 +145,56 @@ revocation, retired/replaced proofs, duplicate receipts, synchronous lock releas
 retirement ordering, plus actual IpcServer socket dispatch bypass. Unit launch records
 use a labelled synthetic process fixture; they do not claim an actual Philote child.
 
-Remaining recovery gap: the real executable's startup sweep discards restored turns.
-No runtime sweep policy, scripted-loop resume, real-child crash demonstration or
-LocalWork-to-IPC recovery adapter is implemented here. Implemented/tested local
+The boundary alone does not alter the real executable's startup sweep or restore
+turns. The next follow-up adds a separate feature-gated test driver and ledger
+integration, without changing default recovery policy. Implemented/tested local
 boundary, merged, deployed and live-verified remain separate facts.
+
+## Follow-up: actual executable, disposable recovery driver
+
+The `philote` Cargo feature `disposable-recovery` plus the explicit supervisor
+fixture environment select `AgentRuntime::run_disposable_recovery`. This runs the
+actual `philote` binary and existing IPC client/ScriptedLoopExecutor, but **not the
+default AgentRuntime::run startup/turn loop**. Default startup sweep behavior is
+unchanged. The driver verifies the connected hotel's kernel PID/UID, requests a
+single protected bootstrap key, and accepts only one `synthetic.receipt` script
+step. It has no model, real tool, memory or network operation path.
+
+The aiua test-only `RecoveryFixture` plugs into the protected adapter under the
+same launch guard. It uses the existing `LocalWork` SQLite ledger for claims,
+epochs, authority checks, operation intent, synthetic effects, retries and budget.
+`Work.checkpoint` (serde-defaulted for old records) stores the compact serialized
+script in the same fenced Task transaction; no apartment receipt or second
+execution ledger is written by this fixture. Checkpoint writes validate the
+current task fence and original authority revision. Lock order extends to the
+fixture mutex and then the ledger transaction; no asynchronous wait occurs under
+these locks. The test intentionally withholds the response only after all guards
+are released and the effect transaction commits.
+
+The ignored `actual_philote_interruption_reconciles_existing_ledger` test requires
+an explicitly supplied built binary. It supervises only its own children using
+`ProtectedLocalGuest`, attaching the registry before accepting their connection:
+
+- interrupt after the durable effect but before result checkpoint; reopen ledger;
+- claim a new epoch, reconcile success, restore script and refuse duplicate dispatch;
+- refuse a third actual child after durable authority revocation;
+- refuse a still-live child's result checkpoint after a separate ledger takeover;
+- deny actual-child bootstrap for an unknown dispatched outcome with no receipt;
+- assert durable attempts, prepaid budget quanta and exhaustion; reap children and
+  remove their sockets, retaining databases/stdout/stderr as evidence.
+
+Commands (use absolute paths for the two environment variables):
+
+```sh
+cargo build --offline -p philote --bin philote --features disposable-recovery
+PHILOTIC_DISPOSABLE_BINARY=/path/to/target/debug/philote PHILOTIC_DISPOSABLE_REVISION=<commit> cargo test --offline -p aiua --bin aiua actual_philote_interruption_reconciles_existing_ledger -- --ignored --nocapture
+cargo test --offline -p graph-intelligence --test local_work_recovery
+```
+
+The fixture clock is deterministic (epochs at logical times 0/10/20). Budget
+values are prepaid simulation quanta, not measured child CPU time or token usage.
+The hotel is a test-only in-process socket fixture using the production protected
+adapter; the children are actual executables. This proves the opt-in local recovery
+path, not general production turn restoration, external exactly-once effects,
+production grants, a running hotel integration or live verification. No default
+runtime installation, migration, daemon or grant service is added.
