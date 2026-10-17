@@ -50,6 +50,18 @@ Contract: [CarPlay foundation](../apps/philotic-apple/CARPLAY.md).
 - [ ] Install and verify authoritative voice/privacy dispatch and correlated hands-free contracts before any capability activation. Entitlement request is deferred.
 - [ ] Device/live-car verification remains separately approved future work; no real audio, credential or live hotel traffic used in this source slice.
 
+### Synthetic local work recovery candidate
+
+Contract: [local recovery](architecture/LOCAL_WORK_RECOVERY.md). Branch:
+`codex/local-work-recovery`, base `60ca892d2db85573b953dbddf4f0db7e6803d50f`.
+One builder, one independent review; synthetic local records only.
+
+- [x] Preserve occupied checkout; create isolated worktree from tracking develop.
+- [x] Implement durable claim, checkpoint, reconciliation, authority and evidence contract.
+- [x] Deterministic harness: 9 integration tests and 17 library tests pass; focused Clippy denies warnings.
+- [x] One independent review completed; its takeover-before-reconcile finding is fixed with dispatch-epoch and process-local execution permits plus regression tests.
+- [x] Local candidate committed; focused rereview confirms stale-dispatch correction. Draft publication and hosted verification authorized separately; merge/deployment remain out of scope.
+
 ### Apple voice privacy and cancellation
 
 Current remote source integration: `codex/voice-integrated-689bfc7d` is based on verified develop `689bfc7ddce26341cac994bb77d0027bea2ac98a`, preserving the original seven-commit checkpoint. See [integrated source evidence](../crates/philotic-web/src/serve/VOICE_INTEGRATION_CHECKPOINT.md). This integrates voice only; other owners' iPad/privacy/notch deltas remain separate.

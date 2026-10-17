@@ -5,6 +5,7 @@ pub mod diagrams;
 pub mod egress;
 pub mod embeddings;
 pub mod engine;
+pub mod local_work;
 pub mod plantuml;
 pub mod scanner;
 pub mod schema;

@@ -47,6 +47,11 @@ tracks_domains:
 
 # Philotic Architecture Status
 
+Local candidate (2026-10-17): [synthetic local work recovery](LOCAL_WORK_RECOVERY.md)
+adds an opt-in graph-intelligence library contract and disposable recovery harness.
+It does not add a scheduler, runtime route or production authority. Source/test,
+merge, deployment and live-verification facts remain separate.
+
 > **Status:** Transitional Snapshot | **Last Updated:** 2026-09-04
 
 This document is a legacy human-readable projection of current architecture state.
