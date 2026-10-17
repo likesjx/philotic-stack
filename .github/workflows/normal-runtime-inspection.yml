@@ -1,0 +1,124 @@
+name: Normal runtime inspection recovery
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'crates/aiua/**'
+      - 'crates/graph-intelligence/**'
+      - 'crates/philote/**'
+      - 'crates/philotic-client/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/normal-runtime-inspection.yml'
+permissions:
+  contents: read
+concurrency:
+  group: normal-inspection-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  actual-normal-runtime:
+    name: actual normal-runtime inspection (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      PHILOTIC_INSPECTION_REVISION: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Record exact head and runner
+        run: |
+          mkdir -p normal-evidence
+          test "$(git rev-parse HEAD)" = "$PHILOTIC_INSPECTION_REVISION"
+          git rev-parse HEAD > normal-evidence/revision.txt
+          uname -a > normal-evidence/environment.txt
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libssl-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: normal-inspection-linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            normal-inspection-linux-
+            disposable-philote-linux-
+      - name: Build default-path executable
+        run: |
+          rustc --version > normal-evidence/toolchain.txt
+          cargo build --locked -p philote --bin philote
+          sha256sum target/debug/philote > normal-evidence/executable.sha256
+      - name: Run actual normal-runtime acceptance explicitly
+        id: actual
+        shell: bash
+        run: |
+          set -o pipefail
+          export PHILOTIC_INSPECTION_BINARY="$PWD/target/debug/philote"
+          printf '%s\n' 'cargo test --locked -p aiua --bin aiua actual_normal_runtime_inspection_recovery -- --ignored --nocapture' > normal-evidence/command.txt
+          cargo test --locked -p aiua --bin aiua actual_normal_runtime_inspection_recovery -- --ignored --nocapture 2>&1 | tee normal-evidence/actual-process.log
+      - name: Ledger and protected boundary regressions
+        run: |
+          cargo test --locked -p graph-intelligence --test local_work_recovery
+          cargo test --locked -p aiua --bin aiua protected_boundary
+      - name: Preserve and validate evidence
+        if: always()
+        env:
+          ACTUAL_OUTCOME: ${{ steps.actual.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, sqlite3
+          reports = pathlib.Path('normal-evidence')
+          reports.mkdir(exist_ok=True)
+          log = reports / 'actual-process.log'
+          text = log.read_text() if log.exists() else ''
+          matches = re.findall(r'^NORMAL_FIXTURE_DIR (/tmp/nr-[0-9a-f]{32})$', text, re.M)
+          summary = {'revision': os.environ['PHILOTIC_INSPECTION_REVISION'], 'environment': 'linux:x86_64:normal-runtime', 'actual_outcome': os.environ['ACTUAL_OUTCOME'], 'ledgers': {}, 'processes': []}
+          if matches:
+              fixture = pathlib.Path(matches[-1])
+              sockets = list(fixture.glob('*.sock'))
+              summary['remaining_sockets'] = [p.name for p in sockets]
+              for socket in sockets:
+                  if socket.is_socket():
+                      socket.unlink()
+              shutil.copytree(fixture, reports / 'fixture', dirs_exist_ok=True)
+              for path in sorted(fixture.glob('*.db')):
+                  with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
+                      row = db.execute("SELECT properties FROM nodes WHERE id='synthetic:task:normal-inspection'").fetchone()
+                      if row:
+                          work = json.loads(row[0])
+                          assert work['revision'] == summary['revision']
+                          assert work['environment'] == summary['environment']
+                          summary['ledgers'][path.stem] = {'work': work, 'receipt_count': db.execute('SELECT count(*) FROM local_inspection_receipts').fetchone()[0]}
+              for path in sorted(fixture.glob('*.stdout')):
+                  output = path.read_text()
+                  pids = re.findall(r'NORMAL_RUNTIME_ENTER pid=(\d+)', output)
+                  summary['processes'].append({'scenario': path.stem, 'pids': pids, 'computed': output.count('NORMAL_INSPECTION_COMPUTED'), 'completed': output.count('NORMAL_INSPECTION_COMPLETE')})
+          if os.environ['ACTUAL_OUTCOME'] == 'success':
+              assert matches and not summary['remaining_sockets']
+              assert 'all_owned_children_reaped=true' in text
+              assert len(summary['processes']) == 13 and all(p['pids'] for p in summary['processes'])
+              assert summary['ledgers']['main']['receipt_count'] == 1
+              assert summary['ledgers']['retry']['receipt_count'] == 1
+              assert all(v['receipt_count'] == 0 for k, v in summary['ledgers'].items() if k not in ('main', 'retry'))
+              assert next(p for p in summary['processes'] if p['scenario'] == 'resumed')['computed'] == 0
+          summary['log_sha256'] = hashlib.sha256(text.encode()).hexdigest()
+          (reports / 'receipt.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PY
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: normal-runtime-evidence-${{ github.event.pull_request.head.sha }}
+          path: normal-evidence/
+          retention-days: 7
