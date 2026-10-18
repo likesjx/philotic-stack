@@ -81,3 +81,32 @@ complete persistent rollout.
 Validation: targeted public-fixture tests cover missing inputs, duplicate client
 bindings, independent revocation, scope/expiry denial, rotation evidence, missing
 privacy authority and revocation during recall. No network, database or credentials.
+# Lifecycle preparation update
+
+`persistent-lifecycle.mjs` now implements a single durable lifecycle owner with
+exclusive process ownership, fsync/rename state transitions, revision checks,
+expiry denial, withdrawal before response drain, and explicit credential rotation.
+Crash/interrupted transaction state retains a recovery interlock; it is never
+automatically deleted. Responses remain leased through finish/close. An error
+destroys the transport but does not itself release ownership; a drain timeout
+keeps serving withdrawn. Rotation evidence is supplied by a trusted integration
+owner and must come from real adoption/old-key-denial checks, not caller input.
+
+28 public-fixture tests cover this module and the existing issuer/boundary code.
+Observed expiry is durably latched withdrawn, including timer-triggered expiry;
+wall-clock rollback cannot silently restore serving. Ordinary disconnect aborts
+pending recall before releasing the response lease.
+This is not production activation: ServerResponse finish means handed to the
+transport, not proof the client received bytes. Already delivered bytes cannot be
+retracted. Issuer/privacy changes need an agreed serialization point with response
+delivery, including a bounded revocation/drain contract; double introspection is
+insufficient. The production route remains unwired pending that owner contract.
+
+Existing `crates/ansible-mesh-core/src/privacy.rs` and `privacy_storage.rs` provide
+a separate versioned privacy policy authority and transaction leases. Reuse must
+be evaluated with its owner rather than introducing a competing grant store.
+Its policies are not yet demonstrated to bind Muninn record identity/content
+versions and every emitted summary/related record. Muninn's concept classification,
+provenance trust and tags are not disclosure authorization. Real-memory selection
+and cloud disclosure require explicit user approval before provisioning.
+
