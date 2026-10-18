@@ -1,0 +1,38 @@
+name: Official Muninn observe verification
+on:
+  push:
+    branches: [codex/muninn-official-observe-ci]
+    paths:
+      - services/personal-mcp/official-observe-fixture/**
+      - .github/workflows/muninn-official-observe.yml
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Test fixture classifications
+        run: python3 -m unittest discover -s services/personal-mcp/official-observe-fixture -v
+      - name: Download and verify official public executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --max-time 60 --max-filesize 101319128 \
+            https://github.com/scrypster/muninndb/releases/download/v0.11.0/muninn-linux-amd64 \
+            -o "$RUNNER_TEMP/muninn-official"
+          printf '%s  %s\n' '6a862d2fa39d48fe20b849b6ced66f2673822d1677e8bfe52300f8c16dc032d4' "$RUNNER_TEMP/muninn-official" | sha256sum --check
+          chmod 0555 "$RUNNER_TEMP/muninn-official"
+      - name: Run offline synthetic acceptance and remove container
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime=''
+          for candidate in /opt/hostedtoolcache/node/24.*/x64/bin/node /opt/hostedtoolcache/node/22.*/x64/bin/node; do
+            if [[ -x "$candidate" ]]; then runtime="$candidate"; break; fi
+          done
+          test -n "$runtime"
+          python3 services/personal-mcp/official-observe-fixture/ci-launch.py "$RUNNER_TEMP/muninn-official" "$runtime"

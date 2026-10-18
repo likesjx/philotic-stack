@@ -1,0 +1,10 @@
+{
+  "embed_provider": "none",
+  "enrich_url": "",
+  "enrich_api_key": "",
+  "enrich_entities": false,
+  "enrich_relationships": false,
+  "enrich_classification": false,
+  "enrich_summary": false,
+  "llm_verbose_logs": false
+}
