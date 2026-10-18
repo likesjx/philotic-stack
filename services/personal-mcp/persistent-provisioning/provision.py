@@ -1,11 +1,14 @@
 """Private operator transaction; no network, credentials, or effects on import.
 
 Reuse the existing API and encrypted-vault owners through injected adapters.
-The command line is deliberately plan-only: it never collects or transmits secrets.
+The apply command requires an interactive protected root terminal and exact confirmation.
 An operator-controlled runner calls execute with a private handoff AFTER confirming
 its manifest digest. No automated runner is authorized by a manifest boolean.
 """
-import base64, datetime, fcntl, hashlib, json, os, re, secrets, stat, sys
+import sys
+if __name__=='__main__' and not sys.flags.isolated:
+    sys.stderr.write('isolated Python required; no private input accepted\n');sys.exit(1)
+import base64, datetime, fcntl, hashlib, json, os, re, secrets, stat
 from pathlib import Path
 CLIENTS = ['claude_muninn_recall_v1', 'chatgpt_muninn_recall_v1']
 RESOURCE = 'https://mcp.jaredlikes.com/personal/mcp'
@@ -70,12 +73,17 @@ class Journal:
         return value
 
 def validate(m, now=None):
-    require(set(m) == {'version','resource','subject','vault','include_future_records','clients','expires_at'})
+    require(set(m) == {'version','resource','subject','vault','include_future_records','clients','expires_at','transport'})
     require(m['version']==1 and m['resource']==RESOURCE and m['subject']==SUBJECT)
-    require(isinstance(m['vault'],str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}',m['vault']))
+    require(isinstance(m['vault'],str) and re.fullmatch(r'[a-z0-9_-]{1,64}',m['vault']))
     require(m['include_future_records'] is True)
     require(isinstance(m['clients'],list) and len(m['clients'])==2 and
             sorted(m['clients'])==sorted(CLIENTS))
+    t=m['transport']
+    require(isinstance(t,dict) and set(t)=={'rest_port','ui_port','helper_sha256'})
+    require(all(type(t[k]) is int and 1024<=t[k]<=65535 for k in ['rest_port','ui_port']) and t['rest_port']!=t['ui_port'])
+    require(isinstance(t['helper_sha256'],str) and re.fullmatch('[0-9a-f]{64}',t['helper_sha256']))
+    require(isinstance(m['expires_at'],str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})',m['expires_at']))
     end=datetime.datetime.fromisoformat(m['expires_at'].replace('Z','+00:00'))
     require(end.tzinfo is not None)
     now=now or datetime.datetime.now(datetime.timezone.utc)
@@ -90,7 +98,7 @@ def plan(m):
     return {'manifest_sha256':digest(m),'live_changes':False,'key_request':{
         'vault':m['vault'],'mode':'observe','label':'persistent-two-client-recall-v1','expires':m['expires_at']},
         'introspection_client':INTROSPECTION,'role':ROLE,'guest':GUEST,
-        'requires_private_operator_handoff':True,'requires_creation_and_storage_confirmation':True}
+        'transport':m['transport'],'requires_private_operator_handoff':True,'requires_creation_and_storage_confirmation':True}
 
 def execute(m, journal, confirm, private_handoff):
     """API.request and broker.store_exact_acl must be existing trusted owner adapters.
@@ -99,7 +107,7 @@ def execute(m, journal, confirm, private_handoff):
     returns (api, broker). It is never invoked until confirm approves this digest.
     The broker adapter must persist with the exact scope/ACL and verify readback,
     returning ONLY {'reference': ...}. It must not adopt policy or restart services.
-    No production CLI adapter is installed by this module.
+    CLI apply supplies the concrete localhost API and protected hotel helper.
     """
     m=json.loads(json.dumps(m))
     end=validate(m); bound=digest(m)
@@ -147,13 +155,51 @@ def execute(m, journal, confirm, private_handoff):
         if api is not None:
             try:api.close_private_session()
             except Exception:pass
+        if broker is not None and hasattr(broker,'close'):broker.close()
 
 def main():
-    # No apply subcommand, credential argv/env parsing, SSH, or secret collection.
-    m=json.loads(Path(sys.argv[1]).read_text())
-    try:print(json.dumps(plan(m),sort_keys=True))
-    except Exception:print(json.dumps({'outcome':'operator_scope_or_expiry_required','live_changes':False}));return 1
-    return 0
+    import argparse,getpass,warnings
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['plan','apply']);p.add_argument('--manifest',required=True);p.add_argument('--journal')
+    a=p.parse_args()
+    with open(a.manifest,'rb') as f:
+        raw=f.read(65537);require(len(raw)<=65536);m=json.loads(raw)
+    prepared=plan(m)
+    if a.action=='plan':print(json.dumps(prepared,sort_keys=True));return 0
+    # Only isolated stdlib is loaded until fixed installation provenance and
+    # process protection have been checked. No local module import before this.
+    import ctypes,resource
+    BASE=Path('/opt/percival-personal-mcp/provisioning');HELPER=BASE/'persistent-broker-helper';HANDOFF=BASE/'private_key_handoff.py'
+    require(a.journal is not None and sys.stdin.isatty() and sys.stdout.isatty())
+    require(sys.platform=='linux' and os.geteuid()==0 and sys.flags.isolated)
+    require(Path(__file__).absolute()==BASE/'provision.py')
+    for path in [BASE/'provision.py',BASE/'adapters.py',HELPER,HANDOFF]:
+        for part in [path,*path.parents]:
+            st=part.lstat();require(not stat.S_ISLNK(st.st_mode) and st.st_uid==0 and not st.st_mode&0o022)
+        require(path.is_file())
+    require(hashlib.sha256(HELPER.read_bytes()).hexdigest()==m['transport']['helper_sha256'])
+    resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+    libc=ctypes.CDLL(None,use_errno=True)
+    require(libc.prctl(4,0,0,0,0)==0 and libc.prctl(3,0,0,0,0)==0)
+    sys.path.insert(0,str(BASE))
+    from adapters import API,Broker
+    warnings.simplefilter('error',getpass.GetPassWarning)
+    print(json.dumps(prepared,indent=2,sort_keys=True))
+    def confirm(bound):
+        return input('Create and store these persistent credentials? Type CREATE_AND_STORE '+bound+': ')
+    def handoff():
+        # Operator enters existing secrets privately, only after digest confirmation.
+        username=getpass.getpass('Existing Muninn admin username (hidden): ')
+        password=getpass.getpass('Existing Muninn admin password (hidden): ')
+        key=getpass.getpass('Existing hotel master key (base64, hidden): ').encode('ascii')
+        broker=Broker(key,m['transport']['helper_sha256'])
+        api=API(m['transport']['rest_port'],m['transport']['ui_port'])
+        try:api.login(username,password);return api,broker
+        except BaseException:broker.close();api.cookies.clear();raise
+    journal=Journal(a.journal)
+    try:
+        outcome=execute(m,journal,confirm,handoff)
+        print(json.dumps(outcome,sort_keys=True));return 0 if outcome['outcome']=='stored_not_activated' else 1
+    finally:journal.close()
 if __name__=='__main__':
     try:sys.exit(main())
-    except Exception:print('{"outcome":"invalid_manifest","live_changes":false}');sys.exit(1)
+    except (Exception,KeyboardInterrupt):print('{"outcome":"stopped_reconcile_private_journal","live_activation":false}',file=sys.stderr);sys.exit(1)

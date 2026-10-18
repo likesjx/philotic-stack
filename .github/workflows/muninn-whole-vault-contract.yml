@@ -13,7 +13,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Test private provisioning decisions with dummy owner adapters
-        run: python3 -m unittest discover -s services/personal-mcp/persistent-provisioning -v
+        run: RUN_PRIVATE_HTTP_TESTS=1 python3 -m unittest discover -s services/personal-mcp/persistent-provisioning -v
       - name: Test gateway HTTP denial and exact whole-vault mapping
         shell: bash
         run: |
@@ -25,3 +25,26 @@ jobs:
           test -n "$runtime"
           cd services/personal-mcp
           "$runtime" --test whole-vault.test.mjs whole-vault-http.test.mjs remote-clients.test.mjs gateway.test.mjs bootstrap.test.mjs
+  protected-helper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      CARGO_INCREMENTAL: '0'
+      PHILOTIC_VAULT_KEYCHAIN: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Prepare pinned Rust and locked dependencies
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --target x86_64-unknown-linux-gnu
+          cargo fetch --locked --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml
+      - name: Test actual encryption persistence and build protected helper
+        run: |
+          cargo test --offline --locked --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml --bin persistent-broker-helper -- --test-threads=1
+          cargo build --offline --locked --release --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml --bin persistent-broker-helper --example private_start_fixture
+      - name: Verify protected handoff with public fixture and hostile sibling
+        run: sudo --preserve-env=GITHUB_ACTIONS /usr/bin/python3 services/personal-mcp/persistent-provisioning/linux_handoff_acceptance.py --disposable-public-fixture
+      - name: Record helper hash
+        run: sha256sum services/personal-mcp/synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper

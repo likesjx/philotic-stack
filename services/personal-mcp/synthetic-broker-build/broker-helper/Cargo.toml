@@ -14,3 +14,7 @@ libc = "0.2"
 [workspace]
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
+
+[[bin]]
+name = "persistent-broker-helper"
+path = "src/persistent_main.rs"

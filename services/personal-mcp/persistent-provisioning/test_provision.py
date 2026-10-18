@@ -19,7 +19,7 @@ class Broker:
 class Tests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'journal.json';self.j=Journal(self.path)
-        self.m={'version':1,'resource':RESOURCE,'subject':SUBJECT,'vault':'fixture_vault','include_future_records':True,
+        self.m={'transport':{'rest_port':18476,'ui_port':18478,'helper_sha256':'a'*64},'version':1,'resource':RESOURCE,'subject':SUBJECT,'vault':'fixture_vault','include_future_records':True,
             'clients':CLIENTS[:],'expires_at':(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=1)).isoformat()}
     def tearDown(self):self.j.close();self.tmp.cleanup()
     def confirm(self,d):return 'CREATE_AND_STORE '+d
@@ -48,6 +48,35 @@ class Tests(unittest.TestCase):
     def test_store_failure_retains_known_key_for_recovery(self):
         out=execute(self.m,self.j,self.confirm,lambda:(API(self.m),Broker(True)))
         self.assertEqual(out['outcome'],'recovery_required');self.assertEqual(self.j.data['key_ids']['observe'],'fixture-id')
+    def test_expiry_must_be_future_aware_and_at_most_31_days(self):
+        for expiry in ['2020-01-01T00:00:00Z', '2030-01-01T00:00:00Z', '2030-01-01T00:00:00']:
+            with self.assertRaises(Refused):plan({**self.m,'expires_at':expiry})
+    def test_malformed_return_retains_id_without_store_or_automatic_rollback(self):
+        api=API(self.m)
+        original=api.request
+        def malformed(*args,**kwargs):
+            status,body=original(*args,**kwargs)
+            if status==201:body['key']['mode']='full'
+            return status,body
+        api.request=malformed;broker=Broker()
+        out=execute(self.m,self.j,self.confirm,lambda:(api,broker))
+        self.assertEqual(out['outcome'],'recovery_required')
+        self.assertEqual(self.j.data['key_ids'],{'observe':'fixture-id'})
+        self.assertEqual(self.j.data['steps']['create_observe'],'pending')
+        self.assertEqual(broker.calls,[])
+        self.assertEqual([c[0] for c in api.calls],['GET','POST'])
+    def test_second_store_uncertainty_preserves_first_reference_and_never_retries(self):
+        broker=Broker();original=broker.store_exact_acl
+        def second(**kw):
+            if kw['kind']=='percival-issuer-introspection':raise TimeoutError(SECRET)
+            return original(**kw)
+        broker.store_exact_acl=second
+        out=execute(self.m,self.j,self.confirm,lambda:(API(self.m),broker))
+        self.assertEqual(out['outcome'],'recovery_required')
+        self.assertIn('secret_ref',self.j.data)
+        self.assertEqual(self.j.data['steps']['store_percival-issuer-introspection'],'pending')
+        self.assertNotIn(SECRET,self.path.read_text())
+        with self.assertRaises(Refused):execute(self.m,self.j,self.confirm,lambda:self.fail('retry'))
     def test_mutating_original_manifest_cannot_change_confirmed_scope(self):
         api=API(self.m);broker=Broker()
         def confirm(d):self.m['vault']='other';return self.confirm(d)

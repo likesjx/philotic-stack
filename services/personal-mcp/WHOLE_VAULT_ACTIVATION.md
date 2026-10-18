@@ -27,33 +27,60 @@ silently implemented here. Whole-vault approval includes every record in scope,
 including later additions/updates. Complete cognitive-write suppression is not
 claimed.
 
-## Private provisioning wrapper
+## Private provisioning adapters
 
 `persistent-provisioning/manifest.unset.json` intentionally leaves vault,
-future-record inclusion and expiry unset. The only CLI is plan-only:
+future-record inclusion and expiry unset. The default preparation command is non-mutating:
 
 ```
-python3 services/personal-mcp/persistent-provisioning/provision.py PATH_TO_MANIFEST
+python3 -I -B services/personal-mcp/persistent-provisioning/provision.py plan --manifest PATH_TO_MANIFEST
 ```
 
-A completed manifest is SHA256-bound. The operator-controlled runner must call
-`execute(manifest, journal, confirm, private_handoff)` and obtain the exact
-`CREATE_AND_STORE <digest>` confirmation before invoking private authentication
-or transmitting credentials. Do not call this from an agent tool with live
-secrets. No credentials are accepted through argv/environment, collected by the
-CLI, or printed. Use a private owner0700 nonsymlink journal directory.
+A completed manifest is SHA256-bound, including the exact localhost REST/UI
+ports and built helper SHA256. They remain unset until verified. Run `plan
+--manifest PATH` to inspect the nonsecret transaction. The executable private
+handoff is installed root-owned and non-writable by others under
+`/opt/percival-personal-mcp/provisioning` with provision.py, adapters.py,
+private_key_handoff.py and the built persistent-broker-helper. Installation and
+actual execution remain action-time operations, not performed by this change.
 
-The wrapper reuses the existing trusted API and encrypted-vault owner interfaces:
-- API: request(method,path,payload,admin=True), close_private_session().
-- Broker: store_exact_acl(kind,scope,secret,allowed_roles,allowed_guests), returning
-  only a reference after durable store and exact ACL/readback verification.
+In an operator-controlled VPS terminal (not an agent/tool invocation):
 
-The supplied adapters in tests are dummy fixtures. **A production private runner
-and its authenticated API / persistent-scope broker adapters are not installed or
-validated by this change.** The existing synthetic helper has a hardcoded synthetic
-scope; do not pass it a real vault or claim it implements this adapter. Integrating
-these existing owners into the private runner requires review and action-time
-approval before any live credential transmission.
+```
+sudo /usr/bin/python3 -I -B /opt/percival-personal-mcp/provisioning/provision.py apply --manifest APPROVED_MANIFEST --journal PRIVATE_0700_DIRECTORY/receipt.json
+```
+
+Apply refuses noninteractive execution, non-Linux/non-root callers, mutable or
+symlinked installation paths, and helper-hash mismatch. It disables core dumps
+and dumpability before prompting. The user must type `CREATE_AND_STORE <digest>`
+before hidden prompts for the existing Muninn admin login and existing hotel
+master key. No secret discovery, environment reads, SSH copying or generation of
+a replacement hotel master key occurs. Secret inputs stay in memory/private pipes;
+there is no argv/env credential input. Prompt echo fallback is refused.
+
+The concrete API adapter speaks actual Muninn login/session-cookie and admin-key
+JSON contracts on literal localhost only, with redirects/proxies disabled and
+bounded requests/responses. Only vault-name metadata and observe-key creation
+are allowed. The concrete broker adapter invokes a separate persistent helper
+entry point sharing the existing hotel `vault.rs` encryption/storage and
+`private_start.rs` privilege-drop/undumpability handshake. It validates scope and
+singleton ACLs, opens only the existing hotel database, stores, checks metadata
+and decrypts for readback, then returns only the reference and exits. The master
+key is delivered after READY and lives in a private no-swap tmpfs destroyed on
+namespace exit. The launcher/helper share one killable process group; timeout
+kills and waits without repeating creation. A killed launcher can leave an empty
+root-only /run directory, but cannot preserve its namespace-mounted key file.
+
+Broker records persist after helper exit and do not expire automatically. The
+native observe key has its explicit expiry; encrypted references and the separate
+introspection credential require explicit revocation/removal. The adapter never
+changes the serving broker policy, admissions, proxy or service state.
+
+Tests cover real HTTP cookies/key response shapes, actual subprocess pipe and
+exit/timeout behavior, actual encrypted storage surviving a child-process exit,
+wrong ACL rejection and the reused Linux protected-handoff adversary fixture.
+Live operator execution against the installed DB and admin endpoints remains
+unperformed. A successful CI build is not production provisioning acceptance.
 
 After confirmation, the wrapper checks vault-name metadata only, creates one
 native observe key with exact expiry (maximum31days), stores it and a separately

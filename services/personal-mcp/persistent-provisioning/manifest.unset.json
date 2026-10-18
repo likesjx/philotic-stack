@@ -4,6 +4,14 @@
   "subject": "15393f50-045b-4227-90b0-0cf4264f0b3d",
   "vault": null,
   "include_future_records": null,
-  "clients": ["claude_muninn_recall_v1", "chatgpt_muninn_recall_v1"],
-  "expires_at": null
+  "clients": [
+    "claude_muninn_recall_v1",
+    "chatgpt_muninn_recall_v1"
+  ],
+  "expires_at": null,
+  "transport": {
+    "rest_port": null,
+    "ui_port": null,
+    "helper_sha256": null
+  }
 }
