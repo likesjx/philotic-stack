@@ -29,9 +29,9 @@ export function preparePersistentRecall(input) {
   require(m && m.version === 1 && m.mode === 'persistent', 'persistent manifest required');
   require(typeof m.subject === 'string' && m.subject.length > 0, 'subject required');
   require(typeof m.resource === 'string' && httpsCallback(m.resource), 'HTTPS resource required');
-  require(Array.isArray(m.clients) && m.clients.length === 2 &&
-    new Set(m.clients.map(c => c?.kind)).size === 2 &&
-    m.clients.every(c => CLIENTS.includes(c?.kind)), 'two distinct client kinds required');
+  require(Array.isArray(m.clients) && m.clients.length >= 1 && m.clients.length <= 2 &&
+    new Set(m.clients.map(c => c?.kind)).size === m.clients.length &&
+    m.clients.every(c => CLIENTS.includes(c?.kind)), 'one or two distinct client kinds required');
   const blockers = [];
   const ids = new Set(), callbacks = new Set();
   for (const client of m.clients) {
@@ -107,13 +107,19 @@ export function withdraw(state) {
 
 // Re-evaluate after upstream completion so revocation/expiry during recall fails shut.
 // The authority owns record filtering and binds its decision to the exact payload.
-export async function guardedRecall({ state, request, now, fetchRecall, privacyAuthority }) {
+export async function guardedRecall({ state, request, now, fetchRecall, privacyAuthority, signal }) {
+  signal?.throwIfAborted();
   const boundRequest = frozenJson(request);
   require(canRecall(await state(), boundRequest, now()), 'recall denied');
+  signal?.throwIfAborted();
   require(typeof privacyAuthority?.filterAndBind === 'function' && typeof privacyAuthority?.verify === 'function', 'privacy authority absent');
   const raw = await fetchRecall();
-  const bounded = frozenJson(await privacyAuthority.filterAndBind(raw, boundRequest));
-  require(await privacyAuthority.verify(bounded, boundRequest), 'privacy decision invalid');
+  signal?.throwIfAborted();
+  const bounded = frozenJson(await privacyAuthority.filterAndBind(raw, boundRequest, {signal}));
+  signal?.throwIfAborted();
+  require(await privacyAuthority.verify(bounded, boundRequest, {signal}), 'privacy decision invalid');
+  signal?.throwIfAborted();
   require(canRecall(await state(), boundRequest, now()), 'recall revoked');
+  signal?.throwIfAborted();
   return bounded;
 }

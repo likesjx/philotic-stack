@@ -92,10 +92,28 @@ destroys the transport but does not itself release ownership; a drain timeout
 keeps serving withdrawn. Rotation evidence is supplied by a trusted integration
 owner and must come from real adoption/old-key-denial checks, not caller input.
 
-28 public-fixture tests cover this module and the existing issuer/boundary code.
+33 public-fixture tests cover this module and the existing issuer/boundary code.
 Observed expiry is durably latched withdrawn, including timer-triggered expiry;
 wall-clock rollback cannot silently restore serving. Ordinary disconnect aborts
 pending recall before releasing the response lease.
+
+The composition accepts one explicitly configured client for Claude-first rollout
+or two distinct clients when both are approved. Omitted dot configuration confers
+no dot authority. Request cancellation propagates into confidential introspection,
+scope/privacy callbacks and upstream recall; cancellation is checked after each
+await so a noncooperative callback cannot release output after completing late.
+Callbacks still must honor the supplied signal to stop work promptly.
+
+The issuer/native owner is preparing reuse of the existing supervised release and
+mutation coordinator; this gateway must not introduce another authority or public
+lease endpoint. Await that owner's typed interface. Hold its response enrollment
+through defined server transport handoff, with mutations serialized against
+enrollment and record-policy changes coordinated or drained. A trusted versioned
+mapping must bind exact subject/client/resource/memory:recall to the one approved
+collection. Each record must have authoritative matching owner and explicit
+nonprivate policy; missing/unknown/private metadata denies before derived output.
+Metadata must be immutable for the enrolled revision or protected by the same
+coordinator. Current injected privacy callbacks are not proof this is installed.
 This is not production activation: ServerResponse finish means handed to the
 transport, not proof the client received bytes. Already delivered bytes cannot be
 retracted. Issuer/privacy changes need an agreed serialization point with response

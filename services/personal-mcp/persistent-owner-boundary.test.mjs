@@ -13,6 +13,32 @@ function fixture() {
  return {grants,calls,options,service:createPersistentOwnerBoundary(options),withdraw:()=>{phase='withdrawn';},hook:fn=>{hook=fn;}};
 }
 const request=client=>({accessToken:client,vault:'approved_fixture',arguments:{context:['synthetic']}});
+test('Claude-only configuration does not authorize dot',async()=>{
+ const f=fixture();const service=createPersistentOwnerBoundary({...f.options,clients:['claude']});
+ await service.recall(request('claude'));await assert.rejects(service.recall(request('dot')),/authorization denied/);
+ assert.equal(f.calls.length,1);
+});
+test('already cancelled request never calls issuer or upstream',async()=>{
+ const f=fixture(),controller=new AbortController();let calls=0;
+ f.options.issuer.authorizeRecall=async()=>{calls++;throw new Error('unexpected');};controller.abort();
+ await assert.rejects(f.service.recall({...request('claude'),signal:controller.signal}),{name:'AbortError'});
+ assert.equal(calls,0);assert.equal(f.calls.length,0);
+});
+test('disconnect cancellation reaches upstream and prevents privacy work',async()=>{
+ const f=fixture(),controller=new AbortController();let entered;const ready=new Promise(r=>{entered=r;});let privacyCalls=0;
+ f.options.privacyAuthority.filterAndBind=async()=>{privacyCalls++;};
+ f.options.upstream.recall=({signal})=>new Promise((resolve,reject)=>{
+  assert.equal(signal,controller.signal);signal.addEventListener('abort',()=>reject(signal.reason),{once:true});entered();
+ });
+ const pending=f.service.recall({...request('claude'),signal:controller.signal});await ready;controller.abort();
+ await assert.rejects(pending,{name:'AbortError'});assert.equal(privacyCalls,0);
+});
+test('cancellation while privacy owner awaits prevents verification and release',async()=>{
+ const f=fixture(),controller=new AbortController();let verify=0;
+ f.options.privacyAuthority.filterAndBind=async(raw,bound,{signal})=>{assert.equal(signal,controller.signal);controller.abort();return raw;};
+ f.options.privacyAuthority.verify=async()=>{verify++;return true;};
+ await assert.rejects(f.service.recall({...request('claude'),signal:controller.signal}),{name:'AbortError'});assert.equal(verify,0);
+});
 test('uses canonical per-client admission and never sends OAuth token upstream',async()=>{
  const f=fixture();await f.service.recall(request('dot'));f.grants.dot.enabled=false;f.grants.dot.clientVersion++;
  await assert.rejects(f.service.recall(request('dot')));await f.service.recall(request('claude'));

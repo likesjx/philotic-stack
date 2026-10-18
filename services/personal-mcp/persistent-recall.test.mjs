@@ -6,6 +6,12 @@ const state = () => ({phase:'active',subject:'fixture-user',subjectEnabled:true,
   activeCredential:{reference:'secret://fixture/old',expiresAt:200},privacyLeaseExpiresAt:150});
 const request = (id='dot') => ({clientId:id,clientVersion:id==='dot'?2:5,subject:'fixture-user',resource:'https://mcp.fixture.test/mcp',scope:'memory:recall',tool:'muninn_recall',readOnly:true,vault:'approved_fixture'});
 const manifest = () => ({version:1,mode:'persistent',subject:'fixture-user',resource:'https://mcp.fixture.test/mcp',clients:[{kind:'dot'},{kind:'claude'}]});
+test('Claude-first preparation stays blocked without scope and access evidence',()=>{
+ const result=preparePersistentRecall({...manifest(),clients:[{kind:'claude'}]});
+ assert.equal(result.activationAllowed,false);assert.ok(result.blockers.includes('approved-real-memory-scope'));
+ assert.ok(!result.blockers.some(x=>x.startsWith('dot:')));
+ for(const clients of [[],[{kind:'claude'},{kind:'claude'}],[{kind:'unknown'}]])assert.throws(()=>preparePersistentRecall({...manifest(),clients}));
+});
 test('unknown callbacks, scope and evidence remain blocked, even with approval-looking extras',()=>{
  const result=preparePersistentRecall({...manifest(),approved:true});
  assert.equal(result.activationAllowed,false); assert.equal(result.preparationComplete,false);
