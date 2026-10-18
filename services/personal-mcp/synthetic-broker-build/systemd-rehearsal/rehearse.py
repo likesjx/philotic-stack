@@ -7,8 +7,8 @@ UNIT='muninn-broker-dummy-e43bb385-r3.service'
 SLICE='muninn-synthetic-run4.slice'
 UNITPATH=pathlib.Path('/run/systemd/system')/UNIT
 SLICEPATH=pathlib.Path('/run/systemd/system')/SLICE
-ARCHIVE_SHA='15d427d6fff8c4b6ac615c98e4f2672eb455e5a0663d005a384a63096811f3a0'
-MANIFEST_SHA='94d15a963307033789cf0386432b7943a5311434faee0cffd1d4bf1826fbe65e'
+ARCHIVE_SHA='45b79bf407a7353eadc670c1bd6996c3e18a11a829a3edba4b3233f88fa637f0'
+MANIFEST_SHA='516291589195f1451688b0f9ad9e07d0b8bdd08dbd27b650a637435ca6255587'
 UNIT_SHA='95b7cf6b27cb0e8930f144f95d84c5fe10da5b095318a604bae14a2b8a735ac7'
 SLICE_DATA=b'[Slice]\nMemoryMax=640M\nMemorySwapMax=0\nCPUQuota=50%\nTasksMax=128\n'
 def run(*args,check=True):return subprocess.run(args,capture_output=True,text=True,check=check,timeout=20)
@@ -166,6 +166,7 @@ def main():
     owned_unit=False;owned_slice=False;cg=None
     try:
         preflight(report)
+        report['operation']='stage-reviewed-archive'
         stage()
         with SLICEPATH.open('xb') as f:f.write(SLICE_DATA)
         owned_slice=True;SLICEPATH.chmod(0o644)
@@ -180,11 +181,13 @@ def main():
         assert slice_limits=={'MemoryMax':'671088640','MemorySwapMax':'0','CPUQuotaPerSecUSec':'500ms','TasksMax':'128','DropInPaths':''}
         report['effective_slice_limits']=slice_limits
         report['run_count']=1
+        report['operation']='start-exact-unit'
         run('systemctl','start',UNIT) # Exactly one start, no retry.
         slice_cg=show(SLICE,'ControlGroup')['ControlGroup']
         unit_cg=show(UNIT,'ControlGroup')['ControlGroup']
         cg=cgroup_path(unit_cg) if unit_cg else cgroup_path(slice_cg)/UNIT
         report['actual_cgroup_path']=str(cg)
+        report['operation']='await-runtime-result'
         deadline=time.monotonic()+140
         while True:
             status=show(UNIT,'ActiveState','Result','MainPID','ExecMainStatus','ControlGroup')
@@ -192,7 +195,8 @@ def main():
             assert time.monotonic()<deadline,'supervisor deadline'
             time.sleep(1)
         report['unit_result']=status
-        assert status['Result']=='success' and status['ExecMainStatus']=='0' and status['MainPID']=='0'
+        assert status['Result']=='success' and status['ExecMainStatus']=='0' and status['MainPID']=='0','runtime failed; inspect bounded validator journal'
+        report['operation']='verify-runtime-receipt'
         receipt=json.loads((BASE/'root/results/receipt.json').read_text())
         report['receipt']=receipt
         for key in ['uid999_sqlite_regression','dummy_create_readback_delete','private_mount_cleanup','sysctl_unchanged']:assert receipt[key] is True
