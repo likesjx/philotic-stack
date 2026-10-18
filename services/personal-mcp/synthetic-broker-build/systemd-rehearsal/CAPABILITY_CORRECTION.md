@@ -1,0 +1,17 @@
+# Local capability correction — unpublished, runtime unverified
+
+Diagnostic run39129148107 measured effective/permitted0x200063 (missing SETUID), bounding0x2000e3, inheritable0x200000 (SYS_ADMIN), ambient0, NoNewPrivs1. Both mismatches remain failures.
+
+The only unit behavior change removes explicit User=root. This is a system-manager unit, whose default execution UID is0; Group=root remains explicit. The validator still requires actual UID0 before database setup. RootDirectory, namespace bootstrap, NoNewPrivileges, all seccomp-producing settings, six-capability bounding set, empty ambient set, resource limits, UID999/GID987 worker drops and cleanup are unchanged. No exec privilege prefixes or extra capabilities are introduced.
+
+Source rationale: systemd255 exec-invoke.c gates temporary seccomp capability retention on a valid explicitly resolved UID; it drops SETUID absent from the ambient set and uses keep_capability(SYS_ADMIN). Omitting User avoids that UID path while retaining sandboxing. See https://raw.githubusercontent.com/systemd/systemd/v255/src/core/exec-invoke.c and system-manager default identity documentation https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html. This is a source-supported correction, not a claim about the exact distro-patched binary until tested.
+
+Required runtime result remains effective=permitted=bounding0x2000e3, inheritable=ambient0, NoNewPrivs1. No subset acceptance. Tests load the actual packaged validator, check each set independently, reject the observed failed state, and exercise supplementary-group clear -> GID987 -> UID999 ordering and stop-on-failure. Fixtures cannot emulate kernel credential transitions; the existing real UID999 SQLite write and adversarial controls must still pass on Linux.
+
+Archive delta relative to5980608a: unit plus manifest only; validator/bootstrap/helper/adapter untouched. New archive SHA2562b16d7b303e8bc3c1ce57e5cd939fb1fb6e402c4d5241fefe7c38678bae54fa4; unit SHA2566d41b4b0cc71ba2b5b8fa33513cb5150cbcde0d7849d7dba1dcf07146ab0879c. Matching runner pins updated. CAPABILITY_DIAGNOSIS.md describes the preceding diagnostic candidate, not this candidate's hashes.
+
+Verification:6 packaged capability/drop tests +7 preflight tests +6 cleanup fault tests +7 validator/ownership tests pass locally. The external cleanup fixture was pointed at the current runner rather than the obsolete r3-ci-rehearsal copy; its previous pin mismatch correctly refused cleanup. No assertion was loosened.
+
+Proposed bundled authorization: publish the reviewed exact local commit to PR672's existing DO NOT MERGE branch, verify remote head, then dispatch build-linux.yml once on disposable ubuntu24.04. Keep120s+15s/128MiB/no swap/25%CPU/32tasks service,640MiB/no swap/50%CPU/128tasks slice and8-minute job, public dummy only. Inspect all exact capability sets, actual UID999 regression, positive/negative isolation controls and cleanup; no automatic retry. No merge, VPS change, real credential or persistent access.
+
+Remaining Claude path: pass this runtime gate; resolve current public discovery and issuer readiness using bounded read-only metadata; reconcile exact Claude callback/client and existing gateway/issuer tooling; obtain the concrete deployment/scoped-credential/admission approval; direct user sign-in/consent; synthetic recall and cleanup. Persistent useful recall requires the separate unfinished record privacy and delivery-fencing work. Shared issuer files are untouched.
