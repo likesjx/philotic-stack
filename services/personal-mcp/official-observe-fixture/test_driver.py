@@ -73,6 +73,19 @@ class Tests(unittest.TestCase):
         out = run(Added(), EXPECTED_SHA, self.expiry())
         self.assertEqual(out['cases']['denied_writes_did_not_add_records'], 'fail')
 
+    def test_readiness_never_discards_a_foreign_result(self):
+        class ForeignFirst(Fixture):
+            recalls = 0
+            def rpc(self, token, tool, args, query=''):
+                if tool == 'muninn_recall':
+                    self.recalls += 1
+                    if self.recalls == 1: return result(MARK_B)
+                return super().rpc(token, tool, args, query)
+        fixture = ForeignFirst()
+        out = run(fixture, EXPECTED_SHA, self.expiry())
+        self.assertIn('setup_or_transport', out)
+        self.assertEqual(fixture.recalls, 1)
+
     def test_unknown_outcome_stops_and_revokes_without_retry(self):
         fixture = Fixture(break_recall=True)
         out = run(fixture, EXPECTED_SHA, self.expiry())

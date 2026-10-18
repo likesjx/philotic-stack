@@ -172,11 +172,19 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
             record(name, passed)
         before = client.rpc(token, 'muninn_read', read_args)
         # Writes enqueue asynchronous FTS indexing. Poll only a read-only
-        # positive control, before any negative test, for at most five seconds.
+        # positive control before any negative test. Never discard errors or
+        # foreign content while waiting for the index to catch up.
         ready_end = time.monotonic() + 5
         while True:
-            recall = client.rpc(token, 'muninn_recall', args)
-            if rpc_ok(recall) and MARK_A in json.dumps(recall[1]): break
+            original_deadline = getattr(client, 'deadline', None)
+            if original_deadline is not None: client.deadline = min(original_deadline, ready_end)
+            try:
+                recall = client.rpc(token, 'muninn_recall', args)
+            finally:
+                if original_deadline is not None: client.deadline = original_deadline
+            if not rpc_ok(recall) or MARK_B in json.dumps(recall[1]):
+                raise RuntimeError('unsafe recall readiness response')
+            if MARK_A in json.dumps(recall[1]): break
             if time.monotonic() >= ready_end: break
             time.sleep(.1)
         record('mcp_observe_own_vault_recall', rpc_ok(recall) and MARK_A in json.dumps(recall[1])
