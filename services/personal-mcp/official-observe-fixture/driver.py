@@ -133,6 +133,13 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
                 {'vault': vault, 'concept': marker, 'content': marker + ' synthetic recall fixture.'},
                 admin=True), (200, 201))
             ids[vault] = item['id']
+        phase = 'synthetic_record_inventory'
+        inventory_path = '/api/engrams?vault=' + A + '&limit=10&offset=0'
+        baseline = must(client.request('GET', inventory_path, admin=True))
+        baseline_ids = [item['id'] for item in baseline.get('engrams', [])]
+        if baseline_ids != [ids[A]]: raise RuntimeError('unexpected synthetic inventory')
+        baseline_stats = must(client.request('GET', '/api/stats?vault=' + A, admin=True))
+        receipt['synthetic_count_before'] = baseline_stats.get('engram_count')
         phase = 'observe_key_creation'
         key = must(client.request('POST', '/api/admin/keys',
             {'vault': A, 'label': 'disposable-exact-binary-check', 'mode': 'observe', 'expires': expires},
@@ -151,7 +158,7 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
             record('test_key_expiry_metadata_bounded', False)
             raise RuntimeError('test key expiry not established')
         phase = 'observe_acceptance'
-        args = {'vault': A, 'context': [MARK_A], 'threshold': 0, 'limit': 10}
+        args = {'vault': A, 'context': [MARK_A], 'threshold': 0, 'limit': 10, 'read_only': True}
         read_args = {'vault': A, 'id': ids[A], 'read_only': True}
         def negative(name, passed):
             # A denied expired key proves nothing about vault/write enforcement.
@@ -164,7 +171,14 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
                 raise RuntimeError('denial not attributable to scope')
             record(name, passed)
         before = client.rpc(token, 'muninn_read', read_args)
-        recall = client.rpc(token, 'muninn_recall', args)
+        # Writes enqueue asynchronous FTS indexing. Poll only a read-only
+        # positive control, before any negative test, for at most five seconds.
+        ready_end = time.monotonic() + 5
+        while True:
+            recall = client.rpc(token, 'muninn_recall', args)
+            if rpc_ok(recall) and MARK_A in json.dumps(recall[1]): break
+            if time.monotonic() >= ready_end: break
+            time.sleep(.1)
         record('mcp_observe_own_vault_recall', rpc_ok(recall) and MARK_A in json.dumps(recall[1])
                and MARK_B not in json.dumps(recall[1]))
         negative('mcp_body_cross_vault_denied', denied(client.rpc(token, 'muninn_recall',
@@ -194,7 +208,10 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
         after = client.rpc(token, 'muninn_read', read_args)
         record('observed_record_response_unchanged', rpc_ok(before) and rpc_ok(after) and before == after)
         count = must(client.request('GET', '/api/stats?vault=' + A, admin=True))
-        record('denied_writes_did_not_add_records', count.get('engram_count') == 1)
+        receipt['synthetic_count_after'] = count.get('engram_count')
+        after_inventory = must(client.request('GET', inventory_path, admin=True))
+        after_ids = [item['id'] for item in after_inventory.get('engrams', [])]
+        record('denied_writes_did_not_add_records', after_ids == baseline_ids == [ids[A]])
         receipt['cases']['all_cognitive_storage_writes_suppressed'] = 'unsupported: response equality does not cover activation logs, feedback or association storage'
         receipt['cases']['actual_gateway_adapter'] = (
             gateway_check(token, A, MARK_A) if gateway_check else 'not_run: gateway callback absent')

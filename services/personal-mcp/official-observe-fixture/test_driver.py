@@ -17,6 +17,7 @@ class Fixture:
             self.revoked = True
             return 204, None
         if path == '/api/vaults': return 200, ['default']
+        if path.startswith('/api/engrams?') and method == 'GET' and kwargs.get('admin'): return 200, {'engrams': [{'id': A + '_id'}]}
         if path.startswith('/api/stats'): return 200, {'engram_count': 0 if 'default' in path else 1}
         if path == '/api/admin/vaults/config': return 200, body
         if path == '/api/admin/keys': return 201, {'token': 'public-fixture-token', 'key': {'id': 'fixture-key', 'expires_at': body['expires']}}
@@ -59,6 +60,18 @@ class Tests(unittest.TestCase):
         out = run(Fixture(leak=True), EXPECTED_SHA, self.expiry())
         self.assertEqual(out['cases']['mcp_body_cross_vault_denied'], 'fail')
         self.assertEqual(out['cases']['mcp_query_no_foreign_content'], 'fail')
+
+    def test_added_record_fails_even_when_stats_count_is_unchanged(self):
+        class Added(Fixture):
+            inventories = 0
+            def request(self, method, path, body=None, **kwargs):
+                status, result = super().request(method, path, body, **kwargs)
+                if method == 'GET' and path.startswith('/api/engrams?') and kwargs.get('admin'):
+                    self.inventories += 1
+                    if self.inventories > 1: result['engrams'].append({'id': 'unexpected-record'})
+                return status, result
+        out = run(Added(), EXPECTED_SHA, self.expiry())
+        self.assertEqual(out['cases']['denied_writes_did_not_add_records'], 'fail')
 
     def test_unknown_outcome_stops_and_revokes_without_retry(self):
         fixture = Fixture(break_recall=True)
