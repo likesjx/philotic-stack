@@ -26,6 +26,7 @@ jobs:
           cd services/personal-mcp
           "$runtime" --test whole-vault.test.mjs whole-vault-http.test.mjs remote-clients.test.mjs gateway.test.mjs bootstrap.test.mjs
   protected-helper:
+    needs: public-fixtures
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -46,5 +47,23 @@ jobs:
           cargo build --offline --locked --release --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml --bin persistent-broker-helper --example private_start_fixture
       - name: Verify protected handoff with public fixture and hostile sibling
         run: sudo --preserve-env=GITHUB_ACTIONS /usr/bin/python3 services/personal-mcp/persistent-provisioning/linux_handoff_acceptance.py --disposable-public-fixture
-      - name: Record helper hash
-        run: sha256sum services/personal-mcp/synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper
+      - name: Package tested operator helper and source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir retained-helper
+          cp services/personal-mcp/synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper retained-helper/
+          cp services/personal-mcp/persistent-provisioning/{provision.py,adapters.py,private_key_handoff.py} retained-helper/
+          git rev-parse HEAD > retained-helper/SOURCE_COMMIT
+          git rev-parse HEAD:services/personal-mcp/synthetic-broker-build/broker-helper > retained-helper/HELPER_SOURCE_TREE
+          printf '%s\n' 'Fixture-tested only. No production installation or activation authorized by this artifact.' > retained-helper/NOTICE
+          cd retained-helper
+          sha256sum persistent-broker-helper provision.py adapters.py private_key_handoff.py SOURCE_COMMIT HELPER_SOURCE_TREE NOTICE > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Retain tested private handoff package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: persistent-helper-${{ github.sha }}
+          path: retained-helper/
+          retention-days: 7
+          if-no-files-found: error

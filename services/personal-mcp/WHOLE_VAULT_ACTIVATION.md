@@ -110,7 +110,28 @@ requires native key-metadata reconciliation before any retry.
   and gateway restart. Preserve deployed coordination and unrelated services.
 
 Rollback: withdraw gateway to discovery-only, disable/version-bump exact client
-admissions and revoke families, reconcile/revoke new native key IDs, delete only
-owned new broker references through existing owner APIs, and restore captured
-public config. Never roll admission versions backward or delete memory records.
-Stop and retain the journal for unknown outcomes; expiry is not revocation proof.
+admissions and revoke families, reconcile/revoke new native key IDs through
+`DELETE /api/admin/keys/{id}`, disable the new issuer introspection verifier,
+and restore captured public configuration. Withdraw the newly adopted broker
+references and restart the hotel because its policy is loaded at startup.
+Never roll admission versions backward or delete memory records. Stop and retain
+the journal for unknown outcomes; expiry is not revocation proof.
+
+Rollback revokes access; encrypted-byte deletion is a separate cleanup feature.
+The current hotel exposes get/rotate/add operations, not a deletion RPC for these
+references. Internal `GraphDomain.delete_secret` is not a supported operator API.
+Do not invent a deletion RPC or edit SQLite directly. Retained encrypted rows
+are not exposed to the gateway after reference withdrawal; the fixed broker only
+serves its startup-pinned references, and the gateway cannot access general hotel
+IPC or the database. They remain accessible to trusted hotel/root administrators.
+Once the native key is revoked and the issuer verifier disabled, retained rows
+contain unusable credentials. This is recoverable access rollback, not secure
+physical erasure. Unknown creation/revocation outcomes still require reconciliation;
+do not claim rollback complete until the owner confirms those effects.
+
+The verification-only workflow retains the tested Linux helper and three Python
+entry files for seven days after both public-fixture and protected-helper tests
+pass. `SHA256SUMS`, `SOURCE_COMMIT` and `HELPER_SOURCE_TREE` bind the downloaded
+package to the build. Verify checksums locally and recheck the binary hash in the
+completed manifest before a separately approved installation. Artifact retention
+performs no production deployment, credential handoff, or activation.
