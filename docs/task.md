@@ -1,5 +1,8 @@
 # Ansible Mesh Architecture Separation Task List
 
+- [x] Prepare pure persistent Muninn/two-client policy primitives with independent revocation, rotation withdrawal, expiry and immutable request/result checks. Nine synthetic tests; source review fixes included. [Scope and outstanding integration](../services/personal-mcp/PERSISTENT_RECALL_PREPARATION.md).
+- [ ] Integrate canonical issuer/storage privacy authorities, durable CAS, persistent lifecycle/observation and reviewed rotation/rollback. Unknown dot callback and approved real-memory scope remain blocked; no production activation.
+
 - [ ] Release read-only LifeGraph issuer/gateway composition after exact binding approval, Linux owner acceptance, and issuer Mongo gates. Versioned delegated-binding resolver and local typecheck implemented: [implementation notes](../services/personal-mcp/LIFEGRAPH_READONLY_IMPLEMENTATION.md).
 
 - [x] Inspect the `openclaw-plugin-ansible` repository and identify the rust port branch.

@@ -109,7 +109,7 @@ function recallSchema(tool, vault) {
       operator_intent: { type: 'string', enum: ['open_loops_by_context', 'goals_and_next_actions', 'commitments_approaching', 're_entry_context'] },
     } };
 }
-function recallArguments(tool, args, vault) {
+export function recallArguments(tool, args, vault) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) deny(400, 'invalid_arguments');
   if (tool === 'muninn_recall' && args.vault !== undefined && args.vault !== vault) deny(403, 'vault_not_granted');
   const schema = recallSchema(tool, vault);

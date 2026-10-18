@@ -1,0 +1,26 @@
+name: Persistent recall owner contract
+on:
+  push:
+    branches: [codex/muninn-persistent-contract]
+permissions:
+  contents: read
+jobs:
+  public-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Test canonical adapter and denial contracts with public fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime=''
+          for candidate in /opt/hostedtoolcache/node/24.*/x64/bin/node /opt/hostedtoolcache/node/22.*/x64/bin/node; do
+            if [[ -x "$candidate" ]]; then runtime="$candidate"; break; fi
+          done
+          test -n "$runtime"
+          "$runtime" --version
+          cd services/personal-mcp
+          RUN_MEMORY_HTTP_TESTS=1 "$runtime" --test persistent-recall.test.mjs persistent-owner-boundary.test.mjs persistent-issuer-owner.test.mjs persistent-lifecycle.test.mjs memory-release.test.mjs memory-release-http.test.mjs
