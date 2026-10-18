@@ -23,4 +23,4 @@ jobs:
           test -n "$runtime"
           "$runtime" --version
           cd services/personal-mcp
-          "$runtime" --test persistent-recall.test.mjs persistent-owner-boundary.test.mjs persistent-issuer-owner.test.mjs persistent-lifecycle.test.mjs
+          "$runtime" --test persistent-recall.test.mjs persistent-owner-boundary.test.mjs persistent-issuer-owner.test.mjs persistent-lifecycle.test.mjs memory-release.test.mjs

@@ -65,13 +65,14 @@ export class PersistentLifecycle {
     check(!response.destroyed&&!response.writableEnded,'response already closed');
     const controller=new AbortController();let timer,finished=false;
     const lease={abort:()=>{controller.abort();response.destroy();}};
-    const release=()=>{if(finished)return;finished=true;controller.abort();clearTimeout(timer);this.#leases.delete(lease);
-      for(const event of ['finish','close'])response.removeListener(event,release);
+    const release=cancel=>{if(finished)return;finished=true;if(cancel)controller.abort();clearTimeout(timer);this.#leases.delete(lease);
+      response.removeListener('finish',onFinish);response.removeListener('close',onClose);
       response.removeListener('error',onError);};
     // An error alone is not proof that transport closed. Destroy it and keep
     // the lease until close/finish confirms termination; drain timeout fails shut.
     const onError=()=>lease.abort();
-    for(const event of ['finish','close'])response.once(event,release);
+    const onFinish=()=>release(false),onClose=()=>release(true);
+    response.once('finish',onFinish);response.once('close',onClose);
     response.once('error',onError);
     this.#leases.add(lease);
     const schedule=()=>{const remaining=this.#state.credentialExpiresAt*1000-this.#clock();
