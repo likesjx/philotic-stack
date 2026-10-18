@@ -26,8 +26,14 @@ pub struct SupervisorConfig {
     pub uid: u32,
     pub socket: PathBuf,
     pub journal: PathBuf,
-    pub graph_connection_file: PathBuf,
+    pub graph_connection_file: Option<PathBuf>,
+    pub profile: Option<SupervisorProfile>,
     pub workers: Vec<WorkerConfig>,
+}
+#[derive(Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorProfile {
+    FenceOnly,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,7 +136,12 @@ pub fn load_config(path: &Path) -> Result<SupervisorConfig> {
 }
 impl SupervisorConfig {
     pub fn validate(&self, uid: u32) -> Result<()> {
-        if self.version != 1
+        let graph_profile =
+            self.version == 1 && self.profile.is_none() && self.graph_connection_file.is_some();
+        let fence_profile = self.version == 2
+            && self.profile == Some(SupervisorProfile::FenceOnly)
+            && self.graph_connection_file.is_none();
+        if !(graph_profile || fence_profile)
             || self.uid != uid
             || !text(&self.hotel)
             || !text(&self.owner)
@@ -139,14 +150,18 @@ impl SupervisorConfig {
             || !self.socket.to_string_lossy().ends_with(".sock")
             || self.socket.as_os_str().len() > 100
             || self.socket == self.journal
-            || self.socket == self.graph_connection_file
-            || self.journal == self.graph_connection_file
+            || self
+                .graph_connection_file
+                .as_ref()
+                .is_some_and(|p| p == &self.socket || p == &self.journal)
         {
             bail!("supervisor manifest invalid");
         }
         private_parent(&self.socket, uid)?;
         private_parent(&self.journal, uid)?;
-        private_parent(&self.graph_connection_file, uid)?;
+        if let Some(path) = &self.graph_connection_file {
+            private_parent(path, uid)?;
+        }
         let mut names = BTreeSet::new();
         let mut agents = BTreeSet::new();
         let mut total = 0usize;
@@ -333,17 +348,6 @@ pub async fn run(
 ) -> Result<()> {
     let uid = unsafe { libc::geteuid() };
     config.validate(uid)?;
-    let secret: GraphConnection =
-        serde_json::from_slice(&private_bytes(&config.graph_connection_file, uid, 8192)?)
-            .map_err(|_| anyhow!("graph configuration unavailable"))?;
-    if secret.uri.is_empty()
-        || secret.user.is_empty()
-        || secret.uri.len() > 2048
-        || secret.user.len() > 128
-        || secret.password.len() > 4096
-    {
-        bail!("graph configuration unavailable");
-    }
     // Fail all artifact checks before opening admission or launching any worker.
     let mut executables = Vec::new();
     for w in &config.workers {
@@ -352,16 +356,35 @@ pub async fn run(
             let _ = verified_artifact(a, false, uid)?;
         }
     }
-    let owner = ReadOwner::new(
-        config.hotel.clone(),
-        config.owner.clone(),
-        &config.journal,
-        uid,
-        neo4rs::ConfigBuilder::default()
-            .uri(secret.uri)
-            .user(secret.user)
-            .password(secret.password),
-    )?;
+    let owner = if let Some(path) = &config.graph_connection_file {
+        let secret: GraphConnection = serde_json::from_slice(&private_bytes(path, uid, 8192)?)
+            .map_err(|_| anyhow!("graph configuration unavailable"))?;
+        if secret.uri.is_empty()
+            || secret.user.is_empty()
+            || secret.uri.len() > 2048
+            || secret.user.len() > 128
+            || secret.password.len() > 4096
+        {
+            bail!("graph configuration unavailable");
+        }
+        ReadOwner::new(
+            config.hotel.clone(),
+            config.owner.clone(),
+            &config.journal,
+            uid,
+            neo4rs::ConfigBuilder::default()
+                .uri(secret.uri)
+                .user(secret.user)
+                .password(secret.password),
+        )?
+    } else {
+        ReadOwner::fence_only(
+            config.hotel.clone(),
+            config.owner.clone(),
+            &config.journal,
+            uid,
+        )?
+    };
     // bind() fails on an existing path; never unlink a previous generation.
     let listener = UnixListener::bind(&config.socket)?;
     let m = std::fs::symlink_metadata(&config.socket)?;

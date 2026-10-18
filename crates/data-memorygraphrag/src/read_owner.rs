@@ -145,7 +145,7 @@ pub struct ReadOwner {
     launches: Arc<LocalLaunchRegistry>,
     roles: StdMutex<BTreeMap<String, OwnerRole>>,
     journal: Arc<Mutex<Journal>>,
-    graph: Graph,
+    graph: Option<Graph>,
     connections: Arc<Semaphore>,
     stopping: watch::Sender<bool>,
 }
@@ -168,7 +168,30 @@ impl ReadOwner {
             launches: Arc::new(LocalLaunchRegistry::default()),
             roles: StdMutex::new(BTreeMap::new()),
             journal: Arc::new(Mutex::new(Journal::open(journal, uid)?)),
-            graph: Graph::connect(connection.max_connections(1).fetch_size(32).build()?)?,
+            graph: Some(Graph::connect(
+                connection.max_connections(1).fetch_size(32).build()?,
+            )?),
+            connections: Arc::new(Semaphore::new(32)),
+            stopping: watch::channel(false).0,
+        }))
+    }
+    /// Same authenticated, durable fence without any graph capability.
+    pub fn fence_only(
+        hotel: String,
+        identity: String,
+        journal: &Path,
+        uid: u32,
+    ) -> Result<Arc<Self>> {
+        if !bounded(&hotel) || !bounded(&identity) {
+            bail!("owner unavailable");
+        }
+        Ok(Arc::new(Self {
+            hotel,
+            identity,
+            launches: Arc::new(LocalLaunchRegistry::default()),
+            roles: StdMutex::new(BTreeMap::new()),
+            journal: Arc::new(Mutex::new(Journal::open(journal, uid)?)),
+            graph: None,
             connections: Arc::new(Semaphore::new(32)),
             stopping: watch::channel(false).0,
         }))
@@ -277,6 +300,8 @@ impl ReadOwner {
         // replacement happens before setup; no retries/recycle occur between.
         Ok(self
             .graph
+            .as_ref()
+            .ok_or_else(|| anyhow!("graph reads unavailable in fence-only profile"))?
             .start_txn_with_verified_session(
                 query("SET SESSION TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION"),
                 query("SHOW STORAGE INFO"),
@@ -654,6 +679,19 @@ mod tests {
         drop(j);
         assert!(Journal::open(&f.journal, f.uid).is_err());
         assert_eq!(std::fs::read(&f.journal).unwrap(), b"dirty\n");
+    }
+    #[tokio::test]
+    async fn fence_only_has_no_graph_capability() {
+        let f = Fixture::new();
+        let owner = ReadOwner::fence_only(
+            "synthetic".into(),
+            "synthetic-owner".into(),
+            &f.journal,
+            f.uid,
+        )
+        .unwrap();
+        assert!(owner.begin_read().await.is_err());
+        assert_eq!(std::fs::read(&f.journal).unwrap(), b"clean\n");
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 name: LifeGraph owner synthetic acceptance
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, codex/lifegraph-authority-acceptance]
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'crates/ansible-mesh-core/**'
@@ -11,7 +11,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/lifegraph-owner-acceptance.yml'
   push:
-    branches: [develop]
+    branches: [develop, codex/muninn-native-fence]
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'vendor/neo4rs/**'
@@ -62,3 +62,14 @@ jobs:
           PY
           )
           services/personal-mcp/lifegraph-owner-tests/run-disposable-bolt.sh --approved-fixture-run "$binary"
+      - name: Record qualified native candidate identity
+        run: |
+          mkdir -p .muninn-fence-evidence
+          git rev-parse HEAD > .muninn-fence-evidence/source.txt
+          sha256sum .lifegraph-owner-target/debug/lifegraph-read-supervisor > .muninn-fence-evidence/supervisor.sha256
+          cp .lifegraph-owner-target/debug/lifegraph-read-supervisor .muninn-fence-evidence/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muninn-native-fence-candidate
+          path: .muninn-fence-evidence/
+          retention-days: 7

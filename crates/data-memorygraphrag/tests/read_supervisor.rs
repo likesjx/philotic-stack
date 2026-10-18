@@ -296,6 +296,69 @@ fn real_children_serialize_and_clean_shutdown_can_restart() {
     assert_eq!(f.journal(), b"clean\n");
 }
 #[test]
+fn fence_only_serializes_without_graph_credentials() {
+    let mut f = Fixture::new();
+    f.manifest["version"] = json!(2);
+    f.manifest["profile"] = json!("fence_only");
+    f.manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("graph_connection_file");
+    fs::remove_file(f.dir.join("connection.json")).unwrap();
+    let mut c = f.spawn();
+    f.wait("ready-gateway");
+    f.wait("ready-issuer");
+    f.trigger("start-gateway");
+    f.wait("held-gateway");
+    let before = f.contention.load(Ordering::SeqCst);
+    f.trigger("start-issuer");
+    f.wait_contention(before);
+    f.assert_blocked("held-issuer");
+    f.trigger("finish-gateway");
+    f.wait("completed-gateway");
+    f.wait("held-issuer");
+    f.trigger("finish-issuer");
+    f.wait("completed-issuer");
+    terminate(&mut c);
+    assert_eq!(f.journal(), b"clean\n");
+}
+
+#[test]
+fn fence_only_refuses_mixed_profiles_before_spawn() {
+    for version in [1, 2] {
+        let mut f = Fixture::new();
+        f.manifest["version"] = json!(version);
+        f.manifest["profile"] = json!("fence_only");
+        let mut c = f.spawn();
+        assert!(!exit(&mut c).success());
+        assert!(!f.dir.join("ready-gateway").exists());
+        assert!(!f.dir.join("owner.sock").exists());
+    }
+}
+#[test]
+fn fence_only_unknown_mutation_denies_restart() {
+    let mut f = Fixture::new();
+    f.manifest["version"] = json!(2);
+    f.manifest["profile"] = json!("fence_only");
+    f.manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("graph_connection_file");
+    fs::remove_file(f.dir.join("connection.json")).unwrap();
+    let mut c = f.spawn();
+    f.wait("ready-gateway");
+    f.wait("ready-issuer");
+    f.trigger("start-issuer");
+    f.wait("held-issuer");
+    f.trigger("abort-issuer");
+    f.trigger("finish-issuer");
+    assert!(!exit(&mut c).success());
+    assert_eq!(f.journal(), b"dirty\n");
+    let mut restarted = f.spawn();
+    assert!(!exit(&mut restarted).success());
+    assert_eq!(f.journal(), b"dirty\n");
+}
+#[test]
 fn required_worker_exit_with_unknown_mutation_denies_restart() {
     let f = Fixture::new();
     let mut c = f.spawn();
