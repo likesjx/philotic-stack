@@ -22,7 +22,7 @@ export async function start(config, env = process.env, { resolveLifeGraphBinding
   if (!Array.isArray(config.allowedSubjects) || !Array.isArray(config.allowedClients)) throw new Error('Explicit operator/client arrays required');
   if (config.lifeGraph !== undefined) {
     if (config.lifeGraph.enabled !== true || enabledTools.length !== 1 || enabledTools[0] !== 'life.recall' ||
-        config.upstreams !== undefined || config.clientPolicies !== undefined || config.muninnVault !== undefined ||
+        config.upstreams !== undefined || config.clientPolicies !== undefined || config.muninnVault !== undefined || config.wholeVaultAccess !== undefined ||
         config.issuer.clientSecretEnv !== undefined || config.issuer.clientSecret !== undefined)
       throw new Error('Explicit separate LifeGraph composition required');
     const { createApprovedLifeGraphGateway } = await import('./lifegraph-production.mjs');
@@ -61,7 +61,8 @@ export async function start(config, env = process.env, { resolveLifeGraphBinding
   const issuer = issuerAdapter({ ...config.issuer, credential: brokerCredential({ socketPath: config.issuer.credentialBrokerSocketPath, kind: 'introspection' }) });
   const upstream = frontdoorAdapter({ endpoints, enabledTools });
   const server = await createPersonalMcp({ resource: config.resource, issuer, upstream,
-    allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients), clientPolicies: config.clientPolicies, muninnVault: config.muninnVault, enabledTools });
+    allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients), clientPolicies: config.clientPolicies,
+    wholeVaultAccess: config.wholeVaultAccess, muninnVault: config.muninnVault, enabledTools });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
   return server;
 }

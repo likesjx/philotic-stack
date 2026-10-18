@@ -169,7 +169,7 @@ export function frontdoorAdapter({ endpoints, enabledTools, fetchImpl = fetch })
   };
 }
 
-export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients, clientPolicies,
+export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients, clientPolicies, wholeVaultAccess,
   lifeGraph, clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools, requestDeadlineMs = 45000 }) {
   const tools = selectedTools(enabledTools);
   const canonical = httpsUrl(resource);
@@ -191,13 +191,19 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
        ['bindResponse', 'verifyResponse'].some(k => typeof lifeGraph.storageAuthority[k] !== 'function')))
     throw new Error('LifeGraph production response lifetime authorities required');
   if (!lifeOnly && (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault))) throw new Error('Explicit bounded Muninn vault required');
-  // Transitional remote-client milestone: synthetic recall only. No LifeGraph,
+  if (wholeVaultAccess !== undefined) {
+    if (lifeOnly) throw new Error('Separate whole-vault composition required');
+    const { validateWholeVaultAccess } = await import('./whole-vault.mjs');
+    validateWholeVaultAccess(wholeVaultAccess, { resource, muninnVault, allowedSubjects, allowedClients, clientPolicies, tools });
+  }
+  // Without the explicit whole-vault contract, preserve synthetic-only policy.
+  // No LifeGraph,
   // private vault, operation authority or write projection may be inherited.
   if (!lifeOnly && allowedClients.size > 1 && clientPolicies === undefined) throw new Error('Explicit synthetic per-client recall policies required');
   if (clientPolicies !== undefined) {
     if (!Array.isArray(clientPolicies) || clientPolicies.length !== allowedClients.size ||
         new Set(clientPolicies.map(p => p?.clientId)).size !== clientPolicies.length ||
-        muninnVault !== 'percival_connection_test' || tools.length !== 1 || tools[0] !== 'muninn_recall' ||
+        (wholeVaultAccess === undefined && muninnVault !== 'percival_connection_test') || tools.length !== 1 || tools[0] !== 'muninn_recall' ||
         clientPolicies.some(p => !p || !allowedClients.has(p.clientId) || !Array.isArray(p.subjects) ||
           !p.subjects.length || p.subjects.some(s => !allowedSubjects.has(s)) || p.vault !== muninnVault ||
           !Array.isArray(p.scopes) || p.scopes.length !== 1 || p.scopes[0] !== 'memory:recall'))
