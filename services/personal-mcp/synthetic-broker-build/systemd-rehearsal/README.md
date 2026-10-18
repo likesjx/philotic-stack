@@ -18,6 +18,6 @@ Cleanup attempts service and CI-owned slice stops independently of journal colle
 
 The runner must never be used on an existing production machine: its fresh-path and hosted-runner guards are accidental-execution checks, and its owned-slice teardown is specific to the disposable environment. Local/source review does not establish Linux runtime success. The unchanged helper's5second receive timeout includes probing under CPU throttling; all positive/negative controls and cleanup must pass in the actual rehearsal.
 
-Archive SHA256: `45b79bf407a7353eadc670c1bd6996c3e18a11a829a3edba4b3233f88fa637f0`.
-This local diagnostic candidate is not yet approved for publication or execution; see CAPABILITY_DIAGNOSIS.md. The previous archive reached the capability guard and failed; runtime qualification remains open.
+Archive SHA256: `2b16d7b303e8bc3c1ce57e5cd939fb1fb6e402c4d5241fefe7c38678bae54fa4`.
+This local correction candidate is not yet approved for publication or execution; see CAPABILITY_CORRECTION.md. The previous archive reached the capability guard and failed; runtime qualification remains open.
 Helper SHA256: `6cbbda167477d5e4365cf36b14e6d2b45c41baa0c6032004901318c509022989`.

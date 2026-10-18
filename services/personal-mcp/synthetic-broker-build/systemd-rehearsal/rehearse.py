@@ -7,9 +7,9 @@ UNIT='muninn-broker-dummy-e43bb385-r3.service'
 SLICE='muninn-synthetic-run4.slice'
 UNITPATH=pathlib.Path('/run/systemd/system')/UNIT
 SLICEPATH=pathlib.Path('/run/systemd/system')/SLICE
-ARCHIVE_SHA='45b79bf407a7353eadc670c1bd6996c3e18a11a829a3edba4b3233f88fa637f0'
-MANIFEST_SHA='516291589195f1451688b0f9ad9e07d0b8bdd08dbd27b650a637435ca6255587'
-UNIT_SHA='95b7cf6b27cb0e8930f144f95d84c5fe10da5b095318a604bae14a2b8a735ac7'
+ARCHIVE_SHA='2b16d7b303e8bc3c1ce57e5cd939fb1fb6e402c4d5241fefe7c38678bae54fa4'
+MANIFEST_SHA='fb3f3bdf304b61c4810f56d2467d1a4c29983aa8eba5e902241214a1e3add802'
+UNIT_SHA='6d41b4b0cc71ba2b5b8fa33513cb5150cbcde0d7849d7dba1dcf07146ab0879c'
 SLICE_DATA=b'[Slice]\nMemoryMax=640M\nMemorySwapMax=0\nCPUQuota=50%\nTasksMax=128\n'
 def run(*args,check=True):return subprocess.run(args,capture_output=True,text=True,check=check,timeout=20)
 def show(name,*props):
