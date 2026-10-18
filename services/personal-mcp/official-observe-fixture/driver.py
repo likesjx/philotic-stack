@@ -129,7 +129,7 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
         phase = 'synthetic_record_creation'
         ids = {}
         for vault, marker in ((A, MARK_A), (B, MARK_B)):
-            item = must(client.request('POST', '/api/engrams',
+            item = must(client.request('POST', '/api/engrams?vault=' + vault,
                 {'vault': vault, 'concept': marker, 'content': marker + ' synthetic recall fixture.'},
                 admin=True), (200, 201))
             ids[vault] = item['id']

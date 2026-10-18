@@ -20,7 +20,9 @@ class Fixture:
         if path.startswith('/api/stats'): return 200, {'engram_count': 0 if 'default' in path else 1}
         if path == '/api/admin/vaults/config': return 200, body
         if path == '/api/admin/keys': return 201, {'token': 'public-fixture-token', 'key': {'id': 'fixture-key', 'expires_at': body['expires']}}
-        if path == '/api/engrams' and kwargs.get('admin'): return 201, {'id': body['vault'] + '_id'}
+        if path.startswith('/api/engrams?') and kwargs.get('admin'):
+            if path != '/api/engrams?vault=' + body['vault']: return 400, None
+            return 201, {'id': body['vault'] + '_id'}
         return 403, None
 
     def rpc(self, token, tool, args, query=''):
