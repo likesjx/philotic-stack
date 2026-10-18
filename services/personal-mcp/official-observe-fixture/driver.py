@@ -97,6 +97,7 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
         raise ValueError('binary verification required')
     receipt = {'binary_sha256': verified_sha, 'synthetic_only': True, 'cases': {}}
     keys = []
+    phase = 'fresh_vault_inventory'
 
     def record(name, passed):
         receipt['cases'][name] = 'pass' if passed else 'fail'
@@ -104,6 +105,8 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
     def must(reply, statuses=(200,)):
         status, body = reply
         if status not in statuses or not isinstance(body, dict):
+            receipt['setup_http_status'] = status
+            receipt['setup_body_type'] = type(body).__name__
             raise RuntimeError('synthetic setup failed')
         return body
 
@@ -111,23 +114,30 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
         # Refuse nonempty or previously provisioned fixtures; never reuse stores.
         status, names = client.request('GET', '/api/vaults', admin=True)
         if status != 200 or names != ['default']:
+            receipt['setup_http_status'] = status
+            receipt['setup_body_type'] = type(names).__name__
             raise RuntimeError('fresh fixture required')
+        phase = 'fresh_default_stats'
         stats = must(client.request('GET', '/api/stats?vault=default', admin=True))
         if stats.get('engram_count') != 0:
             raise RuntimeError('fresh fixture required')
+        phase = 'private_vault_configuration'
         for vault in ('default', A, B):
             # Do not disable reinforcement: observe suppression must be exercised.
             must(client.request('PUT', '/api/admin/vaults/config',
                                 {'name': vault, 'public': False}, admin=True))
+        phase = 'synthetic_record_creation'
         ids = {}
         for vault, marker in ((A, MARK_A), (B, MARK_B)):
             item = must(client.request('POST', '/api/engrams',
                 {'vault': vault, 'concept': marker, 'content': marker + ' synthetic recall fixture.'},
                 admin=True), (200, 201))
             ids[vault] = item['id']
+        phase = 'observe_key_creation'
         key = must(client.request('POST', '/api/admin/keys',
             {'vault': A, 'label': 'disposable-exact-binary-check', 'mode': 'observe', 'expires': expires},
             admin=True), (201,))
+        phase = 'observe_key_metadata'
         token = key['token']
         keys.append(key['key']['id'])
         try:
@@ -140,6 +150,7 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
         except (KeyError, ValueError, TypeError):
             record('test_key_expiry_metadata_bounded', False)
             raise RuntimeError('test key expiry not established')
+        phase = 'observe_acceptance'
         args = {'vault': A, 'context': [MARK_A], 'threshold': 0, 'limit': 10}
         read_args = {'vault': A, 'id': ids[A], 'read_only': True}
         def negative(name, passed):
@@ -189,7 +200,9 @@ def run(client, verified_sha, expires, gateway_check=None, expiry_check=None):
             gateway_check(token, A, MARK_A) if gateway_check else 'not_run: gateway callback absent')
         receipt['cases']['expired_key_rejected'] = (
             expiry_check(token, actual_expiry, args) if expiry_check else 'not_run: expiry callback absent')
-    except Exception:
+    except Exception as error:
+        receipt['failure_phase'] = phase
+        receipt['failure_type'] = type(error).__name__
         receipt['setup_or_transport'] = 'failed_or_uncertain; no retry'
     finally:
         receipt['test_keys_revoked'] = True
