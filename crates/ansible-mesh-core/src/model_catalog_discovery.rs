@@ -414,9 +414,227 @@ pub fn parse_google_models(
     Ok(out)
 }
 
+// ------------------------------------------------------------------------
+// OpenAI: GET https://api.openai.com/v1/models  (Bearer key)
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct OpenAIList {
+    data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIModel {
+    id: String,
+}
+
+/// Parse an OpenAI `/v1/models` response. The endpoint is capability-sparse
+/// (ids only — no context/pricing/tool metadata), so most fields stay `None`;
+/// existence + retirement diffing is the value.
+pub fn parse_openai_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let list: OpenAIList = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        list.data.iter().all(|m| !m.id.trim().is_empty()),
+        "empty model id"
+    );
+    let source_url = "https://api.openai.com/v1/models".to_string();
+    Ok(list
+        .data
+        .into_iter()
+        .map(|m| DiscoveredModel {
+            provider: "openai".to_string(),
+            endpoint_family: "openai-hosted".to_string(),
+            model_ref: m.id.clone(),
+            provider_model_ref: m.id,
+            display_name: None,
+            context_window_tokens: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            modalities: Vec::new(),
+            reasoning_default: None,
+            supports_tools: None,
+            declared_task_kinds: Vec::new(),
+            lifecycle_hint: None,
+            source_url: source_url.clone(),
+            fetched_at_secs,
+        })
+        .collect())
+}
+
+// ------------------------------------------------------------------------
+// Anthropic: GET https://api.anthropic.com/v1/models  (x-api-key + version)
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AnthropicList {
+    data: Vec<AnthropicModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModel {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+/// Parse an Anthropic `/v1/models` listing. IDs and display names do not
+/// establish capabilities; unreported capabilities remain unknown.
+pub fn parse_anthropic_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let list: AnthropicList = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        list.data.iter().all(|m| !m.id.trim().is_empty()),
+        "empty model id"
+    );
+    let source_url = "https://api.anthropic.com/v1/models".to_string();
+    Ok(list
+        .data
+        .into_iter()
+        .map(|m| DiscoveredModel {
+            provider: "anthropic".to_string(),
+            endpoint_family: "anthropic-hosted".to_string(),
+            model_ref: m.id.clone(),
+            provider_model_ref: m.id,
+            display_name: m.display_name,
+            context_window_tokens: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            modalities: Vec::new(),
+            reasoning_default: None,
+            supports_tools: None,
+            declared_task_kinds: Vec::new(),
+            lifecycle_hint: None,
+            source_url: source_url.clone(),
+            fetched_at_secs,
+        })
+        .collect())
+}
+
+// ------------------------------------------------------------------------
+// Ollama (local): GET http://localhost:11434/api/tags
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct OllamaList {
+    models: Vec<OllamaModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModel {
+    name: String,
+}
+
+/// Parse a local Ollama `/api/tags` response. The catalog is PER-HOTEL by
+/// design (whatever the operator pulled locally), so consumers must treat
+/// each hotel's `model_catalog.ollama` as hotel-scoped truth. The listing
+/// does not establish pricing or capabilities, which remain unknown.
+pub fn parse_ollama_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let list: OllamaList = serde_json::from_str(body)?;
+    anyhow::ensure!(
+        list.models.iter().all(|m| !m.name.trim().is_empty()),
+        "empty model name"
+    );
+    let source_url = "http://localhost:11434/api/tags".to_string();
+    Ok(list
+        .models
+        .into_iter()
+        .map(|m| DiscoveredModel {
+            provider: "ollama".to_string(),
+            endpoint_family: "ollama-local".to_string(),
+            model_ref: m.name.clone(),
+            provider_model_ref: m.name,
+            display_name: None,
+            context_window_tokens: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            modalities: Vec::new(),
+            reasoning_default: None,
+            supports_tools: None,
+            declared_task_kinds: Vec::new(),
+            lifecycle_hint: None,
+            source_url: source_url.clone(),
+            fetched_at_secs,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_provider_listings_preserve_unknown_capabilities() {
+        for (models, provider, id) in [
+            (
+                parse_openai_models(r#"{"data":[{"id":"example-openai"}]}"#, Some(42)).unwrap(),
+                "openai",
+                "example-openai",
+            ),
+            (
+                parse_anthropic_models(
+                    r#"{"data":[{"id":"example-anthropic","display_name":"Example"}]}"#,
+                    Some(42),
+                )
+                .unwrap(),
+                "anthropic",
+                "example-anthropic",
+            ),
+            (
+                parse_ollama_models(r#"{"models":[{"name":"example:local"}]}"#, Some(42)).unwrap(),
+                "ollama",
+                "example:local",
+            ),
+        ] {
+            let m = &models[0];
+            assert_eq!(m.provider, provider);
+            assert_eq!(m.model_ref, id);
+            assert_eq!(m.provider_model_ref, id);
+            assert_eq!(m.fetched_at_secs, Some(42));
+            assert_eq!(m.supports_tools, None);
+            assert_eq!(m.reasoning_default, None);
+            assert_eq!(m.context_window_tokens, None);
+            assert_eq!(m.input_cost_per_million, None);
+            assert_eq!(m.output_cost_per_million, None);
+            assert!(m.modalities.is_empty());
+            assert!(m.declared_task_kinds.is_empty());
+        }
+    }
+
+    #[test]
+    fn sparse_provider_parsers_distinguish_empty_listings_from_malformed_responses() {
+        type Parser = fn(&str, Option<u64>) -> anyhow::Result<Vec<DiscoveredModel>>;
+        for (parser, list_key, id_key) in [
+            (parse_openai_models as Parser, "data", "id"),
+            (parse_anthropic_models as Parser, "data", "id"),
+            (parse_ollama_models as Parser, "models", "name"),
+        ] {
+            assert!(
+                parser(&serde_json::json!({list_key: []}).to_string(), None)
+                    .unwrap()
+                    .is_empty()
+            );
+            for body in [
+                "invalid".to_string(),
+                "{}".to_string(),
+                serde_json::json!({list_key: [{}]}).to_string(),
+                serde_json::json!({list_key: [{id_key: 7}]}).to_string(),
+                serde_json::json!({list_key: [{id_key: " "}]}).to_string(),
+            ] {
+                assert!(
+                    parser(&body, None).is_err(),
+                    "accepted malformed listing: {body}"
+                );
+            }
+        }
+    }
 
     // Minimal fixtures shaped exactly like the live provider responses
     // (verified against openrouter.ai/api/v1/models and
