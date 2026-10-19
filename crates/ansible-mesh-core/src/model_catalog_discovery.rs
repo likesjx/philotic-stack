@@ -616,11 +616,9 @@ mod tests {
             (parse_anthropic_models as Parser, "data", "id"),
             (parse_ollama_models as Parser, "models", "name"),
         ] {
-            assert!(
-                parser(&serde_json::json!({list_key: []}).to_string(), None)
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(parser(&serde_json::json!({list_key: []}).to_string(), None)
+                .unwrap()
+                .is_empty());
             for body in [
                 "invalid".to_string(),
                 "{}".to_string(),
