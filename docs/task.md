@@ -28,6 +28,11 @@
 
 ## Current Work Item Split
 
+### Preserved model catalog parsers
+
+- [x] Extract pure OpenAI, Anthropic and Ollama listing parsers from preserved `model-graph-s123`; seven focused discovery tests and independent review pass. Unreported capability/pricing facts stay unknown. This source-only extraction adds no polling, credential access or network fallback.
+- [ ] Review config-only multi-provider browsing separately; preserve governed discovery transport and last-good catalogs. Graph projection and authenticated polling from the archival branch are not integrated.
+
 ### Scripted Hotel Sensors
 
 - [ ] Consolidate duplicate sensor branches in an isolated local candidate; both crates keep the nondefault `scripted-sensors` gate. Validate engine, injected provider I/O and cron routing before review and publication.
