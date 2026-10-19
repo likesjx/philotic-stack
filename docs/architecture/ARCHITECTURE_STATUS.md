@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-10-17
+last_updated: 2026-10-19
 tags:
 - source-of-truth
 - current-state
@@ -184,9 +184,15 @@ UI acceptance and EventKit-write proof remain pending. October 3 source adds
 separate device-authorized confirm/close/reopen controls with atomic
 `LifeLoopAction` audits, full text/lifecycle conflict guards and retry receipts.
 Mac/iOS builds and actual disposable-Memgraph persistence/concurrent retry
-tests pass. These actions are not deployed or installed on the phone yet;
-their revision guard is not yet shared by legacy lifecycle writers. Live
-action validation and a durable multi-device Reminders sync ledger remain
+tests pass. The historical October 3 record in `a9cc1129` reports PR #612 merged
+to develop `04856a44`, deployed CI artifacts and verified running gateway/runner
+hashes. It records enrolled-device confirm/close/reopen, audit replay, stale
+HTTP 409, read-back and persisted audits passing, with synthetic records cleaned
+up and auth configuration/native callback containers retained. At that check,
+the signed phone action build was not installed because the device was unavailable.
+This record was reconciled on October 19 without deployment or fresh live
+validation. The revision guard is not yet shared by legacy lifecycle writers. Phone UI
+acceptance and a durable multi-device Reminders sync ledger remain
 follow-up work in [docs/task.md](../task.md#apple-memory-workspace).
 
 ### Runtime and authority
