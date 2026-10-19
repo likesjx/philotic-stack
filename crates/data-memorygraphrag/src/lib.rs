@@ -19,6 +19,8 @@ pub mod projection;
 pub mod read_owner;
 #[cfg(target_os = "linux")]
 pub mod read_supervisor;
+#[cfg(feature = "scripted-sensors")]
+pub mod sensor_scripts;
 pub mod zoning;
 
 use serde::{Deserialize, Serialize};
