@@ -3,6 +3,10 @@ name = "aiua"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Dormant integration only; production builds do not route scripted sensors.
+scripted-sensors = []
+
 [dependencies]
 graph-intelligence = { path = "../graph-intelligence" }
 libc = "0.2"

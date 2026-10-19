@@ -453,7 +453,8 @@ impl CronTicker {
         let payload_data = interpolate_payload(&job.payload, &vars);
 
         let task_id = Uuid::new_v4();
-        let task_json = build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data);
+        let task_json =
+            build_cron_dispatch_task(job, fire_epoch, &self.local_node_id, payload_data);
 
         // Single-delivery ownership: claim the event id BEFORE the envelope is
         // visible to any other consumer. `fire()` is the sole delivery owner of
@@ -727,6 +728,37 @@ pub(crate) fn cron_payload_reaches_an_agent(payload: &str) -> bool {
     has_text("message") || has_text("content") || value.get("paracrine_signal").is_some()
 }
 
+/// Experimental sensor dispatch is compiled out by default. Even when enabled,
+/// only operator-authored `sensor.run` jobs targeting the exact runner bypass
+/// the normal agent envelope; guest jobs cannot self-grant datasource access.
+fn build_cron_dispatch_task(
+    job: &CronJob,
+    fire_epoch: u64,
+    local_node_id: &str,
+    payload_data: String,
+) -> String {
+    #[cfg(feature = "scripted-sensors")]
+    if job.target_role == "life-graph-runner"
+        && matches!(
+            job.created_by,
+            ansible_mesh_core::cron::CronJobSource::Operator
+        )
+        && serde_json::from_str::<serde_json::Value>(&payload_data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("kind")
+                    .and_then(|kind| kind.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("sensor.run")
+    {
+        return payload_data;
+    }
+    build_cron_task_json(job, fire_epoch, local_node_id, payload_data)
+}
+
 fn build_cron_task_json(
     job: &CronJob,
     fire_epoch: u64,
@@ -938,6 +970,59 @@ mod tests {
             session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
             policy: None,
         }
+    }
+
+    #[test]
+    fn sensor_dispatch_requires_explicit_feature_operator_and_exact_runner() {
+        let payload = r#"{"kind":"sensor.run","sensor_id":"synthetic"}"#.to_string();
+        let mut job = test_job();
+        job.target_role = "life-graph-runner".into();
+        let actual = build_cron_dispatch_task(&job, 1_234, "synthetic-hotel", payload.clone());
+        if cfg!(feature = "scripted-sensors") {
+            assert_eq!(actual, payload);
+        } else {
+            assert_ne!(actual, payload);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual).unwrap()["cron_job_id"],
+                "job-1"
+            );
+        }
+
+        job.created_by = CronJobSource::Guest("synthetic-guest".into());
+        assert_ne!(
+            build_cron_dispatch_task(&job, 1_234, "synthetic-hotel", payload.clone()),
+            payload
+        );
+        job.created_by = CronJobSource::Operator;
+        job.target_role = "role:life-graph-runner".into();
+        assert_ne!(
+            build_cron_dispatch_task(&job, 1_234, "synthetic-hotel", payload.clone()),
+            payload
+        );
+    }
+
+    #[test]
+    fn sensor_dispatch_keeps_other_datasource_kinds_and_agent_policy_wrapped() {
+        let mut job = test_job();
+        job.target_role = "life-graph-runner".into();
+        for payload in [r#"{"kind":"lifegraph.write"}"#, r#"{"kind":5}"#, "invalid"] {
+            assert_eq!(
+                build_cron_dispatch_task(&job, 1_234, "synthetic-hotel", payload.into()),
+                build_cron_task_json(&job, 1_234, "synthetic-hotel", payload.into())
+            );
+        }
+        job.target_role = "attention-steward".into();
+        let payload =
+            r#"{"kind":"sensor.run","message":"review","preapproved_tools":["life.search"]}"#;
+        let value: serde_json::Value = serde_json::from_str(&build_cron_dispatch_task(
+            &job,
+            1_234,
+            "synthetic-hotel",
+            payload.into(),
+        ))
+        .unwrap();
+        assert_eq!(value["content"], "review");
+        assert_eq!(value["cron_policy"]["preapproved_tools"][0], "life.search");
     }
 
     #[test]

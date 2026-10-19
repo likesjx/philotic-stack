@@ -33,6 +33,11 @@
 - [x] Extract pure OpenAI, Anthropic and Ollama listing parsers from preserved `model-graph-s123`; seven focused discovery tests and independent review pass. Unreported capability/pricing facts stay unknown. This source-only extraction adds no polling, credential access or network fallback.
 - [ ] Review config-only multi-provider browsing separately; preserve governed discovery transport and last-good catalogs. Graph projection and authenticated polling from the archival branch are not integrated.
 
+### Scripted Hotel Sensors
+
+- [ ] Consolidate duplicate sensor branches in an isolated local candidate; both crates keep the nondefault `scripted-sensors` gate. Validate engine, injected provider I/O and cron routing before review and publication.
+- [ ] Before any activation, separately review authenticated approval, full LifeGraph/config callback authority, delivery destinations and callback deadlines. No production scripts, jobs or services are installed by consolidation. See [scope and limits](architecture/SCRIPTED_HOTEL_SENSORS_PROPOSAL.md).
+
 ### LifeGraph capture Memgraph compatibility — runtime off (PR #668)
 
 - [x] Preflight storage and constraint metadata before BEGIN on one reserved connection; retain strict snapshot checks and carry the constraint set into that transaction.
