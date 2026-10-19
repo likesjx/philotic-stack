@@ -13,9 +13,12 @@
 //!
 //! ## Trust model
 //!
-//! The relay forwards **opaque, already-HMAC-signed** mesh frames; it never holds
+//! The relay is intended to forward **already-HMAC-signed** mesh frames; it never holds
 //! peer signing keys and cannot forge a frame — receiving hotels validate the
-//! HMAC exactly as they do for a directly delivered frame. QUIC/TLS supplies the
+//! HMAC exactly as they do for a directly delivered frame. That hotel integration
+//! is not wired by this source-only crate. The relay terminates TLS and can inspect
+//! payload bytes; QUIC provides hop confidentiality, not end-to-end encryption.
+//! QUIC/TLS supplies the
 //! wire confidentiality the mesh itself lacks (the mesh is signed, not
 //! encrypted), so relayed frames are not cleartext on the public internet.
 //!
