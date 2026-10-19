@@ -1,4 +1,6 @@
 mod provider;
+#[cfg(feature = "scripted-sensors")]
+mod sensor_provider;
 
 use anyhow::Result;
 use data_memorygraphrag::hygiene;
@@ -203,7 +205,18 @@ async fn main() -> Result<()> {
     run_datasource_controller(DatasourceGuestConfig {
         guest_id: guest_id_static,
         role: "life-graph-runner",
+        #[cfg(not(feature = "scripted-sensors"))]
         providers: Box::new(|| vec![Arc::new(LifeGraphProvider::from_env())]),
+        #[cfg(feature = "scripted-sensors")]
+        providers: Box::new(move || {
+            let life = Arc::new(LifeGraphProvider::from_env());
+            let sensor = Arc::new(sensor_provider::SensorProvider::new(
+                Arc::clone(&life),
+                guest_id_static.to_string(),
+                "life-graph-runner".to_string(),
+            ));
+            vec![life, sensor]
+        }),
     })
     .await
 }

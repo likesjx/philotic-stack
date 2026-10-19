@@ -28,6 +28,11 @@
 
 ## Current Work Item Split
 
+### Scripted Hotel Sensors
+
+- [ ] Consolidate duplicate sensor branches in an isolated local candidate; both crates keep the nondefault `scripted-sensors` gate. Validate engine, injected provider I/O and cron routing before review and publication.
+- [ ] Before any activation, separately review authenticated approval, full LifeGraph/config callback authority, delivery destinations and callback deadlines. No production scripts, jobs or services are installed by consolidation. See [scope and limits](architecture/SCRIPTED_HOTEL_SENSORS_PROPOSAL.md).
+
 ### LifeGraph capture Memgraph compatibility — runtime off (PR #668)
 
 - [x] Preflight storage and constraint metadata before BEGIN on one reserved connection; retain strict snapshot checks and carry the constraint set into that transaction.
