@@ -1,6 +1,36 @@
 # Philotic Stack Management - Command Center Compliant
 # Run `just` to see available commands
 
+# Offline paired Muninn release catalog; these never inspect a live service.
+[positional-arguments]
+muninn-plan issuer:
+    just --justfile "$1/justfile" muninn-plan "{{justfile_directory()}}"
+
+[positional-arguments]
+muninn-check issuer plan:
+    just --justfile "$1/justfile" muninn-check "{{justfile_directory()}}" "$2"
+
+[positional-arguments]
+muninn-status issuer:
+    just --justfile "$1/justfile" muninn-status "{{justfile_directory()}}"
+
+[positional-arguments]
+muninn-reconcile issuer plan:
+    just --justfile "$1/justfile" muninn-reconcile "{{justfile_directory()}}" "$2"
+
+[positional-arguments]
+muninn-activate issuer:
+    just --justfile "$1/justfile" muninn-activate "{{justfile_directory()}}"
+
+[positional-arguments]
+muninn-disable issuer:
+    just --justfile "$1/justfile" muninn-disable "{{justfile_directory()}}"
+
+[positional-arguments]
+muninn-status-live issuer:
+    just --justfile "$1/justfile" muninn-status-live "{{justfile_directory()}}"
+
+[default]
 default:
     @just --list
 

@@ -1,5 +1,8 @@
 # Ansible Mesh Architecture Separation Task List
 
+- [x] Prepare local exact-source Muninn release catalog and thin paired justfile review commands; synthetic validation only. [Scope and commands](../services/personal-mcp/RELEASE_REVIEW.md).
+- [ ] Separately approve publication; resolve candidate artifacts, authority-mode snapshot contract, current installed evidence and private operator gates before any production execution. No provisioning retry.
+
 - [x] Prepare pure persistent Muninn/two-client policy primitives with independent revocation, rotation withdrawal, expiry and immutable request/result checks. Nine synthetic tests; source review fixes included. [Scope and outstanding integration](../services/personal-mcp/PERSISTENT_RECALL_PREPARATION.md).
 - [ ] Integrate canonical issuer/storage privacy authorities, durable CAS, persistent lifecycle/observation and reviewed rotation/rollback. Unknown dot callback and approved real-memory scope remain blocked; no production activation.
 
