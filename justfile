@@ -19,6 +19,10 @@ muninn-reconcile issuer plan:
     just --justfile "$1/justfile" muninn-reconcile "{{justfile_directory()}}" "$2"
 
 [positional-arguments]
+muninn-attestation-check issuer attestation:
+    just --justfile "$1/justfile" muninn-attestation-check "{{justfile_directory()}}" "$2"
+
+[positional-arguments]
 muninn-activate issuer:
     just --justfile "$1/justfile" muninn-activate "{{justfile_directory()}}"
 

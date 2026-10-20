@@ -21,6 +21,7 @@ just muninn-plan /absolute/jaredlikes-com > /absolute/review-plan.json
 just muninn-check /absolute/jaredlikes-com /absolute/review-plan.json
 just muninn-status /absolute/jaredlikes-com
 just muninn-reconcile /absolute/jaredlikes-com /absolute/review-plan.json
+just muninn-attestation-check /absolute/jaredlikes-com /absolute/public-attestation.json
 ```
 
 All operations are local. `muninn-activate`, `muninn-disable`, and
@@ -31,3 +32,8 @@ The proposed two-client gateway mapping and Claude-first admissions still requir
 paired acceptance. Installed state, native seven-day key validity, private terminal
 readiness, restricted writer and artifacts remain unavailable or historical.
 No provisioning should be repeated from this review.
+
+The attestation checker validates explicitly supplied secret-free mode metadata.
+Required authority is refused even if coordination is disabled. It cannot collect
+live state, clear release gates, or bypass the existing admission operator's
+source guard. The issuer README documents the closed record and invalid template.
