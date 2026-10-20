@@ -23,6 +23,18 @@ muninn-attestation-check issuer attestation:
     just --justfile "$1/justfile" muninn-attestation-check "{{justfile_directory()}}" "$2"
 
 [positional-arguments]
+muninn-candidate-plan issuer snapshot:
+    just --justfile "$1/justfile" muninn-candidate-plan "{{justfile_directory()}}" "$2"
+
+[positional-arguments]
+muninn-candidate-check issuer snapshot plan:
+    just --justfile "$1/justfile" muninn-candidate-check "{{justfile_directory()}}" "$2" "$3"
+
+[positional-arguments]
+muninn-candidate-reconcile issuer snapshot plan:
+    just --justfile "$1/justfile" muninn-candidate-reconcile "{{justfile_directory()}}" "$2" "$3"
+
+[positional-arguments]
 muninn-activate issuer:
     just --justfile "$1/justfile" muninn-activate "{{justfile_directory()}}"
 

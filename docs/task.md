@@ -1,5 +1,6 @@
 # Ansible Mesh Architecture Separation Task List
 
+- [x] Bind schema-2 offline candidate snapshots/plans to authority metadata and the proposed Claude-first paired configuration; historical writer/recovery unchanged, no live execution.
 - [x] Prepare local exact-source Muninn release catalog and thin paired justfile review commands; synthetic validation only. [Scope and commands](../services/personal-mcp/RELEASE_REVIEW.md).
 - [ ] Separately approve publication; resolve candidate artifacts, authority-mode snapshot contract, current installed evidence and private operator gates before any production execution. No provisioning retry.
 

@@ -37,3 +37,15 @@ The attestation checker validates explicitly supplied secret-free mode metadata.
 Required authority is refused even if coordination is disabled. It cannot collect
 live state, clear release gates, or bypass the existing admission operator's
 source guard. The issuer README documents the closed record and invalid template.
+
+The schema-2 candidate commands additionally take an explicit public snapshot:
+
+```sh
+just muninn-candidate-plan /absolute/jaredlikes-com /absolute/public-snapshot.json > /absolute/candidate-plan.json
+just muninn-candidate-check /absolute/jaredlikes-com /absolute/public-snapshot.json /absolute/candidate-plan.json
+just muninn-candidate-reconcile /absolute/jaredlikes-com /absolute/public-snapshot.json /absolute/candidate-plan.json
+```
+
+These bind exact source, authority metadata and the proposed two-client mapping
+with Claude-first admissions. They never change current admission rows or run
+gateway/issuer services. Historical commands and all live refusals remain.
