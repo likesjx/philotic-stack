@@ -23,7 +23,7 @@ jobs:
           path: historical-source
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 8c880f88bb14bc6f37a3df0d6a8543586a158098
+          ref: 230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
           persist-credentials: false
           path: candidate-source
       - name: Retrieve exact retained nonproduction artifacts
@@ -77,7 +77,7 @@ jobs:
           mkdir /candidate
           tar -C /input-candidate --exclude=.git -cf - . | tar -C /candidate -xf -
           cd /candidate
-          export PHILOTIC_BUILD_SHA=8c880f88bb14bc6f37a3df0d6a8543586a158098
+          export PHILOTIC_BUILD_SHA=230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
           cargo build --locked --release --target x86_64-unknown-linux-gnu --target-dir /hotel-target -p aiua
           cp /hotel-target/x86_64-unknown-linux-gnu/release/aiua /binaries/candidate
           cargo test --locked --release --target x86_64-unknown-linux-gnu --target-dir /hotel-target -p aiua --no-run --message-format=json > /evidence/unit-compile.json
@@ -97,7 +97,7 @@ jobs:
           import hashlib,json,pathlib
           digest=hashlib.sha256(pathlib.Path('/binaries/candidate').read_bytes()).hexdigest()
           pathlib.Path('/evidence/candidate-sha256.txt').write_text(digest+'\n')
-          pathlib.Path('/evidence/candidate-receipt.json').write_text(json.dumps({'source_commit':'8c880f88bb14bc6f37a3df0d6a8543586a158098','aiua_sha256':digest,'production_selection':False,'source_changes':'atomic credential migration and existing reference validation'},sort_keys=True,indent=2)+'\n')
+          pathlib.Path('/evidence/candidate-receipt.json').write_text(json.dumps({'source_commit':'230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219','aiua_sha256':digest,'production_selection':False,'source_changes':'atomic credential migration and existing reference validation'},sort_keys=True,indent=2)+'\n')
           RECEIPT
           cat > /fixtures/run_all.py <<'RUNALL'
           import json,os,pathlib,re,subprocess
@@ -108,7 +108,7 @@ jobs:
           unit=subprocess.run([binary,'provider_api_key_migration','--test-threads=1'],env=unit_env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120)
           print(unit.stdout,flush=True)
           pathlib.Path('/evidence/migration-unit-tests.log').write_text(unit.stdout)
-          unit_pass=unit.returncode==0 and re.search(r'^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$',unit.stdout,re.M) is not None
+          unit_pass=unit.returncode==0 and re.search(r'^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$',unit.stdout,re.M) is not None
           state=subprocess.run(['/usr/bin/python3','/fixtures/compatibility.py'],env={**common,'QUALIFICATION_CANDIDATE_SHA256':os.environ['QUALIFICATION_CANDIDATE_SHA256']},timeout=240)
           broker=subprocess.run(['/usr/bin/python3','/candidate/services/personal-mcp/scoped-vault-tests/run_linux_ci.py'],env={**common,'PERCIVAL_BOOTSTRAP_FIXTURES':'/candidate/services/personal-mcp/scoped-vault-tests'},timeout=240)
           report={'migration_units_passed':unit_pass,'state_suite_returncode':state.returncode,'broker_suite_returncode':broker.returncode,'installed_equivalence':False}
@@ -120,7 +120,7 @@ jobs:
           rustc -vV > /evidence/rustc.txt
           dpkg-query -W > /evidence/packages.txt
           BUILD
-          test "$(git -C candidate-source rev-parse HEAD)" = 8c880f88bb14bc6f37a3df0d6a8543586a158098
+          test "$(git -C candidate-source rev-parse HEAD)" = 230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
           test -z "$(git -C candidate-source status --porcelain)"
           docker pull ubuntu:24.04
           docker image inspect ubuntu:24.04 > evidence/base-image.json
