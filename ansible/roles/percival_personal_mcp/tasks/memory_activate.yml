@@ -1,0 +1,70 @@
+---
+- name: Refuse check-mode mutation and nonlocal fixture overrides
+  ansible.builtin.assert:
+    that:
+      - not ansible_check_mode
+      - percival_memory_fixture_root == '' or (ansible_connection | default('') == 'local' and percival_memory_fixture_root is match('^/run/muninn-memory-activation-fixture-[a-f0-9]{16}$') and lookup('ansible.builtin.env', 'PERCIVAL_ISOLATED_LINUX_FIXTURE') == '1')
+
+- name: Compute actual controller operator closure before approval validation
+  ansible.builtin.set_fact:
+    memory_operator_sha256: {}
+- name: Hash actual controller task and helper bytes
+  ansible.builtin.set_fact:
+    memory_operator_sha256: "{{ memory_operator_sha256 | combine({item: lookup('ansible.builtin.file', role_path + '/../../../' + item, rstrip=False) | hash('sha256')}) }}"
+  loop:
+    - justfile
+    - ansible/deploy_personal_mcp.yml
+    - ansible/module_utils/percival_memory_contract.py
+    - ansible/module_utils/percival_memory_journal.py
+    - ansible/module_utils/percival_memory_host.py
+    - ansible/module_utils/percival_provenance.py
+    - ansible/library/percival_memory_checkpoint.py
+    - ansible/roles/percival_personal_mcp/tasks/main.yml
+    - ansible/roles/percival_personal_mcp/tasks/memory_activate.yml
+    - ansible/roles/percival_personal_mcp/tasks/memory_step.yml
+    - ansible/roles/percival_personal_mcp/defaults/main.yml
+
+- name: Select the explicit transaction direction
+  ansible.builtin.set_fact:
+    memory_direction: "{{ 'recover' if percival_profile == 'memory-recover-v1' else 'activate' }}"
+    memory_steps: "{{ ['stop_gateway', 'restore_policy', 'remove_override', 'reload', 'start_socket', 'restart_hotel', 'start_discovery'] if percival_profile == 'memory-recover-v1' else ['stop_gateway', 'write_policy', 'write_override', 'reload', 'start_socket', 'restart_hotel', 'start_gateway'] }}"
+
+# Preparation validates live metadata and exact files before creating an exclusive
+# public transaction record. It never changes a service, policy or runtime file.
+- name: Validate exact approval and acquire owned public transaction
+  percival_memory_checkpoint:
+    action: "{{ 'recover' if memory_direction == 'recover' else 'prepare' }}"
+    manifest: '{{ percival_memory_manifest }}'
+    qualification: '{{ percival_memory_qualification }}'
+    approved_sha256: '{{ percival_memory_approval_sha256 }}'
+    operator_sha256: '{{ memory_operator_sha256 }}'
+    fixture_root: '{{ percival_memory_fixture_root }}'
+  environment:
+    PERCIVAL_ISOLATED_LINUX_FIXTURE: "{{ '1' if percival_memory_fixture_root != '' else '0' }}"
+  register: memory_prepared
+  no_log: true
+
+- name: Apply owned transition with gateway closure on failure
+  block:
+    - name: Execute checked ordered transition
+      ansible.builtin.include_tasks: memory_step.yml
+      loop: '{{ memory_steps }}'
+      loop_control:
+        loop_var: memory_step
+  rescue:
+    # No policy restoration, daemon reload or hotel restart is attempted here.
+    # A failed/timeout command may still be running in systemd. Preserve the
+    # pending record; fresh explicit recovery/quiescence approval is required.
+    - name: Close production gateway on transition failure
+      when: percival_memory_fixture_root == ''
+      ansible.builtin.systemd_service:
+        name: percival-personal-mcp.service
+        state: stopped
+    - name: Close disposable gateway on transition failure
+      when: percival_memory_fixture_root != ''
+      ansible.builtin.command:
+        argv: ['/usr/bin/python3', '{{ percival_memory_fixture_root }}/systemctl_fixture.py', stop_gateway]
+      changed_when: true
+    - name: Refuse automatic compensation or retry
+      ansible.builtin.fail:
+        msg: Memory transition failed or is uncertain. Gateway closure was requested; preserve transaction records. Explicit quiescent recovery is required; never retry activation.

@@ -19,3 +19,8 @@ percival_source_sha256: {}
 percival_secret_ref: ''
 percival_introspection_secret_ref: ''
 percival_gateway_config: {}
+
+# No executable default approval or compatibility receipt exists.
+percival_memory_manifest: {}
+percival_memory_qualification: {}
+percival_memory_approval_sha256: ''

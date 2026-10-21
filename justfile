@@ -1,6 +1,29 @@
 # Philotic Stack Management - Command Center Compliant
 # Run `just` to see available commands
 
+# Explicit remote file/service operations; use only after exact production approval.
+# These reuse the dedicated play. They never run as a side effect of plan/status.
+[positional-arguments]
+muninn-memory-stage inputs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    muninn_public_vars=$(python3 -I -B "{{justfile_directory()}}/ansible/module_utils/percival_memory_contract.py" --validate-vars "$1" --mode stage --emit-vars)
+    env -i PATH="$PATH" HOME="$HOME" ANSIBLE_CONFIG=/dev/null ANSIBLE_HOST_KEY_CHECKING=True ANSIBLE_VARS_ENABLED= ansible-playbook -i 'jane-vps,' --user deploy --private-key "$HOME/.ssh/vps_deploy_key" --ssh-common-args '-F /dev/null -o IdentitiesOnly=yes -o ForwardAgent=no -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o ControlMaster=no -o ControlPath=none -o ControlPersist=no' "{{justfile_directory()}}/ansible/deploy_personal_mcp.yml" --extra-vars "$muninn_public_vars" --extra-vars '{"ansible_host":"31.97.130.98","ansible_port":22,"ansible_connection":"ssh","ansible_python_interpreter":"/usr/bin/python3","ansible_become":true,"ansible_become_user":"root","ansible_become_flags":"-n","percival_enabled":true,"percival_profile":"memory-stage-v1","percival_memory_operation":"stage","percival_memory_fixture_root":""}'
+
+[positional-arguments]
+muninn-memory-activate inputs approval_sha256:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    muninn_public_vars=$(python3 -I -B "{{justfile_directory()}}/ansible/module_utils/percival_memory_contract.py" --validate-vars "$1" --mode activate --approval-sha "$2" --emit-vars)
+    env -i PATH="$PATH" HOME="$HOME" ANSIBLE_CONFIG=/dev/null ANSIBLE_HOST_KEY_CHECKING=True ANSIBLE_VARS_ENABLED= ansible-playbook -i 'jane-vps,' --user deploy --private-key "$HOME/.ssh/vps_deploy_key" --ssh-common-args '-F /dev/null -o IdentitiesOnly=yes -o ForwardAgent=no -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o ControlMaster=no -o ControlPath=none -o ControlPersist=no' "{{justfile_directory()}}/ansible/deploy_personal_mcp.yml" --extra-vars "$muninn_public_vars" --extra-vars '{"ansible_host":"31.97.130.98","ansible_port":22,"ansible_connection":"ssh","ansible_python_interpreter":"/usr/bin/python3","ansible_become":true,"ansible_become_user":"root","ansible_become_flags":"-n","percival_enabled":true,"percival_profile":"memory-activate-v1","percival_memory_fixture_root":""}'
+
+[positional-arguments]
+muninn-memory-recover inputs approval_sha256:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    muninn_public_vars=$(python3 -I -B "{{justfile_directory()}}/ansible/module_utils/percival_memory_contract.py" --validate-vars "$1" --mode recover --approval-sha "$2" --emit-vars)
+    env -i PATH="$PATH" HOME="$HOME" ANSIBLE_CONFIG=/dev/null ANSIBLE_HOST_KEY_CHECKING=True ANSIBLE_VARS_ENABLED= ansible-playbook -i 'jane-vps,' --user deploy --private-key "$HOME/.ssh/vps_deploy_key" --ssh-common-args '-F /dev/null -o IdentitiesOnly=yes -o ForwardAgent=no -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o ControlMaster=no -o ControlPath=none -o ControlPersist=no' "{{justfile_directory()}}/ansible/deploy_personal_mcp.yml" --extra-vars "$muninn_public_vars" --extra-vars '{"ansible_host":"31.97.130.98","ansible_port":22,"ansible_connection":"ssh","ansible_python_interpreter":"/usr/bin/python3","ansible_become":true,"ansible_become_user":"root","ansible_become_flags":"-n","percival_enabled":true,"percival_profile":"memory-recover-v1","percival_memory_fixture_root":""}'
+
 # Offline paired Muninn release catalog; these never inspect a live service.
 [positional-arguments]
 muninn-plan issuer:

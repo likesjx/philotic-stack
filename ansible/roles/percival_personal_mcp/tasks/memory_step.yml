@@ -1,0 +1,62 @@
+---
+- name: Record durable pending action after fresh guards
+  percival_memory_checkpoint:
+    action: checkpoint
+    manifest: '{{ percival_memory_manifest }}'
+    qualification: '{{ percival_memory_qualification }}'
+    approved_sha256: '{{ percival_memory_approval_sha256 }}'
+    operator_sha256: '{{ memory_operator_sha256 }}'
+    mode: '{{ memory_direction }}'
+    step: '{{ memory_step }}'
+    status: pending
+    fixture_root: '{{ percival_memory_fixture_root }}'
+  environment:
+    PERCIVAL_ISOLATED_LINUX_FIXTURE: "{{ '1' if percival_memory_fixture_root != '' else '0' }}"
+  no_log: true
+
+- name: Mutate only ownership-checked policy or override under transaction lock
+  when: memory_step in ['write_policy', 'write_override', 'restore_policy', 'remove_override']
+  percival_memory_checkpoint:
+    action: mutate
+    manifest: '{{ percival_memory_manifest }}'
+    qualification: '{{ percival_memory_qualification }}'
+    approved_sha256: '{{ percival_memory_approval_sha256 }}'
+    operator_sha256: '{{ memory_operator_sha256 }}'
+    mode: '{{ memory_direction }}'
+    step: '{{ memory_step }}'
+    fixture_root: '{{ percival_memory_fixture_root }}'
+  environment:
+    PERCIVAL_ISOLATED_LINUX_FIXTURE: "{{ '1' if percival_memory_fixture_root != '' else '0' }}"
+  no_log: true
+
+- name: Reload production supervisor after owned changes
+  when: memory_step == 'reload' and percival_memory_fixture_root == ''
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Execute production service action in fixed order
+  when: memory_step in ['stop_gateway', 'start_socket', 'restart_hotel', 'start_gateway', 'start_discovery'] and percival_memory_fixture_root == ''
+  ansible.builtin.systemd_service:
+    name: "{{ 'philotic-hotel.service' if memory_step == 'restart_hotel' else 'percival-personal-vault.socket' if memory_step == 'start_socket' else 'percival-personal-mcp.service' }}"
+    state: "{{ 'stopped' if memory_step == 'stop_gateway' else 'restarted' if memory_step == 'restart_hotel' else 'started' }}"
+
+- name: Exercise disposable supervisor model only in explicit fixture
+  when: memory_step in ['stop_gateway', 'reload', 'start_socket', 'restart_hotel', 'start_gateway', 'start_discovery'] and percival_memory_fixture_root != ''
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '{{ percival_memory_fixture_root }}/systemctl_fixture.py', '{{ memory_step }}']
+  changed_when: true
+
+- name: Record completed action only after rechecking owned state
+  percival_memory_checkpoint:
+    action: checkpoint
+    manifest: '{{ percival_memory_manifest }}'
+    qualification: '{{ percival_memory_qualification }}'
+    approved_sha256: '{{ percival_memory_approval_sha256 }}'
+    operator_sha256: '{{ memory_operator_sha256 }}'
+    mode: '{{ memory_direction }}'
+    step: '{{ memory_step }}'
+    status: done
+    fixture_root: '{{ percival_memory_fixture_root }}'
+  environment:
+    PERCIVAL_ISOLATED_LINUX_FIXTURE: "{{ '1' if percival_memory_fixture_root != '' else '0' }}"
+  no_log: true

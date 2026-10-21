@@ -1,0 +1,53 @@
+name: Isolated Muninn activation and recovery contract
+
+on:
+  push:
+    branches: [codex/muninn-memory-activation]
+
+permissions:
+  contents: read
+
+jobs:
+  disposable-contract:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-memory-activation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: ubuntu:24.04
+    steps:
+      - name: Disposable public test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3 ansible-core
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact staged Node fixture
+        run: |
+          echo '7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c  /__e/node24/bin/node' | sha256sum --check --strict
+          echo /__e/node24/bin >> "$GITHUB_PATH"
+      - name: Existing gateway and HTTP regression tests
+        working-directory: services/personal-mcp
+        env:
+          RUN_MEMORY_HTTP_TESTS: '1'
+        run: node --test *.test.mjs
+      - name: Pure approval, ownership and transaction tests
+        run: python3 -B services/personal-mcp/scoped-vault-tests/memory_activation_contract_test.py
+      - name: Operator recipes with local stub only
+        run: python3 -B services/personal-mcp/scoped-vault-tests/memory_operator_entry_test.py
+      - name: Real Ansible variable-loader isolation controls
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: python3 -B services/personal-mcp/scoped-vault-tests/memory_operator_entry_test.py --ansible-vars-fixture
+      - name: Actual inert staging role regression
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: python3 -B services/personal-mcp/scoped-vault-tests/memory_stage_acceptance.py --node /__e/node24/bin/node
+      - name: Activation and recovery role with disposable supervisor model
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: python3 -B services/personal-mcp/scoped-vault-tests/memory_activation_acceptance.py --node /__e/node24/bin/node
+      - name: Require unchanged tracked tree
+        run: |
+          git -c safe.directory="$GITHUB_WORKSPACE" diff --exit-code
+          test -z "$(git -c safe.directory="$GITHUB_WORKSPACE" ls-files --others --exclude-standard)"
