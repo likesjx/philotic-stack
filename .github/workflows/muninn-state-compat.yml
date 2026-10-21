@@ -1,0 +1,108 @@
+name: Isolated historical guest and state compatibility
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  qualification:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-side-by-side-qualification'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          path: tools
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          persist-credentials: false
+          path: historical-source
+      - name: Retrieve exact retained nonproduction artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir evidence artifacts
+          gh api repos/likesjx/philotic-stack/actions/runs/39665912963 > evidence/producing-run.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open('evidence/producing-run.json'))
+          assert r['head_sha']=='ab26ebc5200458f5abc07597583b9b372474fc7f'
+          assert r['conclusion']=='success' and r['event']=='push'
+          PY
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12377712944/zip > artifacts/candidate.zip
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12377009217/zip > artifacts/historical.zip
+          echo '25bda32b4baf0361f4896c83e3eda8ea2b9ff10f477ece2450427ef7f8d4cce0  artifacts/candidate.zip' | sha256sum --check --strict
+          echo '345d486e6418e460a5ef06d5055369e9c85ce5884814596448b7ddbd6d539d84  artifacts/historical.zip' | sha256sum --check --strict
+          python3 - <<'PY'
+          import hashlib,pathlib,zipfile
+          expected={'candidate':'d49b977c4649f56883bfd4dca77bfa65cc3f27451bda6527955bab0523d272d5','historical':'0beb8f1c02bb12c34acdedbf5a062950465e0dc681cbf3fdeb0b6a49f6254c82'}
+          for name,digest in expected.items():
+              target=pathlib.Path('artifacts')/name;target.mkdir()
+              with zipfile.ZipFile('artifacts/'+name+'.zip') as z:
+                  assert all('/' not in n and n not in ('.','..') for n in z.namelist())
+                  z.extractall(target)
+              assert hashlib.sha256((target/'aiua').read_bytes()).hexdigest()==digest
+          PY
+          git -C tools rev-parse HEAD HEAD^{tree} > evidence/fixture-source.txt
+          test "$(git -C historical-source rev-parse HEAD)" = 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          test -z "$(git -C historical-source status --porcelain)"
+      - name: Build only controlled historical client
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/build.sh" <<'BUILD'
+          set -euo pipefail
+          export HOME=/root PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          export DEBIAN_FRONTEND=noninteractive CARGO_INCREMENTAL=0 CMAKE_POLICY_VERSION_MINIMUM=3.5 PHILOTIC_KEYCHAIN_ENABLED=0 CARGO_PROFILE_RELEASE_DEBUG=0
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev libopus-dev python3
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.94.0
+          mkdir /work /fixtures /binaries /evidence
+          tar -C /input-old --exclude=.git -cf - . | tar -C /work -xf -
+          cp /input-tools/services/personal-mcp/qualification/* /fixtures/
+          mkdir -p /work/crates/philotic-client/examples
+          cp /fixtures/guest.rs /work/crates/philotic-client/examples/qualification_guest.rs
+          cd /work
+          cargo build --locked --release --target-dir /guest-target -p philotic-client --example qualification_guest
+          cp /input-artifacts/historical/aiua /binaries/historical
+          cp /input-artifacts/candidate/aiua /binaries/candidate
+          chmod 0555 /binaries/*
+          sha256sum /binaries/* /guest-target/release/examples/qualification_guest /fixtures/* > /evidence/executed-inputs.sha256
+          rustc -vV > /evidence/rustc.txt
+          dpkg-query -W > /evidence/packages.txt
+          BUILD
+          docker pull ubuntu:24.04
+          docker image inspect ubuntu:24.04 > evidence/base-image.json
+          docker create --name compatibility-build --mount type=bind,source="$GITHUB_WORKSPACE/historical-source",target=/input-old,readonly --mount type=bind,source="$GITHUB_WORKSPACE/tools",target=/input-tools,readonly --mount type=bind,source="$GITHUB_WORKSPACE/artifacts",target=/input-artifacts,readonly --mount type=bind,source="$RUNNER_TEMP/build.sh",target=/build.sh,readonly ubuntu:24.04 /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash /build.sh
+          docker start -a compatibility-build
+          test "$(docker inspect -f '{{.State.ExitCode}}' compatibility-build)" = 0
+          docker commit compatibility-build compatibility-input
+      - name: Execute synthetic state and protocol fixtures with no network or host mounts
+        run: |
+          set -euo pipefail
+          docker create --name compatibility-test --network none --pids-limit 256 --memory 4g compatibility-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 /usr/bin/python3 /fixtures/compatibility.py
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' compatibility-test)" = none
+          test "$(docker inspect -f '{{len .Mounts}}' compatibility-test)" = 0
+          test "$(docker inspect -f '{{.HostConfig.Privileged}}' compatibility-test)" = false
+          docker inspect compatibility-test > evidence/isolation.json
+          docker start -a compatibility-test | tee evidence/compatibility.log
+          code="$(docker inspect -f '{{.State.ExitCode}}' compatibility-test)"
+          docker cp compatibility-test:/evidence/. evidence/
+          echo "$GITHUB_RUN_ID" > evidence/workflow-run.txt
+          (cd evidence && sha256sum * > SHA256SUMS)
+          test "$code" = 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: synthetic-historical-guest-state-qualification
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Remove disposable containers
+        if: always()
+        run: |
+          docker rm -f compatibility-build compatibility-test 2>/dev/null || true
+          docker image rm compatibility-input 2>/dev/null || true
