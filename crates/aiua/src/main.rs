@@ -1357,19 +1357,24 @@ fn migrate_plaintext_provider_api_key(graph: &GraphDomain, spec: &ProviderKeySpe
             secret.secret_kind == spec.vault_name,
             "existing provider credential reference has the wrong kind"
         );
-        anyhow::ensure!(
+        let reader_role = spec.allowed_roles.iter().find(|role| {
             secret.allowed_roles.is_empty()
-                || spec.allowed_roles.iter().any(|role| {
-                    secret.allowed_roles.iter().any(|allowed| allowed.as_str() == *role)
-                }),
-            "existing provider credential reference denies provider roles"
-        );
+                || secret.allowed_roles.iter().any(|allowed| allowed.as_str() == **role)
+        }).context("existing provider credential reference denies provider roles")?;
         anyhow::ensure!(
             secret.allowed_guests.is_empty(),
             "existing provider credential is guest-restricted; legacy plaintext preserved"
         );
+        let existing_value = resolve_secret(
+            graph,
+            &secret_ref,
+            &SecretAccess {
+                role: (*reader_role).to_string(),
+                guest_id: "aiua-credential-migration".into(),
+            },
+        )?.context("existing provider credential reference is missing")?;
         anyhow::ensure!(
-            !resolve_internal_secret(graph, &secret_ref)?.trim().is_empty(),
+            !existing_value.trim().is_empty(),
             "existing provider credential reference is empty"
         );
         graph.remove_config_value(spec.legacy_api_key_key)?;
@@ -10939,6 +10944,33 @@ mod tests {
                 .any(|entry| entry.vault_name == "openrouter_api_key"
                     && entry.secret_ref == secret_ref)
         );
+    }
+
+    #[test]
+    fn provider_api_key_migration_reuses_valid_existing_reference() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                BASE64_STANDARD.encode([7u8; 32]),
+            );
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        graph.set_config_value("openrouter_api_key", &serde_json::json!("original").to_string())
+            .expect("seed original plaintext");
+        assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
+        let reference = read_string_config(&graph, "openrouter_api_key_ref").unwrap().unwrap();
+        let before = serde_json::to_value(graph.get_secret(&reference).unwrap().unwrap()).unwrap();
+        graph.set_config_value("openrouter_api_key", &serde_json::json!("obsolete").to_string())
+            .expect("seed legacy duplicate");
+        assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
+        assert!(graph.get_config_value("openrouter_api_key").unwrap().is_none());
+        assert_eq!(read_string_config(&graph, "openrouter_api_key_ref").unwrap(), Some(reference.clone()));
+        assert_eq!(serde_json::to_value(graph.get_secret(&reference).unwrap().unwrap()).unwrap(), before);
+        let value = resolve_secret(&graph, &reference, &SecretAccess {
+            role: "model".into(), guest_id: "synthetic-model".into(),
+        }).unwrap();
+        assert_eq!(value.as_deref(), Some("original"));
     }
 
     #[test]
