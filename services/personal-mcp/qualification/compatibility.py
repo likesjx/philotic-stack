@@ -159,12 +159,16 @@ class Qualification(unittest.TestCase):
         with db(w) as c:config(c,'openrouter_api_key','public-obsolete-duplicate')
         p=launch(w);ready(w,p);guest(w,'existing-valid');stop(p);self.assertEqual(credentials(w),first);integrity(w)
     def test_04_invalid_existing_refs_preserve_plaintext(self):
-        for variant in ('missing','corrupt','wrong-kind','empty','wrong-key'):
+        for variant in ('missing','corrupt','wrong-kind','empty','wrong-key','wrong-acl'):
             with self.subTest(variant=variant):
                 w=seed('invalid-'+variant)
                 with db(w) as c:
                     ref='secret://hotel/default/openrouter_api_key/missing'
                     if variant!='missing':ref=secret(c,kind='telegram_bot_token' if variant=='wrong-kind' else 'openrouter_api_key',plain=b'' if variant=='empty' else b'public-provider-key',corrupt=variant=='corrupt')
+                    if variant=='wrong-acl':
+                        row=c.execute('SELECT data_json FROM graph_nodes WHERE node_key=?',('secret:'+ref,)).fetchone()
+                        value=json.loads(row[0]);value['allowed_roles']=['membrane']
+                        c.execute('UPDATE graph_nodes SET data_json=? WHERE node_key=?',(json.dumps(value),'secret:'+ref))
                     config(c,'openrouter_api_key_ref',ref)
                 before=credentials(w);owned(w);failstart(w,bytes([8]*32) if variant=='wrong-key' else None)
                 self.assertEqual(credentials(w),before);integrity(w)
@@ -191,7 +195,14 @@ class Qualification(unittest.TestCase):
         self.assertEqual(credentials(w),before);integrity(w)
         p=launch(w);ready(w,p);guest(w,'kill-retry');stop(p);first=credentials(w)
         p=launch(w);ready(w,p);stop(p);self.assertEqual(credentials(w),first)
-    def test_07_restore_state_and_executable_then_old_roundtrip(self):
+    def test_07_commit_busy_rolls_back_credential_writes(self):
+        w=seed('commit-busy');before=credentials(w)
+        reader=db(w);reader.execute('BEGIN');reader.execute('SELECT * FROM graph_nodes').fetchall()
+        try:failstart(w)
+        finally:reader.rollback();reader.close()
+        self.assertEqual(credentials(w),before);integrity(w)
+        p=launch(w);ready(w,p);guest(w,'commit-busy-retry');stop(p)
+    def test_08_restore_state_and_executable_then_old_roundtrip(self):
         w=seed('rollback');selection=w/'selected-aiua';selection.symlink_to(OLD)
         (w/'selection.json').write_text(json.dumps({'path':OLD,'sha256':HASHES[OLD]}))
         p=launch(w,str(selection));ready(w,p);guest(w,'before-rollback');stop(p)
