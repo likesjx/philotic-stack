@@ -1,0 +1,42 @@
+name: Isolated Muninn inert staging
+
+on:
+  push:
+    branches: [codex/muninn-inert-stage]
+
+permissions:
+  contents: read
+
+jobs:
+  disposable-installer:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-inert-stage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    # No privileged mode, host mounts, service sockets or production access.
+    container: ubuntu:24.04
+    steps:
+      - name: Disposable public test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3 ansible-core
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact candidate Node fixture
+        run: |
+          test -x /__e/node24/bin/node
+          echo '7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c  /__e/node24/bin/node' | sha256sum --check --strict
+          echo /__e/node24/bin >> "$GITHUB_PATH"
+          /__e/node24/bin/node --version
+      - name: Gateway and staging contract tests
+        working-directory: services/personal-mcp
+        run: node --test *.test.mjs
+      - name: Actual inert role acceptance in disposable filesystem
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: python3 -B services/personal-mcp/scoped-vault-tests/memory_stage_acceptance.py --node /__e/node24/bin/node
+      - name: Verify tracked source remained unchanged
+        run: |
+          git -c safe.directory="$GITHUB_WORKSPACE" diff --exit-code
+          test -z "$(git -c safe.directory="$GITHUB_WORKSPACE" ls-files --others --exclude-standard)"

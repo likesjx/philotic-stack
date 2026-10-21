@@ -1,0 +1,43 @@
+---
+- name: Inspect only the closed staged tree
+  ansible.builtin.find:
+    paths: '{{ memory_destination }}'
+    recurse: true
+    hidden: true
+    follow: false
+    file_type: any
+  register: memory_tree
+
+- name: Refuse extra missing or substituted staged entries
+  ansible.builtin.assert:
+    that:
+      - memory_tree.files | map(attribute='path') | list | sort == ((memory_files.keys() | list + ['gateway.json', 'gateway', 'bin']) | map('regex_replace', '^', memory_destination + '/') | list | sort)
+      - memory_tree.files | selectattr('islnk', 'equalto', true) | list | length == 0
+
+- name: Hash every staged file without following symlinks
+  ansible.builtin.stat:
+    path: '{{ memory_destination }}/{{ item.key }}'
+    checksum_algorithm: sha256
+    follow: false
+  loop: "{{ (memory_files | combine({'gateway.json': percival_memory_config_sha256})) | dict2items }}"
+  register: memory_staged
+
+- name: Refuse any staged byte or permission drift
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false)
+      - not (item.stat.islnk | default(false))
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == ('0755' if item.item.key == 'bin/node' else '0644')
+      - item.stat.checksum | default('') == item.item.value
+  loop: '{{ memory_staged.results }}'
+
+- name: Refuse staged directory permission drift
+  ansible.builtin.assert:
+    that:
+      - item.isdir
+      - item.uid == 0
+      - item.gid == 0
+      - item.mode == '0755'
+  loop: "{{ memory_tree.files | selectattr('isdir', 'equalto', true) | list }}"

@@ -1,6 +1,14 @@
 ---
-- name: Scoped rollout only when explicitly enabled
+- name: Require an explicitly supported scoped profile
   when: percival_enabled | bool
+  ansible.builtin.assert:
+    that:
+      - percival_profile in ['synthetic', 'memory-stage-v1']
+- name: Stage the separately selected memory-only profile
+  when: percival_enabled | bool and percival_profile == 'memory-stage-v1'
+  ansible.builtin.include_tasks: memory_stage.yml
+- name: Scoped rollout only when explicitly enabled
+  when: percival_enabled | bool and percival_profile == 'synthetic'
   block:
     - name: Require reviewed nonsecret rollout inputs
       ansible.builtin.assert:

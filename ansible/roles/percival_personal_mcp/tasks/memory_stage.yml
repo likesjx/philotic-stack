@@ -1,0 +1,166 @@
+---
+# This profile has no activation contract. Never notify the historical handlers.
+- name: Refuse memory activation before any host or controller mutation
+  ansible.builtin.assert:
+    that:
+      - percival_memory_operation == 'stage'
+    fail_msg: Memory activation is unavailable. Installed gateway configuration and broker compatibility are not established; a separately reviewed activation contract is required.
+
+- name: Allow fixture root only for explicit local disposable acceptance
+  ansible.builtin.assert:
+    that:
+      - percival_memory_fixture_root == '' or (ansible_connection | default('') == 'local' and percival_memory_fixture_root is match('^/tmp/muninn-memory-stage-[A-Za-z0-9_-]+$') and lookup('ansible.builtin.env', 'PERCIVAL_ISOLATED_LINUX_FIXTURE') == '1')
+
+- name: Stage only the exact reviewed memory package and public configuration
+  vars:
+    memory_gateway_revision: '709c0d7e3de6e85df6ba45786fbd7537123e4011'
+    memory_files: {"bin/node": "7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c", "gateway/gateway.mjs": "307fc9ac422d575579f9b9e66f221e29d40592c7dbf9b4d0fed5544d0eb86259", "gateway/lifegraph-catalog.mjs": "579b3e7f9dcbbda4cec2b212821830811799786c615be67823850a616a3da0ad", "gateway/lifegraph-gateway.mjs": "d3ba769bee254bb0ff4f5088d1a3a465897af20a3bb646ee36c35a7791fa53b6", "gateway/lifegraph-identity.mjs": "0ffce4263fffa14a9d3354e11517ad5a8671c41e215160652ff61088bbdd3bb0", "gateway/lifegraph-memgraph.mjs": "bb8e4362279150ce83424655f0bcb51c608120cb32b84e1edbebf71ab5223e8c", "gateway/lifegraph-owned-storage.mjs": "ce79d24e9f5c5867eb4213224a3c76d2f94b0c5b28a5f2dd0c5747bf9b2719a5", "gateway/lifegraph-owner-transport.mjs": "630a98be90b8991f11eea60b0cc6db16542edb4c4634bebaf6556b00dd569e35", "gateway/lifegraph-policy-owner.mjs": "1e345e04d5fc2949b379875e459809b4a302ed0c2a1547f168d2e60f129f57b8", "gateway/lifegraph-production.mjs": "c8db6973ba654429ea344181a7a6e1ee8e1b7798907778526ccd1318be51e1d2", "gateway/lifegraph-release.mjs": "1b98d0d9a7da8304a236693130ed65ddb0f8d5e7172de6a62a95cd64f8f68c2f", "gateway/lifegraph-storage.mjs": "fec79d7604eab753178183fbc28d3840493338a2a69d67725499fe95892b0928", "gateway/lifegraph.mjs": "01dbd596f4d2bce41b62dbd6e34ee9a471bbc5edaecbf2cd40f5ad17a770c577", "gateway/package.json": "9866d92cb6f04ba3ba4e6c22993fc469ab432151b5ed889f43708ab05a792193", "gateway/server.mjs": "d6fb41b6c4626da12ac4ff46e6bb0a02e4b383d294ba2f6356ff3cbc8ae32d79", "gateway/vault.mjs": "13469581477a55729ce34273ad60e07ab9f2c2549f7379ea91bbc1a6e749df27", "gateway/whole-vault.mjs": "ed44b97ea73999c6bfce013444fdb50675c0ce5ef91741082243c54dc2a0427e"}
+    memory_base: "{{ percival_memory_fixture_root if percival_memory_fixture_root != '' else '/opt/percival-personal-mcp' }}"
+    memory_destination: '{{ memory_base }}/staged/memory-v1-{{ percival_memory_config_sha256 }}'
+    memory_expected_config:
+      resource: https://mcp.jaredlikes.com/personal/mcp
+      port: 8913
+      muninnVault: default
+      enabledTools: [muninn_recall]
+      allowedSubjects: ['15393f50-045b-4227-90b0-0cf4264f0b3d']
+      allowedClients: [claude_muninn_recall_v1, chatgpt_muninn_recall_v1]
+      wholeVaultAccess:
+        version: 1
+        subject: '15393f50-045b-4227-90b0-0cf4264f0b3d'
+        vault: default
+        includeFutureRecords: true
+      clientPolicies:
+        - clientId: claude_muninn_recall_v1
+          subjects: ['15393f50-045b-4227-90b0-0cf4264f0b3d']
+          vault: default
+          scopes: ['memory:recall']
+        - clientId: chatgpt_muninn_recall_v1
+          subjects: ['15393f50-045b-4227-90b0-0cf4264f0b3d']
+          vault: default
+          scopes: ['memory:recall']
+      issuer:
+        issuer: https://www.jaredlikes.com
+        discovery: https://www.jaredlikes.com/.well-known/oauth-authorization-server
+        introspection: https://www.jaredlikes.com/oauth/introspect
+        clientId: percival_gateway_persistent_recall_v1
+        credentialBrokerSocketPath: /run/percival-personal-vault-broker.sock
+      upstreams:
+        muninn_recall:
+          url: http://127.0.0.1:8750/mcp
+          backendProtocol: muninn-unary-json
+          credentialBrokerSocketPath: /run/percival-personal-vault-broker.sock
+  block:
+    - name: Require exact public staging inputs
+      ansible.builtin.assert:
+        that:
+          - percival_memory_package_dir is match('^/')
+          - percival_memory_config_file is match('^/')
+          - percival_memory_config_sha256 is match('^[0-9a-f]{64}$')
+
+    - name: Hash source package files on the controller
+      ansible.builtin.stat:
+        path: '{{ percival_memory_package_dir }}/{{ item.key }}'
+        checksum_algorithm: sha256
+        follow: false
+      delegate_to: localhost
+      become: false
+      loop: '{{ memory_files | dict2items }}'
+      register: memory_sources
+
+    - name: Refuse missing symlinked or changed package files
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.checksum | default('') == item.item.value
+      loop: '{{ memory_sources.results }}'
+
+    - name: Hash the explicitly approved public configuration on controller
+      ansible.builtin.stat:
+        path: '{{ percival_memory_config_file }}'
+        checksum_algorithm: sha256
+        follow: false
+      delegate_to: localhost
+      become: false
+      register: memory_config_source
+
+    - name: Require regular configuration with exact approved bytes and closed schema
+      ansible.builtin.assert:
+        that:
+          - memory_config_source.stat.isreg | default(false)
+          - not (memory_config_source.stat.islnk | default(false))
+          - memory_config_source.stat.checksum | default('') == percival_memory_config_sha256
+          - lookup('ansible.builtin.file', percival_memory_config_file, rstrip=False) | from_json == memory_expected_config
+        fail_msg: Public configuration must match the approved bytes and closed memory-only contract.
+      no_log: true
+
+    - name: Inspect fixed staging ancestors without following symlinks
+      ansible.builtin.stat:
+        path: '{{ item }}'
+        follow: false
+      loop: "{{ ['/opt', memory_base, memory_base + '/staged'] if percival_memory_fixture_root == '' else [memory_base, memory_base + '/staged'] }}"
+      register: memory_ancestors
+
+    - name: Refuse unsafe existing staging ancestors
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists or (item.stat.isdir | default(false) and not (item.stat.islnk | default(false)) and item.stat.uid == 0 and item.stat.gid == 0 and item.stat.mode == '0755')
+      loop: '{{ memory_ancestors.results }}'
+
+    - name: Inspect immutable destination before any change
+      ansible.builtin.stat:
+        path: '{{ memory_destination }}'
+        follow: false
+      register: memory_existing
+
+    - name: Refuse unsafe existing release
+      ansible.builtin.assert:
+        that:
+          - not memory_existing.stat.exists or (memory_existing.stat.isdir | default(false) and not (memory_existing.stat.islnk | default(false)) and memory_existing.stat.uid == 0 and memory_existing.stat.gid == 0 and memory_existing.stat.mode == '0755')
+
+    - name: Verify any existing immutable release without repairing or overwriting it
+      when: memory_existing.stat.exists
+      ansible.builtin.include_tasks: memory_verify_stage.yml
+
+    - name: Create fresh staging directories only
+      when: not memory_existing.stat.exists
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - '{{ memory_base }}'
+        - '{{ memory_base }}/staged'
+        - '{{ memory_destination }}'
+        - '{{ memory_destination }}/gateway'
+        - '{{ memory_destination }}/bin'
+
+    - name: Copy exact runtime bytes into a fresh inert release only
+      when: not memory_existing.stat.exists
+      ansible.builtin.copy:
+        src: '{{ percival_memory_package_dir }}/{{ item.key }}'
+        dest: '{{ memory_destination }}/{{ item.key }}'
+        owner: root
+        group: root
+        mode: "{{ '0755' if item.key == 'bin/node' else '0644' }}"
+        force: false
+      loop: '{{ memory_files | dict2items }}'
+
+    - name: Copy approved public configuration beside staged files only
+      when: not memory_existing.stat.exists
+      ansible.builtin.copy:
+        src: '{{ percival_memory_config_file }}'
+        dest: '{{ memory_destination }}/gateway.json'
+        owner: root
+        group: root
+        mode: '0644'
+        force: false
+
+    - name: Verify staged bytes and closed directory contents
+      ansible.builtin.include_tasks: memory_verify_stage.yml
+
+    - name: Report inert staging only
+      ansible.builtin.debug:
+        msg: 'Verified staged memory source {{ memory_gateway_revision }} at {{ memory_destination }}. No activation, account, broker policy, service or current-link changes were performed.'

@@ -1,5 +1,11 @@
 ---
 percival_enabled: false
+percival_profile: synthetic
+percival_memory_operation: stage
+percival_memory_package_dir: ''
+percival_memory_config_file: ''
+percival_memory_config_sha256: ''
+percival_memory_fixture_root: ''
 percival_gateway_user: percival-gateway
 percival_gateway_uid: null
 percival_gateway_gid: null
