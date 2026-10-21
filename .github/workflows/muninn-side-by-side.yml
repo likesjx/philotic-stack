@@ -1,0 +1,121 @@
+name: Isolated hotel side-by-side comparison
+on:
+  push:
+    branches: [codex/muninn-side-by-side-qualification]
+    paths: ['.github/workflows/muninn-side-by-side.yml']
+permissions:
+  contents: read
+jobs:
+  linux:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-side-by-side-qualification'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: historical
+            source: 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          - label: candidate
+            source: 7dc7c2b24c223fd8b418f8e70567c38eaf7973ae
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ matrix.source }}
+          path: source
+          persist-credentials: false
+      - name: Build exact Linux sources in disposable container
+        env:
+          SOURCE_SHA: ${{ matrix.source }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git -C source status --porcelain)"
+          mkdir evidence
+          git -C source rev-parse HEAD HEAD^{tree} > evidence/source-identity.txt
+          echo "$GITHUB_SHA" > evidence/workflow-commit.txt
+          cat > "$RUNNER_TEMP/build.sh" <<'BUILD'
+          set -euo pipefail
+          export HOME=/root PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          export DEBIAN_FRONTEND=noninteractive CARGO_INCREMENTAL=0 CMAKE_POLICY_VERSION_MINIMUM=3.5
+          export CARGO_PROFILE_RELEASE_DEBUG=0 PHILOTIC_KEYCHAIN_ENABLED=0
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev libopus-dev python3 binutils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.94.0
+          rustup target add x86_64-unknown-linux-gnu
+          mkdir /work /evidence
+          tar -C /input --exclude=.git -cf - . | tar -C /work -xf -
+          cd /work
+          test ! -e .git
+          printf '%s\n' "$SOURCE_SHA" > /evidence/source-commit.txt
+          rustc -vV > /evidence/rustc.txt
+          cargo -V > /evidence/cargo.txt
+          cc --version > /evidence/cc.txt
+          ldd --version > /evidence/libc.txt
+          dpkg-query -W > /evidence/packages.txt
+          sha256sum Cargo.lock rust-toolchain.toml .cargo/config.toml > /evidence/source-inputs.sha256
+          PHILOTIC_BUILD_SHA="$SOURCE_SHA" cargo build --locked --release --target x86_64-unknown-linux-gnu --target-dir /hotel-target -p aiua
+          cp /hotel-target/x86_64-unknown-linux-gnu/release/aiua /evidence/aiua
+          sha256sum /evidence/aiua > /evidence/aiua.sha256
+          readelf -h /evidence/aiua > /evidence/elf-header.txt
+          readelf -d /evidence/aiua > /evidence/elf-dynamic.txt
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          actual=hashlib.sha256(pathlib.Path('/evidence/aiua').read_bytes()).hexdigest()
+          expected='b7d0c9703b3670efc5b93cfc8cb2561b3f80fe7d0d94be65c400987751eb7a17'
+          pathlib.Path('/evidence/comparison.json').write_text(json.dumps({
+            'source_commit':os.environ['SOURCE_SHA'],'label':os.environ['LABEL'],
+            'built_aiua_sha256':actual,'recorded_installed_sha256':expected,
+            'byte_match':actual==expected,'historical_binary_executed':False,
+            'mismatch_interpretation':'inconclusive about source; original patches and build inputs unknown',
+            'production_selection':False},sort_keys=True,indent=2)+'\n')
+          PY
+          if [ "$LABEL" = candidate ]; then
+            cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target
+            cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target --no-run
+            mkdir -p /hotel-target/debug
+            ln -s ../x86_64-unknown-linux-gnu/release/aiua /hotel-target/debug/aiua
+            test "$(sha256sum /hotel-target/debug/aiua | cut -d' ' -f1)" = "$(sha256sum /evidence/aiua | cut -d' ' -f1)"
+          fi
+          BUILD
+          docker pull ubuntu:24.04
+          docker image inspect ubuntu:24.04 > evidence/base-image.json
+          docker create --name hotel-build --mount type=bind,source="$GITHUB_WORKSPACE/source",target=/input,readonly --mount type=bind,source="$RUNNER_TEMP/build.sh",target=/build.sh,readonly ubuntu:24.04 /usr/bin/env -i SOURCE_SHA="$SOURCE_SHA" LABEL="$LABEL" PATH=/usr/bin:/bin /bin/bash /build.sh
+          docker start -a hotel-build
+          test "$(docker inspect -f '{{.State.ExitCode}}' hotel-build)" = 0
+          docker cp hotel-build:/evidence/. evidence/
+          docker commit hotel-build hotel-qualified-input
+          docker image inspect hotel-qualified-input > evidence/test-image.json
+      - name: Existing candidate fixtures with no network or host mounts
+        if: matrix.label == 'candidate'
+        run: |
+          set -euo pipefail
+          docker create --name hotel-acceptance --network none --pids-limit 256 --memory 4g hotel-qualified-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 PERCIVAL_BOOTSTRAP_FIXTURES=/work/services/personal-mcp/scoped-vault-tests /usr/bin/python3 /work/services/personal-mcp/scoped-vault-tests/run_linux_ci.py
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' hotel-acceptance)" = none
+          test "$(docker inspect -f '{{len .Mounts}}' hotel-acceptance)" = 0
+          test "$(docker inspect -f '{{.HostConfig.Privileged}}' hotel-acceptance)" = false
+          docker inspect hotel-acceptance > evidence/isolated-container.json
+          docker start -a hotel-acceptance | tee evidence/candidate-acceptance.log
+          test "$(docker inspect -f '{{.State.ExitCode}}' hotel-acceptance)" = 0
+          docker cp hotel-acceptance:/evidence/aiua.sha256 evidence/accepted-aiua.sha256
+          cmp evidence/aiua.sha256 evidence/accepted-aiua.sha256
+          echo 'Existing source/UID/FD/lifecycle fixtures against exact release executable; other guests and production remain unqualified.' > evidence/qualification-scope.txt
+      - name: Publish nonproduction build evidence
+        run: |
+          set -euo pipefail
+          cat evidence/comparison.json
+          echo "$GITHUB_RUN_ID" > evidence/workflow-run.txt
+          (cd evidence && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hotel-side-by-side-${{ matrix.label }}-${{ matrix.source }}
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Remove disposable containers
+        if: always()
+        run: |
+          docker rm -f hotel-build hotel-acceptance 2>/dev/null || true
+          docker image rm hotel-qualified-input 2>/dev/null || true
