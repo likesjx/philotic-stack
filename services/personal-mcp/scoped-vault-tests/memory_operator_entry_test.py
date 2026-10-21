@@ -55,7 +55,7 @@ class Entry(unittest.TestCase):
         self.assertEqual(fixed['ansible_connection'], 'ssh')
         self.assertEqual(fixed['percival_profile'], profile)
         self.assertEqual(fixed['percival_memory_fixture_root'], '')
-        self.assertEqual(captured['env']['ANSIBLE_CONFIG'], '/dev/null')
+        self.assertEqual(captured['env']['ANSIBLE_CONFIG'], str(ROOT/'ansible/muninn-memory.cfg'))
         self.assertEqual(captured['env']['ANSIBLE_HOST_KEY_CHECKING'], 'True')
         self.assertEqual(captured['env']['ANSIBLE_VARS_ENABLED'], '')
         for key in ('SSH_AUTH_SOCK','ANSIBLE_VAULT_PASSWORD_FILE','PUBLIC_AMBIENT_CANARY'):
@@ -126,7 +126,10 @@ def vars_plugin_fixture():
                 observed = subprocess.run([executable,'-i','jane-vps,',str(play)],
                     cwd=fixture, env=dict(env, ANSIBLE_VARS_ENABLED=enabled),
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
-                assert (observed.returncode == 0) == success, 'Public vars loader isolation failed.'
+                output = observed.stdout.decode('utf-8', errors='replace')
+                assert (observed.returncode == 0) == success, output
+                if not success:
+                    assert str(sentinel) in output and 'YAML' in output, output
                 print('PASS actual vars loader '+relative+': '+('disabled' if success else 'positive control'))
             sentinel.unlink()
 

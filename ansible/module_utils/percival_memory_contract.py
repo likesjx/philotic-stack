@@ -109,7 +109,7 @@ def memory_configuration(value):
     require(canonical(value)==canonical(expected))
     return value
 
-OPERATOR_FILES = ('justfile', 'ansible/deploy_personal_mcp.yml', 'ansible/module_utils/percival_memory_contract.py', 'ansible/module_utils/percival_memory_journal.py', 'ansible/module_utils/percival_memory_host.py', 'ansible/module_utils/percival_provenance.py', 'ansible/library/percival_memory_checkpoint.py', 'ansible/roles/percival_personal_mcp/tasks/main.yml', 'ansible/roles/percival_personal_mcp/tasks/memory_activate.yml', 'ansible/roles/percival_personal_mcp/tasks/memory_step.yml', 'ansible/roles/percival_personal_mcp/defaults/main.yml')
+OPERATOR_FILES = ('justfile', 'ansible/muninn-memory.cfg', 'ansible/deploy_personal_mcp.yml', 'ansible/module_utils/percival_memory_contract.py', 'ansible/module_utils/percival_memory_journal.py', 'ansible/module_utils/percival_memory_host.py', 'ansible/module_utils/percival_provenance.py', 'ansible/library/percival_memory_checkpoint.py', 'ansible/roles/percival_personal_mcp/tasks/main.yml', 'ansible/roles/percival_personal_mcp/tasks/memory_activate.yml', 'ansible/roles/percival_personal_mcp/tasks/memory_step.yml', 'ansible/roles/percival_personal_mcp/defaults/main.yml')
 
 
 def validate_vars(value, mode, root, now=None, approval_sha=None):

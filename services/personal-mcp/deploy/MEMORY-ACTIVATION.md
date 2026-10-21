@@ -38,7 +38,7 @@ example or executable default approval. Inputs require:
   not revoked, matching the exact approved policy reference. Verification must
   precede approval by less than30minutes and activation approval must end before
   key expiry. No credential retrieval, provisioning or renewal is implemented.
-- Exact installer justfile/task/module/helper closure. Controller files are hashed by the
+- Exact installer justfile/configuration/playbook/task/module/helper closure. Controller files are hashed by the
   role; loaded remote helper/module sources are checked against the same map.
   Retain the entire exact operator release for recovery; upgrading the operator
   cannot reinterpret an earlier journal.
@@ -52,6 +52,10 @@ refuse. `--emit-vars` returns the canonical validated public snapshot; the wrapp
 passes this captured JSON directly to Ansible and does not reread the input file. The stage entry similarly accepts only package directory, configuration
 file and configuration hash, with bounded plain absolute paths. These commands
 validate inputs; successful local validation is not live approval or inspection.
+
+The entry uses the dedicated public `ansible/muninn-memory.cfg`, included in the
+operator hash closure. It disables automatic variable plugins and keeps host-key
+checking enabled; no global repository vault-password configuration is inherited.
 
 The production target is fixed to root on srv875272. Existing gateway1003/1003
 and hotel999/987 identities, isolation, socket ownership/mode and loaded socket
