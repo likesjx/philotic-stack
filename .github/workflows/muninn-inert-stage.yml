@@ -31,6 +31,8 @@ jobs:
           /__e/node24/bin/node --version
       - name: Gateway and staging contract tests
         working-directory: services/personal-mcp
+        env:
+          RUN_MEMORY_HTTP_TESTS: '1'
         run: node --test *.test.mjs
       - name: Actual inert role acceptance in disposable filesystem
         env:
