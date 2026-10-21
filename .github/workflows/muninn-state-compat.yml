@@ -108,61 +108,7 @@ jobs:
           unit=subprocess.run([binary,'provider_api_key_migration','--test-threads=1'],env=unit_env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120)
           print(unit.stdout,flush=True)
           pathlib.Path('/evidence/migration-unit-tests.log').write_text(unit.stdout)
-          unit_pass=unit.returncode==0 and re.search(r'^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+
-          state=subprocess.run(['/usr/bin/python3','/fixtures/compatibility.py'],env={**common,'QUALIFICATION_CANDIDATE_SHA256':os.environ['QUALIFICATION_CANDIDATE_SHA256']},timeout=240)
-          broker=subprocess.run(['/usr/bin/python3','/candidate/services/personal-mcp/scoped-vault-tests/run_linux_ci.py'],env={**common,'PERCIVAL_BOOTSTRAP_FIXTURES':'/candidate/services/personal-mcp/scoped-vault-tests'},timeout=240)
-          report={'migration_units_passed':unit_pass,'state_suite_returncode':state.returncode,'broker_suite_returncode':broker.returncode,'installed_equivalence':False}
-          pathlib.Path('/evidence/combined-results.json').write_text(json.dumps(report,sort_keys=True,indent=2)+'\n')
-          raise SystemExit(0 if unit_pass and state.returncode==0 and broker.returncode==0 else 1)
-          RUNALL
-          chmod 0555 /binaries/*
-          sha256sum /binaries/* /guest-target/release/examples/qualification_guest /fixtures/* > /evidence/executed-inputs.sha256
-          rustc -vV > /evidence/rustc.txt
-          dpkg-query -W > /evidence/packages.txt
-          BUILD
-          test "$(git -C candidate-source rev-parse HEAD)" = 8c880f88bb14bc6f37a3df0d6a8543586a158098
-          test -z "$(git -C candidate-source status --porcelain)"
-          docker pull ubuntu:24.04
-          docker image inspect ubuntu:24.04 > evidence/base-image.json
-          docker create --name compatibility-build --mount type=bind,source="$GITHUB_WORKSPACE/historical-source",target=/input-old,readonly --mount type=bind,source="$GITHUB_WORKSPACE/tools",target=/input-tools,readonly --mount type=bind,source="$GITHUB_WORKSPACE/artifacts",target=/input-artifacts,readonly --mount type=bind,source="$GITHUB_WORKSPACE/candidate-source",target=/input-candidate,readonly --mount type=bind,source="$RUNNER_TEMP/build.sh",target=/build.sh,readonly ubuntu:24.04 /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash /build.sh
-          docker start -a compatibility-build
-          test "$(docker inspect -f '{{.State.ExitCode}}' compatibility-build)" = 0
-          docker cp compatibility-build:/evidence/. evidence/
-          docker commit compatibility-build compatibility-input
-      - name: Execute synthetic state and protocol fixtures with no network or host mounts
-        run: |
-          set -euo pipefail
-          candidate_sha="$(cat evidence/candidate-sha256.txt)"
-          docker create --name compatibility-test --network none --pids-limit 256 --memory 4g compatibility-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 QUALIFICATION_CANDIDATE_SHA256="$candidate_sha" /usr/bin/python3 /fixtures/run_all.py
-          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' compatibility-test)" = none
-          test "$(docker inspect -f '{{len .Mounts}}' compatibility-test)" = 0
-          test "$(docker inspect -f '{{.HostConfig.Privileged}}' compatibility-test)" = false
-          docker inspect compatibility-test > evidence/isolation.json
-          set +e
-          docker start -a compatibility-test | tee evidence/compatibility.log
-          stream_status="$?"
-          set -e
-          code="$(docker inspect -f '{{.State.ExitCode}}' compatibility-test)"
-          docker cp compatibility-test:/evidence/. evidence/
-          cat evidence/candidate-receipt.json
-          cat evidence/combined-results.json
-          echo "$GITHUB_RUN_ID" > evidence/workflow-run.txt
-          (cd evidence && sha256sum * > SHA256SUMS)
-          test "$stream_status" = 0
-          test "$code" = 0
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: synthetic-historical-guest-state-qualification
-          path: evidence/
-          retention-days: 14
-          if-no-files-found: error
-      - name: Remove disposable containers
-        if: always()
-        run: |
-          docker rm -f compatibility-build compatibility-test 2>/dev/null || true
-          docker image rm compatibility-input 2>/dev/null || true
-,unit.stdout,re.M) is not None
+          unit_pass=unit.returncode==0 and re.search(r'^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$',unit.stdout,re.M) is not None
           state=subprocess.run(['/usr/bin/python3','/fixtures/compatibility.py'],env={**common,'QUALIFICATION_CANDIDATE_SHA256':os.environ['QUALIFICATION_CANDIDATE_SHA256']},timeout=240)
           broker=subprocess.run(['/usr/bin/python3','/candidate/services/personal-mcp/scoped-vault-tests/run_linux_ci.py'],env={**common,'PERCIVAL_BOOTSTRAP_FIXTURES':'/candidate/services/personal-mcp/scoped-vault-tests'},timeout=240)
           report={'migration_units_passed':unit_pass,'state_suite_returncode':state.returncode,'broker_suite_returncode':broker.returncode,'installed_equivalence':False}
