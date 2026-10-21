@@ -78,7 +78,10 @@ def main():
         ansible_config.write_text('[defaults]\nretry_files_enabled = False\ninterpreter_python = auto_silent\n')
         env = {'PATH': os.environ['PATH'], 'HOME': str(inputs), 'LANG': 'C.UTF-8',
                'ANSIBLE_CONFIG': str(ansible_config), 'ANSIBLE_LOCAL_TEMP': str(inputs / 'ansible-local'),
-               'ANSIBLE_REMOTE_TEMP': str(inputs / 'ansible-remote'), 'PERCIVAL_ISOLATED_LINUX_FIXTURE': '1'}
+               'ANSIBLE_REMOTE_TEMP': str(inputs / 'ansible-remote'),
+               'ANSIBLE_LIBRARY': str(repo / 'ansible/library'),
+               'ANSIBLE_MODULE_UTILS': str(repo / 'ansible/module_utils'),
+               'PERCIVAL_ISOLATED_LINUX_FIXTURE': '1'}
         base_vars = dict(percival_enabled=True, percival_profile='memory-stage-v1',
                          percival_memory_package_dir=str(package), percival_memory_config_file=str(config),
                          percival_memory_config_sha256=digest(config), percival_memory_fixture_root=str(target))
