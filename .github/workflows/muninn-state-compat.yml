@@ -10,7 +10,7 @@ jobs:
   qualification:
     if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-side-by-side-qualification'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -21,6 +21,11 @@ jobs:
           ref: 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
           persist-credentials: false
           path: historical-source
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 8c880f88bb14bc6f37a3df0d6a8543586a158098
+          persist-credentials: false
+          path: candidate-source
       - name: Retrieve exact retained nonproduction artifacts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,13 +39,11 @@ jobs:
           assert r['head_sha']=='ab26ebc5200458f5abc07597583b9b372474fc7f'
           assert r['conclusion']=='success' and r['event']=='push'
           PY
-          gh api repos/likesjx/philotic-stack/actions/artifacts/12377712944/zip > artifacts/candidate.zip
           gh api repos/likesjx/philotic-stack/actions/artifacts/12377009217/zip > artifacts/historical.zip
-          echo '25bda32b4baf0361f4896c83e3eda8ea2b9ff10f477ece2450427ef7f8d4cce0  artifacts/candidate.zip' | sha256sum --check --strict
           echo '345d486e6418e460a5ef06d5055369e9c85ce5884814596448b7ddbd6d539d84  artifacts/historical.zip' | sha256sum --check --strict
           python3 - <<'PY'
           import hashlib,pathlib,zipfile
-          expected={'candidate':'d49b977c4649f56883bfd4dca77bfa65cc3f27451bda6527955bab0523d272d5','historical':'0beb8f1c02bb12c34acdedbf5a062950465e0dc681cbf3fdeb0b6a49f6254c82'}
+          expected={'historical':'0beb8f1c02bb12c34acdedbf5a062950465e0dc681cbf3fdeb0b6a49f6254c82'}
           for name,digest in expected.items():
               target=pathlib.Path('artifacts')/name;target.mkdir()
               with zipfile.ZipFile('artifacts/'+name+'.zip') as z:
@@ -52,7 +55,7 @@ jobs:
           git -C tools rev-parse HEAD HEAD^{tree} > evidence/fixture-source.txt
           test "$(git -C historical-source rev-parse HEAD)" = 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
           test -z "$(git -C historical-source status --porcelain)"
-      - name: Build only controlled historical client
+      - name: Build reviewed fixed hotel and controlled historical client
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/build.sh" <<'BUILD'
@@ -71,22 +74,66 @@ jobs:
           cd /work
           cargo build --locked --release --target-dir /guest-target -p philotic-client --example qualification_guest
           cp /input-artifacts/historical/aiua /binaries/historical
-          cp /input-artifacts/candidate/aiua /binaries/candidate
+          mkdir /candidate
+          tar -C /input-candidate --exclude=.git -cf - . | tar -C /candidate -xf -
+          cd /candidate
+          export PHILOTIC_BUILD_SHA=8c880f88bb14bc6f37a3df0d6a8543586a158098
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --target-dir /hotel-target -p aiua
+          cp /hotel-target/x86_64-unknown-linux-gnu/release/aiua /binaries/candidate
+          cargo test --locked --release --target x86_64-unknown-linux-gnu --target-dir /hotel-target -p aiua --no-run --message-format=json > /evidence/unit-compile.json
+          python3 - <<'UNIT'
+          import json,pathlib
+          paths=[x['executable'] for line in pathlib.Path('/evidence/unit-compile.json').read_text().splitlines() if (x:=json.loads(line)).get('reason')=='compiler-artifact' and x.get('profile',{}).get('test') and x.get('target',{}).get('name')=='aiua' and x.get('executable')]
+          assert len(paths)==1,paths
+          pathlib.Path('/evidence/unit-executable.txt').write_text(paths[0])
+          UNIT
+          cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target
+          cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target --no-run
+          mkdir -p /hotel-target/debug
+          ln -s ../x86_64-unknown-linux-gnu/release/aiua /hotel-target/debug/aiua
+          cp /binaries/candidate /evidence/aiua
+          sha256sum Cargo.lock rust-toolchain.toml .cargo/config.toml crates/aiua/src/main.rs > /evidence/runtime-source-inputs.sha256
+          python3 - <<'RECEIPT'
+          import hashlib,json,pathlib
+          digest=hashlib.sha256(pathlib.Path('/binaries/candidate').read_bytes()).hexdigest()
+          pathlib.Path('/evidence/candidate-sha256.txt').write_text(digest+'\n')
+          pathlib.Path('/evidence/candidate-receipt.json').write_text(json.dumps({'source_commit':'8c880f88bb14bc6f37a3df0d6a8543586a158098','aiua_sha256':digest,'production_selection':False,'source_changes':'atomic credential migration and existing reference validation'},sort_keys=True,indent=2)+'\n')
+          RECEIPT
+          cat > /fixtures/run_all.py <<'RUNALL'
+          import json,os,pathlib,subprocess
+          common={'PATH':'/usr/bin:/bin','PERCIVAL_ISOLATED_LINUX_FIXTURE':'1'}
+          unit_env={**common,'HOME':'/tmp/synthetic-unit-home','PHILOTIC_KEYCHAIN_ENABLED':'0','PHILOTIC_VAULT_MASTER_KEY':'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='}
+          pathlib.Path(unit_env['HOME']).mkdir()
+          binary=pathlib.Path('/evidence/unit-executable.txt').read_text()
+          unit=subprocess.run([binary,'provider_api_key_migration','--test-threads=1'],env=unit_env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=120)
+          print(unit.stdout,flush=True)
+          pathlib.Path('/evidence/migration-unit-tests.log').write_text(unit.stdout)
+          unit_pass=unit.returncode==0 and '2 passed; 0 failed; 0 ignored' in unit.stdout
+          state=subprocess.run(['/usr/bin/python3','/fixtures/compatibility.py'],env={**common,'QUALIFICATION_CANDIDATE_SHA256':os.environ['QUALIFICATION_CANDIDATE_SHA256']},timeout=240)
+          broker=subprocess.run(['/usr/bin/python3','/candidate/services/personal-mcp/scoped-vault-tests/run_linux_ci.py'],env={**common,'PERCIVAL_BOOTSTRAP_FIXTURES':'/candidate/services/personal-mcp/scoped-vault-tests'},timeout=240)
+          report={'migration_units_passed':unit_pass,'state_suite_returncode':state.returncode,'broker_suite_returncode':broker.returncode,'installed_equivalence':False}
+          pathlib.Path('/evidence/combined-results.json').write_text(json.dumps(report,sort_keys=True,indent=2)+'\n')
+          raise SystemExit(0 if unit_pass and state.returncode==0 and broker.returncode==0 else 1)
+          RUNALL
           chmod 0555 /binaries/*
           sha256sum /binaries/* /guest-target/release/examples/qualification_guest /fixtures/* > /evidence/executed-inputs.sha256
           rustc -vV > /evidence/rustc.txt
           dpkg-query -W > /evidence/packages.txt
           BUILD
+          test "$(git -C candidate-source rev-parse HEAD)" = 8c880f88bb14bc6f37a3df0d6a8543586a158098
+          test -z "$(git -C candidate-source status --porcelain)"
           docker pull ubuntu:24.04
           docker image inspect ubuntu:24.04 > evidence/base-image.json
-          docker create --name compatibility-build --mount type=bind,source="$GITHUB_WORKSPACE/historical-source",target=/input-old,readonly --mount type=bind,source="$GITHUB_WORKSPACE/tools",target=/input-tools,readonly --mount type=bind,source="$GITHUB_WORKSPACE/artifacts",target=/input-artifacts,readonly --mount type=bind,source="$RUNNER_TEMP/build.sh",target=/build.sh,readonly ubuntu:24.04 /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash /build.sh
+          docker create --name compatibility-build --mount type=bind,source="$GITHUB_WORKSPACE/historical-source",target=/input-old,readonly --mount type=bind,source="$GITHUB_WORKSPACE/tools",target=/input-tools,readonly --mount type=bind,source="$GITHUB_WORKSPACE/artifacts",target=/input-artifacts,readonly --mount type=bind,source="$GITHUB_WORKSPACE/candidate-source",target=/input-candidate,readonly --mount type=bind,source="$RUNNER_TEMP/build.sh",target=/build.sh,readonly ubuntu:24.04 /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash /build.sh
           docker start -a compatibility-build
           test "$(docker inspect -f '{{.State.ExitCode}}' compatibility-build)" = 0
+          docker cp compatibility-build:/evidence/. evidence/
           docker commit compatibility-build compatibility-input
       - name: Execute synthetic state and protocol fixtures with no network or host mounts
         run: |
           set -euo pipefail
-          docker create --name compatibility-test --network none --pids-limit 256 --memory 4g compatibility-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 /usr/bin/python3 /fixtures/compatibility.py
+          candidate_sha="$(cat evidence/candidate-sha256.txt)"
+          docker create --name compatibility-test --network none --pids-limit 256 --memory 4g compatibility-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 QUALIFICATION_CANDIDATE_SHA256="$candidate_sha" /usr/bin/python3 /fixtures/run_all.py
           test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' compatibility-test)" = none
           test "$(docker inspect -f '{{len .Mounts}}' compatibility-test)" = 0
           test "$(docker inspect -f '{{.HostConfig.Privileged}}' compatibility-test)" = false
@@ -97,6 +144,8 @@ jobs:
           set -e
           code="$(docker inspect -f '{{.State.ExitCode}}' compatibility-test)"
           docker cp compatibility-test:/evidence/. evidence/
+          cat evidence/candidate-receipt.json
+          cat evidence/combined-results.json
           echo "$GITHUB_RUN_ID" > evidence/workflow-run.txt
           (cd evidence && sha256sum * > SHA256SUMS)
           test "$stream_status" = 0
