@@ -159,15 +159,17 @@ class Qualification(unittest.TestCase):
         with db(w) as c:config(c,'openrouter_api_key','public-obsolete-duplicate')
         p=launch(w);ready(w,p);guest(w,'existing-valid');stop(p);self.assertEqual(credentials(w),first);integrity(w)
     def test_04_invalid_existing_refs_preserve_plaintext(self):
-        for variant in ('missing','corrupt','wrong-kind','empty','wrong-key','wrong-acl'):
+        for variant in ('missing','corrupt','wrong-kind','empty','wrong-key','wrong-acl','guest-restricted'):
             with self.subTest(variant=variant):
                 w=seed('invalid-'+variant)
                 with db(w) as c:
                     ref='secret://hotel/default/openrouter_api_key/missing'
                     if variant!='missing':ref=secret(c,kind='telegram_bot_token' if variant=='wrong-kind' else 'openrouter_api_key',plain=b'' if variant=='empty' else b'public-provider-key',corrupt=variant=='corrupt')
-                    if variant=='wrong-acl':
+                    if variant in ('wrong-acl','guest-restricted'):
                         row=c.execute('SELECT data_json FROM graph_nodes WHERE node_key=?',('secret:'+ref,)).fetchone()
-                        value=json.loads(row[0]);value['allowed_roles']=['membrane']
+                        value=json.loads(row[0])
+                        if variant=='wrong-acl':value['allowed_roles']=['membrane']
+                        else:value['allowed_guests']=['unrelated-public-guest']
                         c.execute('UPDATE graph_nodes SET data_json=? WHERE node_key=?',(json.dumps(value),'secret:'+ref))
                     config(c,'openrouter_api_key_ref',ref)
                 before=credentials(w);owned(w);failstart(w,bytes([8]*32) if variant=='wrong-key' else None)
@@ -198,7 +200,10 @@ class Qualification(unittest.TestCase):
     def test_07_commit_busy_rolls_back_credential_writes(self):
         w=seed('commit-busy');before=credentials(w)
         reader=db(w);reader.execute('BEGIN');reader.execute('SELECT * FROM graph_nodes').fetchall()
-        try:failstart(w)
+        try:
+            failstart(w)
+            logs=b''.join(path.read_bytes() for path in w.glob('process-*.log'))
+            self.assertIn(b'commit credential migration',logs,'startup failed before the COMMIT boundary')
         finally:reader.rollback();reader.close()
         self.assertEqual(credentials(w),before);integrity(w)
         p=launch(w);ready(w,p);guest(w,'commit-busy-retry');stop(p)

@@ -1365,6 +1365,10 @@ fn migrate_plaintext_provider_api_key(graph: &GraphDomain, spec: &ProviderKeySpe
             "existing provider credential reference denies provider roles"
         );
         anyhow::ensure!(
+            secret.allowed_guests.is_empty(),
+            "existing provider credential is guest-restricted; legacy plaintext preserved"
+        );
+        anyhow::ensure!(
             !resolve_internal_secret(graph, &secret_ref)?.trim().is_empty(),
             "existing provider credential reference is empty"
         );
