@@ -46,6 +46,7 @@ jobs:
                   z.extractall(target)
               assert hashlib.sha256((target/'aiua').read_bytes()).hexdigest()==digest
           PY
+          test "$(git -C tools rev-parse HEAD)" = "$GITHUB_SHA"
           git -C tools rev-parse HEAD HEAD^{tree} > evidence/fixture-source.txt
           test "$(git -C historical-source rev-parse HEAD)" = 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
           test -z "$(git -C historical-source status --porcelain)"
@@ -88,11 +89,15 @@ jobs:
           test "$(docker inspect -f '{{len .Mounts}}' compatibility-test)" = 0
           test "$(docker inspect -f '{{.HostConfig.Privileged}}' compatibility-test)" = false
           docker inspect compatibility-test > evidence/isolation.json
+          set +e
           docker start -a compatibility-test | tee evidence/compatibility.log
+          stream_status="$?"
+          set -e
           code="$(docker inspect -f '{{.State.ExitCode}}' compatibility-test)"
           docker cp compatibility-test:/evidence/. evidence/
           echo "$GITHUB_RUN_ID" > evidence/workflow-run.txt
           (cd evidence && sha256sum * > SHA256SUMS)
+          test "$stream_status" = 0
           test "$code" = 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

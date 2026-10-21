@@ -70,14 +70,15 @@ def seed(name,provider=True):
         config(c,'qualification-marker',{'public':'preserve','version':1})
         config(c,'telegram_bot_token_qualification','public-telegram-token')
         if provider:config(c,'openrouter_api_key','public-provider-key')
-        for kind in ('session','role','grant'):
-            # Dedicated fixture kind is opaque to runtime; real session records are
-            # separately created/asserted by historical guest roundtrips.
-            c.execute('INSERT INTO graph_nodes(node_key,kind,label,data_json) VALUES(?,?,?,?)',
-                ('qualification-sentinel:'+kind,'qualification_sentinel',kind,json.dumps({'category':kind,'public':'unchanged'})))
+        sentinels=[
+          ('session:qualification:sentinel','session',{'session_id':'qualification:sentinel','session_kind':'qualification','primary_agent_id':None,'channel_kind':None,'channel_session_key':None,'status':'idle','lease_owner_component_id':None,'lease_expires_at':None,'summary_json':{'public':'preserve'},'created_at':123,'updated_at':123}),
+          ('role_incarnation:qualification-agent:qualification-role','role_incarnation',{'agent_id':'qualification-agent','role_name':'qualification-role','guest_id':'qualification-role-guest','toolset_profile':'worker','role_manifest':'public preserve','is_admin':False,'home_node':'public-offline-home','placement_updated_unix':123}),
+          ('autonomy_grant:qualification.fixture','autonomy_grant',{'lane':'qualification.fixture','posture':'confirm_first','budget':{'max_actions_per_day':2,'max_consecutive_failures':1},'earned':{'confirmed_good_outcomes':3,'required_for_promotion':5,'consecutive_failures':0},'frozen_until_operator_review':True,'actions_today':1,'action_day_utc':0,'updated_at':123})]
+        for key,kind,data in sentinels:
+            c.execute('INSERT INTO graph_nodes(node_key,kind,label,data_json) VALUES(?,?,?,?)',(key,kind,key,json.dumps(data)))
     owned(work);return work
 def markers(work):
-    with db(work) as c:return c.execute("SELECT node_key,data_json FROM graph_nodes WHERE kind='qualification_sentinel' OR node_key='config:qualification-marker' ORDER BY node_key").fetchall()
+    with db(work) as c:return c.execute("SELECT node_key,data_json FROM graph_nodes WHERE node_key IN ('session:qualification:sentinel','role_incarnation:qualification-agent:qualification-role','autonomy_grant:qualification.fixture','config:qualification-marker') ORDER BY node_key").fetchall()
 def launch(work,binary=NEW,key=None):
     log=(work/('process-'+str(time.time_ns())+'.log')).open('wb')
     p=subprocess.Popen([binary,'--hotel',HOTEL],cwd=work,env=env(work,key),preexec_fn=drop,stdout=log,stderr=log)
@@ -129,7 +130,12 @@ class Qualification(unittest.TestCase):
             with self.subTest(label=label):
                 w=seed('protocol-'+label);before=markers(w);p=launch(w,binary);ready(w,p)
                 guest(w,label);stop(p);integrity(w);self.assertEqual(markers(w),before)
-                with db(w) as c:self.assertGreater(c.execute("SELECT count(*) FROM graph_nodes WHERE kind='session'").fetchone()[0],0)
+                with db(w) as c:
+                    session=c.execute("SELECT data_json FROM graph_nodes WHERE kind='session' AND json_extract(data_json,'$.session_id')=?",('qualification:'+label,)).fetchall()
+                    self.assertEqual(len(session),1)
+                    turns=c.execute("SELECT data_json FROM graph_nodes WHERE kind='session_turn' AND json_extract(data_json,'$.session_id')=? AND json_extract(data_json,'$.turn_id')=?",('qualification:'+label,'turn:'+label)).fetchall()
+                    self.assertEqual(len(turns),1)
+                    self.assertEqual(json.loads(turns[0][0])['user_message_json']['content'],'public-input')
     def test_02_legacy_columns_preserved_and_added(self):
         w=seed('legacy-columns')
         columns={'materialized_guests':['active_pid','hotel_name','last_active_at'],'hotels':['execution_port'],'agent_identities':['authority_hotel']}

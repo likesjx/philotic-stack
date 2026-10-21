@@ -23,23 +23,25 @@ async fn secret(c:&mut PhiloticClient,reference:&str,expected:&str)->Result<()>{
 }
 async fn denied(c:&mut PhiloticClient,reference:&str)->Result<()>{
  let response=request(c,IpcRequest::GetSecret{secret_ref:reference.into()}).await?;
- ensure!(!matches!(response,IpcResponse::SecretData{value_json:Some(_),..}),"unauthorized credential returned");Ok(())
+ ensure!(matches!(response,IpcResponse::Standard{ok:false,ref code,..} if code=="SECRET_ERROR"),"expected explicit secret denial: {response:?}");Ok(())
 }
 async fn hop(from:&mut PhiloticClient,to:&mut PhiloticClient,node:&str,role:&str,guest:&str,stage:&str,label:&str,ids:&mut HashSet<String>)->Result<()>{
  let payload=json!({"source":"qualification","session_id":format!("qualification:{label}"),"turn_id":format!("turn:{label}"),"stage":stage,"content":format!("public-{stage}"),"reply_guest_id":guest});
  ensure!(matches!(request(from,IpcRequest::EmitTask{target_node:node.into(),target_role:role.into(),target_guest_id:Some(guest.into()),task_json:payload.to_string()}).await?,IpcResponse::Standard{ok:true,..}));
+ timeout(Duration::from_secs(4),async {
  loop {
- match timeout(Duration::from_secs(4),to.recv_task()).await?? {
+ match to.recv_task().await? {
  IpcResponse::InboundTask{task_id,task_json,source_node}=>{
  ensure!(source_node==node,"wrong source node");
  ensure!(ids.insert(task_id.to_string()),"duplicate task id");
  let got:Value=serde_json::from_str(&task_json)?;
  for key in ["session_id","turn_id","stage","content"]{ensure!(got[key]==payload[key],"changed payload field {key}: {got}");}
- return Ok(())},
+ return Ok::<(),anyhow::Error>(())},
  IpcResponse::MuninnStatus{..}|IpcResponse::NetworkState{..}=>{},
  other=>anyhow::bail!("unexpected push {other:?}")
  }
  }
+ }).await??;Ok(())
 }
 #[tokio::main]
 async fn main()->Result<()>{
