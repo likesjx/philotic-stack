@@ -10954,23 +10954,30 @@ mod tests {
                 BASE64_STANDARD.encode([7u8; 32]),
             );
         }
-        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
-        let graph = GraphDomain::new(Arc::new(storage.adapter()));
-        graph.set_config_value("openrouter_api_key", &serde_json::json!("original").to_string())
-            .expect("seed original plaintext");
-        assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
-        let reference = read_string_config(&graph, "openrouter_api_key_ref").unwrap().unwrap();
-        let before = serde_json::to_value(graph.get_secret(&reference).unwrap().unwrap()).unwrap();
-        graph.set_config_value("openrouter_api_key", &serde_json::json!("obsolete").to_string())
-            .expect("seed legacy duplicate");
-        assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
-        assert!(graph.get_config_value("openrouter_api_key").unwrap().is_none());
-        assert_eq!(read_string_config(&graph, "openrouter_api_key_ref").unwrap(), Some(reference.clone()));
-        assert_eq!(serde_json::to_value(graph.get_secret(&reference).unwrap().unwrap()).unwrap(), before);
-        let value = resolve_secret(&graph, &reference, &SecretAccess {
-            role: "model".into(), guest_id: "synthetic-model".into(),
-        }).unwrap();
-        assert_eq!(value.as_deref(), Some("original"));
+        for roles in [vec!["model".to_string()], Vec::new()] {
+            let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+            let graph = GraphDomain::new(Arc::new(storage.adapter()));
+            graph.set_config_value("openrouter_api_key", &serde_json::json!("original").to_string())
+                .expect("seed original plaintext");
+            assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
+            let reference = read_string_config(&graph, "openrouter_api_key_ref").unwrap().unwrap();
+            let mut record = graph.get_secret(&reference).unwrap().unwrap();
+            record.allowed_roles = roles;
+            graph.upsert_secret(&record).unwrap();
+            let before = serde_json::to_value(&record).unwrap();
+            let registry = graph.get_config_value("vault_registry").unwrap();
+            graph.set_config_value("openrouter_api_key", &serde_json::json!("obsolete").to_string())
+                .expect("seed legacy duplicate");
+            assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
+            assert!(graph.get_config_value("openrouter_api_key").unwrap().is_none());
+            assert_eq!(read_string_config(&graph, "openrouter_api_key_ref").unwrap(), Some(reference.clone()));
+            assert_eq!(serde_json::to_value(graph.get_secret(&reference).unwrap().unwrap()).unwrap(), before);
+            assert_eq!(graph.get_config_value("vault_registry").unwrap(), registry);
+            let value = resolve_secret(&graph, &reference, &SecretAccess {
+                role: "model".into(), guest_id: "synthetic-model".into(),
+            }).unwrap();
+            assert_eq!(value.as_deref(), Some("original"));
+        }
     }
 
     #[test]
