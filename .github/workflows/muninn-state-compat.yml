@@ -1,6 +1,8 @@
 name: Isolated historical guest and state compatibility
 on:
-  workflow_dispatch: {}
+  push:
+    branches: [codex/muninn-side-by-side-qualification]
+    paths: ['.github/workflows/muninn-state-compat.yml']
 permissions:
   contents: read
   actions: read
