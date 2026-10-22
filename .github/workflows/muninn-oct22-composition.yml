@@ -1,4 +1,4 @@
-name: Isolated retained runtime Claude composition
+name: Isolated retained runtime dual-database qualification
 on:
   push:
     branches: [codex/muninn-oct22-readiness]
@@ -6,133 +6,140 @@ permissions:
   contents: read
   actions: read
 jobs:
-  composition:
+  state-qualification:
     if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-oct22-readiness'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    container: ubuntu:24.04
-    env:
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      PHILOTIC_KEYCHAIN_ENABLED: '0'
-      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    timeout-minutes: 45
     steps:
-      - name: Disposable public build prerequisites
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git gh build-essential pkg-config libssl-dev libopus-dev python3
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           path: tools
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: likesjx/jaredlikes-com
-          ref: 7d1a48ab63f6cb533329cc79605a35f7112f53dc
-          fetch-depth: 0
-          path: operator
+          ref: 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          path: historical-source
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: likesjx/jaredlikes-com
-          ref: 37696c02564add6319c3d6ae7f74331d30d67a3d
-          path: package-issuer
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: 709c0d7e3de6e85df6ba45786fbd7537123e4011
-          path: gateway
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: 230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
-          path: runtime-source
-          persist-credentials: false
-      - name: Verify source and archive guards without executing artifacts
+      - name: Verify public sources and retained artifact guards
         run: |
-          set -eu
-          test "$(git -c safe.directory="$GITHUB_WORKSPACE/tools" -C tools rev-parse HEAD)" = "$GITHUB_SHA"
+          set -euo pipefail
+          test "$(git -C tools rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C historical-source rev-parse HEAD)" = 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          test -z "$(git -C tools status --porcelain)"
+          test -z "$(git -C historical-source status --porcelain)"
           python3 -B tools/services/personal-mcp/qualification/retained_runtime_test.py
-          python3 -B operator/ops/muninn-release/packaged-claude-tests.py
-      - name: Retrieve and verify exact previously qualified runtime
+      - name: Retrieve both exact retained public executables
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
-          mkdir artifact
-          gh api repos/likesjx/philotic-stack/actions/runs/39671418572 > artifact/producer-run.json
-          gh api repos/likesjx/philotic-stack/actions/artifacts/12379818356 > artifact/producer-artifact.json
-          gh api repos/likesjx/philotic-stack/actions/artifacts/12379818356/zip > artifact/runtime.zip
-          mkdir -p /hotel-target/debug
-          python3 -B tools/services/personal-mcp/qualification/retained_runtime.py --archive artifact/runtime.zip --run artifact/producer-run.json --artifact artifact/producer-artifact.json --output /hotel-target/debug/aiua --receipt artifact/verified-runtime.json
-          echo '7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd  /hotel-target/debug/aiua' | sha256sum --check --strict
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
-        with:
-          toolchain: '1.94.0'
-      - name: Build existing public broker harness only
-        working-directory: runtime-source
-        run: |
-          set -eu
-          test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = 230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
-          cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target
-          cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target --no-run
-      - name: Package the same exact gateway and Node closure
-        run: |
+          set -euo pipefail
+          mkdir artifacts evidence
+          gh api repos/likesjx/philotic-stack/actions/runs/39671418572 > evidence/candidate-run.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12379818356 > evidence/candidate-artifact.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12379818356/zip > artifacts/candidate.zip
+          python3 -B tools/services/personal-mcp/qualification/retained_runtime.py --archive artifacts/candidate.zip --run evidence/candidate-run.json --artifact evidence/candidate-artifact.json --output artifacts/candidate --receipt evidence/verified-candidate.json
+          gh api repos/likesjx/philotic-stack/actions/runs/39665912963 > evidence/historical-run.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12377009217 > evidence/historical-artifact.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12377009217/zip > artifacts/historical.zip
           python3 -B - <<'PY'
-          import hashlib,json,os,pathlib,subprocess,sys
-          root=pathlib.Path.cwd()
-          sys.path.insert(0,str(root/'operator/ops/ansible/lifegraph'))
-          from memory_package import MEMORY_PROFILE,MEMORY_SOURCES,package_memory
-          pins={'operator':'7d1a48ab63f6cb533329cc79605a35f7112f53dc','package-issuer':'37696c02564add6319c3d6ae7f74331d30d67a3d','gateway':'709c0d7e3de6e85df6ba45786fbd7537123e4011'}
-          for name,pin in pins.items():
-              repo=root/name
-              assert subprocess.check_output(['git','-c','safe.directory='+str(repo),'-C',str(repo),'rev-parse','HEAD'],text=True).strip()==pin
-          node=pathlib.Path('/__e/node24/bin/node').resolve()
-          digest=hashlib.sha256(node.read_bytes()).hexdigest()
-          assert digest=='7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c'
-          version=subprocess.check_output([str(node),'--version'],text=True).strip().removeprefix('v')
-          assert version=='24.21.0'
-          build={'schema':1,'operator_sha':pins['operator'],'qualification_sha':os.environ['GITHUB_SHA'],'runtime_source':'230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219','run_id':os.environ['GITHUB_RUN_ID'],'source':MEMORY_SOURCES,'node_version':version,'node_sha256':digest,'production_selected':False}
-          receipt=json.dumps(build,sort_keys=True,separators=(',',':')).encode()
-          (root/'artifact/build-receipt.json').write_bytes(receipt)
-          provenance={'profile':MEMORY_PROFILE,'source':MEMORY_SOURCES,'platform':'linux-x86_64-glibc','node_version':version,'files':{'node':digest},'build_receipt_sha256':hashlib.sha256(receipt).hexdigest()}
-          result=package_memory((root/'package-issuer').resolve(),(root/'gateway').resolve(),node,provenance,root/'artifact/memory')
-          assert result['archive_sha256']=='15b205a1ba8bceb3c5c7599c3bd9571d459055ed280895d3c99ed4c1549a64f9'
+          import hashlib,io,json,pathlib,stat,zipfile
+          r=json.loads(pathlib.Path('evidence/historical-run.json').read_text())
+          a=json.loads(pathlib.Path('evidence/historical-artifact.json').read_text())
+          assert r['id']==39665912963 and r['head_sha']=='ab26ebc5200458f5abc07597583b9b372474fc7f'
+          assert r['conclusion']=='success' and r['event']=='push' and r['repository']['full_name']=='likesjx/philotic-stack'
+          archive='345d486e6418e460a5ef06d5055369e9c85ce5884814596448b7ddbd6d539d84'
+          binary='0beb8f1c02bb12c34acdedbf5a062950465e0dc681cbf3fdeb0b6a49f6254c82'
+          assert a['id']==12377009217 and a['workflow_run']['id']==r['id'] and a['expired'] is False
+          assert a['digest']=='sha256:'+archive
+          p=pathlib.Path('artifacts/historical.zip')
+          assert p.stat().st_size <= 512*1024**2
+          raw=p.read_bytes();assert hashlib.sha256(raw).hexdigest()==archive
+          with zipfile.ZipFile(io.BytesIO(raw)) as z:
+              entries=z.infolist();names=[e.filename for e in entries]
+              assert len(entries)<=100 and len(names)==len(set(names))
+              assert sum(e.file_size for e in entries)<=600*1024**2
+              for e in entries:
+                  assert e.filename not in ('','.','..') and '/' not in e.filename and '\\' not in e.filename
+                  assert stat.S_IFMT(e.external_attr>>16) in (0,stat.S_IFREG) and not e.flag_bits&1
+                  assert e.file_size<=512*1024**2
+              data=z.read('aiua')
+          assert hashlib.sha256(data).hexdigest()==binary
+          assert data[:6]==b'\x7fELF\x02\x01' and data[18:20]==b'\x3e\x00'
+          with pathlib.Path('artifacts/historical').open('xb') as f:f.write(data)
+          pathlib.Path('evidence/verified-historical.json').write_text(json.dumps({
+              'source':'56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6','producer_revision':r['head_sha'],
+              'producer_run':r['id'],'producer_artifact':a['id'],'archive_sha256':archive,
+              'aiua_sha256':binary,'installed_equivalence':False},sort_keys=True)+'\n')
           PY
-      - name: Requalify unchanged issuer HTTP and packaged gateway with exact fixed runtime
-        env:
-          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+      - name: Build only the controlled historical SDK guest in a disposable container
         run: |
-          python3 -B operator/ops/muninn-release/packaged-claude.py --disposable-public-fixture --gateway-source "$GITHUB_WORKSPACE/gateway" --issuer-source "$GITHUB_WORKSPACE/operator" --package "$GITHUB_WORKSPACE/artifact/memory" --receipt-output "$GITHUB_WORKSPACE/artifact/COMPOSITION.json"
-          python3 -B - <<'PY'
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/build-state.sh" <<'BUILD'
+          set -euo pipefail
+          export HOME=/root PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          export DEBIAN_FRONTEND=noninteractive CARGO_INCREMENTAL=0 CMAKE_POLICY_VERSION_MINIMUM=3.5 PHILOTIC_KEYCHAIN_ENABLED=0 CARGO_PROFILE_RELEASE_DEBUG=0
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev libopus-dev python3
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.94.0
+          mkdir /work /fixtures /binaries /evidence
+          tar -C /input-old --exclude=.git -cf - . | tar -C /work -xf -
+          cp /input-tools/services/personal-mcp/qualification/compatibility.py /fixtures/
+          cp /input-tools/services/personal-mcp/qualification/guest.rs /fixtures/
+          mkdir -p /work/crates/philotic-client/examples
+          cp /fixtures/guest.rs /work/crates/philotic-client/examples/qualification_guest.rs
+          cd /work
+          cargo build --locked --release --target-dir /guest-target -p philotic-client --example qualification_guest
+          cp /input-artifacts/historical /binaries/historical
+          cp /input-artifacts/candidate /binaries/candidate
+          echo '0beb8f1c02bb12c34acdedbf5a062950465e0dc681cbf3fdeb0b6a49f6254c82  /binaries/historical' | sha256sum --check --strict
+          echo '7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd  /binaries/candidate' | sha256sum --check --strict
+          chmod 0555 /binaries/*
+          sha256sum /binaries/* /guest-target/release/examples/qualification_guest /fixtures/* > /evidence/executed-inputs.sha256
+          rustc -vV > /evidence/rustc.txt
+          dpkg-query -W > /evidence/packages.txt
+          BUILD
+          docker pull ubuntu:24.04
+          docker image inspect ubuntu:24.04 > evidence/base-image.json
+          docker create --name retained-state-build --mount type=bind,source="$GITHUB_WORKSPACE/historical-source",target=/input-old,readonly --mount type=bind,source="$GITHUB_WORKSPACE/tools",target=/input-tools,readonly --mount type=bind,source="$GITHUB_WORKSPACE/artifacts",target=/input-artifacts,readonly --mount type=bind,source="$RUNNER_TEMP/build-state.sh",target=/build.sh,readonly ubuntu:24.04 /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash /build.sh
+          docker start -a retained-state-build
+          test "$(docker inspect -f '{{.State.ExitCode}}' retained-state-build)" = 0
+          docker commit retained-state-build retained-state-input
+      - name: Run all ten synthetic cases without network or host mounts
+        run: |
+          set -euo pipefail
+          docker create --name retained-state-test --network none --pids-limit 256 --memory 4g retained-state-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 QUALIFICATION_CANDIDATE_SHA256=7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd /usr/bin/python3 -B /fixtures/compatibility.py
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' retained-state-test)" = none
+          test "$(docker inspect -f '{{len .Mounts}}' retained-state-test)" = 0
+          test "$(docker inspect -f '{{.HostConfig.Privileged}}' retained-state-test)" = false
+          docker inspect retained-state-test > evidence/isolation.json
+          set +e
+          docker start -a retained-state-test | tee evidence/compatibility.log
+          stream_status="$?"
+          set -e
+          code="$(docker inspect -f '{{.State.ExitCode}}' retained-state-test)"
+          docker cp retained-state-test:/evidence/. evidence/
+          test "$stream_status" = 0
+          test "$code" = 0
+          python3 - <<'PY'
           import json,pathlib
-          r=json.loads(pathlib.Path('artifact/COMPOSITION.json').read_text())
-          assert r['native_aiua_sha256']=='7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd'
-          assert r['issuer_source']=='2031a9cff6609ed77e961868b976ba8c7bcf87c6'
-          assert r['gateway_source']=='709c0d7e3de6e85df6ba45786fbd7537123e4011'
-          assert r['payload_sha256']=='15b205a1ba8bceb3c5c7599c3bd9571d459055ed280895d3c99ed4c1549a64f9'
-          assert r['tests']==r['passed']==5 and r['cleanup_complete'] is True
-          assert r['production_qualified'] is False and r['activation_authorized'] is False
+          r=json.loads(pathlib.Path('evidence/compatibility-result.json').read_text())
+          assert r['passed'] is True and r['tests_run']==10 and r['failures']==r['errors']==0
+          assert r['installed_equivalence'] is False
+          assert r['binaries']['/binaries/candidate']=='7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd'
           PY
-      - name: Retain peer, FD, lifecycle and full native bootstrap negative cases
-        env:
-          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
-        run: python3 -B runtime-source/services/personal-mcp/scoped-vault-tests/run_linux_ci.py
-      - name: Require unchanged source and record final binary identity
-        run: |
-          set -eu
-          echo '7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd  /hotel-target/debug/aiua' | sha256sum --check --strict
-          cp /hotel-target/debug/aiua artifact/aiua-release
-          for directory in tools operator package-issuer gateway runtime-source; do
-            git -c safe.directory="$GITHUB_WORKSPACE/$directory" -C "$directory" diff --exit-code
-            test -z "$(git -c safe.directory="$GITHUB_WORKSPACE/$directory" -C "$directory" ls-files --others --exclude-standard)"
-          done
-          cd artifact
-          sha256sum aiua-release producer-run.json producer-artifact.json runtime.zip verified-runtime.json COMPOSITION.json build-receipt.json memory/payload.tar memory/receipt.json > SHA256SUMS
+          echo "$GITHUB_SHA" > evidence/fixture-source.txt
+          echo "$GITHUB_RUN_ID" > evidence/workflow-run.txt
+          (cd evidence && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          name: retained-runtime-claude-composition-${{ github.sha }}
-          path: artifact/
-          if-no-files-found: error
+          name: retained-runtime-dual-database-qualification
+          path: evidence/
           retention-days: 14
+          if-no-files-found: error
+      - name: Remove disposable containers
+        if: always()
+        run: |
+          docker rm -f retained-state-build retained-state-test 2>/dev/null || true
+          docker image rm retained-state-input 2>/dev/null || true

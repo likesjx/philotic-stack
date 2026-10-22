@@ -3,6 +3,7 @@
 Requires network-none disposable container, zero host mounts, synthetic HOME/state.
 Does not inspect installed services, real credentials or memory.
 """
+from contextlib import ExitStack, closing
 import base64,ctypes,hashlib,json,os,pathlib,shutil,signal,socket,sqlite3,struct,subprocess,time,unittest
 ROOT=pathlib.Path('/tmp/hotel-compat-fixture')
 OLD='/binaries/historical'
@@ -111,14 +112,38 @@ def guest(work,label):
 def integrity(work):
     with db(work) as c:assert c.execute('PRAGMA integrity_check').fetchone()==('ok',)
 def snapshot(work,target):
+    assert all(p.poll() is not None for p in PROCS), 'all fixture hotel writers must be stopped'
     target.mkdir();(target/'home').mkdir()
-    with db(work) as source,sqlite3.connect(target/'aiua_context.db') as dest:source.backup(dest)
-    shutil.copytree(work/'home',target/'home',dirs_exist_ok=True)
-    shutil.copy2(work/'public-config.json',target/'public-config.json')
-    shutil.copy2(work/'selection.json',target/'selection.json')
+    names=('aiua_context.db','whisper_training.db')
+    present={name:(work/name).exists() for name in names}
+    assert present['aiua_context.db']
+    with ExitStack() as stack:
+        sources={}
+        versions={}
+        # Establish both observations before either backup. Rechecking each DB
+        # only around its own backup would accept an old/new mixed pair.
+        for name in names:
+            if not present[name]:continue
+            assert (work/name).is_file()
+            source=stack.enter_context(closing(sqlite3.connect(work/name)))
+            sources[name]=source
+            versions[name]=source.execute('PRAGMA data_version').fetchone()
+        for name,source in sources.items():
+            with closing(sqlite3.connect(target/name)) as dest:
+                source.backup(dest)
+                assert dest.execute('PRAGMA integrity_check').fetchone()==('ok',)
+        shutil.copytree(work/'home',target/'home',dirs_exist_ok=True)
+        shutil.copy2(work/'public-config.json',target/'public-config.json')
+        shutil.copy2(work/'selection.json',target/'selection.json')
+        assert {name:(work/name).exists() for name in names}==present, 'fixture database presence changed during backup'
+        for name,source in sources.items():
+            assert source.execute('PRAGMA data_version').fetchone()==versions[name], 'unexpected fixture writer during backup'
 def restore(work,snap):
-    for suffix in ('','-wal','-shm','-journal'):(work/('aiua_context.db'+suffix)).unlink(missing_ok=True)
-    shutil.copy2(snap/'aiua_context.db',work/'aiua_context.db')
+    assert all(p.poll() is not None for p in PROCS), 'all fixture hotel writers must be stopped'
+    assert (snap/'aiua_context.db').is_file()
+    for name in ('aiua_context.db','whisper_training.db'):
+        for suffix in ('','-wal','-shm','-journal'):(work/(name+suffix)).unlink(missing_ok=True)
+        if (snap/name).exists():shutil.copy2(snap/name,work/name)
     shutil.rmtree(work/'home');shutil.copytree(snap/'home',work/'home')
     shutil.copy2(snap/'public-config.json',work/'public-config.json');shutil.copy2(snap/'selection.json',work/'selection.json')
     owned(work)
@@ -211,17 +236,94 @@ class Qualification(unittest.TestCase):
         w=seed('rollback');selection=w/'selected-aiua';selection.symlink_to(OLD)
         (w/'selection.json').write_text(json.dumps({'path':OLD,'sha256':HASHES[OLD]}))
         p=launch(w,str(selection));ready(w,p);guest(w,'before-rollback');stop(p)
-        before=logical(w);before_credentials=credentials(w);before_markers=markers(w)
-        snap=ROOT/'rollback-snapshot';snapshot(w,snap)
+        # Hotel is stopped. Keep committed WAL frames present in both databases:
+        # a main-file-only copy must not satisfy this restoration test.
+        held=[]
+        try:
+            for name in ('aiua_context.db','whisper_training.db'):
+                c=sqlite3.connect(w/name);held.append(c)
+                self.assertEqual(c.execute('PRAGMA journal_mode=WAL').fetchone(),('wal',))
+                c.execute('PRAGMA wal_autocheckpoint=0')
+                c.execute('CREATE TABLE qualification_backup_marker(value TEXT PRIMARY KEY)')
+                c.execute("INSERT INTO qualification_backup_marker VALUES('public-committed-wal')")
+                c.commit()
+                self.assertGreater((w/(name+'-wal')).stat().st_size,32)
+            before=logical(w);before_credentials=credentials(w);before_markers=markers(w)
+            with sqlite3.connect(w/'whisper_training.db') as c:
+                before_training=c.execute('SELECT * FROM whisper_training_samples ORDER BY sample_id').fetchall()
+            snap=ROOT/'rollback-snapshot';snapshot(w,snap)
+            for name in ('aiua_context.db','whisper_training.db'):
+                with sqlite3.connect(snap/name) as c:
+                    self.assertEqual(c.execute('SELECT value FROM qualification_backup_marker').fetchall(),[('public-committed-wal',)])
+        finally:
+            for c in held:c.close()
         selection.unlink();selection.symlink_to(NEW);(w/'selection.json').write_text(json.dumps({'path':NEW,'sha256':HASHES[NEW]}))
         p=launch(w,str(selection));ready(w,p);guest(w,'candidate-before-restore');stop(p)
         with db(w) as c:config(c,'qualification-candidate-only',True)
+        with sqlite3.connect(w/'whisper_training.db') as c:
+            c.execute("INSERT INTO qualification_backup_marker VALUES('candidate-only')")
+            c.execute("INSERT INTO whisper_training_samples(sample_id,agent_id,raw_transcript,timestamp) VALUES('public-candidate-only','fixture','synthetic transcript',1)")
         restore(w,snap);selection.unlink();selection.symlink_to(OLD)
+        for name in ('aiua_context.db','whisper_training.db'):
+            with sqlite3.connect(w/name) as c:
+                self.assertEqual(c.execute('PRAGMA integrity_check').fetchone(),('ok',))
+                self.assertEqual(c.execute('SELECT value FROM qualification_backup_marker').fetchall(),[('public-committed-wal',)])
+        with sqlite3.connect(w/'whisper_training.db') as c:
+            self.assertEqual(c.execute('SELECT * FROM whisper_training_samples ORDER BY sample_id').fetchall(),before_training)
         self.assertEqual(sha(selection),HASHES[OLD]);self.assertEqual(logical(w),before)
         self.assertEqual((w/'home/.philotic/vault-master-key.env').read_bytes(),(snap/'home/.philotic/vault-master-key.env').read_bytes())
         self.assertEqual(json.loads((w/'selection.json').read_text())['sha256'],HASHES[OLD])
         p=launch(w,str(selection));ready(w,p);guest(w,'after-rollback');stop(p)
         self.assertEqual(credentials(w),before_credentials);self.assertEqual(markers(w),before_markers);integrity(w)
+    def test_09_restore_training_absence_before_old_start(self):
+        w=seed('rollback-training-absent')
+        self.assertFalse((w/'whisper_training.db').exists())
+        (w/'selection.json').write_text(json.dumps({'path':OLD,'sha256':HASHES[OLD]}))
+        before=logical(w);snap=ROOT/'absent-training-snapshot';snapshot(w,snap)
+        self.assertFalse((snap/'whisper_training.db').exists())
+        p=launch(w,NEW);ready(w,p);stop(p)
+        self.assertTrue((w/'whisper_training.db').is_file())
+        with sqlite3.connect(w/'whisper_training.db') as c:
+            c.execute("INSERT INTO whisper_training_samples(sample_id,agent_id,raw_transcript,timestamp) VALUES('public-candidate-only','fixture','synthetic transcript',1)")
+        restore(w,snap)
+        for suffix in ('','-wal','-shm','-journal'):
+            self.assertFalse((w/('whisper_training.db'+suffix)).exists())
+        self.assertEqual(logical(w),before);integrity(w)
+        p=launch(w,OLD);ready(w,p);guest(w,'restored-training-absence');stop(p)
+        with sqlite3.connect(w/'whisper_training.db') as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM whisper_training_samples WHERE sample_id='public-candidate-only'").fetchone(),(0,))
+
+    def test_10_reject_between_database_backup_writer(self):
+        from unittest.mock import patch
+        w=ROOT/'between-backups';w.mkdir();(w/'home').mkdir()
+        for name in ('public-config.json','selection.json'):(w/name).write_text('{}')
+        names=('aiua_context.db','whisper_training.db')
+        original=sqlite3.connect
+        for name in names:
+            with closing(original(w/name)) as c:
+                c.execute('CREATE TABLE qualification_backup_marker(value TEXT)')
+                c.execute("INSERT INTO qualification_backup_marker VALUES('before')")
+                c.commit()
+        target=ROOT/'between-backups-snapshot'
+        injected=False
+        def connect(path,*args,**kwargs):
+            nonlocal injected
+            if pathlib.Path(path)==target/'whisper_training.db':
+                assert not injected;injected=True
+                for name in names:
+                    with closing(original(w/name)) as c:
+                        c.execute("UPDATE qualification_backup_marker SET value='after'")
+                        c.commit()
+            return original(path,*args,**kwargs)
+        with patch.object(sqlite3,'connect',connect):
+            with self.assertRaisesRegex(AssertionError,'unexpected fixture writer'):
+                snapshot(w,target)
+        self.assertTrue(injected)
+        # Prove the negative control actually produced the mixed backup pair.
+        for name,expected in zip(names,('before','after')):
+            with closing(original(target/name)) as c:
+                self.assertEqual(c.execute('SELECT value FROM qualification_backup_marker').fetchone(),(expected,))
+
 if __name__=='__main__':
     assert os.geteuid()==0 and pathlib.Path('/.dockerenv').is_file()
     assert set(os.listdir('/sys/class/net'))=={'lo'},'network isolation missing'
