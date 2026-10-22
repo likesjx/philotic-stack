@@ -105,7 +105,7 @@ jobs:
           docker start -a retained-state-build
           test "$(docker inspect -f '{{.State.ExitCode}}' retained-state-build)" = 0
           docker commit retained-state-build retained-state-input
-      - name: Run all ten synthetic cases without network or host mounts
+      - name: Run all eleven synthetic cases without network or host mounts
         run: |
           set -euo pipefail
           docker create --name retained-state-test --network none --pids-limit 256 --memory 4g retained-state-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 QUALIFICATION_CANDIDATE_SHA256=7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd /usr/bin/python3 -B /fixtures/compatibility.py
@@ -124,7 +124,7 @@ jobs:
           python3 - <<'PY'
           import json,pathlib
           r=json.loads(pathlib.Path('evidence/compatibility-result.json').read_text())
-          assert r['passed'] is True and r['tests_run']==10 and r['failures']==r['errors']==0
+          assert r['passed'] is True and r['tests_run']==11 and r['failures']==r['errors']==0
           assert r['installed_equivalence'] is False
           assert r['binaries']['/binaries/candidate']=='7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd'
           PY

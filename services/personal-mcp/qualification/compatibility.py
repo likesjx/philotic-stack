@@ -15,7 +15,7 @@ HOTEL='qualification-hotel'
 KEY=bytes([7]*32)
 PROCS=[]
 def sha(p):return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
-def drop():os.setgroups([]);os.setgid(999);os.setuid(999)
+def drop():os.setgroups([]);os.setgid(987);os.setuid(999)
 def env(work,key=None):
     result={'PATH':'/usr/bin:/bin','HOME':str(work/'home'),'PHILOTIC_HOTEL_SOCKET':str(work/'hotel.sock'),
         'PHILOTIC_LOG_DIR':str(work/'logs'),'PHILOTIC_SMOKE_MODE':'1','PHILOTIC_DISABLE_GUEST_SUPERVISOR':'1',
@@ -54,8 +54,8 @@ def secret(c,kind='openrouter_api_key',plain=b'public-provider-key',corrupt=Fals
     return ref
 def owned(work):
     for root,dirs,files in os.walk(work):
-        os.chown(root,999,999)
-        for name in files:os.chown(pathlib.Path(root)/name,999,999)
+        os.chown(root,999,987)
+        for name in files:os.chown(pathlib.Path(root)/name,999,987)
 def seed(name,provider=True):
     work=ROOT/name;work.mkdir(mode=0o755);(work/'home/.philotic').mkdir(parents=True)
     (work/'home/.philotic/vault-master-key.env').write_text('PHILOTIC_VAULT_MASTER_KEY='+base64.b64encode(KEY).decode()+'\n')
@@ -132,6 +132,11 @@ def snapshot(work,target):
             with closing(sqlite3.connect(target/name)) as dest:
                 source.backup(dest)
                 assert dest.execute('PRAGMA integrity_check').fetchone()==('ok',)
+            # Synthetic snapshot metadata is part of executable+state recovery.
+            # SQLite backup creates a new inode; it does not preserve mode/owner.
+            original=(work/name).stat()
+            shutil.copystat(work/name,target/name)
+            os.chown(target/name,original.st_uid,original.st_gid)
         shutil.copytree(work/'home',target/'home',dirs_exist_ok=True)
         shutil.copy2(work/'public-config.json',target/'public-config.json')
         shutil.copy2(work/'selection.json',target/'selection.json')
@@ -323,6 +328,54 @@ class Qualification(unittest.TestCase):
         for name,expected in zip(names,('before','after')):
             with closing(original(target/name)) as c:
                 self.assertEqual(c.execute('SELECT value FROM qualification_backup_marker').fetchone(),(expected,))
+
+
+    def test_11_multiple_holders_and_mode_preserving_recovery(self):
+        import select
+        w=ROOT/'multiple-holders';w.mkdir(mode=0o755);(w/'home').mkdir()
+        for name in ('public-config.json','selection.json'):(w/name).write_text('{}')
+        for name,mode in (('aiua_context.db',0o600),('whisper_training.db',0o644)):
+            with closing(sqlite3.connect(w/name)) as c:
+                c.execute('CREATE TABLE public_marker(value TEXT)')
+                c.execute("INSERT INTO public_marker VALUES('before')");c.commit()
+            os.chmod(w/name,mode)
+        owned(w)
+        # Seven real disposable processes, not assumed main-PID-only fencing.
+        code="import sqlite3,sys,time; a=sqlite3.connect(sys.argv[1]); b=sqlite3.connect(sys.argv[2]); print('ready',flush=True); time.sleep(60)"
+        holders=[]
+        try:
+            for _ in range(7):
+                process=subprocess.Popen(['/usr/bin/python3','-I','-B','-c',code,str(w/'aiua_context.db'),str(w/'whisper_training.db')],preexec_fn=drop,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                holders.append(process);PROCS.append(process)
+                self.assertTrue(select.select([process.stdout],[],[],3)[0],'synthetic holder readiness timeout')
+                self.assertEqual(process.stdout.readline(),b'ready\n')
+            holders[0].terminate();holders[0].wait(timeout=3)
+            with self.assertRaisesRegex(AssertionError,'all fixture hotel writers'):
+                snapshot(w,ROOT/'must-not-snapshot')
+            self.assertFalse((ROOT/'must-not-snapshot').exists())
+            for process in holders[1:-1]:process.terminate();process.wait(timeout=3)
+            with self.assertRaisesRegex(AssertionError,'all fixture hotel writers'):
+                restore(w,ROOT/'must-not-restore')
+            holders[-1].terminate();holders[-1].wait(timeout=3)
+            before={name:((w/name).stat().st_uid,(w/name).stat().st_gid,(w/name).stat().st_mode&0o777) for name in ('aiua_context.db','whisper_training.db')}
+            self.assertEqual(before,{'aiua_context.db':(999,987,0o600),'whisper_training.db':(999,987,0o644)})
+            snap=ROOT/'multiple-holders-snapshot';snapshot(w,snap)
+            for name in before:
+                self.assertEqual(((snap/name).stat().st_uid,(snap/name).stat().st_gid,(snap/name).stat().st_mode&0o777),before[name])
+                with closing(sqlite3.connect(w/name)) as c:c.execute("UPDATE public_marker SET value='candidate-only'");c.commit()
+                os.chmod(w/name,0o666)
+                # Stale sidecars must be removed, never copied over a restored main.
+                for suffix,mode in (('-wal',0o664 if name=='aiua_context.db' else 0o644),('-shm',0o664 if name=='aiua_context.db' else 0o644),('-journal',0o600)):
+                    side=w/(name+suffix);side.write_bytes(b'public-stale-sidecar');os.chmod(side,mode)
+            restore(w,snap)
+            for name in before:
+                self.assertEqual(((w/name).stat().st_uid,(w/name).stat().st_gid,(w/name).stat().st_mode&0o777),before[name])
+                for suffix in ('-wal','-shm','-journal'):self.assertFalse((w/(name+suffix)).exists())
+                with closing(sqlite3.connect(w/name)) as c:self.assertEqual(c.execute('SELECT value FROM public_marker').fetchall(),[('before',)])
+        finally:
+            for process in holders:
+                if process.poll() is None:process.kill();process.wait(timeout=3)
+                process.stdout.close()
 
 if __name__=='__main__':
     assert os.geteuid()==0 and pathlib.Path('/.dockerenv').is_file()

@@ -39,3 +39,25 @@ Independent review covered source, fixture rigor, isolation and workflow effects
 Installed provenance remains unresolved. Historical-source proxies are not installed-binary equivalence. The full parallel workspace suite, actual installed guest population/provider loops, real state/key migration and systemd rollout/rollback have not run. Legacy memory-refresh calls are explicitly refused by candidate source; consumers requiring that protocol need compatibility selection.
 
 Next obtain only an owner-projected non-sensitive inventory to select further fixtures: guest role/build/hash/protocol families; effective supervisor dependencies/readiness/stop settings; SQLite DDL/indexes and record field/type/presence/count shapes; credential-source mechanism/presence and ACL categories (including guest-restricted references), plus validity/decryptability booleans where needed. No credentials, credential hashes, memory/session payloads, raw configuration/environment or copied installed binary are required for that inventory. This note does not authorize querying production or activation.
+
+## Additional disposable recovery coverage
+
+The retained-runtime fixture now uses synthetic UID999/GID987 and includes a
+seven-process database-holder case. Stopping the first process leaves six real
+holders, and snapshot remains refused; restore is also refused with one holder
+still running. Once every fixture-owned holder exits, snapshot and restore must
+preserve context0600/training0644 ownership and modes and remove stale sidecars.
+The snapshot fixture explicitly preserves main-file metadata: SQLite backup
+creates new files and does not preserve ownership/modes by itself. This is a
+fixture correction, not a production backup implementation or installed-writer
+fence. Sidecar bytes are not restored over a restored main database.
+
+The isolated retained-runtime workflow runs eleven cases against the unchanged
+exact candidate and historical proxy binaries. Existing joint executable/state
+recovery and committed-WAL tests remain required. No production metadata receipt,
+private state, credentials or installed binaries are copied into this public
+fixture. Seven holders and the metadata values are disposable test parameters,
+not a claim that all installed writers or effective hooks are known. Socket and
+maintenance trigger ownership/order, external writers and authoritative runtime
+configuration still require an artifact-bound operator contract; no fake service
+model is substituted for those missing facts.
