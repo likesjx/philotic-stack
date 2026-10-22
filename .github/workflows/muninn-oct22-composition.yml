@@ -1,0 +1,138 @@
+name: Isolated retained runtime Claude composition
+on:
+  push:
+    branches: [codex/muninn-oct22-readiness]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  composition:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-oct22-readiness'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: ubuntu:24.04
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PHILOTIC_KEYCHAIN_ENABLED: '0'
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - name: Disposable public build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git gh build-essential pkg-config libssl-dev libopus-dev python3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: tools
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: likesjx/jaredlikes-com
+          ref: 7d1a48ab63f6cb533329cc79605a35f7112f53dc
+          fetch-depth: 0
+          path: operator
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: likesjx/jaredlikes-com
+          ref: 37696c02564add6319c3d6ae7f74331d30d67a3d
+          path: package-issuer
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 709c0d7e3de6e85df6ba45786fbd7537123e4011
+          path: gateway
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
+          path: runtime-source
+          persist-credentials: false
+      - name: Verify source and archive guards without executing artifacts
+        run: |
+          set -eu
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE/tools" -C tools rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B tools/services/personal-mcp/qualification/retained_runtime_test.py
+          python3 -B operator/ops/muninn-release/packaged-claude-tests.py
+      - name: Retrieve and verify exact previously qualified runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir artifact
+          gh api repos/likesjx/philotic-stack/actions/runs/39671418572 > artifact/producer-run.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12379818356 > artifact/producer-artifact.json
+          gh api repos/likesjx/philotic-stack/actions/artifacts/12379818356/zip > artifact/runtime.zip
+          mkdir -p /hotel-target/debug
+          python3 -B tools/services/personal-mcp/qualification/retained_runtime.py --archive artifact/runtime.zip --run artifact/producer-run.json --artifact artifact/producer-artifact.json --output /hotel-target/debug/aiua --receipt artifact/verified-runtime.json
+          echo '7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd  /hotel-target/debug/aiua' | sha256sum --check --strict
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: '1.94.0'
+      - name: Build existing public broker harness only
+        working-directory: runtime-source
+        run: |
+          set -eu
+          test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = 230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219
+          cargo build --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target
+          cargo test --locked --manifest-path services/personal-mcp/scoped-vault-tests/Cargo.toml --target-dir /test-target --no-run
+      - name: Package the same exact gateway and Node closure
+        run: |
+          python3 -B - <<'PY'
+          import hashlib,json,os,pathlib,subprocess,sys
+          root=pathlib.Path.cwd()
+          sys.path.insert(0,str(root/'operator/ops/ansible/lifegraph'))
+          from memory_package import MEMORY_PROFILE,MEMORY_SOURCES,package_memory
+          pins={'operator':'7d1a48ab63f6cb533329cc79605a35f7112f53dc','package-issuer':'37696c02564add6319c3d6ae7f74331d30d67a3d','gateway':'709c0d7e3de6e85df6ba45786fbd7537123e4011'}
+          for name,pin in pins.items():
+              repo=root/name
+              assert subprocess.check_output(['git','-c','safe.directory='+str(repo),'-C',str(repo),'rev-parse','HEAD'],text=True).strip()==pin
+          node=pathlib.Path('/__e/node24/bin/node').resolve()
+          digest=hashlib.sha256(node.read_bytes()).hexdigest()
+          assert digest=='7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c'
+          version=subprocess.check_output([str(node),'--version'],text=True).strip().removeprefix('v')
+          assert version=='24.21.0'
+          build={'schema':1,'operator_sha':pins['operator'],'qualification_sha':os.environ['GITHUB_SHA'],'runtime_source':'230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219','run_id':os.environ['GITHUB_RUN_ID'],'source':MEMORY_SOURCES,'node_version':version,'node_sha256':digest,'production_selected':False}
+          receipt=json.dumps(build,sort_keys=True,separators=(',',':')).encode()
+          (root/'artifact/build-receipt.json').write_bytes(receipt)
+          provenance={'profile':MEMORY_PROFILE,'source':MEMORY_SOURCES,'platform':'linux-x86_64-glibc','node_version':version,'files':{'node':digest},'build_receipt_sha256':hashlib.sha256(receipt).hexdigest()}
+          result=package_memory((root/'package-issuer').resolve(),(root/'gateway').resolve(),node,provenance,root/'artifact/memory')
+          assert result['archive_sha256']=='15b205a1ba8bceb3c5c7599c3bd9571d459055ed280895d3c99ed4c1549a64f9'
+          PY
+      - name: Requalify unchanged issuer HTTP and packaged gateway with exact fixed runtime
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: |
+          python3 -B operator/ops/muninn-release/packaged-claude.py --disposable-public-fixture --gateway-source "$GITHUB_WORKSPACE/gateway" --issuer-source "$GITHUB_WORKSPACE/operator" --package "$GITHUB_WORKSPACE/artifact/memory" --receipt-output "$GITHUB_WORKSPACE/artifact/COMPOSITION.json"
+          python3 -B - <<'PY'
+          import json,pathlib
+          r=json.loads(pathlib.Path('artifact/COMPOSITION.json').read_text())
+          assert r['native_aiua_sha256']=='7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd'
+          assert r['issuer_source']=='2031a9cff6609ed77e961868b976ba8c7bcf87c6'
+          assert r['gateway_source']=='709c0d7e3de6e85df6ba45786fbd7537123e4011'
+          assert r['payload_sha256']=='15b205a1ba8bceb3c5c7599c3bd9571d459055ed280895d3c99ed4c1549a64f9'
+          assert r['tests']==r['passed']==5 and r['cleanup_complete'] is True
+          assert r['production_qualified'] is False and r['activation_authorized'] is False
+          PY
+      - name: Retain peer, FD, lifecycle and full native bootstrap negative cases
+        env:
+          PERCIVAL_ISOLATED_LINUX_FIXTURE: '1'
+        run: python3 -B runtime-source/services/personal-mcp/scoped-vault-tests/run_linux_ci.py
+      - name: Require unchanged source and record final binary identity
+        run: |
+          set -eu
+          echo '7f789203dc87790740399885f093b940d22f66bff66dd6541c5fdf6f3345b9dd  /hotel-target/debug/aiua' | sha256sum --check --strict
+          cp /hotel-target/debug/aiua artifact/aiua-release
+          for directory in tools operator package-issuer gateway runtime-source; do
+            git -c safe.directory="$GITHUB_WORKSPACE/$directory" -C "$directory" diff --exit-code
+            test -z "$(git -c safe.directory="$GITHUB_WORKSPACE/$directory" -C "$directory" ls-files --others --exclude-standard)"
+          done
+          cd artifact
+          sha256sum aiua-release producer-run.json producer-artifact.json runtime.zip verified-runtime.json COMPOSITION.json build-receipt.json memory/payload.tar memory/receipt.json > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: retained-runtime-claude-composition-${{ github.sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
