@@ -60,7 +60,7 @@ class GuidanceContract(unittest.TestCase):
 
     def test_claude_discovery_resolves_canonical_skills(self):
         for name in ["runtime-debugger", "verification-ladder", "runtime-rollout-watch",
-                     "philotic-slice-closeout", "muninn-memory-habit"]:
+                     "philotic-slice-closeout", "muninn-memory-habit", "check-engine"]:
             projected = ROOT / ".claude/skills" / name / "SKILL.md"
             self.assertEqual(projected.resolve(), ROOT / "skills" / name / "SKILL.md")
             self.assertTrue(projected.is_file())
@@ -104,6 +104,44 @@ class GuidanceContract(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_check_engine_closeout_scenarios(self):
+        # Prose regression checks; independent scenario review checks meaning.
+        text = (ROOT / "skills/check-engine/SKILL.md").read_text()
+        cases = {
+            "Muninn outage": [
+                "#recovery-and-temporary-defer",
+                "Otherwise record the write as deferred under the canonical path",
+                "do not redirect it into transcript capture or local memory as a workaround",
+                "responsible owner and recheck trigger",
+                "no attempt is not a pass",
+            ],
+            "read-only task": [
+                "#83-approval-evidence-across-handoffs",
+                "Check Engine creates no new access or write authority",
+                "a repository-only task does not authorize this file access",
+                "in a read-only task, report proposed updates as not applied",
+                "graph access is prohibited/outside scope, do not start it or probe it",
+            ],
+            "authorized healthy closeout": [
+                "Muninn remains the default continuity mechanism",
+                "write only the durable memory delta directly from the main agent thread",
+                "Do not delegate these final writes to a background subagent",
+                "If a session was started and its closure is authorized/available, close that session",
+                "Do not store transcripts, noisy logs",
+                "do not duplicate a confirmed hook delivery",
+            ],
+        }
+        for scenario, required in cases.items():
+            with self.subTest(scenario=scenario):
+                for phrase in required:
+                    self.assertIn(phrase, text)
+        self.assertLess(text.index("## Closeout Authority and Availability"),
+                        text.index("bash scripts/mempalace_reflex_hook.sh"))
+        for obsolete in ["Execute the bash hook directly as the final step",
+                         "→ auto-cleanup", "If not, close it now.",
+                         "At session end, ensure the Mempalace broker received"]:
+            self.assertNotIn(obsolete, text)
 
 
 if __name__ == "__main__":
