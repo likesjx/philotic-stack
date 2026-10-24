@@ -29,8 +29,16 @@ while True:
   except Exception:pass
 '''
 def run(argv):return subprocess.check_output(argv,stderr=subprocess.DEVNULL,text=True,timeout=120).strip()
+def fixture_mkdir(path):
+ # Set modes on newly created fixture directories explicitly: hosted filesystem
+ # inheritance can produce 0777 even with an explicit process umask.
+ path=pathlib.Path(path);missing=[];part=path
+ while not part.exists():missing.append(part);part=part.parent
+ path.mkdir(parents=True,exist_ok=True)
+ for part in reversed(missing):
+  assert part.lstat().st_uid==os.geteuid()and not part.is_symlink();part.chmod(0o755)
 def write(path,raw,mode=0o644):
- path=pathlib.Path(path);path.parent.mkdir(parents=True,exist_ok=True);path.write_text(raw);path.chmod(mode)
+ path=pathlib.Path(path);fixture_mkdir(path.parent);path.write_text(raw);path.chmod(mode)
 def main():
  assert sys.argv[1:]==['--disposable-public-fixture']and sys.platform=='linux'and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
  assert not any(p.exists()or p.is_symlink()for p in ROOTS)
@@ -52,7 +60,7 @@ def main():
     except KeyError:subprocess.run(['useradd','--system','--uid',str(uid),'--gid',str(gid),'--no-create-home','--shell','/usr/sbin/nologin',name],check=True);created_users.append(name)
   try:pwd.getpwnam('deploy')
   except KeyError:subprocess.run(['useradd','--system','--no-create-home','--shell','/usr/sbin/nologin','deploy'],check=True);created_users.append('deploy')
-  ROOT.mkdir(parents=True,mode=0o755)
+  fixture_mkdir(ROOT)
   # mkdir(parents=True) does not apply its mode to intermediate directories.
   # The preceding disposable handoff fixture may leave this root-owned parent
   # at the runner's group-writable umask. Normalize only this fixture parent,
@@ -67,10 +75,10 @@ def main():
   for name in('provision.py','adapters.py','introspection.py','introspection_owner.py','introspection_compose.py','private_key_handoff.py'):shutil.copyfile(HERE/name,ROOT/name);(ROOT/name).chmod(0o644)
   binary=HERE.parent/'synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper';shutil.copyfile(binary,ROOT/'persistent-broker-helper');(ROOT/'persistent-broker-helper').chmod(0o755)
   helper_sha=hashlib.sha256(binary.read_bytes()).hexdigest()
-  data=pathlib.Path('/opt/philotic/data');data.mkdir(parents=True);os.chown(data,999,987);db=sqlite3.connect(data/'aiua_context.db');db.execute('CREATE TABLE graph_nodes(node_key TEXT PRIMARY KEY,kind TEXT NOT NULL,label TEXT,data_json TEXT NOT NULL,updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)');db.commit();db.close();os.chown(data/'aiua_context.db',999,987);(data/'aiua_context.db').chmod(0o600)
+  data=pathlib.Path('/opt/philotic/data');fixture_mkdir(data);os.chown(data,999,987);db=sqlite3.connect(data/'aiua_context.db');db.execute('CREATE TABLE graph_nodes(node_key TEXT PRIMARY KEY,kind TEXT NOT NULL,label TEXT,data_json TEXT NOT NULL,updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)');db.commit();db.close();os.chown(data/'aiua_context.db',999,987);(data/'aiua_context.db').chmod(0o600)
   policy='/etc/percival-personal-mcp/scoped-vault-policy.json';before_policy=json.dumps({'caller_uid':1003,'hotel_uid':999,'secret_ref':'secret://hotel/default/percival-muninn-observe/untouched','introspection_secret_ref':'secret://hotel/default/percival-issuer-introspection/missing'})+'\n';write(policy,before_policy)
   verifier='/home/deploy/.config/jaredlikes-com/personal-oauth-verifier.env';before_verifier='PERSONAL_OAUTH_INTROSPECTION_VERIFIER='+'b'*64+'\n';write(verifier,before_verifier,0o600)
-  hotel=pathlib.Path('/opt/philotic/bin/aiua');hotel.parent.mkdir();shutil.copyfile(pathlib.Path('/usr/bin/python3').resolve(),hotel);hotel.chmod(0o755);write('/opt/philotic/fixture_hotel.py',HOTEL)
+  hotel=pathlib.Path('/opt/philotic/bin/aiua');fixture_mkdir(hotel.parent);shutil.copyfile(pathlib.Path('/usr/bin/python3').resolve(),hotel);hotel.chmod(0o755);write('/opt/philotic/fixture_hotel.py',HOTEL)
   write('/etc/systemd/system/philotic-hotel.service','[Unit]\nRequires=percival-personal-vault.socket\nAfter=percival-personal-vault.socket\n[Service]\nUser=philotic\nGroup=philotic\nExecStart=/opt/philotic/bin/aiua -I -B /opt/philotic/fixture_hotel.py\n')
   write('/etc/systemd/system/percival-personal-vault.socket','[Socket]\nListenStream=/run/percival-personal-vault-broker.sock\nSocketUser=percival-gateway\nSocketGroup=percival-gateway\nSocketMode=0600\nRemoveOnStop=yes\nService=philotic-hotel.service\n')
   write('/etc/systemd/system/percival-personal-mcp.service','[Service]\nUser=percival-gateway\nGroup=percival-gateway\nExecStart=/usr/bin/sleep 600\n')

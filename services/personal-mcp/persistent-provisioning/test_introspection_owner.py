@@ -45,6 +45,15 @@ class Fixture:
   if self.fail and self.fail in argv:raise TimeoutError('synthetic')
   return ''if capture else None
 class Tests(unittest.TestCase):
+ def test_disposable_directory_modes_do_not_depend_on_umask(self):
+  from linux_introspection_acceptance import fixture_mkdir
+  import stat
+  with tempfile.TemporaryDirectory()as root:
+   parent=Path(root);before=stat.S_IMODE(parent.stat().st_mode);old=os.umask(0)
+   try:fixture_mkdir(parent/'first/second')
+   finally:os.umask(old)
+   self.assertEqual(stat.S_IMODE(parent.stat().st_mode),before)
+   for name in('first','first/second'):self.assertEqual(stat.S_IMODE((parent/name).stat().st_mode),0o755)
  def f(self):f=Fixture();self.addCleanup(f.close);return f
  def test_real_adapter_capture_cas_command_assembly_pair_and_recovery(self):
   f=self.f();original=f.fs.read(o.POLICY)[0];self.assertEqual(i.transition(f.manifest,f.j,f.owner)['outcome'],'introspection_adopted');self.assertEqual(f.loaded,f.j.data['introspection_secret_ref']);self.assertIn(b'unchanged',f.fs.read(o.POLICY)[0]);self.assertFalse(f.active);self.assertEqual(i.transition(f.manifest,f.j,f.owner,recover=True,prior_finished=True)['outcome'],'introspection_restored_closed');self.assertEqual(f.fs.read(o.POLICY)[0],original);self.assertEqual(f.env,{'PERSONAL_OAUTH_ENABLED':'false'});self.assertFalse(f.fs.path('/home/deploy/jaredlikes-com/muninn-introspection-only.override.yml').exists());self.assertTrue(f.fs.path('/home/deploy/jaredlikes-com/muninn-introspection-only.rollback.yml').exists())
