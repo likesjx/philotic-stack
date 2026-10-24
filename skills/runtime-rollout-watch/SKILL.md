@@ -29,9 +29,9 @@ Use [$verification-ladder](../verification-ladder/SKILL.md) when the main questi
 
 1. Identify the live runtime boundary.
 2. Verify the target binary path.
-3. Verify the installed artifact actually changed.
-4. Verify the supervisor restarted the right process.
-5. Verify the running PID is using the updated binary path.
+3. Classify the change: unchanged-service inspection, configuration-only reload, or binary deployment.
+4. For inspection, qualify the existing artifact; for configuration, verify a supported reload and effective settings; require restart only when the change needs it.
+5. For binary deployment, verify installation and supervisor process replacement/restart onto the intended artifact. Always correlate running process identity and effective configuration to the observation, not just the path on disk.
 6. Only then run smoke or watched-live validation.
 7. Record whether the result is proven live truth or only source truth.
 
@@ -45,9 +45,9 @@ Use [$verification-ladder](../verification-ladder/SKILL.md) when the main questi
 
 ## Heuristics
 
-- If the file write failed, nothing else matters.
-- If the PID did not change, assume the old process may still be serving.
-- If logs do not show fresh startup/registration, assume restart did not take.
+- A failed required artifact write blocks binary rollout proof.
+- An unchanged PID is valid for inspection or supported reload; for binary deployment, investigate a stale process rather than claiming success from the file path.
+- When restart is required, establish fresh process/startup/registration evidence. Liveness alone is not readiness.
 - If the user-visible behavior contradicts the rollout story, trust the behavior first.
 - A tagged release is watched-live-green only after `just verify-release <hotel> <tag>` passes on all three hotels (vps-jane, mac-jane, mbp-jane) and a Telegram round trip succeeds on each persona hotel. See `docs/process/RELEASE.md`.
 

@@ -13,9 +13,11 @@ use uuid::Uuid;
 
 const HARNESS_UPDATE_RETRIES: usize = 3;
 const MUNINN_HARNESS_INSTRUCTIONS: &str = "\
+- Muninn remains the default. Before bootstrap when unavailable or restricted, follow AGENTS.md §8.2 and skills/muninn-memory-habit/SKILL.md Recovery and Temporary Defer; these conditions govern the steps below.
+- Pause memory-dependent actions. Bounded owner-authorized repair uses repository/task evidence only, no personal memory access or recall claim; record missing continuity, scope, owner and recheck before dependent work or the next checkpoint. Reconcile relevant continuity after authorized recovery.
 - For meaningful work, run the Muninn bootstrap/orientation before decisions, resumed work, or implementation.
 - Prefer `just session-start`; otherwise run `python3 scripts/muninn_mcp.py bootstrap`, then retrieve self/user/topic context with the Muninn triad.
-- If Muninn cannot bootstrap, stop and get explicit operator approval before continuing on repo/runtime truth only.
+- If Muninn cannot bootstrap, disclose missing continuity and apply that recovery/defer path. Preserve current restrictions and approval evidence; never bypass a tool rejection.
 - At closeout, write only the durable Muninn memory delta: decisions, reality gaps, validation outcomes, next seams, or operator preferences.
 - Do not store transcripts, routine task churn, noisy logs, or proposal/docs summaries already committed in the repo.
 ";
@@ -3175,17 +3177,9 @@ fn write_claude_code_workspace_files(
     ])
 }
 
-fn write_antigravity_workspace_files(
-    harness_id: &str,
-    projection_path: &PathBuf,
-) -> Result<Vec<AuxCheck>> {
+fn render_antigravity_workspace_hook(harness_id: &str, projection_path: &Path) -> String {
     let harness_id = short_harness_id(harness_id);
-    let root = std::env::current_dir().context("failed to locate current workspace")?;
-    let agents_dir = root.join(".agents").join("workflows");
-
-    let harness_hook_path =
-        agents_dir.join(format!("{}-harness.md", harness_id.replace("harness:", "")));
-    let hook_md = format!(
+    format!(
         "---\n\
          description: Philotic Antigravity harness optimization for {harness_id}\n\
          ---\n\
@@ -3195,12 +3189,9 @@ fn write_antigravity_workspace_files(
          \n\
          Then read the repository `AGENTS.md` and `GEMINI.md` files before meaningful work.\n\
          \n\
-         Start meaningful sessions with the shared Philotic bootstrap:\n\
+         First apply the recovery/defer decision before any bootstrap or recall:\n\
          \n\
-         1. Prefer `just session-start`.\n\
-         2. If that is unavailable, run `python3 scripts/muninn_mcp.py bootstrap`.\n\
-         3. Retrieve Muninn context with the self/user/topic triad before decisions, resumed work, or implementation.\n\
-         4. If Muninn cannot bootstrap, stop and get explicit operator approval before continuing on repo/runtime truth only.\n\
+         {MUNINN_HARNESS_INSTRUCTIONS}\n\
          \n\
          Use intel-graph workflows when needed for structural context, workstream visibility, decisions, and verification.\n\
          \n\
@@ -3216,7 +3207,19 @@ fn write_antigravity_workspace_files(
         ",
         harness_id = harness_id,
         projection_path = projection_path.display()
-    );
+    )
+}
+
+fn write_antigravity_workspace_files(
+    harness_id: &str,
+    projection_path: &PathBuf,
+) -> Result<Vec<AuxCheck>> {
+    let harness_id = short_harness_id(harness_id);
+    let root = std::env::current_dir().context("failed to locate current workspace")?;
+    let agents_dir = root.join(".agents").join("workflows");
+    let harness_hook_path =
+        agents_dir.join(format!("{}-harness.md", harness_id.replace("harness:", "")));
+    let hook_md = render_antigravity_workspace_hook(harness_id, projection_path);
     write_harness_file(&harness_hook_path, hook_md.as_bytes())?;
 
     println!(
@@ -3662,6 +3665,33 @@ fn parse_csv_list(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_clients_preserve_bounded_memory_recovery() {
+        for rendered in [
+            render_codex_markdown("codex-local", "orchestrator", &[]),
+            render_claude_code_markdown("claude-local", "orchestrator", &[]),
+            render_antigravity_markdown("gemini-local", "orchestrator", &[]),
+            render_windsurf_rule_markdown("windsurf-local", "orchestrator", &[]),
+            render_antigravity_workspace_hook("gemini-local", Path::new("harness.md")),
+        ] {
+            assert!(rendered.contains("Muninn remains the default"));
+            assert!(rendered.contains("Pause memory-dependent actions"));
+            assert!(rendered.contains("no personal memory access or recall claim"));
+            assert!(rendered.contains("scope, owner and recheck"));
+            assert!(rendered.contains("never bypass a tool rejection"));
+            let gate = rendered
+                .find("Before bootstrap when unavailable or restricted")
+                .unwrap();
+            let start = rendered.find("Prefer `just session-start`").unwrap();
+            assert!(
+                gate < start,
+                "recovery/access gate must precede bootstrap commands"
+            );
+            assert!(!rendered.contains("stop and get explicit operator approval before continuing"));
+            assert!(!rendered.contains("Always bootstrap and recall personal memory"));
+        }
+    }
 
     #[test]
     fn harness_identifiers_reject_traversal_and_shell_metacharacters() {

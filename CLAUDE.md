@@ -2,6 +2,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 🚀 Session Bootstrap
 
+Muninn remains the default. Before bootstrap when unavailable or restricted, apply [AGENTS.md §8.2](AGENTS.md#82-muninn-failure-rule) and the [recovery/defer path](skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer). Pause memory-dependent actions; bounded owner-authorized repair uses repository/task evidence only, with explicit missing continuity, owner and recheck. No personal memory access or recall claim is permitted under that exception. These conditions govern the bootstrap and memory-delta steps below.
+
 **This protocol is mandatory on every session start — including sessions that resume from a summary or continue mid-task. A context summary is not a substitute for bootstrap. Do not skip these steps.**
 
 Every session MUST begin with these steps in order:
@@ -21,7 +23,7 @@ When starting work on a specific proposal or seam, use the graph workflow:
 - `graph_impact` → check blast radius before committing
 - `session_close` → release the claim when done
 
-If `just session-start` cannot recover Muninn, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
+If `just session-start` cannot recover Muninn, alert the user/operator immediately and apply the recovery/defer path above. Pause dependent actions; preserve already-approved independent scope and its recheck trigger.
 
 Muninn is not the task tracker or transcript archive. Store only compact continuity handles; repo docs/code store truth, the graph stores structure and audit, and `docs/task.md` stores active execution work.
 

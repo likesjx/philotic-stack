@@ -58,6 +58,8 @@ Do not give every subagent the whole repo story by default. That is not collabor
    - explicit assumptions
 
 4. Define the output contract.
+   - preserve exact approval evidence/source and action, target, limits, later restrictions, and denied/pending/uncertain outcomes per AGENTS.md §8.3
+   - do not convert a tool rejection into missing consent or delegate a denied operation as a workaround
    - findings only
    - code change
    - test patch

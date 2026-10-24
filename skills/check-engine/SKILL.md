@@ -1,6 +1,6 @@
 ---
 name: check-engine
-description: End-of-session review. Sweeps Muninn for unstored session work, syncs MEMORY.md, surfaces open threads and next seams, and identifies SVE process gaps. Run at the end of every meaningful session.
+description: End-of-session review under existing authorization. Reviews the durable Muninn delta, MEMORY.md, open threads, verification and process gaps; performs permitted closeout duties or records precise deferred status. Run at the end of every meaningful session.
 ---
 
 # Check Engine
@@ -15,20 +15,25 @@ This is the **E** (End) step of the SVE loop. It is the forcing function that ke
 - After any session involving architectural decisions, deployment changes, bug fixes, or process discoveries
 - Before closing a long-running session that covered multiple topics
 
-## The Five Checks
+## Closeout Authority and Availability
+
+Muninn remains the default continuity mechanism. Before any check or side effect below, apply the canonical [recovery/defer path](../muninn-memory-habit/SKILL.md#recovery-and-temporary-defer) and [approval handoff rules](../../AGENTS.md#83-approval-evidence-across-handoffs). Those rules govern every transcript, memory, file and graph operation here; Check Engine creates no new access or write authority. Do not repeat approval requests for already-authorized actions absent material scope change or required action-time confirmation.
+
+When an operation is unavailable, prohibited or outside authorization, do not run it or substitute another surface. Continue the independent review using permitted evidence. In the existing closeout/task record, name the exact deferred action and target, reason, responsible owner and recheck trigger (before a dependent decision or at the next meaningful checkpoint). Distinguish `not run/deferred`, `failed`, `passed with evidence` and `not applicable`; no attempt is not a pass, and an unobserved write must not be reported as “stored.” No personal-memory or transcript access is implied by permission to repair guidance or review a read-only task.
+
+## The Checks
 
 ### 1. Memory Sweep (Reflex Validation)
 
-Ask: has the `mempalace_reflex_hook.sh` correctly captured the transcript of this session?
+If transcript verification is authorized, ask: is there permitted evidence that `mempalace_reflex_hook.sh` captured this session? Otherwise record transcript capture as not checked; do not inspect or submit transcript contents.
 
-For coding operators (Claude Code, Antigravity, Cursor) that support lifecycle hooks, this occurs automatically on session end into the `intel-graph` broker.
+Coding operators (Claude Code, Antigravity, Cursor) may have lifecycle hooks configured to capture into the `intel-graph` broker. Configuration alone does not prove delivery; do not claim success without evidence or change hook configuration as part of this review.
 
-If your IDE runner does **not** natively support `Stop` or `PreCompact` hooks:
-Execute the bash hook directly as the final step of the session:
+If your IDE runner does **not** natively support `Stop` or `PreCompact` hooks, and the exact transcript submission and target are authorized and available, the existing manual path is:
 `bash scripts/mempalace_reflex_hook.sh overview.txt`
 where `overview.txt` is the path to your current transcript or memory slice.
 
-Muninn write-back is separate from transcript capture. At check-engine time, write only the durable memory delta directly from the main agent thread. Do not delegate these final writes to a background subagent.
+Muninn write-back is separate from transcript capture. After authorized recovery/readiness and within the permitted write scope, write only the durable memory delta directly from the main agent thread. Do not delegate these final writes to a background subagent. Otherwise record the write as deferred under the canonical path; do not redirect it into transcript capture or local memory as a workaround.
 
 Use this filter:
 
@@ -42,13 +47,13 @@ Do not store transcripts, noisy logs, proposal summaries already committed in do
 
 ### 2. MEMORY.md Sync
 
-Check `~/.claude/projects/<project>/memory/MEMORY.md`. Does it have pointers to everything relevant? Add any new memory files to the index. Remove stale pointers.
+Only when personal-memory access is authorized, check `~/.claude/projects/<project>/memory/MEMORY.md` for relevant pointers. Add new memory files or remove stale pointers only within authorized write scope. Otherwise record the specific read or sync as not run/deferred; a repository-only task does not authorize this file access.
 
 ### 2.5 Defect Sweep
 
-Check `docs/DEFECTS.md`. For each defect touched this session:
+Review `docs/DEFECTS.md` using permitted repository evidence. For each defect touched this session, make the following updates only within authorized write scope; in a read-only task, report proposed updates as not applied:
 
-- **New bug found or root-caused** → add a `DEF-NNN` entry with status, severity, size, seam, and found date. Store to Muninn.
+- **New bug found or root-caused** → add a `DEF-NNN` entry with status, severity, size, seam, and found date. Include a durable Muninn delta only under the memory-write conditions above.
 - **Defect resolved** → update `Status: fixed` and add `Fixed: <commit-hash>`. Confirm the closing commit carries `Fixes: DEF-NNN`.
 - **Defect progressed but not closed** → update status to `in-progress` and add a short note.
 
@@ -66,7 +71,7 @@ List explicitly:
 Ask: did the SVE process fail anywhere this session?
 
 Common failure modes:
-- session bootstrap skipped (Mempalace wake-up recall not done at start)
+- session bootstrap skipped without recording the canonical recovery/defer decision (a recorded authorized defer is not itself a process failure)
 - file-based memory and graph memory drifted (one updated, not the other)
 - Mempalace hook failed to fire or dropped payload without alerting
 - slice closed without `philotic-slice-closeout` pass
@@ -82,39 +87,46 @@ Also ask:
 
 ### 5. Green Status
 
-If any code was written or committed this session, confirm:
-- `just check` passes
-- relevant tests pass
-- no stale zombie processes on either machine
+If any code was written or committed this session, report the relevant authorized verification that actually ran:
+- `just check` or the appropriate scoped check, with evidence
+- relevant tests and their results
+- process health only on targets whose inspection is authorized and relevant; no cross-machine access or cleanup is implied
+
+Record checks not run with their reason; do not turn missing runtime evidence into green status.
 
 ### 6. Graph Health Check
 
-If the Intel Graph is running (`just intel-graph-status`), run the combined health check:
+Only if graph inspection is authorized for this task, establish availability with the permitted status check (for example `just intel-graph-status`) and, when running, use the existing health check:
 
 ```bash
 curl -s http://127.0.0.1:8900/api/health | jq .
 ```
 
 Check for:
-- **Stale sessions**: Active sessions older than 4 hours → auto-cleanup via `just intel-graph-session-cleanup`
-- **Orphaned workstreams**: Workstreams with no active session → investigate and close
+- **Stale sessions**: Active sessions older than 4 hours → report candidates; use `just intel-graph-session-cleanup` only if its full affected scope is authorized
+- **Orphaned workstreams**: Workstreams with no active session → investigate with permitted evidence and close only those within authorized scope
 - **Missing dispositions**: Proposals without a disposition → flag for next session
 - **Verification gaps**: High count of `verification_level: none` → prioritize in next slice
-- **Embedding gaps**: Proposals without embeddings → run `just intel-graph-embed-proposals`
+- **Embedding gaps**: Proposals without embeddings → run `just intel-graph-embed-proposals` only within authorized write scope; otherwise record the gap/defer
 
-If the graph is not running, skip this check and note it in the output.
+If unavailable or graph access is prohibited/outside scope, do not start it or probe it; record graph checks and writes as not run/deferred with owner and recheck.
 
 Also check:
-- Was a `session_start` called at the beginning of this session? If not, note the gap.
-- Was `session_close` called? If not, close it now.
-- Were any test runs recorded? If code was tested, record results via `just test-and-record`.
+- Was a `session_start` called at the beginning of this session? If not, distinguish a process gap from an intentional scoped defer.
+- Was this session's `session_close` called? If a session was started and its closure is authorized/available, close that session; otherwise record the exact deferred closure or “not applicable: no session started.” Do not close unrelated sessions.
+- Were test runs recorded? If recording and the recipe's checks are authorized/available, use `just test-and-record`; otherwise report actual local test results and graph recording as not run/deferred. Do not rerun prohibited tests merely to populate the graph.
 
 ## Output Format
+
+If graph inspection did not run, omit numeric fields or mark them unknown; never substitute zero. Record deferred actions once in the existing closeout/task record and reference them from the relevant sections.
 
 ```
 ## Check Engine — <date>
 
-### Stored to Muninn
+### Deferred Operations
+- <action/target — not run/deferred; reason; owner; recheck trigger, or none>
+
+### Muninn Delta — <stored with evidence / not run-deferred / failed / no durable delta>
 - Decision: <one line, or none>
 - Reality gap: <one line, or none>
 - Validation: <one line, or none>
@@ -123,7 +135,7 @@ Also check:
 - ...
 
 ### MEMORY.md
-- <added / updated / no changes>
+- <added / updated / checked-no changes / not run-deferred / failed>
 
 ### Open Threads
 - Next: <highest value seam>
@@ -133,9 +145,10 @@ Also check:
 - <gap and whether a skill was updated>
 
 ### Green Status
-- <check result or skipped if no code changed>
+- <passed with evidence / failed / not run-deferred with reason / not applicable>
 
 ### Graph Health
+- Inspection/recording: <performed with evidence / not run-deferred / failed>
 - Sessions: <active>/<total>, stale: <count>, cleaned: <count>
 - Proposals: <total>, missing disposition: <count>, no verification: <count>
 - Embeddings: <count> unembedded proposals
@@ -148,7 +161,7 @@ Also check:
 
 Use `check-engine` to close the session cleanly:
 
-- memory written
+- authorized durable memory delta written with evidence, or precisely deferred
 - open threads named
 - process gaps surfaced
 - green status stated
@@ -162,7 +175,4 @@ Escalate to [$retrospective-workflow](../retrospective-workflow/SKILL.md) when t
 
 ## Reflexive Write Rule at Session Close
 
-At session end, ensure the Mempalace broker received the latest context slice.
-If you are operating in `Claude Code`, this is handled natively by `.claude.json`.
-If you are operating directly from an operator layer without lifecycle hooks, manually wrap up the terminal loop by invoking:
-`bash scripts/mempalace_reflex_hook.sh <transcript_path>`
+At session end, apply the transcript conditions in Check 1; this section adds no separate submission duty. Verify receipt only through permitted evidence. Use the existing manual hook only when submission is authorized, available and needed; do not duplicate a confirmed hook delivery. Otherwise record the exact capture/verification action as not run/deferred with owner and recheck. Do not edit `.claude.json` or disable normal authorized hooks to satisfy this closeout.

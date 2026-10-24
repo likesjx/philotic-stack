@@ -1,5 +1,68 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Bounded project-guidance repair — 2026-10-24
+
+Publication phase: after local review at `6a8dfeadea82fe32268bf7284955b811cf4a5c1b`, the owner explicitly approved publishing this branch, a draft PR into develop, exact-revision CI/review, and merge only after those pass. Earlier local-only restrictions below describe the implementation phase; production, memory, graph, grants and unrelated-checkout restrictions remain in force. Current develop is integrated while preserving its concurrent task entries. `.github/workflows/guidance-contract.yml` adds a dedicated exact-head offline guidance gate; PR/merge evidence will be reported from GitHub rather than inferred from local checks.
+
+- Implemented locally: conditional installed-runtime gate, bounded diagnosis, end-to-end closeout, approval handoff evidence, and Muninn restore/defer/reconcile guidance. See [AGENTS](../AGENTS.md), [closeout](../skills/philotic-slice-closeout/SKILL.md), and [memory recovery](../skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer).
+- Authority: owner request “Implement the skills and rules”, carried by the bounded delegation from thread `01a1576b-fa36-768d-bd1f-bab7704e800f`; refined by “I do want to push the use of muninn but there should be a clear defined way to get it back up and to know when to make sure it’s up versus when to defer it”. Scope: local guidance edits, isolated checks and scoped commit on mbp-jane. No SSH, production, credentials, personal memory, grants, deployment, restarts, external-agent contact, app approval-rule changes, push or merge. This is not authorization to retry the denied production action.
+- Missing continuity: no Muninn recall or recovery was attempted under this task's restrictions. Owner: repository owner; recheck at the next meaningful checkpoint or before any memory-dependent decision, subject to fresh target-access authorization. Repository/task evidence supports only this repair. No memory delta written and no recovery/recall claim made.
+- Validation: `python3 scripts/tests/test_guidance_contract.py` passes eight offline checks, including compiling the actual pure Rust client and Antigravity workspace-hook renderers, rejecting known contradiction/order mutations, comparing all six generated projections byte-for-byte with canonical renderer output, and Check Engine outage/read-only/healthy-closeout scenarios. `python3 scripts/render_guidance_projections.py` is the exact-output check; `--write` performs the bounded local refresh. Independent `rustfmt --check` and `git diff --check` also pass. Full application build/live acceptance remains untested; prose tripwires are not a proof of arbitrary future semantic consistency.
+- Adoption: Codex discovers root AGENTS and its skill links; no `.agents/skills` exists in this snapshot. Claude's `.claude/skills/*` links resolve to canonical `skills/*`; root CLAUDE references the recovery contract and its checked-in harness projection is refreshed. The five checked-in Gemini workspace hooks are also refreshed. The managed `.claude/CLAUDE.md` import wrapper and settings are unchanged. Shared generator changes cover Codex, Claude, Gemini/Antigravity and Windsurf. Home-directory projections and graph desired/rendered/observed state were neither read nor changed. No default branch is changed and no running client adoption is claimed.
+- Paired repository: inspected local `likesjx/jaredlikes-com` checkout at `37696c02564add6319c3d6ae7f74331d30d67a3d`; its tracked CLAUDE guidance has no conflicting Muninn bootstrap or installed-runtime gate and no tracked AGENTS/skill surface requiring this repair. No paired edit or machine-specific reference added. This is a local-snapshot assessment, not a claim about unpublished or newer remote guidance.
+- Delivery status: implemented, isolated-tested and independently reviewed locally; not integrated, published, deployed or live-verified. Runtime/operator entrypoint/configuration/rollback are unchanged by this guidance slice. Exact existing CI workflow is not changed or run; offline command above is the validation entrypoint. Remaining steps: publish/PR to develop when authorized, CI on that exact revision, merge, then build/apply/verify generated harness projections in separately authorized environments. Live Claude recall remains outstanding and is not closed by this slice. No harness trial or graph/memory telemetry was run under the no-live-integration restriction.
+
+Offline scenario review (synthetic evidence only; not production acceptance):
+
+| Scenario/evidence | Required result under repaired guidance | Review |
+|---|---|---|
+| Existing qualified artifact/process/config; no release | Inspect unchanged runtime without install/restart prerequisite | Pass |
+| Same PID after supported config reload, effective revision confirmed | Accept configuration proof; no binary replacement required | Pass |
+| New binary on disk but old executable/process still serves | Fail running-artifact gate; do not claim deployment/live verification | Pass |
+| Runtime slice tested but required CI workflow absent from release | Mark integration/release incomplete, name exact missing workflow | Pass |
+| Approved action rejected by tool before execution | Record denial separately from consent; no alternate-tool retry | Pass |
+| Owner-authorized Muninn repair; recall unavailable and prohibited | Repository/task evidence only, explicit scope/owner/recheck; no memory access | Pass |
+| Code slice complete but Claude recall never observed | Slice may close locally; overall live objective remains open | Pass |
+| Decision needs missing durable history | Pause dependent decision; independent checks may continue | Pass |
+| Authorized local transient recovery; protocol and needed functional probe succeed | Recovery verified only for that target/operation; reconcile continuity | Pass |
+| Auth/broker failure despite reachable service | Preserve category; seek authorized correction, no blind local restart | Pass |
+| Independent isolated work during outage | Explicit temporary defer, owner and recheck before dependent work/checkpoint | Pass |
+| PID exists or HTTP succeeds but protocol/recall fails | No healthy/recovered/live-recall claim | Pass |
+| Wrapper hides helper's auth failure as generic timeout | Test assembled entrypoint and preserve category; revise hypothesis | Pass |
+
+Independent native reviewer `independent_guidance_review` inspected commit `5d583a3ed8b193a07f7c472f224b008fae1e1d11` and requested four corrections: Antigravity gate ordering/coverage, recall delegation authority, canonical memory-protocol alignment, and contradiction detection. All were fixed and the reviewer confirmed commit `fd85ed9ea97794879d4aabb33ec3a845f1ea3b6b`. The first three affect safe bootstrap/memory-repair semantics: evaluate restrictions before bootstrap, never turn defer approval into memory-access authority, and permit only bounded independent work while dependent work stays paused. The fourth strengthens regression evidence. No external Claude contact or live operations were used. Memory recovery remains deferred under the unchanged access restrictions; recheck before any memory-dependent action.
+
+### Offline projection refresh
+
+The owner subsequently approved closing the local adoption gap. `scripts/render_guidance_projections.py --write` compiles only the canonical pure Rust renderers from `crates/philotic-web/src/harness.rs` in a temporary directory and refreshes exactly:
+
+- `.claude/harness/claude-local.md`
+- `.agents/workflows/gemini-antigravity-harness.md`
+- `.agents/workflows/gemini-architect-harness.md`
+- `.agents/workflows/gemini-implementer-harness.md`
+- `.agents/workflows/gemini-reviewer-harness.md`
+- `.agents/workflows/gemini-verifier-harness.md`
+
+All six now match exact renderer output. Existing role/skills and Gemini reference strings are preserved; the tool does not follow the referenced home paths. It rejects redirected projection paths. No manual managed-wrapper edits, graph database, settings, memory, credentials, service or network operations are involved. This is a local content refresh, not live graph convergence. The independent native reviewer approved this refresh after rerunning seven checks, verifying preserved inputs, and confirming synthetic contradictory output is detected and symlink redirection is rejected; no concrete findings remain.
+
+Remaining adoption: publish this branch and integrate through develop/CI only when authorized. Other checkouts then need the integrated revision. If registered runtime harness state or external projections must also converge, the existing `phil graph harness apply <harness-id>` followed by `phil graph harness verify <harness-id>` requires separate scope: the CLI opens the configured graph database, updates graph projection state, and writes adapter targets. For `claude-local`, apply also updates `.claude/settings.json` and may remove the stale hook from `.claude/settings.local.json`; none of that ran here. For `gemini-antigravity`, `gemini-architect`, `gemini-implementer`, `gemini-reviewer`, and `gemini-verifier`, apply writes `~/.gemini/antigravity/philotic/harnesses/<id>/GEMINI_HARNESS.md` and the workspace hook. Codex's registered harness target is `~/.codex/philotic/harnesses/<id>/AGENTS.md` and its managed home bootstrap block; inspect actual registered IDs during that separately authorized adoption. No external target's freshness or live Claude recall is asserted by this local refresh.
+
+### Check Engine consistency follow-up
+
+The owner's Check Engine clarification prompted a bounded alignment of `skills/check-engine/SKILL.md`, without running its operations. It now links to the canonical recovery/defer and approval-handoff rules before any side effect, preserves Muninn as default and direct durable-delta writes during authorized healthy closeout, and records unrun operations distinctly from failed/passed/not-applicable checks. Transcript verification/submission, personal MEMORY.md access, graph cleanup/embedding/test recording and session closure are conditional on their actual authorized scope and availability. Hooks and transcript storage were not redesigned or disabled.
+
+The independent native reviewer approved these scenarios and reran the eight offline checks:
+
+| Scenario | Required closeout behavior | Independent review |
+|---|---|---|
+| Muninn outage | Defer the exact memory action with target, owner/recheck; no transcript/local-memory workaround; independent review continues | Pass |
+| Read-only task | No new memory/file/graph/transcript authority; proposed changes remain unapplied, unrun checks are not green | Pass |
+| Healthy authorized closeout | Direct durable-delta writes, relevant checks and own-session closure proceed within scope; no duplicate confirmed transcript submission | Pass |
+
+Discovery: `.claude/skills/check-engine` resolves to the canonical source, and `.claude/harness/claude-local.md` already lists the skill. No duplicate generated skill body was found. All six generated projections still exactly match their canonical renderers, so no refresh was required for this follow-up.
+
+Actual task closeout status: transcript-hook submission/receipt verification to the intel-graph broker, Muninn recall/write-back, personal MEMORY.md resolution/read/sync, graph inspection/cleanup/embedding/test recording are **not run/deferred**, because live integrations and personal-memory access remain outside this task. The personal project-memory target was deliberately not resolved. Owner: repository owner; recheck at the next authorized continuity checkpoint or before a dependent decision, retaining current restrictions. Graph session closure is **not applicable: no graph session was started**. Local guidance tests are passed with evidence above; no live green or stored-memory claim is made. Publication/merge remains pending and conversational “continue” supplies no such authorization.
+
 - [x] Verify local normal-loop inspection recovery candidate: actual default-path Philote, pinned two-file snapshot, transactional LocalWork receipt, fenced resume and bounded retries. Actual-process acceptance, 11 ledger tests, 3 protected-boundary tests and 25 checkpoint regressions passed; focused review correction resolved. No normal session recovery-policy change or publication; see [contract](architecture/LOCAL_WORK_RECOVERY.md#normal-loop-inspection-candidate).
 
 - [x] Implement opt-in disposable IPC identity/commit boundary; see [contract](architecture/LOCAL_WORK_RECOVERY.md#follow-up-opt-in-disposable-ipc-commit-boundary). Local tests/review only; publication deferred. Feature-gated actual-Philote interruption/reconciliation fixture implemented; default runtime recovery remains unchanged.

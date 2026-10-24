@@ -35,9 +35,9 @@ This split matters because memory should make the next session sharper without b
 
 ## The Bootstrap Sequence
 
-At the start of every session (before responding to the user):
+At the start of every session, subject to the recovery/defer path below and current access restrictions:
 1.  **Bootstrap Muninn**: run `python3 scripts/muninn_mcp.py bootstrap`
-2.  **If bootstrap fails**: alert the user/operator immediately and do not continue without explicit approval
+2.  **If bootstrap fails**: disclose missing continuity and apply the recovery/defer path; pause dependent actions
 3.  **Recall Self**: `muninn_recall(identity, operating_posture)`
 4.  **Recall User**: `muninn_recall(user_preferences, collaboration_style)`
 5.  **Recall Topic**: `muninn_where_left_off` + `muninn_recall(active_goal, architecture_decisions)`
@@ -49,10 +49,21 @@ If the shared helper or Muninn MCP is unavailable or cannot be recovered automat
 
 - say so immediately
 - do not imply memory retrieval occurred
-- pause and require explicit approval before proceeding without Muninn
+- pause dependent actions; use the bounded recovery/defer path for independent authorized work
 - if approval is granted, say clearly that you are continuing on observed repo/runtime truth only
 
-## Memory Triad
+## Recovery and Temporary Defer
+
+Muninn is the default, not an easy opt-out. Apply this decision path before invoking recovery; existing task restrictions and policy still control every action.
+
+1. **Required now.** If correctness depends on missing durable decisions/history, memory functionality, or live memory acceptance, pause that dependent action until the evidence is available. Current source/tests cannot substitute for recall or live acceptance. Continue independent authorized work.
+2. **Restore first.** Ask one bounded question about the actual target, transport and service health. Distinguish local unavailability from frontdoor/cloud, authentication, broker/authorization, missing-tools and functional errors. The existing `python3 scripts/muninn_mcp.py health` checks protocol connection and required tools; `require` checks readiness without starting a server. Both still require authorized target access. For an authorized local-start recovery only, `bootstrap` tries the existing `muninn start`/local-server fallback and checks again; it does not start locally for frontdoor failure. Do not invoke bootstrap blindly for authentication or broker failure. `just session-start` also has graph/idea/harness side effects and is not a minimal diagnostic. Never change credentials, grant access, restart blindly, or route around a denied action. Preserve sanitized error categories and revise the hypothesis after an inconclusive check, without arbitrary retry loops or asking again for each already-authorized non-sensitive check.
+3. **Temporary defer.** Owner-authorized bounded Muninn repair (including its guidance), isolated tests, or time-sensitive independent work may proceed from sufficient current repository/task evidence. Explicitly state missing continuity, the specific allowed scope, the responsible owner, and a recheck trigger: before any memory-dependent decision or at the next meaningful checkpoint. Do not access personal memory under the repair exception, claim recall occurred, mark recovery complete, or silently drop the pending recovery. Preserve explicit restrictions; ordinary memory-dependent work remains blocked.
+4. **Verify and reconcile.** Recovery means successful authorized protocol readiness and the functional operation needed by the task, not a PID or HTTP response. A tools-list success is protocol readiness, not proof of recall. Once access is authorized and restored, re-read only relevant continuity and reconcile provisional decisions before dependent work. Write only authorized durable deltas, never transcripts. This rule grants no sensitive read/write or new grant authority.
+
+Use the existing task/handoff record for the defer owner, scope and recheck; no separate permission system is needed. Approval already supplied for that bounded scope need not be requested again absent material scope change or a required action-time confirmation (AGENTS.md §8.3).
+
+## Memory Triad Questions
 
 Prefer organizing memory around three questions:
 
@@ -76,7 +87,7 @@ Prefer organizing memory around three questions:
 
 ### During active work: delegate writes to background subagents
 
-During an active session, delegate Muninn writes to background subagents so the main thread is never blocked.
+Only after authorized recovery and with authorization for the specific memory access, delegate permitted Muninn writes to background subagents so the main thread is never blocked. The same restriction applies to direct closeout writes and foreground recall below. Temporary defer never authorizes a memory read/write or a recall subagent.
 
 **Exception — session close (check-engine):** call `muninn_remember` / `muninn_remember_batch` directly in the main thread. Do not delegate to a background subagent at close-out — the session may end before the subagent completes, losing the writes. Direct calls at check-engine time are correct and expected.
 
@@ -89,11 +100,7 @@ Trigger recall:
 - when the conversation shifts to a new topic
 - before architectural decisions or proposals
 
-But before any recall attempt, the main thread should first verify the bootstrap gate with:
-
-- `python3 scripts/muninn_mcp.py bootstrap`
-
-If that gate fails, the main thread should not spawn recall subagents until the user/operator has explicitly approved proceeding without Muninn.
+Before any recall attempt, apply the recovery/defer path and verify authorized protocol readiness with `python3 scripts/muninn_mcp.py require`. Use `bootstrap` only for the authorized local-start recovery described above. Do not spawn recall subagents while access is unavailable or prohibited. Approval to proceed without Muninn is not permission to access memory; resume recall only after authorized recovery and within the specific read scope.
 
 **Write → background subagent** (fire and forget):
 

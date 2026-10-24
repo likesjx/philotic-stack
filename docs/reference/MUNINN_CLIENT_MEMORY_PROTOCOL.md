@@ -64,6 +64,8 @@ Do not retrieve for trivial chatter.
 
 ## Retrieval Sequence
 
+Muninn remains the default. Before the sequence below when unavailable or restricted, apply the [recovery/defer path](../../skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer): pause memory-dependent actions, restore only through authorized target-specific paths, or record bounded independent work with missing continuity, owner and recheck. Deferral does not authorize memory access. Reconcile relevant continuity only after authorized recovery; write only authorized durable deltas.
+
 1. Call `muninn_where_left_off`
 2. Call `muninn_recall`
 
@@ -73,11 +75,11 @@ When calling `muninn_recall`, bias the query around:
 - who am I talking to
 - what matters about this topic right now
 
-Before starting that sequence, clients should run the shared bootstrap gate:
+Before starting that sequence, and only within authorized target access, clients should check readiness without starting a service:
 
-- `python3 scripts/muninn_mcp.py bootstrap`
+- `python3 scripts/muninn_mcp.py require`
 
-That bootstrap should:
+For an authorized local-start recovery, `python3 scripts/muninn_mcp.py bootstrap` can:
 
 - confirm Muninn is already ready, or
 - attempt to start the local Muninn service when it is merely down, then re-check readiness
@@ -86,7 +88,7 @@ If that gate fails:
 
 - the client must alert the user/operator immediately
 - the client must not pretend retrieval occurred
-- the client must obtain explicit approval before continuing without Muninn
+- the client must pause dependent actions and follow the recovery/defer path; existing approval for bounded independent work need not be requested again
 
 ## When To Write Back
 

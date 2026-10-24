@@ -17,11 +17,11 @@ The first three are the standing loop. Retrospective is not mandatory for every 
 
 ### S — Start
 
-At session start or when resuming meaningful work:
+At session start or when resuming meaningful work, first apply the [Muninn recovery/defer path](../../skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer) when unavailable or restricted. It governs the bootstrap steps below; memory-dependent actions remain paused, and bounded independent work records missing continuity, owner and recheck.
 
 - do Muninn bootstrap and orientation (`just session-start` — also runs harness drift check)
 - retrieve Muninn continuity with the self/user/topic triad before decisions, resumed work, or implementation
-- if Muninn cannot bootstrap, stop for explicit operator approval before continuing on observed repo/runtime truth only
+- if Muninn cannot bootstrap, disclose missing continuity and use that recovery/defer path; preserve existing authorization and restrictions
 - when the graph server is reachable, `just session-start` also claims a visible graph session/workstream on the board using the `session-start-bootstrap-slice` seam
 - identify the current owner of truth
 - inspect the relevant code, tests, and nearby docs
