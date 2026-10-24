@@ -37,6 +37,7 @@ def main():
  assert all(not os.path.lexists(pathlib.Path('/etc/systemd/system',u))for u in UNITS)
  assert subprocess.run(['docker','inspect','jaredlikes-com-production'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
  assert pathlib.Path('/proc/sys/fs/suid_dumpable').read_text().strip()in('0','2')
+ parent_mode=ROOT.parent.stat().st_mode&0o7777 if ROOT.parent.exists()else None
  created_users=[];created_groups=[];work=pathlib.Path(tempfile.mkdtemp(prefix='introspection-owner-ci-',dir='/run'));project='muninn-introspection-fixture';cases=[]
  try:
   for name,uid,gid in [('philotic',999,987),('percival-gateway',1003,1003)]:
@@ -49,6 +50,14 @@ def main():
   try:pwd.getpwnam('deploy')
   except KeyError:subprocess.run(['useradd','--system','--no-create-home','--shell','/usr/sbin/nologin','deploy'],check=True);created_users.append('deploy')
   ROOT.mkdir(parents=True,mode=0o755)
+  # mkdir(parents=True) does not apply its mode to intermediate directories.
+  # The preceding disposable handoff fixture may leave this root-owned parent
+  # at the runner's group-writable umask. Normalize only this fixture parent,
+  # preserve its original mode, and keep the production source guard unchanged.
+  assert ROOT.parent.lstat().st_uid==0 and not ROOT.parent.is_symlink()
+  ROOT.parent.chmod(0o755)
+  for part in [ROOT,*ROOT.parents]:
+   st=part.lstat();assert st.st_uid==0 and not part.is_symlink()and not st.st_mode&0o022,('untrusted_fixture_install_parent',str(part),st.st_uid,oct(st.st_mode&0o777))
   for name in('provision.py','adapters.py','introspection.py','introspection_owner.py','introspection_compose.py','private_key_handoff.py'):shutil.copyfile(HERE/name,ROOT/name);(ROOT/name).chmod(0o644)
   binary=HERE.parent/'synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper';shutil.copyfile(binary,ROOT/'persistent-broker-helper');(ROOT/'persistent-broker-helper').chmod(0o755)
   helper_sha=hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -107,7 +116,13 @@ def main():
    if p.exists():shutil.rmtree(p)
   shutil.rmtree(work)
   for name in reversed(created_users):subprocess.run(['userdel',name],check=True)
-  for name in reversed(created_groups):subprocess.run(['groupdel',name],check=True)
+  for name in reversed(created_groups):
+   # userdel may already remove the user's now-empty private group.
+   try:grp.getgrnam(name)
+   except KeyError:continue
+   subprocess.run(['groupdel',name],check=True)
+  if parent_mode is not None:ROOT.parent.chmod(parent_mode)
+  elif ROOT.parent.exists():ROOT.parent.rmdir()
   assert not pathlib.Path('/run/percival-personal-vault-broker.sock').exists()and not list(pathlib.Path('/run').glob('persistent-key-*'))
   print(json.dumps({'fixtureCleanupCompleted':True,'productionUsed':False}))
 if __name__=='__main__':main()
