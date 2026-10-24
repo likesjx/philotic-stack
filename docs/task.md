@@ -2,6 +2,8 @@
 
 ## Bounded project-guidance repair — 2026-10-24
 
+Publication phase: after local review at `6a8dfeadea82fe32268bf7284955b811cf4a5c1b`, the owner explicitly approved publishing this branch, a draft PR into develop, exact-revision CI/review, and merge only after those pass. Earlier local-only restrictions below describe the implementation phase; production, memory, graph, grants and unrelated-checkout restrictions remain in force. Current develop is integrated while preserving its concurrent task entries. `.github/workflows/guidance-contract.yml` adds a dedicated exact-head offline guidance gate; PR/merge evidence will be reported from GitHub rather than inferred from local checks.
+
 - Implemented locally: conditional installed-runtime gate, bounded diagnosis, end-to-end closeout, approval handoff evidence, and Muninn restore/defer/reconcile guidance. See [AGENTS](../AGENTS.md), [closeout](../skills/philotic-slice-closeout/SKILL.md), and [memory recovery](../skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer).
 - Authority: owner request “Implement the skills and rules”, carried by the bounded delegation from thread `01a1576b-fa36-768d-bd1f-bab7704e800f`; refined by “I do want to push the use of muninn but there should be a clear defined way to get it back up and to know when to make sure it’s up versus when to defer it”. Scope: local guidance edits, isolated checks and scoped commit on mbp-jane. No SSH, production, credentials, personal memory, grants, deployment, restarts, external-agent contact, app approval-rule changes, push or merge. This is not authorization to retry the denied production action.
 - Missing continuity: no Muninn recall or recovery was attempted under this task's restrictions. Owner: repository owner; recheck at the next meaningful checkpoint or before any memory-dependent decision, subject to fresh target-access authorization. Repository/task evidence supports only this repair. No memory delta written and no recovery/recall claim made.
@@ -61,6 +63,8 @@ Discovery: `.claude/skills/check-engine` resolves to the canonical source, and `
 
 Actual task closeout status: transcript-hook submission/receipt verification to the intel-graph broker, Muninn recall/write-back, personal MEMORY.md resolution/read/sync, graph inspection/cleanup/embedding/test recording are **not run/deferred**, because live integrations and personal-memory access remain outside this task. The personal project-memory target was deliberately not resolved. Owner: repository owner; recheck at the next authorized continuity checkpoint or before a dependent decision, retaining current restrictions. Graph session closure is **not applicable: no graph session was started**. Local guidance tests are passed with evidence above; no live green or stored-memory claim is made. Publication/merge remains pending and conversational “continue” supplies no such authorization.
 
+- [x] Verify local normal-loop inspection recovery candidate: actual default-path Philote, pinned two-file snapshot, transactional LocalWork receipt, fenced resume and bounded retries. Actual-process acceptance, 11 ledger tests, 3 protected-boundary tests and 25 checkpoint regressions passed; focused review correction resolved. No normal session recovery-policy change or publication; see [contract](architecture/LOCAL_WORK_RECOVERY.md#normal-loop-inspection-candidate).
+
 - [x] Implement opt-in disposable IPC identity/commit boundary; see [contract](architecture/LOCAL_WORK_RECOVERY.md#follow-up-opt-in-disposable-ipc-commit-boundary). Local tests/review only; publication deferred. Feature-gated actual-Philote interruption/reconciliation fixture implemented; default runtime recovery remains unchanged.
 
 - [ ] Release read-only LifeGraph issuer/gateway composition after exact binding approval, Linux owner acceptance, and issuer Mongo gates. Versioned delegated-binding resolver and local typecheck implemented: [implementation notes](../services/personal-mcp/LIFEGRAPH_READONLY_IMPLEMENTATION.md).
@@ -86,6 +90,16 @@ Actual task closeout status: transcript-hook submission/receipt verification to 
 - [ ] ~~Extract the smallest safe primitive crate boundary once the interface map is stable.~~
 
 ## Current Work Item Split
+
+### Preserved model catalog parsers
+
+- [x] Extract pure OpenAI, Anthropic and Ollama listing parsers from preserved `model-graph-s123`; seven focused discovery tests and independent review pass. Unreported capability/pricing facts stay unknown. This source-only extraction adds no polling, credential access or network fallback.
+- [ ] Review config-only multi-provider browsing separately; preserve governed discovery transport and last-good catalogs. Graph projection and authenticated polling from the archival branch are not integrated.
+
+### Scripted Hotel Sensors
+
+- [ ] Consolidate duplicate sensor branches in an isolated local candidate; both crates keep the nondefault `scripted-sensors` gate. Validate engine, injected provider I/O and cron routing before review and publication.
+- [ ] Before any activation, separately review authenticated approval, full LifeGraph/config callback authority, delivery destinations and callback deadlines. No production scripts, jobs or services are installed by consolidation. See [scope and limits](architecture/SCRIPTED_HOTEL_SENSORS_PROPOSAL.md).
 
 ### LifeGraph capture Memgraph compatibility — runtime off (PR #668)
 

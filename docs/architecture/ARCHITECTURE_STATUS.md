@@ -47,6 +47,17 @@ tracks_domains:
 
 # Philotic Architecture Status
 
+Local consolidation candidate (2026-10-19): scripted hotel sensors remain behind
+nondefault features in both aiua and data-memorygraphrag. Default cron and heartbeat
+behavior stays unchanged. Host callbacks retain full underlying authority; activation
+requires a separate authority review. See [scope and limits](SCRIPTED_HOTEL_SENSORS_PROPOSAL.md).
+
+Local candidate (2026-10-17): one opt-in `development.inspect_manifest` task now
+runs through normal Philote startup and inbound dispatch, with a pinned snapshot,
+LocalWork receipt, fenced reconciliation and bounded retries. The hotel adapter
+is explicit local API surface, not production startup wiring. Ordinary session
+recovery remains unchanged. See [contract and limits](LOCAL_WORK_RECOVERY.md#normal-loop-inspection-candidate).
+
 Opt-in disposable IPC now supports kernel-bound registration and retirement-fenced
 local synthetic receipt/checkpoint writes; it is not installed in production and
 has a feature-gated actual-Philote disposable recovery test; default turn restoration

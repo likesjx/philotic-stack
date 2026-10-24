@@ -1,0 +1,58 @@
+name: Guidance Contract
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'CODEX.md'
+      - 'GEMINI.md'
+      - 'docs/process/WORKFLOW.md'
+      - 'docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md'
+      - 'skills/**'
+      - '.claude/harness/**'
+      - '.claude/skills/**'
+      - '.agents/workflows/**'
+      - 'crates/philotic-web/src/harness.rs'
+      - 'scripts/render_guidance_projections.py'
+      - 'scripts/tests/test_guidance_contract.py'
+      - '.github/workflows/guidance-contract.yml'
+  push:
+    branches: [develop]
+    paths:
+      - 'skills/**'
+      - '.claude/**'
+      - '.agents/**'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'CODEX.md'
+      - 'GEMINI.md'
+      - 'docs/process/WORKFLOW.md'
+      - 'docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md'
+      - 'crates/philotic-web/src/harness.rs'
+      - 'scripts/render_guidance_projections.py'
+      - 'scripts/tests/test_guidance_contract.py'
+      - '.github/workflows/guidance-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  guidance:
+    name: offline guidance contract (exact revision)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - name: Verify source, discovery and exact generated outputs offline
+        run: python3 scripts/tests/test_guidance_contract.py

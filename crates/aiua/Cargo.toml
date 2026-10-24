@@ -3,7 +3,12 @@ name = "aiua"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Dormant integration only; production builds do not route scripted sensors.
+scripted-sensors = []
+
 [dependencies]
+graph-intelligence = { path = "../graph-intelligence" }
 libc = "0.2"
 signal-hook-registry = "1"
 aes-gcm = "0.10"
@@ -38,6 +43,3 @@ hex = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 webrtc = "0.17.1"
-
-[dev-dependencies]
-graph-intelligence = { path = "../graph-intelligence" }

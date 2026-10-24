@@ -994,6 +994,10 @@ impl AgentRuntime {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        if std::env::var("PHILOTIC_LOCAL_INSPECTION").as_deref() == Ok("1") {
+            super::development_inspection::ensure_inspection_peer(&mut self.ipc_client)?;
+            println!("NORMAL_RUNTIME_ENTER pid={}", std::process::id());
+        }
         info!("Listening for inbound Persona tasks from the Philotic Web...");
         self.fetch_agent_profile().await;
         self.fetch_default_fallback_tiers().await;
@@ -1082,6 +1086,20 @@ impl AgentRuntime {
                         );
                     }
 
+                    if serde_json::from_str::<Value>(&task_json)
+                        .ok()
+                        .is_some_and(|v| {
+                            v["action"] == philotic_client::development_inspection::ACTION
+                        })
+                    {
+                        if let Err(e) = self.inspect_development_snapshot(&task_json).await {
+                            println!(
+                                "NORMAL_INSPECTION_BLOCKED pid={} reason={e}",
+                                std::process::id()
+                            );
+                        }
+                        continue;
+                    }
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
                             let task_ref = task.clone();
