@@ -40,6 +40,7 @@ def main():
  parent_mode=ROOT.parent.stat().st_mode&0o7777 if ROOT.parent.exists()else None
  opt=pathlib.Path('/opt');opt_stat=opt.lstat();assert opt_stat.st_uid==0 and not opt.is_symlink()
  opt_mode=opt_stat.st_mode&0o7777
+ original_umask=os.umask(0o022)
  created_users=[];created_groups=[];work=pathlib.Path(tempfile.mkdtemp(prefix='introspection-owner-ci-',dir='/run'));project='muninn-introspection-fixture';cases=[]
  try:
   for name,uid,gid in [('philotic',999,987),('percival-gateway',1003,1003)]:
@@ -71,7 +72,7 @@ def main():
   verifier='/home/deploy/.config/jaredlikes-com/personal-oauth-verifier.env';before_verifier='PERSONAL_OAUTH_INTROSPECTION_VERIFIER='+'b'*64+'\n';write(verifier,before_verifier,0o600)
   hotel=pathlib.Path('/opt/philotic/bin/aiua');hotel.parent.mkdir();shutil.copyfile(pathlib.Path('/usr/bin/python3').resolve(),hotel);hotel.chmod(0o755);write('/opt/philotic/fixture_hotel.py',HOTEL)
   write('/etc/systemd/system/philotic-hotel.service','[Unit]\nRequires=percival-personal-vault.socket\nAfter=percival-personal-vault.socket\n[Service]\nUser=philotic\nGroup=philotic\nExecStart=/opt/philotic/bin/aiua -I -B /opt/philotic/fixture_hotel.py\n')
-  write('/etc/systemd/system/percival-personal-vault.socket','[Socket]\nListenStream=/run/percival-personal-vault-broker.sock\nSocketUser=percival-gateway\nSocketGroup=percival-gateway\nSocketMode=0600\nService=philotic-hotel.service\n')
+  write('/etc/systemd/system/percival-personal-vault.socket','[Socket]\nListenStream=/run/percival-personal-vault-broker.sock\nSocketUser=percival-gateway\nSocketGroup=percival-gateway\nSocketMode=0600\nRemoveOnStop=yes\nService=philotic-hotel.service\n')
   write('/etc/systemd/system/percival-personal-mcp.service','[Service]\nUser=percival-gateway\nGroup=percival-gateway\nExecStart=/usr/bin/sleep 600\n')
   run(['systemctl','daemon-reload']);run(['systemctl','start','percival-personal-vault.socket','philotic-hotel.service','percival-personal-mcp.service'])
   compose=pathlib.Path('/home/deploy/jaredlikes-com/docker-compose.yml');write(compose,'services:\n  app:\n    image: '+IMAGE+'\n    container_name: jaredlikes-com-production\n    network_mode: none\n    environment:\n      PERSONAL_OAUTH_ENABLED: "false"\n')
@@ -129,6 +130,7 @@ def main():
   if parent_mode is not None:ROOT.parent.chmod(parent_mode)
   elif ROOT.parent.exists():ROOT.parent.rmdir()
   opt.chmod(opt_mode)
+  os.umask(original_umask)
   assert not pathlib.Path('/run/percival-personal-vault-broker.sock').exists()and not list(pathlib.Path('/run').glob('persistent-key-*'))
   print(json.dumps({'fixtureCleanupCompleted':True,'productionUsed':False}))
 if __name__=='__main__':main()
