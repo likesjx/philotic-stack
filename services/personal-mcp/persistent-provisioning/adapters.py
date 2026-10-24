@@ -1,4 +1,5 @@
 """Concrete localhost Muninn admin and protected hotel-vault subprocess adapters."""
+import select,time
 import base64, ctypes, hashlib, http.cookiejar, json, os, re, resource, signal, stat, subprocess, sys, urllib.error, urllib.request
 from pathlib import Path
 from provision import require,ROLE,GUEST,INTROSPECTION
@@ -47,7 +48,7 @@ def protect_operator():
     libc=ctypes.CDLL(None,use_errno=True)
     require(libc.prctl(4,0,0,0,0)==0 and libc.prctl(3,0,0,0,0)==0) # PR_SET/GET_DUMPABLE
 
-def run_helper(request,key,expected_hash,*,timeout=35):
+def run_helper(request,key,expected_hash,*,timeout=35,allocation=None):
     """Exactly one helper process per store; no resident key-bearing broker.
 
     The launcher/helper share a process group. Any timeout kills and waits for
@@ -62,11 +63,23 @@ def run_helper(request,key,expected_hash,*,timeout=35):
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,pass_fds=(r,),
             start_new_session=True,env={'PATH':'/usr/bin:/bin'})
         os.close(r);r=None
-        try:output,_=proc.communicate(json.dumps(request).encode(),timeout=timeout)
+        try:
+            if allocation is None:output,_=proc.communicate(json.dumps(request).encode(),timeout=timeout)
+            else:
+                deadline=time.monotonic()+timeout
+                proc.stdin.write(json.dumps(request).encode()+b'\n');proc.stdin.flush();line=b''
+                while not line.endswith(b'\n'):
+                    require(len(line)<4096)
+                    require(select.select([proc.stdout],[],[],max(0,deadline-time.monotonic()))[0]);part=os.read(proc.stdout.fileno(),1);require(bool(part));line+=part
+                result=json.loads(line);require(set(result)=={'allocated_reference'});ref=result['allocated_reference']
+                require(isinstance(ref,str)and re.fullmatch('secret://hotel/default/percival-issuer-introspection/[a-f0-9]{32}',ref))
+                allocation(ref) # MUST persist durably before authorizing any DB write.
+                proc.stdin.write(json.dumps({'commit':ref}).encode()+b'\n');proc.stdin.flush();proc.stdin.close();proc.stdin=None
+                output,_=proc.communicate(timeout=max(.001,deadline-time.monotonic()))
         except BaseException:
             os.killpg(proc.pid,signal.SIGKILL);proc.wait();raise
         require(proc.returncode==0 and 0<len(output)<=4096)
-        result=json.loads(output);require(isinstance(result,dict) and set(result)=={'reference'})
+        result=json.loads(output);require(isinstance(result,dict) and(set(result)=={'reference'}if request['operation']!='reconcile_introspection'else set(result)=={'status'}and result['status']in('stored','absent','mismatch')))
         return result
     finally:
         if r is not None:os.close(r)
@@ -80,11 +93,16 @@ class Broker:
         require(isinstance(key,bytes) and len(key)==44 and base64.b64encode(base64.b64decode(key,validate=True))==key and len(base64.b64decode(key))==32)
         require(re.fullmatch('[0-9a-f]{64}',expected_hash) is not None)
         self.key=key;self.expected_hash=expected_hash
-    def store_exact_acl(self,*,kind,scope,secret,allowed_roles,allowed_guests):
+    def store_exact_acl(self,*,kind,scope,secret,allowed_roles,allowed_guests,allocation=None):
         require(allowed_roles==[ROLE] and allowed_guests==[GUEST])
         require((kind=='percival-muninn-observe' and isinstance(scope,str) and re.fullmatch('[a-z0-9_-]{1,64}',scope)) or
                 (kind=='percival-issuer-introspection' and scope==INTROSPECTION))
         require(isinstance(secret,str) and 32<=len(secret)<4096 and not re.search(r'[\x00-\x20\x7f]',secret))
-        return run_helper({'operation':'create','kind':kind,'scope':scope,'secret':secret,
-            'allowed_roles':allowed_roles,'allowed_guests':allowed_guests},self.key,self.expected_hash)
+        require(allocation is None or kind=='percival-issuer-introspection')
+        return run_helper({'operation':'create_introspection'if allocation is not None else'create','kind':kind,'scope':scope,'secret':secret,
+            'allowed_roles':allowed_roles,'allowed_guests':allowed_guests},self.key,self.expected_hash,**({}if allocation is None else{'allocation':allocation}))
+    def reconcile_introspection(self,reference,verifier):
+        require(isinstance(reference,str)and re.fullmatch('secret://hotel/default/percival-issuer-introspection/[a-f0-9]{32}',reference))
+        require(isinstance(verifier,str)and re.fullmatch('[a-f0-9]{64}',verifier))
+        return run_helper({'operation':'reconcile_introspection','kind':'percival-issuer-introspection','scope':INTROSPECTION,'reference':reference,'verifier':verifier,'allowed_roles':[ROLE],'allowed_guests':[GUEST]},self.key,self.expected_hash)
     def close(self):self.key=b''

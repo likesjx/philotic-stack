@@ -2,7 +2,7 @@
 mod vault;
 mod private_start;
 use anyhow::{ensure,Result};
-use std::{io::{self,Read},sync::Arc};
+use std::{io::{self,Read,BufRead,Write},sync::Arc};
 use ansible_mesh_core::{domain::GraphDomain,sqlite_storage::SqliteGraphStorage};
 const ROLE:&str="percival-personal-recall";
 const GUEST:&str="percival-personal-gateway";
@@ -15,19 +15,37 @@ fn request_scope(req:&serde_json::Value)->Result<(&str,&str)> {
   _=>anyhow::bail!("kind")
  };Ok((kind,scope))
 }
+fn verifier(value:&str)->String {use base64::Engine;use sha2::{Digest,Sha256};let header=format!("Basic {}",base64::engine::general_purpose::STANDARD.encode(format!("percival_gateway_persistent_recall_v1:{value}")));format!("{:x}",Sha256::digest(header.as_bytes()))}
+fn graph_for_existing()->Result<GraphDomain>{let db="/opt/philotic/data/aiua_context.db";ensure!(std::path::Path::new(db).is_file(),"existing db");let storage=SqliteGraphStorage::open_existing(db)?;Ok(GraphDomain::new(Arc::new(storage.adapter())))}
 fn run()->Result<()> {
  ensure!(std::env::args().nth(1).as_deref()==Some("--apply-scoped-persistent"),"approval");
  ensure!(std::env::args().nth(2).as_deref()==Some("--root-private-start"),"private start");
  private_start::enter()?;
  private_start::receive_key(std::env::args().nth(3).ok_or_else(||anyhow::anyhow!("channel"))?.parse()?)?;
  ensure!(std::env::var_os("PHILOTIC_VAULT_MASTER_KEY").is_none() && std::env::var("PHILOTIC_VAULT_KEYCHAIN").as_deref()==Ok("0"),"key contract");
- let mut raw=String::new();io::stdin().take(16385).read_to_string(&mut raw)?;ensure!(raw.len()<=16384,"size");
+ let mut input=io::stdin().lock();let mut raw=String::new();(&mut input).take(16385).read_line(&mut raw)?;ensure!(raw.len()<=16384,"size");
  let req:serde_json::Value=serde_json::from_str(&raw)?;let (kind,scope)=request_scope(&req)?;
- ensure!(req["operation"]=="create","operation");
+ let operation=req["operation"].as_str().unwrap_or("");
+ ensure!(matches!(operation,"create"|"create_introspection"|"reconcile_introspection"),"operation");
+ if operation!="create" {ensure!(kind=="percival-issuer-introspection","kind");}
+ if operation=="reconcile_introspection" {
+  let reference=req["reference"].as_str().unwrap_or("");let prefix="secret://hotel/default/percival-issuer-introspection/";
+  ensure!(reference.starts_with(prefix)&&reference.len()==prefix.len()+32&&reference[prefix.len()..].bytes().all(|c|c.is_ascii_hexdigit()&&!c.is_ascii_uppercase()),"reference");
+  let expected=req["verifier"].as_str().unwrap_or("");ensure!(expected.len()==64&&expected.bytes().all(|c|c.is_ascii_hexdigit()&&!c.is_ascii_uppercase()),"verifier");
+  let graph=graph_for_existing()?;
+  let status=match vault::reconcile_introspection_value(&graph,reference)? {None=>"absent",Some(value)=>if verifier(&value)==expected{"stored"}else{"mismatch"}};println!("{}",serde_json::json!({"status":status}));return Ok(());
+ }
  let secret=req["secret"].as_str().unwrap_or("");ensure!((32..4096).contains(&secret.len()) && !secret.bytes().any(|b|b<=32 || b==127),"secret");
  let db="/opt/philotic/data/aiua_context.db";ensure!(std::path::Path::new(db).is_file(),"existing db required");
  let storage=SqliteGraphStorage::open_existing(db)?;let graph=GraphDomain::new(Arc::new(storage.adapter()));
- let reference=vault::store_secret(&graph,vault::SecretInput{secret_kind:kind.into(),scope:scope.into(),allowed_roles:vec![ROLE.into()],allowed_guests:vec![GUEST.into()],plaintext:secret.into()})?;
+ let value=vault::SecretInput{secret_kind:kind.into(),scope:scope.into(),allowed_roles:vec![ROLE.into()],allowed_guests:vec![GUEST.into()],plaintext:secret.into()};
+ let reference=if operation=="create_introspection" {
+  vault::store_secret_with_allocation(&graph,value,|reference|{
+   println!("{}",serde_json::json!({"allocated_reference":reference}));io::stdout().flush()?;
+   let mut ack=String::new();(&mut input).take(257).read_line(&mut ack)?;ensure!(ack.len()<=256,"ack bound");
+   ensure!(serde_json::from_str::<serde_json::Value>(&ack)?==serde_json::json!({"commit":reference}),"durable commit acknowledgement");Ok(())
+  })?
+ }else{vault::store_secret(&graph,value)?};
  let row=graph.get_secret(&reference)?.ok_or_else(||anyhow::anyhow!("readback"))?;
  ensure!(row.secret_kind==kind && row.scope==scope && row.allowed_roles==[ROLE] && row.allowed_guests==[GUEST],"readback");
  ensure!(vault::resolve_secret_exact_acl(&graph,&reference,&vault::SecretAccess{role:ROLE.into(),guest_id:GUEST.into()})?.as_deref()==Some(secret),"readback");
@@ -65,4 +83,29 @@ fn main(){if run().is_err(){eprintln!("persistent broker stopped; reconcile jour
   std::fs::remove_dir_all(dir).unwrap();
  }
 
+}
+#[cfg(test)]mod allocation_tests {
+ use super::*;
+ #[test]fn fresh_allocation_can_refuse_before_any_store(){
+  use base64::Engine;
+  unsafe{std::env::set_var("PHILOTIC_VAULT_MASTER_KEY",base64::engine::general_purpose::STANDARD.encode([7u8;32]));}
+  let store=SqliteGraphStorage::open_in_memory().unwrap();let graph=GraphDomain::new(Arc::new(store.adapter()));let mut allocated=String::new();
+  let out=vault::store_secret_with_allocation(&graph,vault::SecretInput{secret_kind:"percival-issuer-introspection".into(),scope:"percival_gateway_persistent_recall_v1".into(),allowed_roles:vec![ROLE.into()],allowed_guests:vec![GUEST.into()],plaintext:"PUBLIC_SYNTHETIC_CREDENTIAL_123456789".into()},|r|{allocated=r.into();anyhow::bail!("no durable ack")});
+  assert!(out.is_err());assert!(allocated.starts_with("secret://hotel/default/percival-issuer-introspection/"));assert!(graph.get_secret(&allocated).unwrap().is_none());
+ }
+ #[test]fn verifier_matches_existing_basic_contract(){assert_eq!(verifier("PUBLIC_SYNTHETIC_CREDENTIAL_123456789").len(),64);assert_ne!(verifier("a"),verifier("b"));}
+}
+#[cfg(test)]mod reconciliation_tests {
+ use super::*;
+ #[test]fn committed_fresh_record_reconciles_and_scope_changes_refuse(){
+  use base64::Engine;
+  unsafe{std::env::set_var("PHILOTIC_VAULT_MASTER_KEY",base64::engine::general_purpose::STANDARD.encode([7u8;32]));}
+  let store=SqliteGraphStorage::open_in_memory().unwrap();let graph=GraphDomain::new(Arc::new(store.adapter()));
+  let secret="PUBLIC_SYNTHETIC_INTROSPECTION_123456789";
+  let reference=vault::store_secret_with_allocation(&graph,vault::SecretInput{secret_kind:"percival-issuer-introspection".into(),scope:"percival_gateway_persistent_recall_v1".into(),allowed_roles:vec![ROLE.into()],allowed_guests:vec![GUEST.into()],plaintext:secret.into()},|r|{assert!(graph.get_secret(r)?.is_none());Ok(())}).unwrap();
+  assert_eq!(vault::reconcile_introspection_value(&graph,&reference).unwrap().as_deref(),Some(secret));
+  assert_eq!(verifier(&vault::reconcile_introspection_value(&graph,&reference).unwrap().unwrap()),verifier(secret));
+  assert!(vault::reconcile_introspection_value(&graph,"secret://hotel/default/percival-issuer-introspection/missing").unwrap().is_none());
+  let mut row=graph.get_secret(&reference).unwrap().unwrap();row.allowed_guests.push("unrelated".into());graph.upsert_secret(&row).unwrap();assert!(vault::reconcile_introspection_value(&graph,&reference).is_err());
+ }
 }

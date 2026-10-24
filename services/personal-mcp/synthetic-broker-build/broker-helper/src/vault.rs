@@ -32,6 +32,12 @@ pub struct SecretInput {
 }
 
 pub fn store_secret(graph: &GraphDomain, input: SecretInput) -> Result<String> {
+    store_secret_with_allocation(graph, input, |_| Ok(()))
+}
+
+/// Helper lifecycle hook: allocation is always fresh; caller cannot choose a reference.
+/// Commit authorization must be durable before this hook returns.
+pub fn store_secret_with_allocation(graph: &GraphDomain, input: SecretInput, allocated: impl FnOnce(&str) -> Result<()>) -> Result<String> {
     let (ciphertext_b64, nonce_b64) = encrypt(&input.plaintext)?;
     let now = now_secs();
     let secret_ref = format!(
@@ -40,6 +46,7 @@ pub fn store_secret(graph: &GraphDomain, input: SecretInput) -> Result<String> {
         Uuid::new_v4().simple()
     );
 
+    allocated(&secret_ref)?;
     graph.upsert_secret(&SecretRecord {
         secret_ref: secret_ref.clone(),
         secret_kind: input.secret_kind,
@@ -692,4 +699,11 @@ mod tests {
             std::env::remove_var("PHILOTIC_VAULT_KEY_ID");
         }
     }
+}
+
+/// Read exactly the one allocated introspection record under its original scope.
+pub fn reconcile_introspection_value(graph:&GraphDomain,reference:&str)->Result<Option<String>> {
+ let Some(row)=graph.get_secret(reference)? else{return Ok(None)};
+ anyhow::ensure!(row.secret_kind=="percival-issuer-introspection"&&row.scope=="percival_gateway_persistent_recall_v1"&&row.allowed_roles==["percival-personal-recall"]&&row.allowed_guests==["percival-personal-gateway"],"scope");
+ Ok(Some(decrypt(&row)?))
 }

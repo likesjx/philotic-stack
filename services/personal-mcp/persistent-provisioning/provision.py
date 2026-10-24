@@ -159,8 +159,20 @@ def execute(m, journal, confirm, private_handoff):
 
 def main():
     import argparse,getpass,warnings
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['plan','apply']);p.add_argument('--manifest',required=True);p.add_argument('--journal')
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['plan','apply','introspection-plan','introspection-apply','introspection-reconcile']);p.add_argument('--manifest',required=True);p.add_argument('--journal')
     a=p.parse_args()
+    if a.action.startswith('introspection-'):
+        if a.action!='introspection-plan':
+            base=Path('/opt/percival-personal-mcp/provisioning')
+            require(sys.flags.isolated and sys.platform=='linux'and os.geteuid()==0 and Path(__file__).absolute()==base/'provision.py')
+            for file in ('provision.py','introspection.py','adapters.py','private_key_handoff.py','persistent-broker-helper'):
+                path=base/file
+                for part in [path,*path.parents]:
+                    st=part.lstat();require(not stat.S_ISLNK(st.st_mode)and st.st_uid==0 and not st.st_mode&0o022)
+                require(path.is_file())
+        sys.path.insert(0,str(Path(__file__).resolve().parent))
+        from introspection import cli
+        return cli(a)
     with open(a.manifest,'rb') as f:
         raw=f.read(65537);require(len(raw)<=65536);m=json.loads(raw)
     prepared=plan(m)
