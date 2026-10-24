@@ -6,7 +6,7 @@ import introspection_owner as o
 from provision import Journal,digest,Refused
 class Fixture:
  def __init__(self):
-  self.temp=tempfile.TemporaryDirectory(dir=Path(__file__).parent);self.root=Path(self.temp.name).resolve();self.fs=o.Files(str(self.root),{0,os.geteuid()});self.calls=[];self.active=True;self.loaded='old';self.env={'PERSONAL_OAUTH_ENABLED':'false'};self.initial_env=dict(self.env);self.fail=None
+  self.temp=tempfile.TemporaryDirectory(dir=Path(__file__).parent);self.root=Path(self.temp.name).resolve();self.fs=o.Files(str(self.root),{0,os.geteuid()});self.calls=[];self.active=True;self.loaded='old';self.env={'PERSONAL_OAUTH_ENABLED':'false'};self.initial_env=dict(self.env);self.fail=None;self.job='Job=\n'
   self.props={k:''for k in o.PROPS};self.props.update(User='philotic',Group='philotic',ExecStart='{ argv[]=/public/fixture ; }')
   self.m={'schema':1,'host':'srv875272','observed_at':int(time.time()*1000),'policy_sha256':'','verifier_sha256':'','units':{},'source_files':{},'compose':{'project':'synthetic','working_directory':'/home/deploy/jaredlikes-com','files':[],'env_sha256':None},'access_boundary':'issuer-disabled-gateway-stopped-before-publication'}
   self.put(o.POLICY,b'{"caller_uid":1003,"hotel_uid":999,"secret_ref":"secret://hotel/default/percival-muninn-observe/unchanged", "introspection_secret_ref":"secret://hotel/default/percival-issuer-introspection/old"}\n',0o644);self.put(o.VERIFIER,b'PERSONAL_OAUTH_INTROSPECTION_VERIFIER='+b'b'*64+b'\n')
@@ -29,7 +29,9 @@ class Fixture:
   if argv[0]=='/usr/bin/timeout':argv=argv[4:]
   if argv[0]=='/usr/bin/systemctl':
    if argv[1]=='show':
-    if '--property=Job'in argv:return '0\n'
+    if '--property=Job'in argv:
+     assert '--all'in argv and '--value'not in argv
+     return self.job
     if '--property=ActiveState'in argv:return 'active\n'if self.active else'inactive\n'
     props=dict(self.props);props['FragmentPath']='/etc/systemd/system/'+argv[2];return '\n'.join(k+'='+v for k,v in props.items())
    if argv[1]=='stop':self.active=False
@@ -55,6 +57,11 @@ class Tests(unittest.TestCase):
    self.assertEqual(stat.S_IMODE(parent.stat().st_mode),before)
    for name in('first','first/second'):self.assertEqual(stat.S_IMODE((parent/name).stat().st_mode),0o755)
  def f(self):f=Fixture();self.addCleanup(f.close);return f
+ def test_job_requires_explicit_idle_property(self):
+  f=self.f();f.owner.guard(f.j.data)
+  for value in('', '0\n', '[not set]\n', 'Job=23\n', 'Other=\n'):
+   f.job=value
+   with self.subTest(value=value):self.assertRaises(Refused,f.owner.guard,f.j.data)
  def test_real_adapter_capture_cas_command_assembly_pair_and_recovery(self):
   f=self.f();original=f.fs.read(o.POLICY)[0];self.assertEqual(i.transition(f.manifest,f.j,f.owner)['outcome'],'introspection_adopted');self.assertEqual(f.loaded,f.j.data['introspection_secret_ref']);self.assertIn(b'unchanged',f.fs.read(o.POLICY)[0]);self.assertFalse(f.active);self.assertEqual(i.transition(f.manifest,f.j,f.owner,recover=True,prior_finished=True)['outcome'],'introspection_restored_closed');self.assertEqual(f.fs.read(o.POLICY)[0],original);self.assertEqual(f.env,{'PERSONAL_OAUTH_ENABLED':'false'});self.assertFalse(f.fs.path('/home/deploy/jaredlikes-com/muninn-introspection-only.override.yml').exists());self.assertTrue(f.fs.path('/home/deploy/jaredlikes-com/muninn-introspection-only.rollback.yml').exists())
  def test_real_adapter_refuses_file_drift_before_any_mutation(self):

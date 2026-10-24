@@ -131,7 +131,10 @@ class Owner:
  def guard(self,data,recover=False):
   self.identity()
   for unit in UNITS:
-   require(self.query(['/usr/bin/systemctl','show',unit,'--property=Job','--value']).strip()in('0','[not set]'))
+   # systemd v255 renders no queued job as an empty property. --all and the
+   # property name distinguish an explicit idle result from missing output.
+   # https://github.com/systemd/systemd/blob/v255/src/systemctl/systemctl-show.c#L1023
+   require(self.query(['/usr/bin/systemctl','show',unit,'--property=Job','--all']).strip()=='Job=')
   require(not self.fs.path('/nonexistent/muninn-introspection-config').exists())
   if not recover:require(0<=time.time()*1000-self.m['observed_at']<1800000)
   listed=set()
