@@ -87,7 +87,7 @@ Prefer organizing memory around three questions:
 
 ### During active work: delegate writes to background subagents
 
-During an active session, delegate Muninn writes to background subagents so the main thread is never blocked.
+Only after authorized recovery and with authorization for the specific memory access, delegate permitted Muninn writes to background subagents so the main thread is never blocked. The same restriction applies to direct closeout writes and foreground recall below. Temporary defer never authorizes a memory read/write or a recall subagent.
 
 **Exception — session close (check-engine):** call `muninn_remember` / `muninn_remember_batch` directly in the main thread. Do not delegate to a background subagent at close-out — the session may end before the subagent completes, losing the writes. Direct calls at check-engine time are correct and expected.
 
@@ -100,11 +100,7 @@ Trigger recall:
 - when the conversation shifts to a new topic
 - before architectural decisions or proposals
 
-But before any recall attempt, the main thread should first verify the bootstrap gate with:
-
-- `python3 scripts/muninn_mcp.py bootstrap`
-
-If that gate fails, the main thread should not spawn recall subagents until the user/operator has explicitly approved proceeding without Muninn.
+Before any recall attempt, apply the recovery/defer path and verify authorized protocol readiness with `python3 scripts/muninn_mcp.py require`. Use `bootstrap` only for the authorized local-start recovery described above. Do not spawn recall subagents while access is unavailable or prohibited. Approval to proceed without Muninn is not permission to access memory; resume recall only after authorized recovery and within the specific read scope.
 
 **Write → background subagent** (fire and forget):
 

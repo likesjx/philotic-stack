@@ -48,6 +48,8 @@ Remote native Muninn access must stay private: use loopback, a private overlay, 
 
 ## Default Habit
 
+Muninn remains the default. Before the steps below when unavailable or restricted, follow the [recovery/defer path](../muninn-memory-habit/SKILL.md#recovery-and-temporary-defer). Pause memory-dependent actions; independent owner-authorized repair records missing continuity, scope, owner and recheck. Deferral is not authorization to read/write memory. Bootstrap local-start recovery and subsequent recall/write-back require their own existing authorized scope.
+
 Before meaningful work:
 
 - run `bootstrap`
@@ -94,7 +96,7 @@ If `python3 scripts/muninn_mcp.py bootstrap` fails:
 
 - alert the user/operator immediately
 - do not pretend retrieval already happened
-- do not continue with meaningful work until explicit approval is given to proceed without Muninn
+- pause dependent actions and apply the recovery/defer path above; preserve already-authorized independent scope and its recheck trigger
 
 The protocol is continuity first, not silent degradation dressed up as professionalism.
 
