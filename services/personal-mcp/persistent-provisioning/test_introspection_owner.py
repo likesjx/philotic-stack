@@ -57,6 +57,13 @@ class Tests(unittest.TestCase):
    self.assertEqual(stat.S_IMODE(parent.stat().st_mode),before)
    for name in('first','first/second'):self.assertEqual(stat.S_IMODE((parent/name).stat().st_mode),0o755)
  def f(self):f=Fixture();self.addCleanup(f.close);return f
+ def test_dependency_order_is_canonical_but_membership_drift_refuses(self):
+  f=self.f();f.props['After']='second.target first.target'
+  f.owner.m['units']={unit:digest(f.owner.unit(unit))for unit in o.UNITS}
+  f.props['After']='first.target second.target';f.owner.guard(f.j.data)
+  for changed in('first.target second.target extra.target','first.target'):
+   f.props['After']=changed
+   with self.subTest(changed=changed):self.assertRaises(Refused,f.owner.guard,f.j.data)
  def test_filtered_inspect_blank_separator_does_not_hide_malformed_data(self):
   f=self.f();self.assertEqual(f.owner.issuer_env(),{'PERSONAL_OAUTH_ENABLED':'false'})
   with patch.object(f.owner,'query',return_value=' \n'):self.assertRaises(ValueError,f.owner.issuer_env)

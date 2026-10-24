@@ -116,6 +116,11 @@ class Owner:
   for k in PROPS:
    if k.startswith('Exec')and v[k]is not None:
     values=re.findall(r'argv\[\]=(.*?) ;',v[k]);require(not v[k]or values);v[k]=values
+  # Dependency properties are sets of unit relationships, not execution lists.
+  # Preserve every token while canonicalizing their unspecified display order;
+  # command and DropInPaths order remains significant.
+  for k in('Requires','Wants','After','TriggeredBy'):
+   if v[k]is not None:v[k]=' '.join(sorted(v[k].split()))
   return v
  def identity(self):
   require(os.geteuid()==0 and socket.gethostname()=='srv875272')
