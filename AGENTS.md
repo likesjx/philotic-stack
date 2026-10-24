@@ -550,7 +550,7 @@ For older open sessions that may not yet know this shorthand, the operator shoul
 
 Muninn remains the default continuity mechanism on every session start, including resumed or compressed sessions. A summary is observed state, not recalled decision history. Apply the recovery/defer path in [muninn-memory-habit](skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer) before bootstrap when the target is unavailable or current restrictions prohibit memory access.
 
-This canonical rule governs bootstrap/closeout wording in agent entrypoints and generated harness projections. Update the generator and refresh stale projections through the supported harness workflow after integration; never hand-edit generated wrappers or treat stale unconditional wording as new authority.
+This canonical rule governs bootstrap/closeout wording in agent entrypoints and generated harness projections. Update the generator and refresh stale projections through the supported harness workflow; never hand-edit generated wrappers or treat stale unconditional wording as new authority. For the six checked-in guidance projections only, `python3 scripts/render_guidance_projections.py` checks exact canonical-renderer output and `--write` refreshes it offline while preserving checked-in role/skill/reference inputs. This does not reconcile graph desired state, settings or home-directory projections; those remain separate adoption steps.
 
 When Muninn is required by protocol for meaningful work:
 

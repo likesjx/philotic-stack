@@ -6,6 +6,7 @@ test in a temporary crate, avoiding the application's integration/build hooks.
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -95,19 +96,14 @@ class GuidanceContract(unittest.TestCase):
         habit = (ROOT / "skills/muninn-memory-habit/SKILL.md").read_text()
         self.assertIn("Temporary defer never authorizes a memory read/write or a recall subagent", habit)
 
-    def test_generated_projection_adoption_is_reported_separately(self):
-        # Discovery success must never silently imply generated-content adoption.
-        old = "If Muninn cannot bootstrap, stop and get explicit operator approval"
-        generated = list((ROOT / ".claude/harness").glob("*.md"))
-        generated += list((ROOT / ".agents/workflows").glob("*-harness.md"))
-        stale = [str(path.relative_to(ROOT)) for path in generated
-                 if old in path.read_text()]
-        if stale:
-            print("\nADOPTION PENDING (stale generated guidance, not validated as current):\n"
-                  + "\n".join(sorted(stale)))
-            task = (ROOT / "docs/task.md").read_text()
-            self.assertIn("projection refresh requires later authorized integration", task)
-            self.assertIn("never hand-edit generated wrappers", (ROOT / "AGENTS.md").read_text())
+    def test_generated_projections_exactly_match_local_renderer(self):
+        # Byte equality, not presence of selected sentences or discovery alone.
+        # This does not assert agreement with an unread live graph desired state.
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/render_guidance_projections.py")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
