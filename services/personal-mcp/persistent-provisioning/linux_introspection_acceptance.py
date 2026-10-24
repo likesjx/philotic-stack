@@ -38,6 +38,8 @@ def main():
  assert subprocess.run(['docker','inspect','jaredlikes-com-production'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
  assert pathlib.Path('/proc/sys/fs/suid_dumpable').read_text().strip()in('0','2')
  parent_mode=ROOT.parent.stat().st_mode&0o7777 if ROOT.parent.exists()else None
+ opt=pathlib.Path('/opt');opt_stat=opt.lstat();assert opt_stat.st_uid==0 and not opt.is_symlink()
+ opt_mode=opt_stat.st_mode&0o7777
  created_users=[];created_groups=[];work=pathlib.Path(tempfile.mkdtemp(prefix='introspection-owner-ci-',dir='/run'));project='muninn-introspection-fixture';cases=[]
  try:
   for name,uid,gid in [('philotic',999,987),('percival-gateway',1003,1003)]:
@@ -56,6 +58,9 @@ def main():
   # preserve its original mode, and keep the production source guard unchanged.
   assert ROOT.parent.lstat().st_uid==0 and not ROOT.parent.is_symlink()
   ROOT.parent.chmod(0o755)
+  # Hosted runners expose /opt as 0777. Protect this disposable installation
+  # for the test rather than relaxing the production ancestry requirement.
+  opt.chmod(opt_mode&~0o022)
   for part in [ROOT,*ROOT.parents]:
    st=part.lstat();assert st.st_uid==0 and not part.is_symlink()and not st.st_mode&0o022,('untrusted_fixture_install_parent',str(part),st.st_uid,oct(st.st_mode&0o777))
   for name in('provision.py','adapters.py','introspection.py','introspection_owner.py','introspection_compose.py','private_key_handoff.py'):shutil.copyfile(HERE/name,ROOT/name);(ROOT/name).chmod(0o644)
@@ -123,6 +128,7 @@ def main():
    subprocess.run(['groupdel',name],check=True)
   if parent_mode is not None:ROOT.parent.chmod(parent_mode)
   elif ROOT.parent.exists():ROOT.parent.rmdir()
+  opt.chmod(opt_mode)
   assert not pathlib.Path('/run/percival-personal-vault-broker.sock').exists()and not list(pathlib.Path('/run').glob('persistent-key-*'))
   print(json.dumps({'fixtureCleanupCompleted':True,'productionUsed':False}))
 if __name__=='__main__':main()
