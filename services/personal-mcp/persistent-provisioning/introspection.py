@@ -52,7 +52,8 @@ def transition(m,journal,owner,*,recover=False,prior_finished=False):
  require(journal.data['steps'].get('store_introspection')in('done','observed_stored'))
  names=[k for k in journal.data['steps']if k!='store_introspection'];expected=['adopt_'+s for s in ADOPT];require(names==expected[:len(names)] and len(names)<=len(expected))
  for n,key in enumerate(names):require(journal.data['steps'][key]=='done'or n==len(names)-1 and journal.data['steps'][key]=='pending')
- owner.guard(journal.data,recover=recover) # includes gateway/admissions closed and same binary
+ if hasattr(owner,'bind'):owner.bind(journal)
+ owner.guard(journal.data,recover=recover) # actual OAuth false; gateway closed before publication; same binary
  if not recover:
   require('pair_capture'not in journal.data);journal.data['pair_capture']=owner.capture();journal.data['phase']='introspection_adoption_prepared';journal.save()
  steps=RESTORE if recover else ADOPT
@@ -71,14 +72,28 @@ def cli(a):
  import os,sys,getpass,warnings
  from adapters import Broker,protect_operator,trusted,BASE
  require(Path(__file__).absolute()==BASE/'introspection.py'and sys.flags.isolated and sys.stdin.isatty()and sys.stdout.isatty()and a.journal)
- for file in('provision.py','introspection.py','adapters.py','private_key_handoff.py','persistent-broker-helper'):trusted(BASE/file)
+ for file in('provision.py','introspection.py','introspection_owner.py','introspection_compose.py','adapters.py','private_key_handoff.py','persistent-broker-helper'):trusted(BASE/file)
  require(hashlib.sha256((BASE/'persistent-broker-helper').read_bytes()).hexdigest()==m['helper_sha256']);protect_operator();warnings.simplefilter('error',getpass.GetPassWarning)
  def confirm(bound):return input('Type CREATE_INTROSPECTION '+bound+': ')
  def handoff():return Broker(getpass.getpass('Existing hotel master key (hidden): ').encode('ascii'),m['helper_sha256'])
- j=Journal(a.journal)
+ import signal
+ signals=(signal.SIGALRM,signal.SIGTERM,signal.SIGHUP,signal.SIGINT);old={s:signal.getsignal(s)for s in signals}
+ def cancelled(*_):raise TimeoutError()
+ for s in signals:signal.signal(s,cancelled)
+ signal.alarm(600)
+ j=None
  try:
+  j=Journal(a.journal)
   if a.action=='introspection-apply':result=execute(m,j,confirm,handoff)
+  elif a.action in('introspection-adopt','introspection-recover'):
+   from introspection_owner import Owner
+   require(a.adoption_manifest);owner=Owner(json.loads(Path(a.adoption_manifest).read_bytes()));bound=digest({'manifest':m,'owner':owner.m,'journal':j.data})
+   recovering=a.action=='introspection-recover';word='RECOVER_FINISHED'if recovering else'ADOPT_INTROSPECTION';require(input('Type '+word+' '+bound+': ')==word+' '+bound)
+   result=transition(m,j,owner,recover=recovering,prior_finished=recovering)
   else:
    require(input('Type HELPER_FINISHED '+prepared['manifest_sha256']+': ')=='HELPER_FINISHED '+prepared['manifest_sha256']);result=reconcile(m,j,handoff,helper_finished=True)
-  print(json.dumps(result,sort_keys=True));return 0 if result['outcome']=='introspection_stored_not_adopted'else 1
- finally:j.close()
+  print(json.dumps(result,sort_keys=True));return 0 if result['outcome']in('introspection_stored_not_adopted','introspection_adopted','introspection_restored_closed')else 1
+ finally:
+  if j is not None:j.close()
+  signal.alarm(0)
+  for s,h in old.items():signal.signal(s,h)

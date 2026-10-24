@@ -1,0 +1,57 @@
+name: Isolated introspection lifecycle
+on:
+  push:
+    branches: [codex/muninn-introspection-only]
+permissions:
+  contents: read
+jobs:
+  source:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-introspection-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - run: RUN_PRIVATE_HTTP_TESTS=1 python3 -B -m unittest discover -s services/personal-mcp/persistent-provisioning -p 'test_*.py' -v
+  protected-lifecycle:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-introspection-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      CARGO_INCREMENTAL: '0'
+      PHILOTIC_VAULT_KEYCHAIN: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Locked Linux helper build and tests
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --target x86_64-unknown-linux-gnu
+          cargo fetch --locked --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml
+          cargo test --offline --locked --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml --bin persistent-broker-helper -- --test-threads=1
+          cargo build --offline --locked --release --target x86_64-unknown-linux-gnu --manifest-path services/personal-mcp/synthetic-broker-build/broker-helper/Cargo.toml --bin persistent-broker-helper --example private_start_fixture
+      - name: Existing protected key handoff qualification
+        run: sudo --preserve-env=GITHUB_ACTIONS /usr/bin/python3 -I -B services/personal-mcp/persistent-provisioning/linux_handoff_acceptance.py --disposable-public-fixture
+      - name: Exact public issuer fixture image
+        run: docker pull nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+      - name: Real owner lifecycle and recovery in disposable Linux
+        run: sudo --preserve-env=GITHUB_ACTIONS /usr/bin/python3 -I -B services/personal-mcp/persistent-provisioning/linux_introspection_acceptance.py --disposable-public-fixture
+      - name: Pin Linux helper and source
+        run: |
+          mkdir helper-package
+          cp services/personal-mcp/synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper helper-package/
+          printf '%s\n' "$GITHUB_SHA" > helper-package/SOURCE
+          cd helper-package
+          sha256sum persistent-broker-helper SOURCE > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: introspection-helper-${{ github.sha }}
+          path: helper-package/
+          retention-days: 1
+          if-no-files-found: error

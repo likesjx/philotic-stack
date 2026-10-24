@@ -38,17 +38,38 @@ apply on an existing journal is refused. There is no automatic retry or broad sc
 
 ## Policy/verifier adoption
 
-The `transition` function orders existing owner-adapter effects under the same
+The `transition` function orders the reviewed owner-adapter effects under the same
 private journal: close gateway, publish policy reference, publish verifier,
 restart the *same* hotel binary to load policy, adopt issuer verifier, verify pair.
-Owner guards must bind actual baseline/source/paths, same-binary provenance,
-closed public access and guest/dependency readiness. Capture before effects and
-record pending before every action. The adapter is supplied by the existing
-reviewed lifecycle; this library is **not a production host/CAS/service adapter**.
-It cannot be called executable production adoption without that integration and
-fresh baseline/approval inputs. Existing `percival_memory_host`/journal roles own
-policy CAS/same-binary service transitions; issuer adoption remains separately
-bound to the exact existing issuer contract.
+`introspection_owner.Owner` now implements the fixed host operations: private
+baseline capture, inode/byte CAS with directory fsync, narrow new-reference policy
+replacement preserving unrelated bytes, paired-verifier publication, bounded
+same-binary hotel restart and pinned issuer Compose adoption/rollback. The new
+`introspection-adopt` / `introspection-recover` CLI modes consume a separate exact
+adoption manifest and typed digest confirmation. The manifest binds the actual
+policy/verifier hashes, selected units/source files, image, Compose chain/env hash
+and fresh observation. It enforces issuer OAuth=false and gateway stopped before
+publication. This is a repair boundary, **not evidence that DB admissions are
+disabled**; authenticated admission preflight remains separately required before
+OAuth activation. Missing socket-unit properties are explicit nulls, not invented
+values. Root-owned sticky /tmp alone is an ancestor exception for allowed existing
+Compose overrides; lower ancestry/files remain ownership/writeability guarded.
+
+Private override allocation records its inode durably before writing. Recovery
+removes only the recorded owned override, including a known interrupted prefix;
+unknown replacements stop. A pinned image-only rollback override remains until
+its loaded Compose reference can safely be removed. The original source files and
+unrelated bytes are never overwritten. Command output is capped while streaming,
+and owned process groups are reaped even if their leader exited. The getter uses
+protected fork/no exec after UID1003 transition, exact listening socket-inode to
+current hotel association and same-netns before/after. It returns only the derived
+verifier internally. No secret value enters stdout/journal.
+
+The owner CLI requires the fixed trusted installed paths and protected owner
+terminal. Actual installed source/helper/channel and fresh baseline inputs are
+still missing; this is not an executable production approval. TTY consent in the
+Linux qualification is explicitly simulated with public dummy input, not proof of
+human consent or a bypass of the denied agent-private terminal.
 
 Known public source loads Policy once before serving, then resolves secrets per
 request. Changing a file is not a hot reload. Model tests exercise that cache and
@@ -97,3 +118,30 @@ Before a live command, bind:
 
 The current production hotel, accepted bridge, policy, credentials and admissions
 were not inspected or changed by this local candidate. ProductionReady is false.
+
+## Coherent isolated Linux qualification and pinning
+
+`.github/workflows/muninn-introspection-only.yml` is push-only for this feature
+branch, contents-read, no production secrets/SSH/credentials/deployment. It runs
+Python fixtures and locked Rust1.94.1 Linux tests/build; reuses the existing
+same-UID hostile-sibling private-key handoff fixture; then executes
+`linux_introspection_acceptance.py --disposable-public-fixture` on an empty
+GitHub-hosted Linux runner with root. The latter installs only dummy state and
+fixture principals, uses the actual helper/SQLite/private handoff/entrypoint,
+actual systemd socket + Python hotel + gateway, and actual Docker Compose with a
+pinned public nginx fixture issuer (network_mode none). It executes real Owner
+capture/CAS/restart/verifier pairing/recovery and an unloaded drop-in refusal.
+It stops/removes containers, units, fixture accounts and fake state afterward.
+
+Production B7/image pins are replaced only inside the isolated fixture process
+with the actual synthetic interpreter/image identities; production source and CLI
+have no fixture switch. Output explicitly disclaims installed B7/production issuer
+qualification. This tests the real adapter mechanics and assembled command paths,
+not live guest safety or deployment inputs. A successful run is still required;
+Mac syntax/source/model tests must not be described as Linux acceptance.
+
+The workflow builds the Linux helper and records SHA256 plus exact SOURCE commit,
+then uploads only the helper and pin files for one day. No DB, key, policy, verifier
+or private fixture journal is uploaded. Published source commit + successful run +
+artifact checksum are required before proposing its installation. The workflow and
+fixture are part of the same local patch; no later workflow publication is hidden.
