@@ -126,6 +126,7 @@ class Owner:
   fmt='{{range .Config.Env}}{{if or (eq (index (split . "=") 0) "PERSONAL_OAUTH_ENABLED") (eq (index (split . "=") 0) "PERSONAL_OAUTH_INTROSPECTION_CLIENT") (eq (index (split . "=") 0) "PERSONAL_OAUTH_INTROSPECTION_VERIFIER")}}{{json .}}{{println}}{{end}}{{end}}'
   out={}
   for line in self.query(DOCKER+['inspect','--format',fmt,'jaredlikes-com-production']).splitlines():
+   if line=='':continue # template println plus Docker's final newline
    k,sep,value=json.loads(line).partition('=');require(sep and k not in out);out[k]=value
   require(out.get('PERSONAL_OAUTH_ENABLED')=='false');return out
  def guard(self,data,recover=False):

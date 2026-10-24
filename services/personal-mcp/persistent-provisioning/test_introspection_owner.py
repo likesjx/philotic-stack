@@ -38,7 +38,7 @@ class Fixture:
    elif argv[1]=='restart':self.loaded=json.loads(self.fs.read(o.POLICY)[0])['introspection_secret_ref']
    else:raise AssertionError(argv)
   elif argv[:len(o.DOCKER)]==o.DOCKER:
-   if 'inspect'in argv:return json.dumps(o.IMAGE)if '{{json .Image}}'in argv else'\n'.join(json.dumps(k+'='+v)for k,v in self.env.items())
+   if 'inspect'in argv:return json.dumps(o.IMAGE)if '{{json .Image}}'in argv else'\n'.join(json.dumps(k+'='+v)for k,v in self.env.items())+'\n\n'
    assert 'compose'in argv and '--host'in argv and '--no-build'in argv or'config'in argv
    if 'up'in argv:
     if any(p.endswith('/muninn-introspection-only.override.yml')for p in argv):self.env={'PERSONAL_OAUTH_ENABLED':'false','PERSONAL_OAUTH_INTROSPECTION_CLIENT':i.INTROSPECTION,'PERSONAL_OAUTH_INTROSPECTION_VERIFIER':'c'*64}
@@ -57,6 +57,10 @@ class Tests(unittest.TestCase):
    self.assertEqual(stat.S_IMODE(parent.stat().st_mode),before)
    for name in('first','first/second'):self.assertEqual(stat.S_IMODE((parent/name).stat().st_mode),0o755)
  def f(self):f=Fixture();self.addCleanup(f.close);return f
+ def test_filtered_inspect_blank_separator_does_not_hide_malformed_data(self):
+  f=self.f();self.assertEqual(f.owner.issuer_env(),{'PERSONAL_OAUTH_ENABLED':'false'})
+  with patch.object(f.owner,'query',return_value=' \n'):self.assertRaises(ValueError,f.owner.issuer_env)
+  with patch.object(f.owner,'query',return_value='\n'):self.assertRaises(Refused,f.owner.issuer_env)
  def test_job_requires_explicit_idle_property(self):
   f=self.f();f.owner.guard(f.j.data)
   for value in('', '0\n', '[not set]\n', 'Job=23\n', 'Other=\n'):
