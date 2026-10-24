@@ -92,15 +92,28 @@ def main():
     def isatty(self):return True
    out=TtyCapture()
    with patch.object(sys,'argv',argv),patch.object(sys.stdin,'isatty',return_value=True),patch.object(sys.stdout,'isatty',return_value=True),patch('builtins.input',side_effect=consent),patch('getpass.getpass',return_value=base64.b64encode(bytes([7])*32).decode()),patch.object(intro.secrets,'token_urlsafe',return_value='S'*43),patch.object(owner.socket,'gethostname',return_value='srv875272'),contextlib.redirect_stdout(out):code=provision.main()
+   if code!=0:
+    state=json.loads(journal.read_text())if journal.exists()else{}
+    print(json.dumps({'fixtureCliFailed':action,'phase':state.get('phase'),'steps':state.get('steps',{})}),flush=True)
    assert code==0,out.getvalue();return json.loads(out.getvalue().splitlines()[-1])
-  assert cli('introspection-apply')['outcome']=='introspection_stored_not_adopted';cases.append('actual_cli_protected_helper_create')
-  j=json.loads(journal.read_text());ref=j['introspection_secret_ref'];assert 'S'*43 not in journal.read_text();assert pathlib.Path(policy).read_text()==before_policy
   broker=owner.Owner.__new__(owner.Owner);units={};files={}
   for unit in owner.UNITS:
    value=broker.unit(unit);units[unit]=provision.digest(value)
    for path in[value['FragmentPath'],*value['DropInPaths'].split()]:files[path]=hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
   baseline={'schema':1,'host':'srv875272','observed_at':int(time.time()*1000),'policy_sha256':hashlib.sha256(pathlib.Path(policy).read_bytes()).hexdigest(),'verifier_sha256':hashlib.sha256(pathlib.Path(verifier).read_bytes()).hexdigest(),'units':units,'source_files':files,'compose':{'project':project,'working_directory':str(compose.parent),'files':[{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}for p in(compose,override)],'env_sha256':None},'access_boundary':'issuer-disabled-gateway-stopped-before-publication'}
   adoption=work/'adoption';write(adoption,json.dumps(baseline),0o600)
+  # Validate the complete disposable installation before creating even a public
+  # fixture credential. Only fixed fixture path metadata may be diagnostic output.
+  checked=set()
+  for target in [str(hotel),policy,verifier,*files,str(compose),str(override)]:
+   for path in [pathlib.Path(target),*pathlib.Path(target).parents]:
+    if str(path)not in checked:
+     st=path.lstat();checked.add(str(path));print(json.dumps({'fixturePath':str(path),'uid':st.st_uid,'mode':oct(st.st_mode&0o7777),'symlink':path.is_symlink()}),flush=True)
+   owner.Files().read(target,268435456 if target==str(hotel)else 1048576)
+  with patch.object(owner.socket,'gethostname',return_value='srv875272'):owner.Owner(baseline).guard({'steps':{}})
+  cases.append('complete_real_owner_preflight_before_create')
+  assert cli('introspection-apply')['outcome']=='introspection_stored_not_adopted';cases.append('actual_cli_protected_helper_create')
+  j=json.loads(journal.read_text());ref=j['introspection_secret_ref'];assert 'S'*43 not in journal.read_text();assert pathlib.Path(policy).read_text()==before_policy
   extra=pathlib.Path('/etc/systemd/system/philotic-hotel.service.d/99-unapproved-fixture.conf');write(extra,'[Service]\nEnvironment=PUBLIC_FIXTURE=true\n')
   try:
    try:cli('introspection-adopt',adoption);raise AssertionError('source drift accepted')
@@ -117,7 +130,9 @@ def main():
   for unit in UNITS:
    p=pathlib.Path('/etc/systemd/system',unit)
    if p.exists():p.unlink()
-  subprocess.run(['systemctl','daemon-reload'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  subprocess.run(['systemctl','daemon-reload'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+  assert subprocess.run(['docker','inspect','jaredlikes-com-production'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
+  for unit in UNITS:assert subprocess.run(['systemctl','is-active','--quiet',unit]).returncode in(3,4)
   for p in reversed(ROOTS):
    if p.exists():shutil.rmtree(p)
   shutil.rmtree(work)
@@ -129,7 +144,7 @@ def main():
    subprocess.run(['groupdel',name],check=True)
   if parent_mode is not None:ROOT.parent.chmod(parent_mode)
   elif ROOT.parent.exists():ROOT.parent.rmdir()
-  opt.chmod(opt_mode)
+  opt.chmod(opt_mode);assert opt.stat().st_mode&0o7777==opt_mode
   os.umask(original_umask)
   assert not pathlib.Path('/run/percival-personal-vault-broker.sock').exists()and not list(pathlib.Path('/run').glob('persistent-key-*'))
   print(json.dumps({'fixtureCleanupCompleted':True,'productionUsed':False}))
