@@ -90,6 +90,26 @@ def main():
   sys.path.insert(0,str(ROOT));import provision,introspection as intro,introspection_owner as owner
   # Pins replaced only in this disposable fixture process, never source/CLI flags.
   fixture_sha=hashlib.sha256(hotel.read_bytes()).hexdigest();owner.B7=fixture_sha;owner.IMAGE=image_id;owner.REGISTRY=IMAGE
+  # Preserve actual adapter behavior; report only code locations on fixture
+  # refusals, never exception values, credentials, command arguments or files.
+  def observed(method):
+   def call(*args,**kwargs):
+    try:return method(*args,**kwargs)
+    except BaseException as error:
+     frames=[];tb=error.__traceback__
+     while tb is not None:
+      name=pathlib.Path(tb.tb_frame.f_code.co_filename).name
+      if name in('introspection_owner.py','introspection_compose.py','provision.py'):frames.append({'source':name,'function':tb.tb_frame.f_code.co_name,'line':tb.tb_lineno})
+      tb=tb.tb_next
+     print(json.dumps({'fixtureAdapterRefusal':method.__name__,'exceptionClass':type(error).__name__,'locations':frames}),file=sys.stderr,flush=True)
+     for unit,before in unit_values.items():
+      try:
+       after=args[0].unit(unit);keys=[key for key in owner.PROPS if after[key]!=before[key]]
+       print(json.dumps({'fixtureUnit':unit,'changedPropertyNames':keys}),file=sys.stderr,flush=True)
+      except Exception:print(json.dumps({'fixtureUnit':unit,'comparison':'unavailable'}),file=sys.stderr,flush=True)
+     raise
+   return call
+  owner.Owner.guard=observed(owner.Owner.guard);owner.Owner.action=observed(owner.Owner.action)
   manifest={'version':2,'scope':intro.INTROSPECTION,'role':intro.ROLE,'guest':intro.GUEST,'helper_sha256':helper_sha};manifest_path=work/'manifest';write(manifest_path,json.dumps(manifest),0o600);journal=work/'journal'
   def consent(prompt):
    m=re.search(r'(CREATE_INTROSPECTION|ADOPT_INTROSPECTION|RECOVER_FINISHED|HELPER_FINISHED) ([a-f0-9]{64}):',prompt);assert m;return m[1]+' '+m[2]
@@ -104,9 +124,9 @@ def main():
     state=json.loads(journal.read_text())if journal.exists()else{}
     print(json.dumps({'fixtureCliFailed':action,'phase':state.get('phase'),'steps':state.get('steps',{})}),flush=True)
    assert code==0,out.getvalue();return json.loads(out.getvalue().splitlines()[-1])
-  broker=owner.Owner.__new__(owner.Owner);units={};files={}
+  broker=owner.Owner.__new__(owner.Owner);units={};files={};unit_values={}
   for unit in owner.UNITS:
-   value=broker.unit(unit);units[unit]=provision.digest(value)
+   value=broker.unit(unit);unit_values[unit]=value;units[unit]=provision.digest(value)
    for path in[value['FragmentPath'],*value['DropInPaths'].split()]:files[path]=hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
   baseline={'schema':1,'host':'srv875272','observed_at':int(time.time()*1000),'policy_sha256':hashlib.sha256(pathlib.Path(policy).read_bytes()).hexdigest(),'verifier_sha256':hashlib.sha256(pathlib.Path(verifier).read_bytes()).hexdigest(),'units':units,'source_files':files,'compose':{'project':project,'working_directory':str(compose.parent),'files':[{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}for p in(compose,override)],'env_sha256':None},'access_boundary':'issuer-disabled-gateway-stopped-before-publication'}
   adoption=work/'adoption';write(adoption,json.dumps(baseline),0o600)
