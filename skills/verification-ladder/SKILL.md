@@ -58,11 +58,12 @@ Climb the ladder when the change affects IPC, networking, concurrency, supervisi
 
 Before claiming `smoke-green` or `watched-live-green` on an installed stack, confirm the installed runtime truth gate:
 
-- the installed binary changed
-- the supervised process restarted
-- the running process is using the updated binary path
+- target, resolved artifact identity, running process identity and effective configuration match the observation
+- unchanged-service inspection qualifies the current running artifact without replacement or restart
+- configuration-only reload proves the intended effective configuration; restart only when required
+- binary deployment proves the installed artifact and process replacement/restart onto it; a stale running process fails the gate even if its path now contains the new binary
 
-Otherwise the honest result remains `test-green`, no matter how persuasive the theory sounds.
+Tests never imply deployment. Report the actual environment and evidence; isolated smokes are not installed-stack acceptance. Use runtime-debugger's bounded diagnosis and assembled-entrypoint checks. Release status is separate from the historical SVER labels above: report implemented, tested, integrated, deployed and live-verified individually using philotic-slice-closeout.
 
 ## Output Expectations
 

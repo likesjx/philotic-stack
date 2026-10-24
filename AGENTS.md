@@ -360,10 +360,10 @@ When validation depends on an installed or supervised runtime, do not treat sour
 
 Before claiming `smoke-green` or `watched-live-green` on an installed stack:
 
-- verify the installed binary path actually changed
-- verify the running process is using that path
-- verify the relevant supervisor or launch agent actually restarted
-- verify the observed behavior came from the updated runtime, not a stale process or stale cellar binary
+- identify the target, installed artifact (resolved path and version/checksum), running process identity, and effective configuration; correlate the observation to that runtime
+- for unchanged-service inspection, qualify the existing running artifact; replacement and restart are not prerequisites
+- for configuration-only changes, prove the supported reload applied the intended effective configuration; restart only if the configuration requires it
+- for binary deployment, verify the intended artifact was installed and the supervised process replaced/restarted onto it; an updated file at the same path does not prove the running process changed
 
 If source is fixed but rollout is not proven, say so explicitly. That is `test-green`, not live-green with good intentions.
 
@@ -548,17 +548,19 @@ For older open sessions that may not yet know this shorthand, the operator shoul
 
 ### 8.2 Muninn Failure Rule
 
-The session bootstrap in CLAUDE.md is non-negotiable. It applies on every session start — including sessions resumed from a summary, continued mid-task, or picking up after context compression. A context summary is observed state only; Muninn recall is required for decision history.
+Muninn remains the default continuity mechanism on every session start, including resumed or compressed sessions. A summary is observed state, not recalled decision history. Apply the recovery/defer path in [muninn-memory-habit](skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer) before bootstrap when the target is unavailable or current restrictions prohibit memory access.
+
+This canonical rule governs bootstrap/closeout wording in agent entrypoints and generated harness projections. Update the generator and refresh stale projections through the supported harness workflow after integration; never hand-edit generated wrappers or treat stale unconditional wording as new authority.
 
 When Muninn is required by protocol for meaningful work:
 
 - if the Muninn MCP surface or helper is unavailable, say so immediately
 - do not silently continue as if recall happened
-- pause and require explicit user/operator approval before proceeding without Muninn
+- pause actions whose correctness depends on missing history or live memory acceptance; continue only independent authorized work under the bounded temporary-defer path
 - once approval is given, state clearly that the turn is continuing on observed repo/runtime truth only
 
 Use the shared helper in [scripts/muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py).
-The helper should attempt local Muninn recovery first during session bootstrap.
+The helper can attempt local recovery during bootstrap; first establish the actual target and authorization. Do not start a local daemon for a cloud/auth/broker failure.
 The `bootstrap` and `require` modes exist specifically to fail loudly when memory bootstrap is unavailable or unrecoverable.
 
 After bootstrap succeeds, use Muninn deliberately:
@@ -567,6 +569,12 @@ After bootstrap succeeds, use Muninn deliberately:
 - write back only decisions, reality gaps, validation outcomes, next seams, and operator preferences
 - prefer `muninn_decide` for explicit decisions and `muninn_remember` for atomic facts or gaps
 - keep each write short; Muninn should make future orientation faster, not recreate the transcript in another database
+
+### 8.3 Approval Evidence Across Handoffs
+
+Use the existing authorization model in [APPROVAL_UX_PROPOSAL.md](docs/architecture/APPROVAL_UX_PROPOSAL.md); a handoff documents evidence, it does not mint permission. Preserve the exact approval quote and source/message reference, action, target/environment, limits, and any later restriction in the existing task/handoff record. Do not place approval evidence in command arguments or logs.
+
+Do not ask again within that approved scope unless it materially changes or policy requires action-time confirmation. Distinguish missing user consent from tool/policy rejection. For rejection, record the exact action/target, sanitized reason, completed work and whether execution was denied, pending or uncertain. Check uncertain outcomes before retrying. After denial, retry only with materially new relevant evidence and only if the operation is known not to have executed. Never retry via another tool/environment to evade a denial; no skill overrides policy. Continue independent authorized work.
 
 ## 9. Parallel Workstreams
 

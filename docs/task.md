@@ -1,5 +1,35 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Bounded project-guidance repair — 2026-10-24
+
+- Implemented locally: conditional installed-runtime gate, bounded diagnosis, end-to-end closeout, approval handoff evidence, and Muninn restore/defer/reconcile guidance. See [AGENTS](../AGENTS.md), [closeout](../skills/philotic-slice-closeout/SKILL.md), and [memory recovery](../skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer).
+- Authority: owner request “Implement the skills and rules”, carried by the bounded delegation from thread `01a1576b-fa36-768d-bd1f-bab7704e800f`; refined by “I do want to push the use of muninn but there should be a clear defined way to get it back up and to know when to make sure it’s up versus when to defer it”. Scope: local guidance edits, isolated checks and scoped commit on mbp-jane. No SSH, production, credentials, personal memory, grants, deployment, restarts, external-agent contact, app approval-rule changes, push or merge. This is not authorization to retry the denied production action.
+- Missing continuity: no Muninn recall or recovery was attempted under this task's restrictions. Owner: repository owner; recheck at the next meaningful checkpoint or before any memory-dependent decision, subject to fresh target-access authorization. Repository/task evidence supports only this repair. No memory delta written and no recovery/recall claim made.
+- Validation: `python3 scripts/tests/test_guidance_contract.py` passes four offline checks, including compiling the actual pure Rust renderers and their regression test. This validates assembled client guidance without applying harnesses, reading memory or invoking runtime integrations. Full application build/live acceptance remains untested.
+- Adoption: Codex discovers root AGENTS and its skill links; no `.agents/skills` exists in this snapshot. Claude's `.claude/skills/*` links resolve to canonical `skills/*`; root CLAUDE now references the recovery contract. Generated `.claude/CLAUDE.md` and projections were not edited. Shared generator changes cover Codex, Claude, Gemini/Antigravity and Windsurf; projection refresh requires later authorized integration. No default branch is changed.
+- Paired repository: inspected local `likesjx/jaredlikes-com` checkout at `37696c02564add6319c3d6ae7f74331d30d67a3d`; its tracked CLAUDE guidance has no conflicting Muninn bootstrap or installed-runtime gate and no tracked AGENTS/skill surface requiring this repair. No paired edit or machine-specific reference added. This is a local-snapshot assessment, not a claim about unpublished or newer remote guidance.
+- Delivery status: implemented and isolated-tested locally; not integrated, published, deployed or live-verified. Runtime/operator entrypoint/configuration/rollback are unchanged by this guidance slice. Exact existing CI workflow is not changed or run; offline command above is the validation entrypoint. Remaining steps: independent reviewer sign-off, publish/PR to develop when authorized, CI on that exact revision, merge, then build/apply/verify generated harness projections in separately authorized environments. Live Claude recall remains outstanding and is not closed by this slice. No harness trial or graph/memory telemetry was run under the no-live-integration restriction.
+
+Offline scenario review (synthetic evidence only; not production acceptance):
+
+| Scenario/evidence | Required result under repaired guidance | Review |
+|---|---|---|
+| Existing qualified artifact/process/config; no release | Inspect unchanged runtime without install/restart prerequisite | Pass |
+| Same PID after supported config reload, effective revision confirmed | Accept configuration proof; no binary replacement required | Pass |
+| New binary on disk but old executable/process still serves | Fail running-artifact gate; do not claim deployment/live verification | Pass |
+| Runtime slice tested but required CI workflow absent from release | Mark integration/release incomplete, name exact missing workflow | Pass |
+| Approved action rejected by tool before execution | Record denial separately from consent; no alternate-tool retry | Pass |
+| Owner-authorized Muninn repair; recall unavailable and prohibited | Repository/task evidence only, explicit scope/owner/recheck; no memory access | Pass |
+| Code slice complete but Claude recall never observed | Slice may close locally; overall live objective remains open | Pass |
+| Decision needs missing durable history | Pause dependent decision; independent checks may continue | Pass |
+| Authorized local transient recovery; protocol and needed functional probe succeed | Recovery verified only for that target/operation; reconcile continuity | Pass |
+| Auth/broker failure despite reachable service | Preserve category; seek authorized correction, no blind local restart | Pass |
+| Independent isolated work during outage | Explicit temporary defer, owner and recheck before dependent work/checkpoint | Pass |
+| PID exists or HTTP succeeds but protocol/recall fails | No healthy/recovered/live-recall claim | Pass |
+| Wrapper hides helper's auth failure as generic timeout | Test assembled entrypoint and preserve category; revise hypothesis | Pass |
+
+This table is the implementer's scenario review, not a separate reviewer endorsement.
+
 - [x] Implement opt-in disposable IPC identity/commit boundary; see [contract](architecture/LOCAL_WORK_RECOVERY.md#follow-up-opt-in-disposable-ipc-commit-boundary). Local tests/review only; publication deferred. Feature-gated actual-Philote interruption/reconciliation fixture implemented; default runtime recovery remains unchanged.
 
 - [ ] Release read-only LifeGraph issuer/gateway composition after exact binding approval, Linux owner acceptance, and issuer Mongo gates. Versioned delegated-binding resolver and local typecheck implemented: [implementation notes](../services/personal-mcp/LIFEGRAPH_READONLY_IMPLEMENTATION.md).

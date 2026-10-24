@@ -47,12 +47,29 @@ Use [$runtime-materialization](../runtime-materialization/SKILL.md) when the mai
 
 When debugging a supervised or installed runtime:
 
-- verify the installed binary path
-- verify file timestamp or checksum changed
-- verify the running process is using that path
-- verify the supervisor actually restarted the target process
+- identify the target, resolved installed path/version/checksum, running process identity and effective configuration; tie observations to that runtime
+- unchanged-service inspection: qualify the existing running artifact without replacement or restart
+- configuration-only change: verify the supported reload and effective configuration; restart only when required by that change
+- binary deployment: verify installation and process replacement/restart onto the intended artifact; the same path with new file contents is insufficient
 
-If those checks are missing, you are not debugging live behavior yet. You are debugging a story about live behavior.
+Missing identity evidence limits the claim; local tests never prove deployment.
+
+## Bounded Diagnosis
+
+For each step, state one question, the competing hypotheses, the smallest authorized distinguishing check, and an outcome-to-next-action mapping before running it. Set a timeout and stop condition. After inconclusive evidence, revise the hypothesis or check; do not invent replacement, restart, grant, or credential prerequisites.
+
+Preserve sanitized error category, failing layer, exit/status code, correlation ID when safe, and whether execution began. Strip tokens, personal payloads and secret-bearing URLs; do not collapse authentication, authorization rejection, transport timeout, protocol/schema, missing capability, and functional failure into “unavailable.” A timeout alone does not prove which layer failed.
+
+Check the actual assembled operator entrypoint, including quoting, arguments, environment selection, pipeline exit propagation and response parsing. A passing helper test does not validate its wrapper. Use disposable inputs/stubs and realistic non-production failure fixtures before an authorized live check.
+
+| Observation | Next action |
+|---|---|
+| Qualified unchanged process | Inspect the failing boundary without a rollout prerequisite |
+| Authentication/authorization error | Identify the authorized correction or report the gate; no blind restart |
+| Transport timeout | Distinguish target/transport from protocol readiness with a bounded check |
+| Missing capability/schema mismatch | Compare actual protocol surface to the required contract |
+| Inconclusive result | Record uncertainty and revise the hypothesis, not the permissions |
+| Tool rejection before execution | Preserve rejection and scope; follow AGENTS approval handoff rules |
 
 ## Output Expectations
 

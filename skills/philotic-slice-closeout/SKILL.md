@@ -44,15 +44,15 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
    - update `ARCHITECTURE.md` if durable reference changed
    - ensure metadata/domains/links still align
 7. Summarize the highest honest verification level.
-   - If live validation depended on a supervised/installed runtime, confirm installed binary truth and process restart before calling anything `smoke-green` or `watched-live-green`.
+   - If live validation depended on a supervised/installed runtime, apply the conditional installed-runtime gate in AGENTS.md §5.3.1; qualify unchanged artifacts and supported configuration reloads, and require process replacement/restart for binary deployments.
 8. Record assumption-vs-reality gaps exposed by the slice.
-9. Write the Muninn memory delta for durable context only:
+9. Follow the Muninn recovery/defer path; write an authorized memory delta only when available, for durable context only:
    - decisions
    - reality gaps
    - validation outcomes
    - next seams
    - operator preferences
-10. Commit and push one coherent slice per the commit convention in `AGENTS.md §6`.
+10. Commit one coherent slice per `AGENTS.md §6`; push only within the authorized scope. Local-only work must say publication is pending.
 11. If a measured harness trial is open for this slice (see
     [$sver-harness](../sver-harness/SKILL.md)), close it now with an honest
     status and verification level:
@@ -64,6 +64,18 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
 12. State the next seam.
 
 ## Output Expectations
+
+Before closing the overall delivery objective, reuse the existing task/proposal/release record for this end-to-end checklist (evidence link or explicit outstanding/not-applicable reason per item):
+
+- runtime artifact/version and actual running identity
+- actual operator/deployment entrypoint, including assembled wrapper validation
+- exact CI workflow path and revision, with required jobs/artifact production and publication status (runtime code without its workflow is incomplete)
+- intended and effective configuration, reload/restart requirement
+- rollback artifact/configuration and authorized recovery route
+- client acceptance on the intended surface, including live memory recall when that is the objective
+- outstanding requirements, owner and next checkpoint
+
+Distinguish **implemented** (code exists), **tested** (named checks passed), **integrated** (required components/workflows combined on the intended branch), **deployed** (target runs intended artifact/configuration), and **live-verified** (actual acceptance observed). Mark each separately; one completed code slice does not close the delivery objective. No new ledger is needed.
 
 Report:
 

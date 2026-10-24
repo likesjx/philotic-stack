@@ -4,6 +4,8 @@ This file provides guidance to OpenAI Codex when working with code in this repos
 
 ## Session Bootstrap
 
+Muninn remains the default. Before bootstrap when unavailable or restricted, apply [AGENTS.md §8.2](AGENTS.md#82-muninn-failure-rule) and the [recovery/defer path](skills/muninn-memory-habit/SKILL.md#recovery-and-temporary-defer). Pause memory-dependent actions; bounded owner-authorized repair uses repository/task evidence only, with explicit missing continuity, owner and recheck. No personal memory access or recall claim is permitted under that exception. These conditions govern the bootstrap and memory-delta steps below.
+
 **This protocol is mandatory on every session start.**
 
 1. **Read [AGENTS.md](/AGENTS.md)**: Adopt the standing protocol — principles, slice contract, commit discipline.
@@ -11,7 +13,7 @@ This file provides guidance to OpenAI Codex when working with code in this repos
    - `graph_status` → node/edge counts, proposal pipeline
    - `graph_digest` → compressed domain→proposal→seam→verification overview
    - `graph_next_task` → scored work recommendation with conflict avoidance
-3. **Orient and Recall**: Run `just session-start` or `python3 scripts/muninn_mcp.py bootstrap`, then use `$muninn-memory-habit` for the Muninn triad: self, user, topic. If Muninn cannot bootstrap, stop and require explicit operator approval before meaningful work.
+3. **Orient and Recall**: Subject to the recovery/defer path above, run `just session-start` or `python3 scripts/muninn_mcp.py bootstrap`, then use `$muninn-memory-habit` for the Muninn triad: self, user, topic. On failure, pause dependent actions and follow that path.
    - Trusted local Codex clients may use the `muninn-local` MCP server in `.mcp.json`; it runs `muninn mcp` against the loopback Muninn listener.
 4. **Verify Green Status**: Run `just check` and `cargo test --workspace` to confirm the baseline is stable.
 5. **Record Decisions**: After completing work, use `graph_decide` for graph audit and `muninn_decide` / `muninn_remember` for the durable memory delta.
