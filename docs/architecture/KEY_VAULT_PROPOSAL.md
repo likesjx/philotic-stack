@@ -367,6 +367,18 @@ The vault should record:
 - which consumers were rebound
 - whether rollback occurred
 
+**Master-key rotation (2026-09-23, `aiua auth rotate-master-key`)**: implemented, offline-only,
+CLI-first, driven by the 2026-09-23 vault-secret transcript exposure. `crates/aiua/src/vault.rs`'s
+`rotate_master_key` re-encrypts every secret a hotel's vault holds under a new key, resumably
+(each secret is migrated independently and re-detected as already-migrated on a re-run — not a
+transactional batch, deliberately, since a crash mid-batch under this scheme just means "run it
+again" instead of needing rollback). Refuses a real run while the target db's hotel record shows
+a live `active_pid`. Does not persist the new key anywhere — on a host where
+`PHILOTIC_VAULT_MASTER_KEY` comes from a systemd `EnvironmentFile` (vps-jane), only an
+`ansible-vault edit` + redeploy can make a new key active; the command names this but can't do it.
+No AAD binding, no audit table, no IPC/web/desktop surface yet — those are separate follow-ups
+(see `proposal:vault-master-key-rotation` in the intel graph).
+
 ## OAuth Recommendation
 
 OAuth credentials should be split by sensitivity:
