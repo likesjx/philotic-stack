@@ -70,12 +70,18 @@ def cli(a):
  m=json.loads(Path(a.manifest).read_bytes());prepared=plan(m)
  if a.action=='introspection-plan':print(json.dumps(prepared,sort_keys=True));return 0
  import os,sys,getpass,warnings
- from adapters import Broker,protect_operator,trusted,BASE
+ from adapters import Broker,protect_operator,trusted,BASE,existing_hotel_master_key,EXISTING_KEY_SOURCE
  require(Path(__file__).absolute()==BASE/'introspection.py'and sys.flags.isolated and sys.stdin.isatty()and sys.stdout.isatty()and a.journal)
  for file in('provision.py','introspection.py','introspection_owner.py','introspection_compose.py','adapters.py','private_key_handoff.py','persistent-broker-helper'):trusted(BASE/file)
  require(hashlib.sha256((BASE/'persistent-broker-helper').read_bytes()).hexdigest()==m['helper_sha256']);protect_operator();warnings.simplefilter('error',getpass.GetPassWarning)
- def confirm(bound):return input('Type CREATE_INTROSPECTION '+bound+': ')
- def handoff():return Broker(getpass.getpass('Existing hotel master key (hidden): ').encode('ascii'),m['helper_sha256'])
+ source=getattr(a,'master_key_source',None);require(source in(None,'hotel-env')and(source is None or a.action in('introspection-apply','introspection-reconcile')))
+ if source=='hotel-env':print('Existing key input: fixed server-private '+EXISTING_KEY_SOURCE+'; no key output')
+ def confirm(bound):
+  return input('Type CREATE_INTROSPECTION '+bound+': ')
+ def handoff():
+  key=existing_hotel_master_key()if source=='hotel-env'else getpass.getpass('Existing hotel master key (hidden): ').encode('ascii')
+  try:return Broker(key,m['helper_sha256'])
+  finally:key=None
  import signal
  signals=(signal.SIGALRM,signal.SIGTERM,signal.SIGHUP,signal.SIGINT);old={s:signal.getsignal(s)for s in signals}
  def cancelled(*_):raise TimeoutError()

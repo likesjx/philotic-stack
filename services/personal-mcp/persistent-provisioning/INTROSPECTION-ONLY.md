@@ -167,3 +167,53 @@ server storage. It does not need the helper, encryption input, a getter or servi
 mutation. New local persistent-path tests exercise synthetic bytes and substituted
 fixture hashes; they do not verify the actual production baseline or supersede
 the Linux qualification of the earlier source revision.
+
+## Explicit existing server-local key input
+
+`introspection-apply` and `introspection-reconcile` accept the optional selector
+`--master-key-source hotel-env`. It selects only
+`PHILOTIC_VAULT_MASTER_KEY` from `/opt/philotic/etc/secrets.env`. It does not accept
+an arbitrary filename, inspect another key source, generate a key or fall back to
+typed input on failure. Historical hidden-entry behavior remains the default.
+The normal fixed-install, isolated-root, TTY, typed confirmation, durable journal
+and private-handoff guards remain required. This option is not an unattended
+runner or permission to retry the denied agent-private terminal path.
+
+After confirmation, the fixed-source reader disables core/dumpability, reuses the
+exact host/B7/process identity check, and requires current systemd metadata to
+select exactly the one mandatory file, with no pending daemon reload and no final
+UnsetEnvironment removal of the key. Metadata selection is checked again after
+the read. It never requests the service Environment values or process environ.
+The descriptor-walk reader rejects symlinks, hardlinks, writable ancestry and
+unstable reads; its optional private-identity check runs before reading any bytes. The final file must retain the previously observed philotic
+UID999/GID987/mode0600; root/deploy/philotic ancestry is permitted only without
+group/other write permission. Input is bounded to64KiB and reread for stability.
+
+The parser deliberately implements a small subset of systemd EnvironmentFile
+syntax: single-line UTF-8 assignments, whitespace around `=`, ordinary comments,
+and an unquoted or simply single/double-quoted canonical32-byte base64 key. Other
+assignments are not returned or used. Duplicate target assignments refuse, even
+though systemd normally uses the last. Escapes, continuation lines (including in
+comments), multiline quoting, malformed names/values and ambiguous
+syntax refuse without exposing source text. Target substitutions refuse; other
+assignment text is never evaluated. This is not shell sourcing or a full
+EnvironmentFile parser. See [systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=),
+[v255 env-file parser](https://github.com/systemd/systemd/blob/v255/src/basic/env-file.c)
+and [v255 property formatter](https://github.com/systemd/systemd/blob/v255/src/systemctl/systemctl-show.c)
+for the reviewed parsing/metadata semantics. Unsupported syntax stops; it does not
+authorize a broader parser, another source or a second create.
+
+The UnsetEnvironment metadata may contain assignment values internally; none are
+returned. The selected key stays in the protected server process/private pipe and existing
+private noswap tmpfs/helper. It is never placed in argv, inherited environment,
+stdout, errors or journals. The file can also contain other sensitive assignments;
+they may be processed transiently while selecting the one field, but are not
+exported or forwarded. No memory-zeroization guarantee is made.
+
+This proves configured file selection at the checks, not the running hotel's
+historical in-memory key or absence of concurrent trusted changes. The later
+protected getter/verifier acceptance remains necessary after same-binary restart.
+New local tests use dummy files and simulated identity/ownership; the prepared
+Linux fixture uses a real dummy fixed file and actual CLI/helper transport. Hosted
+qualification on this exact source is still required before installation/key use.
+It must not be confused with a successful production credential operation.

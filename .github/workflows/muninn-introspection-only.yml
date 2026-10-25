@@ -1,12 +1,12 @@
 name: Isolated introspection lifecycle
 on:
   push:
-    branches: [codex/muninn-introspection-only]
+    branches: [codex/muninn-introspection-only, codex/muninn-existing-key-source]
 permissions:
   contents: read
 jobs:
   source:
-    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-introspection-only'
+    if: github.repository == 'likesjx/philotic-stack' && (github.ref == 'refs/heads/codex/muninn-introspection-only' || github.ref == 'refs/heads/codex/muninn-existing-key-source')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -17,7 +17,7 @@ jobs:
       - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - run: RUN_PRIVATE_HTTP_TESTS=1 python3 -B -m unittest discover -s services/personal-mcp/persistent-provisioning -p 'test_*.py' -v
   protected-lifecycle:
-    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-introspection-only'
+    if: github.repository == 'likesjx/philotic-stack' && (github.ref == 'refs/heads/codex/muninn-introspection-only' || github.ref == 'refs/heads/codex/muninn-existing-key-source')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:

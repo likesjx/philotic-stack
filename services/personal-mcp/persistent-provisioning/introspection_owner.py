@@ -47,12 +47,14 @@ def source_path_allowed(p):
 class Files:
  def __init__(self,root='',owners=None):self.root=root;self.owners=owners
  def path(self,path):return Path(self.root+path)
- def read(self,path,limit=1048576):
+ def read(self,path,limit=1048576,*,private_identity=None):
   p=self.path(path);owners=self.owners if self.owners is not None else{0,pwd.getpwnam('deploy').pw_uid};d=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
   try:
    for n,part in enumerate(p.parts[1:]):
     last=n==len(p.parts)-2;fd=os.open(part,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(0 if last else os.O_DIRECTORY),dir_fd=d);os.close(d);d=fd;s=os.fstat(d);require((s.st_uid in owners and not s.st_mode&0o022 and stat.S_ISREG(s.st_mode))if last else stat.S_ISDIR(s.st_mode)and parent_allowed(Path('/').joinpath(*p.parts[1:n+2]),s,owners))
-   a=os.fstat(d);require(a.st_nlink==1 and a.st_size<=limit);raw=b''
+   a=os.fstat(d);require(a.st_nlink==1 and a.st_size<=limit)
+   if private_identity is not None:require((a.st_uid,a.st_gid,stat.S_IMODE(a.st_mode))==private_identity)
+   raw=b''
    while len(raw)<=limit:
     value=os.read(d,min(65536,limit+1-len(raw)))
     if not value:break

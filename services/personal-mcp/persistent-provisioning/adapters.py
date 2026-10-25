@@ -1,11 +1,81 @@
 """Concrete localhost Muninn admin and protected hotel-vault subprocess adapters."""
-import select,time
+import select,shlex,time
 import base64, ctypes, hashlib, http.cookiejar, json, os, re, resource, signal, stat, subprocess, sys, urllib.error, urllib.request
 from pathlib import Path
-from provision import require,ROLE,GUEST,INTROSPECTION
+from provision import require,Refused,ROLE,GUEST,INTROSPECTION
 BASE=Path('/opt/percival-personal-mcp/provisioning')
 HELPER=BASE/'persistent-broker-helper'
 HANDOFF=BASE/'private_key_handoff.py'
+EXISTING_KEY_SOURCE='/opt/philotic/etc/secrets.env'
+EXISTING_KEY_FIELD='PHILOTIC_VAULT_MASTER_KEY'
+
+def selected_existing_key(raw):
+    """Deliberately narrow, single-line EnvironmentFile subset; never shell eval.
+
+    Refuse escapes/multiline syntax throughout the file so a key-looking line
+    inside another variable's continued/quoted value cannot become an assignment.
+    Duplicate target assignments refuse rather than adopting systemd's last-wins.
+    """
+    try:
+        require(type(raw)is bytes and 0<len(raw)<=65536)
+        text=raw.decode('utf-8');require(not any(c in text for c in ('\x00','\ufeff')))
+        selected=[]
+        for line in text.split('\n'):
+            line=line.strip(' \t\r')
+            require('\\'not in line and not any(ord(c)<32 and c!='\t'for c in line))
+            if not line or line.startswith(('#',';')):continue
+            name,sep,value=line.partition('=')
+            if not sep:
+                require(not line.startswith(EXISTING_KEY_FIELD));continue
+            name=name.strip(' \t');value=value.strip(' \t\r')
+            require(re.fullmatch('[A-Za-z_][A-Za-z0-9_]*',name)is not None)
+            if value.startswith(('"',"'")):
+                require(len(value)>=2 and value[-1]==value[0]and value[0]not in value[1:-1]);value=value[1:-1]
+            if name==EXISTING_KEY_FIELD:
+                require(re.fullmatch('[A-Za-z0-9+/]{43}=',value)is not None)
+                key=value.encode('ascii');require(base64.b64encode(base64.b64decode(key,validate=True))==key);selected.append(key)
+        require(len(selected)==1);return selected[0]
+    except Exception:pass
+    # Outside the exception handler: no raw decoder/parse exception is chained.
+    raise Refused('existing_key_source_refused')
+
+def check_existing_key_registration(host):
+    """Only selected non-value systemd metadata, no Environment contents.
+    v255 systemctl-show prints each EnvironmentFiles item as path(ignore_errors).
+    Require the one recorded mandatory source and no final key removal.
+    This binds next-start file selection, not a historical in-memory key value.
+    """
+    text=host.query(['/usr/bin/systemctl','show','philotic-hotel.service','--property=EnvironmentFiles,UnsetEnvironment,NeedDaemonReload','--all'])
+    values={}
+    for line in text.splitlines():
+        key,sep,value=line.partition('=');require(sep and key in('EnvironmentFiles','UnsetEnvironment','NeedDaemonReload')and key not in values);values[key]=value
+    require(set(values)=={'EnvironmentFiles','UnsetEnvironment','NeedDaemonReload'})
+    require(values['EnvironmentFiles']==EXISTING_KEY_SOURCE+' (ignore_errors=no)'and values['NeedDaemonReload']=='no')
+    require(all(value!=EXISTING_KEY_FIELD and not value.startswith(EXISTING_KEY_FIELD+'=')for value in shlex.split(values['UnsetEnvironment'])))
+
+def existing_hotel_master_key():
+    """Explicit fixed source only. No fallback, discovery, env injection or output.
+    All file contents stay in the protected process; only the selected key leaves
+    this function for the existing private handoff. No zeroization claim.
+    """
+    raw=None;key=None
+    try:
+        import pwd
+        from introspection_owner import Files,Owner
+        require(sys.flags.isolated and sys.platform=='linux'and os.geteuid()==0)
+        protect_operator()
+        require((pwd.getpwnam('philotic').pw_uid,pwd.getpwnam('philotic').pw_gid)==(999,987))
+        # Reuse exact host/B7/process identity, not a guessed executable owner.
+        host=Owner.__new__(Owner);host.fs=Files();host.identity();check_existing_key_registration(host)
+        files=Files(owners={0,999,pwd.getpwnam('deploy').pw_uid})
+        raw,identity=files.read(EXISTING_KEY_SOURCE,65536,private_identity=(999,987,0o600))
+        require(identity['uid']==999 and identity['gid']==987 and identity['mode']==0o600)
+        key=selected_existing_key(raw)
+        require(files.read(EXISTING_KEY_SOURCE,65536,private_identity=(999,987,0o600))==(raw,identity));host.identity();check_existing_key_registration(host)
+        return key
+    except BaseException:pass
+    finally:raw=None;key=None
+    raise Refused('existing_key_source_refused')
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):raise RuntimeError('redirect refused')
 class API:

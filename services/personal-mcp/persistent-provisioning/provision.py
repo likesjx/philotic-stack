@@ -159,8 +159,9 @@ def execute(m, journal, confirm, private_handoff):
 
 def main():
     import argparse,getpass,warnings
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['plan','apply','introspection-plan','introspection-apply','introspection-reconcile','introspection-adopt','introspection-recover']);p.add_argument('--manifest',required=True);p.add_argument('--journal');p.add_argument('--adoption-manifest')
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['plan','apply','introspection-plan','introspection-apply','introspection-reconcile','introspection-adopt','introspection-recover']);p.add_argument('--manifest',required=True);p.add_argument('--journal');p.add_argument('--adoption-manifest');p.add_argument('--master-key-source',choices=['hotel-env'])
     a=p.parse_args()
+    require(a.master_key_source is None or a.action in('introspection-apply','introspection-reconcile'))
     if a.action.startswith('introspection-'):
         if a.action!='introspection-plan':
             base=Path('/opt/percival-personal-mcp/provisioning')

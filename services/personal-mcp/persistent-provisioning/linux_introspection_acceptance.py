@@ -76,10 +76,11 @@ def main():
   binary=HERE.parent/'synthetic-broker-build/broker-helper/target/x86_64-unknown-linux-gnu/release/persistent-broker-helper';shutil.copyfile(binary,ROOT/'persistent-broker-helper');(ROOT/'persistent-broker-helper').chmod(0o755)
   helper_sha=hashlib.sha256(binary.read_bytes()).hexdigest()
   data=pathlib.Path('/opt/philotic/data');fixture_mkdir(data);os.chown(data,999,987);db=sqlite3.connect(data/'aiua_context.db');db.execute('CREATE TABLE graph_nodes(node_key TEXT PRIMARY KEY,kind TEXT NOT NULL,label TEXT,data_json TEXT NOT NULL,updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)');db.commit();db.close();os.chown(data/'aiua_context.db',999,987);(data/'aiua_context.db').chmod(0o600)
+  key_source=pathlib.Path('/opt/philotic/etc/secrets.env');write(key_source,'# disposable public fixture only\nPHILOTIC_VAULT_MASTER_KEY='+base64.b64encode(bytes([7])*32).decode()+'\n',0o600);os.chown(key_source,999,987)
   policy='/etc/percival-personal-mcp/scoped-vault-policy.json';before_policy=json.dumps({'caller_uid':1003,'hotel_uid':999,'secret_ref':'secret://hotel/default/percival-muninn-observe/untouched','introspection_secret_ref':'secret://hotel/default/percival-issuer-introspection/missing'})+'\n';write(policy,before_policy)
   verifier='/home/deploy/.config/jaredlikes-com/personal-oauth-verifier.env';before_verifier='PERSONAL_OAUTH_INTROSPECTION_VERIFIER='+'b'*64+'\n';write(verifier,before_verifier,0o600)
   hotel=pathlib.Path('/opt/philotic/bin/aiua');fixture_mkdir(hotel.parent);shutil.copyfile(pathlib.Path('/usr/bin/python3').resolve(),hotel);hotel.chmod(0o755);write('/opt/philotic/fixture_hotel.py',HOTEL)
-  write('/etc/systemd/system/philotic-hotel.service','[Unit]\nRequires=percival-personal-vault.socket\nAfter=percival-personal-vault.socket\n[Service]\nUser=philotic\nGroup=philotic\nExecStart=/opt/philotic/bin/aiua -I -B /opt/philotic/fixture_hotel.py\n')
+  write('/etc/systemd/system/philotic-hotel.service','[Unit]\nRequires=percival-personal-vault.socket\nAfter=percival-personal-vault.socket\n[Service]\nUser=philotic\nGroup=philotic\nEnvironmentFile=/opt/philotic/etc/secrets.env\nExecStart=/opt/philotic/bin/aiua -I -B /opt/philotic/fixture_hotel.py\n')
   write('/etc/systemd/system/percival-personal-vault.socket','[Socket]\nListenStream=/run/percival-personal-vault-broker.sock\nSocketUser=percival-gateway\nSocketGroup=percival-gateway\nSocketMode=0600\nRemoveOnStop=yes\nService=philotic-hotel.service\n')
   write('/etc/systemd/system/percival-personal-mcp.service','[Service]\nUser=percival-gateway\nGroup=percival-gateway\nExecStart=/usr/bin/sleep 600\n')
   run(['systemctl','daemon-reload']);run(['systemctl','start','percival-personal-vault.socket','philotic-hotel.service','percival-personal-mcp.service'])
@@ -113,13 +114,14 @@ def main():
   manifest={'version':2,'scope':intro.INTROSPECTION,'role':intro.ROLE,'guest':intro.GUEST,'helper_sha256':helper_sha};manifest_path=work/'manifest';write(manifest_path,json.dumps(manifest),0o600);journal=work/'journal'
   def consent(prompt):
    m=re.search(r'(CREATE_INTROSPECTION|ADOPT_INTROSPECTION|RECOVER_FINISHED|HELPER_FINISHED) ([a-f0-9]{64}):',prompt);assert m;return m[1]+' '+m[2]
-  def cli(action,adoption=None):
+  def cli(action,adoption=None,key_source=None):
    argv=[str(ROOT/'provision.py'),action,'--manifest',str(manifest_path),'--journal',str(journal)]
    if adoption:argv+=['--adoption-manifest',str(adoption)]
+   if key_source:argv+=['--master-key-source',key_source]
    class TtyCapture(io.StringIO):
     def isatty(self):return True
    out=TtyCapture()
-   with patch.object(sys,'argv',argv),patch.object(sys.stdin,'isatty',return_value=True),patch.object(sys.stdout,'isatty',return_value=True),patch('builtins.input',side_effect=consent),patch('getpass.getpass',return_value=base64.b64encode(bytes([7])*32).decode()),patch.object(intro.secrets,'token_urlsafe',return_value='S'*43),patch.object(owner.socket,'gethostname',return_value='srv875272'),contextlib.redirect_stdout(out):code=provision.main()
+   with patch.object(sys,'argv',argv),patch.object(sys.stdin,'isatty',return_value=True),patch.object(sys.stdout,'isatty',return_value=True),patch('builtins.input',side_effect=consent),patch('getpass.getpass',side_effect=AssertionError('fixture must use the fixed file source')),patch.object(intro.secrets,'token_urlsafe',return_value='S'*43),patch.object(owner.socket,'gethostname',return_value='srv875272'),contextlib.redirect_stdout(out):code=provision.main()
    if code!=0:
     state=json.loads(journal.read_text())if journal.exists()else{}
     print(json.dumps({'fixtureCliFailed':action,'phase':state.get('phase'),'steps':state.get('steps',{})}),flush=True)
@@ -140,7 +142,15 @@ def main():
    owner.Files().read(target,268435456 if target==str(hotel)else 1048576)
   with patch.object(owner.socket,'gethostname',return_value='srv875272'):owner.Owner(baseline).guard({'steps':{}})
   cases.append('complete_real_owner_preflight_before_create')
-  assert cli('introspection-apply')['outcome']=='introspection_stored_not_adopted';cases.append('actual_cli_protected_helper_create')
+  import adapters
+  with patch.object(owner.socket,'gethostname',return_value='srv875272'):
+   key_source.chmod(0o644)
+   try:
+    try:adapters.existing_hotel_master_key();raise AssertionError('source mode drift accepted')
+    except provision.Refused:cases.append('real_fixed_source_mode_refusal')
+   finally:key_source.chmod(0o600)
+   assert adapters.existing_hotel_master_key()==base64.b64encode(bytes([7])*32);cases.append('real_fixed_source_identity_and_owner_read')
+  assert cli('introspection-apply',key_source='hotel-env')['outcome']=='introspection_stored_not_adopted';cases+=['actual_cli_fixed_source_protected_helper_create','no_key_prompt_required']
   j=json.loads(journal.read_text());ref=j['introspection_secret_ref'];assert 'S'*43 not in journal.read_text();assert pathlib.Path(policy).read_text()==before_policy
   extra=pathlib.Path('/etc/systemd/system/philotic-hotel.service.d/99-unapproved-fixture.conf');write(extra,'[Service]\nEnvironment=PUBLIC_FIXTURE=true\n')
   try:
