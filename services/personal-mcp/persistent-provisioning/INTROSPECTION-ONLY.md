@@ -145,3 +145,25 @@ then uploads only the helper and pin files for one day. No DB, key, policy, veri
 or private fixture journal is uploaded. Published source commit + successful run +
 artifact checksum are required before proposing its installation. The workflow and
 fixture are part of the same local patch; no later workflow publication is hidden.
+
+## Persistent issuer baseline input
+
+Owner manifest schema2 reuses the canonical issuer adoption contract: project
+`jaredlikes-com`, directory `/home/deploy/jaredlikes-com`, exact content-addressed
+`deployment-baselines/616c8b0a4dae7182177b393750193b19ba9648bf5d6029f7593c937f41da93a4/compose.candidate.json`,
+then only persistent `issuer-configurations/<run>-<attempt>/production-digest-promotion.override.yml`
+files. The baseline bytes must match that SHA256; a JSON suffix grants no trust.
+Overrides retain the closed dependency filter. A JSON override may reference
+only the fixed existing verifier env file, already captured/guarded by this
+adapter. No new indirect file is admitted. The historical YAML filter is a dependency
+filter, not a semantic service/privilege whitelist: later application still needs
+explicit approval of the captured baseline and exact hashes. Schema1 retains its
+historical path and recovery rules; schemas cannot mix chains.
+
+The paired private issuer checkout contains a capture-only payload builder that
+selects just the read/guard methods from this source. Capture requires separate
+approval because it copies potentially secret-bearing configuration to private
+server storage. It does not need the helper, encryption input, a getter or service
+mutation. New local persistent-path tests exercise synthetic bytes and substituted
+fixture hashes; they do not verify the actual production baseline or supersede
+the Linux qualification of the earlier source revision.

@@ -7,7 +7,7 @@ import selectors
 import base64,hashlib,json,os,pwd,re,signal,socket,stat,subprocess,tempfile,time
 from pathlib import Path
 from provision import require,digest
-from introspection_compose import baseline_compose
+from introspection_compose import checked_compose,persistent_chain,PERSISTENT_BASE,PERSISTENT_SHA,APP_DIR
 from introspection import PREFIX,INTROSPECTION,verifier
 POLICY='/etc/percival-personal-mcp/scoped-vault-policy.json'
 VERIFIER='/home/deploy/.config/jaredlikes-com/personal-oauth-verifier.env'
@@ -28,18 +28,22 @@ def exact(value,keys):require(type(value)is dict and set(value)==set(keys.split(
 def hex64(v):return type(v)is str and re.fullmatch('[a-f0-9]{64}',v)
 def validate(m):
  exact(m,'schema host observed_at policy_sha256 verifier_sha256 units source_files compose access_boundary')
- require(type(m['schema'])is int and m['schema']==1 and m['host']=='srv875272'and type(m['observed_at'])is int)
+ require(type(m['schema'])is int and m['schema']in(1,2) and m['host']=='srv875272'and type(m['observed_at'])is int)
  for k in('policy_sha256','verifier_sha256'):require(hex64(m[k]))
  require(m['access_boundary']=='issuer-disabled-gateway-stopped-before-publication')
  require(set(m['units'])==set(UNITS)and all(hex64(v)for v in m['units'].values()))
  require(1<=len(m['source_files'])<=32)
- for p,h in m['source_files'].items():require(re.fullmatch(r'/(?:etc|usr/lib|run)/systemd/system/(?:(?:philotic-hotel\.service|percival-personal-mcp\.service|percival-personal-vault\.socket)(?:\.d/[A-Za-z0-9_.-]{1,128}\.conf)?|(?:service|socket|philotic-\.service|percival-\.service|percival-personal-\.service)\.d/[A-Za-z0-9_.-]{1,128}\.conf)',p)and hex64(h))
+ for p,h in m['source_files'].items():require(source_path_allowed(p)and hex64(h))
  c=m['compose'];exact(c,'project working_directory files env_sha256')
  require(re.fullmatch('[a-z0-9][a-z0-9_-]{0,62}',c['project'])and c['working_directory']in('/home/deploy/jaredlikes-com','/home/deploy/jaredlikes-com-production'))
  require(c['env_sha256']is None or hex64(c['env_sha256']));require(1<=len(c['files'])<=8)
  for n,f in enumerate(c['files']):
-  exact(f,'path sha256');require(hex64(f['sha256'])and(f['path']==c['working_directory']+'/docker-compose.yml'if n==0 else re.fullmatch(r'/tmp/percival-identity-build-[A-Za-z0-9_-]+/production-[A-Za-z0-9_.-]+\.override\.yml',f['path'])))
+  exact(f,'path sha256');require(hex64(f['sha256']))
+  if m['schema']==1:require(f['path']==c['working_directory']+'/docker-compose.yml'if n==0 else re.fullmatch(r'/tmp/percival-identity-build-[A-Za-z0-9_-]+/production-[A-Za-z0-9_.-]+\.override\.yml',f['path']))
+ if m['schema']==2:require(c['project']=='jaredlikes-com'and c['working_directory']==APP_DIR and persistent_chain([f['path']for f in c['files']])and c['files'][0]['sha256']==PERSISTENT_SHA)
  return m
+def source_path_allowed(p):
+ return type(p)is str and re.fullmatch(r'/(?:etc|usr/lib|run)/systemd/system/(?:(?:philotic-hotel\.service|percival-personal-mcp\.service|percival-personal-vault\.socket)(?:\.d/[A-Za-z0-9_.-]{1,128}\.conf)?|(?:service|socket|philotic-\.service|percival-\.service|percival-personal-\.service)\.d/[A-Za-z0-9_.-]{1,128}\.conf)',p)is not None
 class Files:
  def __init__(self,root='',owners=None):self.root=root;self.owners=owners
  def path(self,path):return Path(self.root+path)
@@ -159,7 +163,7 @@ class Owner:
   if any(data.get('steps',{}).get(key)=='done'for key in('adopt_stop_gateway','recover_stop_gateway')):require(self.query(['/usr/bin/systemctl','show','percival-personal-mcp.service','--property=ActiveState','--value']).strip()=='inactive')
   c=self.m['compose']
   for f in c['files']:
-   raw=self.fs.read(f['path'])[0];require(sha(raw)==f['sha256']);baseline_compose(raw)
+   raw=self.fs.read(f['path'])[0];require(sha(raw)==f['sha256']);checked_compose(f['path'],raw,self.m['schema']==2)
   env=c['working_directory']+'/.env'
   if c['env_sha256']is None:require(not self.fs.path(env).exists())
   else:require(sha(self.fs.read(env)[0])==c['env_sha256'])
