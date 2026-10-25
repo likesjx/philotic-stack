@@ -1,0 +1,146 @@
+{
+  "catalogId": "philotic.desktop.v1",
+  "a2uiVersion": "v0.9",
+  "basedOn": "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json",
+  "description": "Philotic surface catalog v1: a strict subset of the A2UI v0.9 basic catalog plus one Philotic extension (Table). It is the single allowlist for philote-authored surfaces; the hotel validator (ansible-mesh-core::surface) and the web renderer both read this file. Anything not listed fails validation. No catalog functions are allowed in v1.",
+  "propKinds": {
+    "dynamicString": "string literal or {\"path\": JSON Pointer}",
+    "dynamicNumber": "number literal or {\"path\": JSON Pointer}",
+    "dynamicBoolean": "boolean literal or {\"path\": JSON Pointer}",
+    "dynamicStringList": "array of strings or {\"path\": JSON Pointer}",
+    "componentId": "id of another component in the surface",
+    "childList": "array of component ids, or {\"componentId\", \"path\"} template",
+    "action": "{\"event\": {\"name\", \"context\"}}; context.action_id is minted by the hotel",
+    "literalString": "string literal",
+    "literalNumber": "number literal",
+    "literalBoolean": "boolean literal",
+    "options": "array of {\"label\": dynamicString, \"value\": string}",
+    "checks": "array of {\"condition\": dynamicBoolean, \"message\": string}",
+    "tableColumns": "array of {\"header\": dynamicString, \"field\": string}",
+    "tableRows": "{\"path\": JSON Pointer} or array of objects",
+    "accessibility": "{\"label\"?: dynamicString, \"description\"?: dynamicString}"
+  },
+  "commonProps": {
+    "accessibility": "accessibility",
+    "weight": "literalNumber"
+  },
+  "components": {
+    "Text": {
+      "required": ["text"],
+      "props": {
+        "text": "dynamicString",
+        "variant": { "enum": ["h1", "h2", "h3", "h4", "h5", "caption", "body"] }
+      }
+    },
+    "Row": {
+      "required": ["children"],
+      "props": {
+        "children": "childList",
+        "justify": { "enum": ["start", "center", "end", "spaceBetween", "spaceAround", "spaceEvenly", "stretch"] },
+        "align": { "enum": ["start", "center", "end", "stretch"] }
+      }
+    },
+    "Column": {
+      "required": ["children"],
+      "props": {
+        "children": "childList",
+        "justify": { "enum": ["start", "center", "end", "spaceBetween", "spaceAround", "spaceEvenly", "stretch"] },
+        "align": { "enum": ["start", "center", "end", "stretch"] }
+      }
+    },
+    "List": {
+      "required": ["children"],
+      "props": {
+        "children": "childList",
+        "direction": { "enum": ["vertical", "horizontal"] },
+        "align": { "enum": ["start", "center", "end", "stretch"] }
+      }
+    },
+    "Card": {
+      "required": ["child"],
+      "props": { "child": "componentId" }
+    },
+    "Modal": {
+      "required": ["trigger", "content"],
+      "props": { "trigger": "componentId", "content": "componentId" }
+    },
+    "Divider": {
+      "required": [],
+      "props": { "axis": { "enum": ["horizontal", "vertical"] } }
+    },
+    "Button": {
+      "required": ["child", "action"],
+      "props": {
+        "child": "componentId",
+        "variant": { "enum": ["default", "primary", "borderless"] },
+        "action": "action",
+        "checks": "checks"
+      }
+    },
+    "TextField": {
+      "required": ["label"],
+      "props": {
+        "label": "dynamicString",
+        "value": "dynamicString",
+        "variant": { "enum": ["shortText", "longText", "number", "obscured"] },
+        "validationRegexp": "literalString",
+        "checks": "checks"
+      }
+    },
+    "CheckBox": {
+      "required": ["label", "value"],
+      "props": {
+        "label": "dynamicString",
+        "value": "dynamicBoolean",
+        "checks": "checks"
+      }
+    },
+    "ChoicePicker": {
+      "required": ["options", "value"],
+      "props": {
+        "label": "dynamicString",
+        "variant": { "enum": ["multipleSelection", "mutuallyExclusive"] },
+        "options": "options",
+        "value": "dynamicStringList",
+        "displayStyle": { "enum": ["checkbox", "chips"] },
+        "filterable": "literalBoolean",
+        "checks": "checks"
+      }
+    },
+    "Slider": {
+      "required": ["value", "max"],
+      "props": {
+        "label": "dynamicString",
+        "min": "literalNumber",
+        "max": "literalNumber",
+        "value": "dynamicNumber",
+        "checks": "checks"
+      }
+    },
+    "Table": {
+      "extension": "philotic",
+      "required": ["columns", "rows"],
+      "props": {
+        "columns": "tableColumns",
+        "rows": "tableRows"
+      }
+    }
+  },
+  "excluded": {
+    "Image": "remote URL fetch from a philote-authored surface needs an egress posture decision",
+    "Icon": "not needed for v1",
+    "Video": "remote URL fetch",
+    "AudioPlayer": "remote URL fetch",
+    "Tabs": "not needed for v1",
+    "DateTimeInput": "not needed for v1"
+  },
+  "functions": [],
+  "limits": {
+    "maxComponents": 200,
+    "maxDepth": 16,
+    "maxMessageBytes": 65536,
+    "maxDataModelBytes": 262144,
+    "maxStringBytes": 4096,
+    "maxRegexBytes": 256
+  }
+}
