@@ -100,6 +100,71 @@ def plan(m):
         'introspection_client':INTROSPECTION,'role':ROLE,'guest':GUEST,
         'transport':m['transport'],'requires_private_operator_handoff':True,'requires_creation_and_storage_confirmation':True}
 
+def native_only_plan(m,now=None):
+    """Native-only scope; never call the two-credential provisioning path."""
+    require(type(m)is dict and set(m)=={'version','vault','client','expires_at','approval_expires_at','helper_sha256','introspection_secret_ref'})
+    require(m['version']==3 and m['vault']=='default' and m['client']=='claude_muninn_recall_v1')
+    require(type(m['helper_sha256'])is str and re.fullmatch('[a-f0-9]{64}',m['helper_sha256']))
+    require(type(m['introspection_secret_ref'])is str and re.fullmatch('secret://hotel/default/percival-issuer-introspection/[a-f0-9]{32}',m['introspection_secret_ref']))
+    require(type(m['expires_at'])is str and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})',m['expires_at']))
+    end=datetime.datetime.fromisoformat(m['expires_at'].replace('Z','+00:00'))
+    now=now or datetime.datetime.now(datetime.timezone.utc)
+    require(end.tzinfo is not None and 0<(end-now).total_seconds()<=31*86400)
+    require(type(m['approval_expires_at'])is str)
+    approval_end=datetime.datetime.fromisoformat(m['approval_expires_at'].replace('Z','+00:00'))
+    require(approval_end.tzinfo is not None and 0<(approval_end-now).total_seconds()<=1800)
+    return {'manifest_sha256':digest(m),'liveChanges':False,'introspectionChanged':False,
+            'key_request':{'vault':'default','mode':'observe','label':'claude-muninn-recall-v1','expires':m['expires_at']}}
+
+def execute_native_only(m,journal,confirm,private_handoff,*,now=None):
+    """Reuse trusted API/Broker; one create/store, no adoption or implicit retry.
+
+    The approved operator owns source/listener checks, private login/key handoff
+    and cleanup if handoff fails before returning. This is not a live CLI or an
+    authorization-by-boolean path. Unknown creation/store acknowledgements stop
+    with owned IDs and evidence retained; no automatic recreation or revocation.
+    """
+    m=json.loads(json.dumps(m));clock=now if callable(now)else lambda:now or datetime.datetime.now(datetime.timezone.utc)
+    prepared=native_only_plan(m,clock())
+    require(journal.data['phase']=='new'and not journal.data['steps'])
+    require(confirm(prepared['manifest_sha256'])=='CREATE_NATIVE_OBSERVE '+prepared['manifest_sha256'])
+    native_only_plan(m,clock()) # Confirmation cannot extend the approved window.
+    journal.data.update(phase='native_handoff_pending',manifest_sha256=prepared['manifest_sha256'],
+                        vault='default',expires_at=m['expires_at'],retained_introspection_ref=m['introspection_secret_ref'])
+    journal.save();api=broker=None;body=None;result={}
+    try:
+        api,broker=private_handoff()
+        status,names=api.request('GET','/api/vaults',admin=True)
+        require(status==200 and type(names)is list and 'default'in names)
+        def record_key(reply):
+            status,body=reply;require(status==201 and type(body)is dict)
+            key=body.get('key',{});require(type(key)is dict and type(key.get('id'))is str and re.fullmatch('[A-Za-z0-9_-]{1,128}',key['id']))
+            journal.data['key_ids']['observe']=key['id'];journal.save()
+            require(key.get('vault')=='default'and key.get('mode')=='observe')
+            require(datetime.datetime.fromisoformat(key['expires_at'].replace('Z','+00:00'))==datetime.datetime.fromisoformat(m['expires_at'].replace('Z','+00:00')))
+            require(type(body.get('token'))is str and body['token'].startswith('mk_')and 32<=len(body['token'])<4096)
+        native_only_plan(m,clock()) # Recheck after private authentication, before creation.
+        _,body=journal.effect('create_observe',lambda:api.request('POST','/api/admin/keys',prepared['key_request'],admin=True),record_key)
+        def record_reference(result):
+            require(type(result)is dict and set(result)=={'reference'}and type(result['reference'])is str and re.fullmatch('secret://hotel/default/percival-muninn-observe/[a-f0-9]{32}',result['reference']))
+            journal.data['secret_ref']=result['reference']
+        journal.effect('store_observe',lambda:broker.store_exact_acl(kind='percival-muninn-observe',scope='default',secret=body.pop('token'),allowed_roles=[ROLE],allowed_guests=[GUEST]),record_reference)
+        journal.data['phase']='native_stored_not_adopted';journal.save()
+        result.update(outcome='native_stored_not_adopted',nativeKeyCreated=True,introspectionChanged=False,automaticRetry=False);return result
+    except BaseException:
+        journal.data['phase']='native_reconciliation_required';journal.save()
+        created=True if 'observe'in journal.data['key_ids']else None if 'create_observe'in journal.data['steps']else False
+        result.update(outcome='native_reconciliation_required',nativeKeyCreated=created,introspectionChanged=False,automaticRetry=False);return result
+    finally:
+        if body is not None:body.pop('token',None)
+        result['logoutAttempted']=api is not None
+        result['logoutCallCompleted']=None
+        if api is not None:
+            try:api.close_private_session();result['logoutCallCompleted']=True
+            except Exception:result['logoutCallCompleted']=False
+        result['clientCookieCleared']=None if api is None or not hasattr(api,'cookies')else not bool(list(api.cookies))
+        if broker is not None:broker.close()
+
 def execute(m, journal, confirm, private_handoff):
     """API.request and broker.store_exact_acl must be existing trusted owner adapters.
 

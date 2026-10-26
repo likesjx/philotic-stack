@@ -1,7 +1,7 @@
 """Introspection-only lifecycle. Existing Journal, Broker, crypto and private handoff.
 No IO on import. No native API, caller-selected reference, policy hot reload or retry.
 """
-import base64,hashlib,json,re,secrets
+import base64,hashlib,json,re,secrets,os,stat,time,copy
 from provision import Journal,require,digest,ROLE,GUEST,INTROSPECTION
 KIND='percival-issuer-introspection';PREFIX='secret://hotel/default/'+KIND+'/'
 def validate(m):
@@ -64,6 +64,71 @@ def transition(m,journal,owner,*,recover=False,prior_finished=False):
   journal.data['phase']='introspection_restored_closed'if recover else'introspection_adopted';journal.save();return {'outcome':journal.data['phase'],'automaticRetry':False}
  except BaseException:
   journal.data['phase']='introspection_recovery_uncertain'if recover else'introspection_adoption_uncertain';journal.save();return {'outcome':journal.data['phase'],'automaticRetry':False}
+
+def finalization_eligible(m,journal):
+ """Non-mutating eligibility check; caller holds the existing journal lock."""
+ validate(m)
+ require(journal.data.get('manifest_sha256')==digest(m)and journal.data.get('phase')=='introspection_adoption_uncertain')
+ expected={'store_introspection':'done',**{'adopt_'+name:'pending'if name=='verify_pair'else'done'for name in ADOPT}}
+ require(journal.data.get('steps')==expected and type(journal.data.get('pair_capture'))is dict)
+ require(re.fullmatch(re.escape(PREFIX)+'[a-f0-9]{32}',journal.data.get('introspection_secret_ref','')))
+ require(type(journal.data.get('introspection_verifier'))is str and re.fullmatch('[a-f0-9]{64}',journal.data['introspection_verifier']))
+ # Refuse consumed/partial finalization before any new private observation.
+ history=journal.path.name+'.before-verified-finalization'
+ for name in(journal.temporary,history):
+  try:os.stat(name,dir_fd=journal.directory,follow_symlinks=False)
+  except FileNotFoundError:pass
+  else:require(False)
+ def read_current():
+  readfd=os.open(journal.path.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=journal.directory)
+  try:
+   st=os.fstat(readfd);require(stat.S_ISREG(st.st_mode)and st.st_nlink==1 and st.st_uid==os.geteuid()and st.st_mode&0o077==0)
+   raw=os.read(readfd,65537);require(0<len(raw)<=65536 and json.loads(raw)==journal.data)
+   return raw
+  finally:os.close(readfd)
+ return read_current()
+
+def finalize_verified_adoption(m,journal,replacement,confirm,observe,*,now_ms=None):
+ """Verification-only finalization; never replay adoption or perform recovery.
+
+ observe is a trusted private operator adapter, not a caller-supplied receipt.
+ It must freshly verify the approved replacement/runtime/configuration and make
+ the separately authorized single pairing comparison. No CLI accepts booleans
+ as proof. The production adapter/installation is a separate qualification gate.
+ """
+ m=json.loads(json.dumps(m));replacement=json.loads(json.dumps(replacement));validate(m)
+ require(type(replacement)is dict and set(replacement)=={'schema','host','source','runtime_sha256','baseline_sha256','expires_at_ms'})
+ require(replacement['schema']==1 and replacement['host']=='srv875272')
+ require(all(isinstance(replacement[k],str)and re.fullmatch('[0-9a-f]{64}'if k!='source'else'[0-9a-f]{40}',replacement[k])for k in('source','runtime_sha256','baseline_sha256')))
+ clock=now_ms or(lambda:int(time.time()*1000));now=clock()
+ require(type(replacement['expires_at_ms'])is int and now<replacement['expires_at_ms']<=now+1800000)
+ before=finalization_eligible(m,journal)
+ history=journal.path.name+'.before-verified-finalization'
+ def read_current():return finalization_eligible(m,journal)
+ bound=digest({'schema':1,'manifest_sha256':digest(m),'journal_sha256':hashlib.sha256(before).hexdigest(),'replacement':replacement})
+ require(confirm(bound)=='FINALIZE_INTROSPECTION '+bound)
+ require(clock()<replacement['expires_at_ms'])
+ observed=observe(copy.deepcopy(replacement),copy.deepcopy(journal.data))
+ require(type(observed)is dict and set(observed)=={'observed_at_ms','host','source','runtime_sha256','baseline_sha256','identity_verified','policy_matches','verifier_matches','pairing_matches','gateway_stopped','oauth_disabled','prior_operation_finished'})
+ now=clock();require(now<replacement['expires_at_ms']and type(observed['observed_at_ms'])is int and 0<=now-observed['observed_at_ms']<=30000)
+ require(all(observed[k]==replacement[k]for k in('host','source','runtime_sha256','baseline_sha256')))
+ require(all(observed[k]is True for k in('identity_verified','policy_matches','verifier_matches','pairing_matches','gateway_stopped','oauth_disabled','prior_operation_finished')))
+ require(read_current()==before) # CAS again after private observation.
+ # Retain exact original bytes before the only state transition. O_EXCL makes
+ # replay or a partial earlier history write a refusal, never an overwrite.
+ fd=os.open(history,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=journal.directory)
+ try:
+  offset=0
+  while offset<len(before):
+   n=os.write(fd,before[offset:]);require(n>0);offset+=n
+  os.fsync(fd)
+ finally:os.close(fd)
+ os.fsync(journal.directory)
+ journal.data['steps']['adopt_verify_pair']='done'
+ journal.data['phase']='introspection_adopted'
+ journal.data['verification_reconciliation']={'schema':1,'source':replacement['source'],'runtime_sha256':replacement['runtime_sha256'],'observed_at_ms':observed['observed_at_ms'],'history_preserved':True}
+ journal.save() # Failure is uncertain; preserve history/.pending and do not retry.
+ return {'outcome':'introspection_adopted','historyPreserved':True,'adoptionReplayed':False,'automaticRetry':False}
 def cli(a):
  """Existing entrypoint extension; only plan is available without private owner IO."""
  from pathlib import Path

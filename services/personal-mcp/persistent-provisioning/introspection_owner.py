@@ -54,20 +54,22 @@ class Files:
     last=n==len(p.parts)-2;fd=os.open(part,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(0 if last else os.O_DIRECTORY),dir_fd=d);os.close(d);d=fd;s=os.fstat(d);require((s.st_uid in owners and not s.st_mode&0o022 and stat.S_ISREG(s.st_mode))if last else stat.S_ISDIR(s.st_mode)and parent_allowed(Path('/').joinpath(*p.parts[1:n+2]),s,owners))
    a=os.fstat(d);require(a.st_nlink==1 and a.st_size<=limit)
    if private_identity is not None:require((a.st_uid,a.st_gid,stat.S_IMODE(a.st_mode))==private_identity)
-   raw=b''
-   while len(raw)<=limit:
-    value=os.read(d,min(65536,limit+1-len(raw)))
+   chunks=[];size=0
+   while size<=limit:
+    value=os.read(d,min(65536,limit+1-size))
     if not value:break
-    raw+=value
+    chunks.append(value);size+=len(value)
+   raw=b''.join(chunks)
    b=os.fstat(d);require((a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns,a.st_ctime_ns)==(b.st_dev,b.st_ino,b.st_size,b.st_mtime_ns,b.st_ctime_ns)and len(raw)==a.st_size)
    return raw,{'dev':a.st_dev,'ino':a.st_ino,'mode':stat.S_IMODE(a.st_mode),'uid':a.st_uid,'gid':a.st_gid}
   finally:os.close(d)
- def replace(self,path,before,after):
-  raw,identity=self.read(path);require(raw==before);p=self.path(path);fd,tmp=tempfile.mkstemp(prefix='.introspection-owned-',dir=p.parent)
+ def replace(self,path,before,after,*,limit=1048576):
+  require(type(before)is bytes and type(after)is bytes and len(before)<=limit and len(after)<=limit)
+  raw,identity=self.read(path,limit);require(raw==before);p=self.path(path);fd,tmp=tempfile.mkstemp(prefix='.introspection-owned-',dir=p.parent)
   try:
    os.fchmod(fd,identity['mode']);os.fchown(fd,identity['uid'],identity['gid']);offset=0
    while offset<len(after):n=os.write(fd,after[offset:]);require(n>0);offset+=n
-   os.fsync(fd);os.close(fd);fd=None;current,now=self.read(path);require(current==before and now==identity);os.replace(tmp,p)
+   os.fsync(fd);os.close(fd);fd=None;current,now=self.read(path,limit);require(current==before and now==identity);os.replace(tmp,p)
    directory=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY)
    try:os.fsync(directory)
    finally:os.close(directory)

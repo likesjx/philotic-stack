@@ -30,11 +30,17 @@ class Tests(unittest.TestCase):
     def test_timeout_waits_for_helper_and_does_not_retry(self):
         with tempfile.TemporaryDirectory() as td:
             helper=Path(td)/'helper';helper.write_bytes(b'public artifact')
-            pidfile=Path(td)/'pid';handoff=Path(td)/'handoff.py'
-            handoff.write_text('import os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\ntime.sleep(60)\n')
-            with patch.object(adapters,'HELPER',helper),patch.object(adapters,'HANDOFF',handoff),patch.object(adapters,'trusted'):
+            handoff=Path(td)/'handoff.py';handoff.write_text('import time\ntime.sleep(60)\n')
+            # Observe process creation directly. A cold interpreter may not run
+            # Python code/write a marker before the deliberately short timeout.
+            real_spawn=subprocess.Popen;children=[]
+            def spawn(*args,**kwargs):
+                child=real_spawn(*args,**kwargs);children.append(child);return child
+            with patch.object(adapters,'HELPER',helper),patch.object(adapters,'HANDOFF',handoff),patch.object(adapters,'trusted'),patch.object(adapters.subprocess,'Popen',side_effect=spawn):
                 with self.assertRaises(subprocess.TimeoutExpired):adapters.run_helper({},KEY,hashlib.sha256(helper.read_bytes()).hexdigest(),timeout=.5)
-            with self.assertRaises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
+            self.assertEqual(len(children),1)
+            self.assertIsNotNone(children[0].returncode)
+            with self.assertRaises(ProcessLookupError):os.kill(children[0].pid,0)
     def test_wrong_helper_hash_stops_before_process(self):
         with tempfile.TemporaryDirectory() as td:
             helper=Path(td)/'helper';helper.write_bytes(b'public artifact')
