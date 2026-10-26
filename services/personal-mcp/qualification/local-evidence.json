@@ -6,44 +6,68 @@
     "python_parse": true,
     "rustfmt_parse": true,
     "shell_syntax": true,
+    "sqlite_connection_closure_wal_regression": true,
     "yaml_parse": true
   },
   "external_execution": false,
   "files_sha256": {
-    ".github/workflows/muninn-known-source.yml": "d4117f3cbc8a922ee3a0fd05aecbb9789112c003439bdaa680725d4d9d89c849",
+    ".github/workflows/muninn-known-source.yml": "4aee938b11c9d34d44d6d2e8395871754536c581d8dcc1864a42bfe08a21abac",
     "crates/aiua/src/main.rs": "37e0c36a45d72a9256d0f206539515979a1a5284f4e7281f749b6cc389c9b701",
     "crates/aiua/src/service/scoped_vault_resolver.rs": "236406984e8cfaea38a524d68de7c870798799c1d267a2afcae7c8b20bd93bf5",
     "crates/aiua/src/vault.rs": "13b169ade7e7da3c41e4b827189f29ef49798943f2e52b4161566053a32f0c38",
-    "services/personal-mcp/qualification/KNOWN_SOURCE_CANDIDATE.md": "206cc51f1e0b41cfecd1e4e991ddf5556daeabebba727016e941f98f6e0682b2",
+    "services/personal-mcp/qualification/KNOWN_SOURCE_CANDIDATE.md": "bc5174a1927cc5630b2a53ec07f2c723aa2b470297cbe9bdd3cbeae74bf2cfe6",
     "services/personal-mcp/qualification/build_known_source.sh": "15951e097e848cfa86884b073d5e637a286b30c768d27766daa7695bdbb19ab9",
     "services/personal-mcp/qualification/compatibility.py": "44e6d27c17033fe23b3cb1df9236e9be6f2e95bdb2a7af4a513eeb1c6e3d52a0",
     "services/personal-mcp/qualification/guest.rs": "9de5a8329572f6db529a70b95cba1d00fa6a364b492ccdfe57329753175bb623",
     "services/personal-mcp/qualification/run_known_source.py": "ab1a23320557a079cded5b700262e3251976534e865f36af9828577fc44ee738",
     "services/personal-mcp/qualification/test_known_source_reporting.py": "de635630f620dcbc6cda9b678fce410edc4f59990cb8c0d894fb7b401fb5b956",
-    "services/personal-mcp/scoped-vault-tests/hotel_bootstrap_acceptance.py": "01f82443465419a37c22fb9fa351c4845b5a7bcc0237df41d623234ac3a38896",
-    "services/personal-mcp/scoped-vault-tests/known_source_helper_fixture.py": "b6686173c7a867a1387f5000ebaeb9008ae8f1de8c083bc517f4d13ade85a52c",
+    "services/personal-mcp/qualification/test_known_source_workflow.py": "cefc4a2a6d9609ec44b229ff2db009d5655c126ca665348ae0cead1b79f196b7",
+    "services/personal-mcp/scoped-vault-tests/hotel_bootstrap_acceptance.py": "533c77b44bca98a3b1fa117032fa356593e43cc9759df2b8ce45a2a36dffcdad",
+    "services/personal-mcp/scoped-vault-tests/known_source_helper_fixture.py": "48bf131de8b27b09af76fc90f1a7cd89c5c910addcf30c14f7d6a1b51bed3ac7",
     "services/personal-mcp/scoped-vault-tests/lib.rs": "a2ca33e2681316b38696a5ed0fe834dc21cb7a1a4082b08efe4a412f7d3a9fdd",
     "services/personal-mcp/scoped-vault-tests/linux_listener_fixture.rs": "bf0216021aa5da217d18207d131f5fd22df3f65efd9632323081f7a379534623",
-    "services/personal-mcp/scoped-vault-tests/test_known_source_helper_fixture.py": "888385afa60579219f567128c507ca468101961da5d50e9cfe71dc0aab673939"
+    "services/personal-mcp/scoped-vault-tests/test_known_source_helper_fixture.py": "5aa02c33f16485ac2f950a5132e1e1924ab67ddb2de9f2676bdadef0c3ab746a"
   },
   "helper_source_unchanged": true,
+  "independent_review": "clear",
   "installed_binary_input": false,
   "local_python": {
-    "helper_protocol_passed": 6,
+    "helper_protocol_and_entrypoint_passed": 11,
     "provisioning_passed": 58,
     "provisioning_skipped": 1,
-    "reporting_passed": 4
+    "reporting_passed": 4,
+    "workflow_shell_passed": 4
   },
   "migration_source": "230d5aaa1ccdf9fe2b18fd14c7d66c91cff95219",
+  "parent": "c31a5074328a7ad69d202265d8e62fd754aee93d",
+  "prior_ci": {
+    "actual_helper_case": "fixture_failed_before_helper_launch",
+    "cleanup": "passed",
+    "conclusion": "failure",
+    "head": "c31a5074328a7ad69d202265d8e62fd754aee93d",
+    "migration_tests_passed": 3,
+    "run": 40353107671,
+    "runtime_receipts_collected": false,
+    "rust_broker_tests_passed": 21,
+    "source_build": "passed",
+    "state_rollback_tests_passed": 11
+  },
   "production_contact": false,
+  "regression_controls": {
+    "old_entrypoint_failed_as_expected": 1,
+    "old_workflow_failed_as_expected": 2
+  },
   "repository": "likesjx/philotic-stack",
   "rust": {
     "available_cache_version": "2.8.0",
-    "compiled": false,
+    "compilation_provenance": "prior_exact_head_CI",
+    "compiled": true,
+    "local_offline_compilation_available": false,
     "local_toolchain": "1.94.1",
-    "reason": "offline_locked_memchr_2.8.3_not_cached"
+    "reason": "offline_locked_memchr_2.8.3_not_cached",
+    "sources_unchanged_from": "c31a5074328a7ad69d202265d8e62fd754aee93d"
   },
   "schema": 1,
   "secret_input": false,
-  "status": "local-source-only-not-linux-qualified"
+  "status": "local-fixture-repair-not-linux-qualified"
 }

@@ -45,9 +45,13 @@ jobs:
           test "$(docker inspect -f '{{len .Mounts}}' known-source-test)" = 0
           test "$(docker inspect -f '{{.HostConfig.Privileged}}' known-source-test)" = false
           docker inspect known-source-test > evidence/isolation.json
+          set +e
           docker start -a known-source-test
+          attach_code="$?"
+          set -e
           code="$(docker inspect -f '{{.State.ExitCode}}' known-source-test)"
           docker cp known-source-test:/evidence/. evidence/
+          test "$attach_code" = 0
           test "$code" = 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

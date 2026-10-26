@@ -26,14 +26,31 @@ or encryption key is an input to this package.
 
 ## Qualification and limits
 
-Local: 59 provisioning tests ran, 58 passed, one existing HTTP fixture skipped;
-six bounded helper-protocol tests and four failure-receipt tests passed. Python
-entrypoints parse, build shell passes `bash -n`, workflow YAML parses with Ruby
-Psych, Rust edits parse with rustfmt, and diff whitespace checks pass.
+Published parent `c31a5074328a7ad69d202265d8e62fd754aee93d` built successfully
+in [run40353107671](https://github.com/likesjx/philotic-stack/actions/runs/40353107671).
+Three migration tests, 21 Rust broker tests, the existing native Linux acceptance
+checks and all 11 historical state/rollback tests passed. The actual-helper case
+failed before helper launch because its socket-pair tuple was incorrectly used
+as a context manager. Container cleanup passed. Failure receipts were not copied
+out before the workflow's errexit, so retained logs and build evidence establish
+these results; no completed interoperability receipt is claimed.
 
-Rust tests did **not compile**: offline locked resolution needs `memchr 2.8.3`,
-while the available cache has `2.8.0`. No lock downgrade or dependency download
-was attempted. There is no supported local Linux runtime in the inspected paths.
+Local fixture-only corrections assign both sockets before entering their context
+managers, and preserve attach/container failure status while copying receipts.
+Eleven fixture tests, four reporting tests and four exact-workflow-shell tests pass.
+The new entrypoint regression reproduces the old tuple failure; both new shell
+failure-receipt regressions fail against the old workflow and pass with the fix.
+Explicit SQLite closure now covers both backup pairs and bootstrap seeding;
+a WAL-mode regression checks that all fixture connections close.
+The full local fixture test uses an actual fake subprocess/socketpair/SQLite
+snapshot with simulated Linux guards, not real UID/security/encryption semantics.
+The unchanged provisioning suite's retained result is 58 passes and one skip.
+Python, shell and YAML checks pass. Focused independent review is clear for this repair.
+
+Rust sources remain unchanged from that compiled parent. The earlier local
+locked build was unavailable because cached `memchr 2.8.0` did not satisfy locked
+`2.8.3`; no dependency downgrade/download was performed. The corrected fixture has
+not run in Linux CI, and no publication or rerun of this repair is authorized yet.
 
 Proposed isolated workflow: `.github/workflows/muninn-known-source.yml`, branch
 `codex/muninn-known-source-candidate`, repository `likesjx/philotic-stack` only.

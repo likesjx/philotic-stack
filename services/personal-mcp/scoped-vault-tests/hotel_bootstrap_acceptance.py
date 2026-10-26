@@ -1,4 +1,5 @@
 """Full real aiua binary, ephemeral encrypted SQLite, numeric UIDs and fake supervisor."""
+from contextlib import closing
 import base64, ctypes, json, os, pathlib, shutil, signal, socket, sqlite3, stat, subprocess, sys, time
 assert os.geteuid() == 0 and sys.platform == 'linux'
 assert pathlib.Path('/.dockerenv').exists()
@@ -53,7 +54,7 @@ def seed(name):
                           preexec_fn=drop(999),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15)
     assert loaded.returncode==0, 'synthetic load failed: '+loaded.stderr.decode()[:400]
     ciphertext,nonce=encrypt_synthetic(); marker=work/'guest-probe.json'
-    with sqlite3.connect(work/'aiua_context.db') as db:
+    with closing(sqlite3.connect(work/'aiua_context.db')) as db, db:
         row=db.execute("SELECT node_key,data_json FROM graph_nodes WHERE kind='hotel'").fetchone()
         assert row
         hotel=json.loads(row[1]); hotel['ipc_socket_path']=str(work/'general.sock')

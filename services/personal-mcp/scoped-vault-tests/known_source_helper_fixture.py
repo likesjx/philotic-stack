@@ -4,6 +4,7 @@ All inputs are public synthetic constants. This module must never be used as an
 operator tool. It refuses occupied fixed paths and cleans only its own fixture.
 """
 import base64
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -62,7 +63,7 @@ def seed_helper_record(work, previous_reference):
         os.chown(data, 999, 987)
         target = data / 'aiua_context.db'
         # Closed fixture snapshots only. No runtime database is transferred.
-        with sqlite3.connect(work / 'aiua_context.db') as src, sqlite3.connect(target) as dest:
+        with closing(sqlite3.connect(work / 'aiua_context.db')) as src, closing(sqlite3.connect(target)) as dest:
             src.backup(dest)
         target.chmod(0o600)
         os.chown(target, 999, 987)
@@ -71,7 +72,8 @@ def seed_helper_record(work, previous_reference):
             p.chmod(0o700)
             os.chown(p, 999, 987)
         deadline = time.monotonic() + 10
-        with socket.socketpair() as (parent, child):
+        parent, child = socket.socketpair()
+        with parent, child:
             parent.settimeout(5)
             process = subprocess.Popen(
                 [str(HELPER), '--apply-scoped-persistent', '--root-private-start', str(child.fileno())],
@@ -98,7 +100,7 @@ def seed_helper_record(work, previous_reference):
             assert line(process.stdout, deadline) == {'reference': reference}
             out, err = process.communicate(timeout=max(.01, deadline - time.monotonic()))
             assert process.returncode == 0 and not out and not err
-        with sqlite3.connect(target) as src:
+        with closing(sqlite3.connect(target)) as src:
             row = src.execute('SELECT data_json FROM graph_nodes WHERE node_key=?', ('secret:' + reference,)).fetchone()
             assert row
             record = json.loads(row[0])
@@ -107,7 +109,7 @@ def seed_helper_record(work, previous_reference):
             assert record['allowed_guests'] == ['percival-personal-gateway']
             src.execute('DELETE FROM graph_nodes WHERE node_key=?', ('secret:' + previous_reference,))
             src.commit()
-            with sqlite3.connect(work / 'aiua_context.db') as dest:
+            with closing(sqlite3.connect(work / 'aiua_context.db')) as dest:
                 src.backup(dest)
         return reference
     finally:
