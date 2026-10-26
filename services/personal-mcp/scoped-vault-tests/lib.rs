@@ -22,11 +22,17 @@ pub mod domain {
         pub record: Record,
         pub lookups: Vec<String>,
         pub replace_after_read: bool,
+        pub lookup_mode: u8,
     }
     impl GraphDomain {
         pub fn get_secret(&self, reference: &str) -> Result<Option<Record>, std::io::Error> {
             let mut state = self.0.lock().unwrap();
             state.lookups.push(reference.into());
+            match state.lookup_mode {
+                1 => return Ok(None),
+                2 => return Err(std::io::Error::other("PRIVATE_BACKEND_DETAIL")),
+                _ => {}
+            }
             let snapshot = state.record.clone();
             if state.replace_after_read {
                 state.record.allowed_roles.clear();
@@ -79,6 +85,7 @@ mod adapter_tests {
             },
             lookups: vec![],
             replace_after_read: race,
+            lookup_mode: 0,
         })))
     }
     #[test]
@@ -142,6 +149,112 @@ mod adapter_tests {
                 }
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod classified_failure_tests {
+    use super::*;
+    use scoped_vault::{GUEST, Policy, ROLE, Resolver};
+    fn graph() -> domain::GraphDomain {
+        let (ciphertext_b64, nonce_b64) =
+            vault::fixture_encrypt("PUBLIC_SYNTHETIC_INTROSPECTION_VALUE_0123456789");
+        domain::GraphDomain(std::sync::Arc::new(std::sync::Mutex::new(domain::State {
+            record: domain::Record {
+                allowed_roles: vec![ROLE.into()],
+                allowed_guests: vec![GUEST.into()],
+                nonce_b64,
+                ciphertext_b64,
+            },
+            lookups: vec![],
+            replace_after_read: false,
+            lookup_mode: 0,
+        })))
+    }
+    fn policy() -> Policy {
+        Policy::new(
+            1003,
+            999,
+            "secret://hotel/default/percival-muninn-observe/public".into(),
+        )
+        .unwrap()
+        .with_introspection(
+            "secret://hotel/default/percival-issuer-introspection/0123456789abcdef0123456789abcdef"
+                .into(),
+        )
+        .unwrap()
+    }
+    fn access() -> vault::SecretAccess {
+        vault::SecretAccess {
+            role: ROLE.into(),
+            guest_id: GUEST.into(),
+        }
+    }
+    #[test]
+    fn classified_absence_storage_acl_and_decryption_do_not_include_private_details() {
+        for (mode, acl_bad, corrupt, expected) in [
+            (1, false, false, None),
+            (2, false, false, Some(vault::ExactSecretFailure::Storage)),
+            (0, true, false, Some(vault::ExactSecretFailure::Acl)),
+            (0, false, true, Some(vault::ExactSecretFailure::Decryption)),
+        ] {
+            let g = graph();
+            {
+                let mut s = g.0.lock().unwrap();
+                s.lookup_mode = mode;
+                if acl_bad {
+                    s.record.allowed_guests.push("PRIVATE_GUEST".into());
+                }
+                if corrupt {
+                    s.record.ciphertext_b64 = "PRIVATE_BAD_CIPHERTEXT".into();
+                }
+            }
+            let result =
+                vault::resolve_secret_exact_acl_classified(&g, "PRIVATE_REFERENCE", &access());
+            match expected {
+                Some(reason) => assert_eq!(result.unwrap_err(), reason),
+                None => assert_eq!(result.unwrap(), None),
+            }
+            assert_eq!(g.0.lock().unwrap().lookups.len(), 1);
+            // Adapter erases all internal failure details at its public boundary.
+            let error = scoped_vault_resolver::HotelVaultResolver(g)
+                .resolve(&policy())
+                .unwrap_err();
+            assert_eq!(error.to_string(), "credential_unavailable");
+        }
+    }
+    #[test]
+    fn malformed_nonce_lengths_fail_without_panicking() {
+        use base64::Engine;
+        for n in [0, 1, 11, 13, 32] {
+            let g = graph();
+            g.0.lock().unwrap().record.nonce_b64 =
+                base64::engine::general_purpose::STANDARD.encode(vec![3; n]);
+            assert_eq!(
+                vault::resolve_secret_exact_acl_classified(&g, "public", &access()).unwrap_err(),
+                vault::ExactSecretFailure::Decryption
+            );
+        }
+    }
+    #[test]
+    fn generated_reference_exact_acl_snapshot() {
+        let g = graph();
+        let p = policy();
+        // for_request selects the introspection reference; use the public request
+        // handler's parser tests plus an exact-reference resolver call here.
+        let value = vault::resolve_secret_exact_acl_classified(
+            &g,
+            "secret://hotel/default/percival-issuer-introspection/0123456789abcdef0123456789abcdef",
+            &access(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value, "PUBLIC_SYNTHETIC_INTROSPECTION_VALUE_0123456789");
+        assert!(
+            scoped_vault_resolver::HotelVaultResolver(g)
+                .resolve(&p)
+                .is_ok()
         );
     }
 }

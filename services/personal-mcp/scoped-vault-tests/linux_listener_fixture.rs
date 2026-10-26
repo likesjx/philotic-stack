@@ -93,6 +93,7 @@ fn main() {
         },
         lookups: vec![],
         replace_after_read: false,
+        lookup_mode: 0,
     })));
     let resolver: Arc<dyn Resolver> = Arc::new(Fixture {
         inner: HotelVaultResolver(graph),

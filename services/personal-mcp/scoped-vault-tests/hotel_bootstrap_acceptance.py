@@ -12,6 +12,9 @@ SOCKET=pathlib.Path('/run/percival-personal-vault-broker.sock')
 HOTEL='percival-bootstrap-fixture'
 REFERENCE='secret://hotel/default/percival-muninn-observe/synthetic-bootstrap'
 INTROSPECTION_REFERENCE='secret://hotel/default/percival-issuer-introspection/synthetic-bootstrap'
+CONTRACT = os.environ.get('PERCIVAL_KNOWN_SOURCE_CONTRACT') == '1'
+CALLER_UID = 1003 if CONTRACT else 1234
+HOTEL_GID = 987 if CONTRACT else 999
 KEY=bytes([7]*32) # Public synthetic fixture key only, never a production credential.
 ENV={'PATH':'/usr/bin:/bin','PERCIVAL_ISOLATED_LINUX_FIXTURE':'1',
      'PHILOTIC_VAULT_MASTER_KEY':base64.b64encode(KEY).decode(),
@@ -20,7 +23,7 @@ ENV={'PATH':'/usr/bin:/bin','PERCIVAL_ISOLATED_LINUX_FIXTURE':'1',
 servers=[]; parent_socket=None
 
 def drop(uid):
-    def apply(): os.setgroups([]); os.setgid(uid); os.setuid(uid)
+    def apply(): os.setgroups([]); os.setgid(HOTEL_GID if uid == 999 else uid); os.setuid(uid)
     return apply
 
 def encrypt_synthetic(plain=b'mk_synthetic', nonce=bytes([3]*12)):
@@ -42,7 +45,8 @@ def encrypt_synthetic(plain=b'mk_synthetic', nonce=bytes([3]*12)):
     finally: crypto.EVP_CIPHER_CTX_free(ctx)
 
 def seed(name):
-    work=BASE/name; work.mkdir(mode=0o700); os.chown(work,999,999)
+    global INTROSPECTION_REFERENCE
+    work=BASE/name; work.mkdir(mode=0o700); os.chown(work,999,HOTEL_GID)
     config=work/'empty.json'; config.write_text('{}')
     env=dict(ENV,PHILOTIC_LOG_DIR=str(work/'logs'))
     loaded=subprocess.run([BIN,'load','--file',str(config),'--hotel',HOTEL],cwd=work,env=env,
@@ -69,11 +73,15 @@ def seed(name):
                'is_active':True,'active_pid':None,'last_active_at':None}
         db.execute('INSERT INTO graph_nodes(node_key,kind,label,data_json) VALUES(?,?,?,?)',
                    ('guest:'+HOTEL+':synthetic-fd-probe','guest','synthetic-fd-probe',json.dumps(guest)))
+    if CONTRACT:
+        from known_source_helper_fixture import seed_helper_record
+        INTROSPECTION_REFERENCE = seed_helper_record(work, INTROSPECTION_REFERENCE)
+        policy()
     return work
 
 def policy():
     POLICY.parent.mkdir(mode=0o755,exist_ok=True)
-    POLICY.write_text(json.dumps({'caller_uid':1234,'hotel_uid':999,'secret_ref':REFERENCE,'introspection_secret_ref':INTROSPECTION_REFERENCE}))
+    POLICY.write_text(json.dumps({'caller_uid':CALLER_UID,'hotel_uid':999,'secret_ref':REFERENCE,'introspection_secret_ref':INTROSPECTION_REFERENCE}))
     os.chmod(POLICY,0o644); os.chown(POLICY,0,0)
 
 def start(work,enabled='1',metadata=True,extra=False,wrong_pid=False,test=False,smoke=False,uid=999):
@@ -99,7 +107,7 @@ def start(work,enabled='1',metadata=True,extra=False,wrong_pid=False,test=False,
     servers.append(child); return child
 
 def client(kind='valid'):
-    result=subprocess.run([sys.executable,str(FILES/'linux_acceptance.py'),'client','1234','0',kind,
+    result=subprocess.run([sys.executable,str(FILES/'linux_acceptance.py'),'client',str(CALLER_UID),'0',kind,
                            json.dumps({'operation':'get_percival_introspection_credential' if kind=='introspection' else 'get_percival_credential'})],
                           env={'PATH':'/usr/bin:/bin'},stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
     assert result.returncode==0, result.stderr.decode()[:300]
@@ -126,7 +134,7 @@ def denied_start(name,**kwargs):
 try:
     BASE.mkdir(mode=0o755,exist_ok=True); policy(); SOCKET.unlink(missing_ok=True)
     parent_socket=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); parent_socket.bind(str(SOCKET)); parent_socket.listen(16)
-    os.chown(SOCKET,1234,1234); os.chmod(SOCKET,0o600)
+    os.chown(SOCKET,CALLER_UID,CALLER_UID); os.chmod(SOCKET,0o600)
     work=seed('normal'); child=start(work); ready(child,work)
     began=time.monotonic(); child.send_signal(signal.SIGTERM); child.wait(timeout=36)
     assert child.returncode==0 and time.monotonic()-began<3

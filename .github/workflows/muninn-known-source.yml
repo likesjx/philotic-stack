@@ -1,0 +1,63 @@
+name: Isolated known-source Muninn candidate
+on:
+  push:
+    branches: [codex/muninn-known-source-candidate]
+permissions:
+  contents: read
+jobs:
+  qualification:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-known-source-candidate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          path: historical
+          persist-credentials: false
+      - name: Verify source and build disposable inputs
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C candidate status --porcelain)"
+          test "$(git -C historical rev-parse HEAD)" = 56b0cdc2ed1123aad01b22eb88fa7b43baf02bf6
+          git -C candidate diff --exit-code 60b7ac3712995a980c04dd2b3675963089a6944e -- services/personal-mcp/synthetic-broker-build/broker-helper
+          mkdir evidence
+          docker pull ubuntu:24.04
+          docker image inspect ubuntu:24.04 > evidence/base-image.json
+          base_id="$(docker image inspect -f '{{.Id}}' ubuntu:24.04)"
+          docker create --name known-source-build --mount type=bind,source="$GITHUB_WORKSPACE/candidate",target=/input-candidate,readonly --mount type=bind,source="$GITHUB_WORKSPACE/historical",target=/input-historical,readonly "$base_id" /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_BUILD=1 QUALIFICATION_SOURCE_SHA="$GITHUB_SHA" /bin/bash /input-candidate/services/personal-mcp/qualification/build_known_source.sh
+          docker start -a known-source-build
+          test "$(docker inspect -f '{{.State.ExitCode}}' known-source-build)" = 0
+          docker commit known-source-build known-source-input
+          docker cp known-source-build:/evidence/. evidence/
+      - name: Execute synthetic contracts without network or host mounts
+        run: |
+          set -euo pipefail
+          docker create --name known-source-test --network none --pids-limit 256 --memory 4g --cpus 2 --security-opt no-new-privileges known-source-input /usr/bin/env -i PATH=/usr/bin:/bin PERCIVAL_ISOLATED_LINUX_FIXTURE=1 /usr/bin/python3 /candidate/services/personal-mcp/qualification/run_known_source.py
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' known-source-test)" = none
+          test "$(docker inspect -f '{{len .Mounts}}' known-source-test)" = 0
+          test "$(docker inspect -f '{{.HostConfig.Privileged}}' known-source-test)" = false
+          docker inspect known-source-test > evidence/isolation.json
+          docker start -a known-source-test
+          code="$(docker inspect -f '{{.State.ExitCode}}' known-source-test)"
+          docker cp known-source-test:/evidence/. evidence/
+          test "$code" = 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: known-source-candidate-evidence
+          path: evidence/
+          retention-days: 1
+          if-no-files-found: error
+      - name: Remove disposable containers
+        if: always()
+        run: |
+          docker rm -f known-source-build known-source-test 2>/dev/null || true
+          docker image rm known-source-input 2>/dev/null || true

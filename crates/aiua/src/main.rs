@@ -1231,6 +1231,63 @@ fn telegram_token_vault_ref(graph: &GraphDomain, key: &str) -> Result<Option<Str
     Ok(Some(value))
 }
 
+/// Credential migrations run before concurrent hotel services exist. Construct the
+/// domain here so every write is on this exact SQLite connection. This does not
+/// make the preceding config import in aiua load transactional.
+fn migrate_plaintext_credentials(
+    storage: &ansible_mesh_core::sqlite_storage::SqliteGraphStorage,
+) -> Result<()> {
+    struct Rollback<'a> {
+        storage: &'a ansible_mesh_core::sqlite_storage::SqliteGraphStorage,
+        armed: bool,
+    }
+    impl Drop for Rollback<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // Normal error paths below report rollback errors.
+                if let Ok(conn) = self.storage.raw_conn().lock() {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
+            }
+        }
+    }
+    {
+        let conn = storage.raw_conn().lock().unwrap();
+        anyhow::ensure!(
+            conn.is_autocommit(),
+            "credential migration requires its own startup transaction"
+        );
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .context("begin credential migration")?;
+    }
+    let mut rollback = Rollback { storage, armed: true };
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    let outcome = (|| -> Result<()> {
+        migrate_plaintext_provider_api_keys(&graph)?;
+        migrate_plaintext_telegram_tokens(&graph)?;
+        storage.raw_conn().lock().unwrap()
+            .execute_batch("COMMIT")
+            .context("commit credential migration")?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => {
+            rollback.armed = false;
+            Ok(())
+        }
+        Err(error) => {
+            let result = storage.raw_conn().lock().unwrap().execute_batch("ROLLBACK");
+            rollback.armed = false;
+            match result {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(error.context(format!(
+                    "credential migration rollback failed: {rollback_error}"
+                ))),
+            }
+        }
+    }
+}
+
 /// Move every plaintext Telegram bot token in config into the vault (DEF-176).
 ///
 /// Tokens were plaintext `config:` values readable by any local process
@@ -1289,7 +1346,37 @@ fn migrate_plaintext_provider_api_key(graph: &GraphDomain, spec: &ProviderKeySpe
         return Ok(false);
     };
 
-    if read_string_config(graph, spec.api_key_ref_key)?.is_some() {
+    if let Some(secret_ref) = read_string_config(graph, spec.api_key_ref_key)? {
+        anyhow::ensure!(
+            secret_ref.starts_with("secret://"),
+            "existing provider credential reference is invalid"
+        );
+        let secret = graph.get_secret(&secret_ref)?
+            .context("existing provider credential reference is missing")?;
+        anyhow::ensure!(
+            secret.secret_kind == spec.vault_name,
+            "existing provider credential reference has the wrong kind"
+        );
+        let reader_role = spec.allowed_roles.iter().find(|role| {
+            secret.allowed_roles.is_empty()
+                || secret.allowed_roles.iter().any(|allowed| allowed.as_str() == **role)
+        }).context("existing provider credential reference denies provider roles")?;
+        anyhow::ensure!(
+            secret.allowed_guests.is_empty(),
+            "existing provider credential is guest-restricted; legacy plaintext preserved"
+        );
+        let existing_value = resolve_secret(
+            graph,
+            &secret_ref,
+            &SecretAccess {
+                role: (*reader_role).to_string(),
+                guest_id: "aiua-credential-migration".into(),
+            },
+        )?.context("existing provider credential reference is missing")?;
+        anyhow::ensure!(
+            !existing_value.trim().is_empty(),
+            "existing provider credential reference is empty"
+        );
         graph.remove_config_value(spec.legacy_api_key_key)?;
         info!(
             provider = spec.provider,
@@ -7281,8 +7368,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     } else {
         warn!("Config file has no context_graph entries.");
     }
-    migrate_plaintext_provider_api_keys(&graph_domain)?;
-    migrate_plaintext_telegram_tokens(&graph_domain)?;
+    migrate_plaintext_credentials(&graph_storage)?;
 
     let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
     if seeded_peer_hotels > 0 {
@@ -7640,8 +7726,7 @@ async fn hotel_main() -> Result<()> {
     }
 
     enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
-    migrate_plaintext_provider_api_keys(&graph_domain_arc)?;
-    migrate_plaintext_telegram_tokens(&graph_domain_arc)?;
+    migrate_plaintext_credentials(&_graph_storage)?;
     let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
@@ -10862,7 +10947,41 @@ mod tests {
     }
 
     #[test]
-    fn provider_api_key_migration_deletes_plaintext_when_ref_exists() {
+    fn provider_api_key_migration_reuses_valid_existing_reference() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                BASE64_STANDARD.encode([7u8; 32]),
+            );
+        }
+        for roles in [vec!["model".to_string()], Vec::new()] {
+            let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+            let graph = GraphDomain::new(Arc::new(storage.adapter()));
+            graph.set_config_value("openrouter_api_key", &serde_json::json!("original").to_string())
+                .expect("seed original plaintext");
+            assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
+            let reference = read_string_config(&graph, "openrouter_api_key_ref").unwrap().unwrap();
+            let mut record = graph.get_secret(&reference).unwrap().unwrap();
+            record.allowed_roles = roles;
+            graph.upsert_secret(&record).unwrap();
+            let before = serde_json::to_value(&record).unwrap();
+            let registry = graph.get_config_value("vault_registry").unwrap();
+            graph.set_config_value("openrouter_api_key", &serde_json::json!("obsolete").to_string())
+                .expect("seed legacy duplicate");
+            assert_eq!(migrate_plaintext_provider_api_keys(&graph).unwrap(), 1);
+            assert!(graph.get_config_value("openrouter_api_key").unwrap().is_none());
+            assert_eq!(read_string_config(&graph, "openrouter_api_key_ref").unwrap(), Some(reference.clone()));
+            assert_eq!(serde_json::to_value(graph.get_secret(&reference).unwrap().unwrap()).unwrap(), before);
+            assert_eq!(graph.get_config_value("vault_registry").unwrap(), registry);
+            let value = resolve_secret(&graph, &reference, &SecretAccess {
+                role: "model".into(), guest_id: "synthetic-model".into(),
+            }).unwrap();
+            assert_eq!(value.as_deref(), Some("original"));
+        }
+    }
+
+    #[test]
+    fn provider_api_key_migration_preserves_plaintext_when_ref_is_missing() {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = GraphDomain::new(Arc::new(storage.adapter()));
 
@@ -10876,9 +10995,8 @@ mod tests {
             )
             .expect("seed existing ref");
 
-        let migrated = migrate_plaintext_provider_api_keys(&graph).expect("migrate provider keys");
-        assert_eq!(migrated, 1);
-        assert!(graph.get_config_value("openai_api_key").unwrap().is_none());
+        assert!(migrate_plaintext_provider_api_keys(&graph).is_err());
+        assert_eq!(read_string_config(&graph, "openai_api_key").unwrap().as_deref(), Some("stale"));
         assert_eq!(
             read_string_config(&graph, "openai_api_key_ref")
                 .unwrap()

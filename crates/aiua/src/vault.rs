@@ -149,7 +149,48 @@ pub fn resolve_secret_exact_acl(
     secret_ref: &str,
     access: &SecretAccess,
 ) -> Result<Option<String>> {
-    resolve_secret_with_acl(graph, secret_ref, access, true)
+    resolve_secret_exact_acl_classified(graph, secret_ref, access)
+        .map_err(|reason| anyhow::anyhow!(reason.code()))
+}
+
+/// Internal-only bounded reasons. Never include backend errors, references,
+/// ACL contents, ciphertext, key material or plaintext in these diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactSecretFailure {
+    Storage,
+    Acl,
+    Decryption,
+}
+impl ExactSecretFailure {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Storage => "storage_read_failed",
+            Self::Acl => "exact_acl_rejected",
+            Self::Decryption => "decryption_or_encoding_failed",
+        }
+    }
+}
+
+pub fn resolve_secret_exact_acl_classified(
+    graph: &GraphDomain,
+    secret_ref: &str,
+    access: &SecretAccess,
+) -> std::result::Result<Option<String>, ExactSecretFailure> {
+    let Some(secret) = graph
+        .get_secret(secret_ref)
+        .map_err(|_| ExactSecretFailure::Storage)?
+    else {
+        return Ok(None);
+    };
+    if secret.allowed_roles != [access.role.as_str()]
+        || secret.allowed_guests != [access.guest_id.as_str()]
+    {
+        return Err(ExactSecretFailure::Acl);
+    }
+    // Check and decrypt the same snapshot; never perform a second lookup.
+    decrypt(&secret)
+        .map(Some)
+        .map_err(|_| ExactSecretFailure::Decryption)
 }
 
 fn resolve_secret_with_acl(
@@ -228,6 +269,9 @@ fn decrypt(secret: &SecretRecord) -> Result<String> {
     let ciphertext = BASE64_STANDARD
         .decode(&secret.ciphertext_b64)
         .context("failed to decode vault ciphertext")?;
+    // from_slice panics on a corrupt persisted nonce. Refuse instead, keeping
+    // a malformed record from panicking the broker's blocking worker.
+    anyhow::ensure!(nonce_bytes.len() == 12, "invalid vault nonce length");
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext.as_ref())
