@@ -8,9 +8,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 /// A single stderr line emitted by a guest process.
@@ -1339,8 +1339,8 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
 
     /// Minimal `GraphAdapter` that stores nodes in memory.
     /// Tracks calls to `list_nodes_by_kind("guest")` so we can simulate
@@ -1513,12 +1513,10 @@ mod tests {
             .await
             .expect("spawn child");
 
-        assert!(
-            materializer
-                .check_status(guest_id, &pid)
-                .await
-                .expect("status query should succeed")
-        );
+        assert!(materializer
+            .check_status(guest_id, &pid)
+            .await
+            .expect("status query should succeed"));
 
         materializer
             .reclaim_guest(guest_id)
@@ -1527,12 +1525,10 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        assert!(
-            !materializer
-                .check_status(guest_id, &pid)
-                .await
-                .expect("status after reclaim should succeed")
-        );
+        assert!(!materializer
+            .check_status(guest_id, &pid)
+            .await
+            .expect("status after reclaim should succeed"));
     }
 
     #[tokio::test]
@@ -1553,17 +1549,40 @@ mod tests {
             duplicate.is_err(),
             "a live tracked child must fence a duplicate spawn"
         );
-        assert!(
-            materializer
-                .check_status(guest_id, &original_pid)
-                .await
-                .expect("original child status")
-        );
+        assert!(materializer
+            .check_status(guest_id, &original_pid)
+            .await
+            .expect("original child status"));
 
         materializer
             .reclaim_guest(guest_id)
             .await
             .expect("reclaim original child");
+    }
+
+    #[tokio::test]
+    async fn absolute_guest_commands_and_targeted_reclaim_leave_other_guest_alive() {
+        const CHILD: &str = "PHILOTIC_SYNTHETIC_TWO_GUEST_CHILD";
+        // Isolate PHILOTIC_BIN_DIR from concurrent tests; use this exact test
+        // executable, never an installed hotel or a production database.
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "service::guest_manager::tests::absolute_guest_commands_and_targeted_reclaim_leave_other_guest_alive", "--nocapture"])
+                .env(CHILD,"1").env("PHILOTIC_BIN_DIR","/nonexistent-synthetic-bin")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut m = LocalProcessMaterializer::new("/nonexistent-synthetic-db");
+        let config = json!({"command":"/bin/sleep","args":["20"]});
+        let first = m.spawn_guest("synthetic-first", &config).await.unwrap();
+        let second = m.spawn_guest("synthetic-second", &config).await.unwrap();
+        assert!(m.check_status("synthetic-first", &first).await.unwrap());
+        assert!(m.check_status("synthetic-second", &second).await.unwrap());
+        m.reclaim_guest("synthetic-first").await.unwrap();
+        let survivor = m.check_status("synthetic-second", &second).await.unwrap();
+        m.reclaim_guest("synthetic-second").await.unwrap();
+        assert!(survivor);
     }
 
     #[test]

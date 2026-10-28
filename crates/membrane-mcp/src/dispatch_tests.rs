@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -44,6 +45,7 @@ struct Harness {
 fn harness(static_mode: bool, tier: ExposureTier, vault: HashMap<String, [u8; 32]>) -> Harness {
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let state = Arc::new(MembraneState {
+        oauth_recall: None,
         routing_table: new_shared_table(),
         endpoint_table: new_shared_endpoint_table(),
         vault_cache: VaultHashCache::new(),
@@ -184,6 +186,415 @@ fn bearer_grant_opts(
         scopes: vec![],
         expires_at,
         allotment,
+    }
+}
+
+// OAuth uses the actual ingress dispatch/correlation path. Only the issuer
+// response is synthetic; no unavailable mac-jane source is claimed as tested.
+struct ClaimsVerifier {
+    issued: u64,
+    calls: std::sync::atomic::AtomicUsize,
+    mode: u8,
+    state: std::sync::Mutex<std::sync::Weak<MembraneState>>,
+}
+#[async_trait::async_trait]
+impl crate::oauth_recall::Verifier for ClaimsVerifier {
+    async fn check(
+        &self,
+        _: &str,
+    ) -> Result<egress_http_runner::transient::Claims, egress_http_runner::transient::Refusal> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.mode == 1 {
+            return Err(egress_http_runner::transient::Refusal::Unavailable);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut claims = egress_http_runner::transient::Claims {
+            active: true,
+            iss: "https://www.jaredlikes.com".into(),
+            aud: "https://mcp.jaredlikes.com/personal/mcp".into(),
+            sub: "synthetic-subject".into(),
+            client_id: "claude_muninn_recall_v1".into(),
+            scope: "memory:recall".into(),
+            iat: self.issued - 30,
+            exp: self.issued + 600,
+        };
+        match self.mode {
+            2 => claims.sub = "outsider".into(),
+            3 => claims.client_id = "chatgpt".into(),
+            4 => claims.aud = "wrong-resource".into(),
+            5 => claims.scope = "memory:recall memory:write".into(),
+            6 => claims.exp = now - 1,
+            7 => claims.iat = now + 60,
+            8 if n > 0 => claims.active = false,
+            9 | 10 if n > 0 => {
+                let weak = self.state.lock().unwrap().clone();
+                if let Some(state) = weak.upgrade() {
+                    if self.mode == 9 {
+                        let mut table = state.endpoint_table.write().await;
+                        let mut cfg = table.config().unwrap().clone();
+                        cfg.updated_at += 1;
+                        table.update(cfg);
+                    } else {
+                        *state.ingress_tier.write().unwrap() = ExposureTier::Local;
+                    }
+                }
+            }
+            11 => claims.iss = "https://evil.invalid".into(),
+            12 => {
+                let weak = self.state.lock().unwrap().clone();
+                if let Some(state) = weak.upgrade() {
+                    state.endpoint_table.write().await.revoke();
+                }
+            }
+            13 if n == 0 => tokio::time::sleep(Duration::from_millis(1100)).await,
+            14 if n > 0 => tokio::time::sleep(Duration::from_millis(1100)).await,
+            _ => {}
+        }
+        Ok(claims)
+    }
+}
+fn oauth_harness(mode: u8, budget: Option<McpCallAllotment>) -> Harness {
+    let mut h = harness(false, ExposureTier::Mesh, HashMap::new());
+    let verifier = Arc::new(ClaimsVerifier {
+        issued: crate::oauth_recall::now(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        mode,
+        state: std::sync::Mutex::new(std::sync::Weak::new()),
+    });
+    Arc::get_mut(&mut h.state).unwrap().oauth_recall =
+        Some(Arc::new(crate::oauth_recall::RecallResource {
+            profile: crate::oauth_recall::Profile {
+                verifier_socket: "/unused/synthetic.sock".into(),
+                verifier_uid: 0,
+                issuer: "https://www.jaredlikes.com".into(),
+                audience: "https://mcp.jaredlikes.com/personal/mcp".into(),
+                client_id: "claude_muninn_recall_v1".into(),
+                subject: "synthetic-subject".into(),
+                endpoint_id: "test-endpoint".into(),
+                existing_token_id: "existing-claude-grant".into(),
+                upstream_id: "synthetic-muninn".into(),
+            },
+            verifier: verifier.clone(),
+        }));
+    // Assign the weak reference after the unique-Arc initialization above.
+    *verifier.state.lock().unwrap() = Arc::downgrade(&h.state);
+    *h.state.declared_exposure.write().unwrap() = Some(ExposureTier::Mesh);
+    let mut tool = echo_tool("muninn_recall", None);
+    tool.inbound_transform = McpInboundTransform::FieldMap {
+        action: "muninn_recall".into(),
+        target: McpRouteTarget::McpUpstream {
+            upstream_id: "synthetic-muninn".into(),
+            target_node: None,
+        },
+        mappings: vec![],
+    };
+    let grant = McpTokenGrant {
+        token_id: "existing-claude-grant".into(),
+        vault_ref: "secret://synthetic/legacy-hash".into(),
+        scopes: vec!["memory:recall".into()],
+        expires_at: None,
+        allotment: budget,
+    };
+    let mut cfg = endpoint_with(
+        vec![tool],
+        Some(McpAuthScheme::BearerToken {
+            grants: vec![grant],
+        }),
+    );
+    cfg.endpoint_id = "test-endpoint".into();
+    cfg.exposure = ExposureTier::Mesh;
+    h.state.endpoint_table.try_write().unwrap().update(cfg);
+    h
+}
+const SYNTHETIC_OAUTH: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+async fn oauth_call(h: &Harness, method: &str, params: Value) -> Value {
+    serde_json::to_value(
+        crate::oauth_recall::dispatch(
+            &h.state,
+            rpc(method, params),
+            Some(&format!("Bearer {SYNTHETIC_OAUTH}")),
+        )
+        .await,
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn oauth_composes_existing_principal_and_dispatch_without_token_persistence() {
+    let mut h = oauth_harness(0, None);
+    h.spawn_stub(|e| {
+        let payload = serde_json::to_value(e).unwrap();
+        let text = payload.to_string();
+        assert!(!text.contains(SYNTHETIC_OAUTH));
+        assert_eq!(e.sender.id.as_deref(), Some("existing-claude-grant"));
+        assert_eq!(e.raw_transport["target_kind"], "mcp_upstream");
+        assert_eq!(e.raw_transport["target_id"], "synthetic-muninn");
+        assert_eq!(e.raw_transport["args"]["vault"], "default");
+        DispatchOutcome::Ok(
+            json!({"content":[{"type":"text","text":"SYNTHETIC_RECALL"}]}).to_string(),
+        )
+    });
+    let out = oauth_call(
+        &h,
+        "tools/call",
+        json!({"name":"muninn_recall","arguments":{"query":"harmless synthetic record"}}),
+    )
+    .await;
+    assert!(out["result"].to_string().contains("SYNTHETIC_RECALL"));
+    assert!(out.get("error").is_none());
+    assert!(h.state.pending_responses.lock().await.is_empty());
+}
+#[tokio::test]
+async fn oauth_rejects_identity_scope_expiry_and_unavailable_verifier_before_dispatch() {
+    for mode in [1, 2, 3, 4, 5, 6, 7, 11] {
+        let h = oauth_harness(mode, None);
+        let out = oauth_call(
+            &h,
+            "tools/call",
+            json!({"name":"muninn_recall","arguments":{"query":"synthetic"}}),
+        )
+        .await;
+        assert!(out.get("error").is_some(), "mode {mode}");
+        assert!(h.state.pending_responses.lock().await.is_empty());
+    }
+}
+#[tokio::test]
+async fn oauth_withholds_results_after_revocation_endpoint_or_perimeter_change() {
+    for mode in [8, 9, 10] {
+        let mut h = oauth_harness(mode, None);
+        h.spawn_stub(|_| DispatchOutcome::Ok("SYNTHETIC_PRIVATE_RESULT".into()));
+        let out = oauth_call(
+            &h,
+            "tools/call",
+            json!({"name":"muninn_recall","arguments":{"query":"synthetic"}}),
+        )
+        .await;
+        assert!(out.get("error").is_some());
+        assert!(!out.to_string().contains("SYNTHETIC_PRIVATE_RESULT"));
+    }
+}
+#[tokio::test]
+async fn oauth_refuses_writes_vault_target_overrides_and_token_as_query() {
+    for params in [
+        json!({"name":"muninn_remember","arguments":{"query":"synthetic"}}),
+        json!({"name":"muninn_recall","target":"evil","arguments":{"query":"synthetic"}}),
+        json!({"name":"muninn_recall","arguments":{"query":"synthetic","vault":"other"}}),
+        json!({"name":"muninn_recall","arguments":{"query":"synthetic","url":"https://evil.invalid"}}),
+        json!({"name":"muninn_recall","arguments":{"query":SYNTHETIC_OAUTH}}),
+        json!({"name":"muninn_recall","arguments":{"query":"synthetic","limit":21}}),
+    ] {
+        let h = oauth_harness(0, None);
+        assert!(
+            oauth_call(&h, "tools/call", params)
+                .await
+                .get("error")
+                .is_some()
+        );
+        assert!(h.state.pending_responses.lock().await.is_empty());
+    }
+}
+#[tokio::test]
+async fn oauth_listing_does_not_charge_existing_call_budget() {
+    let mut h = oauth_harness(
+        0,
+        Some(McpCallAllotment {
+            max_per_window: 1,
+            window_secs: 3600,
+        }),
+    );
+    h.spawn_stub(|_| DispatchOutcome::Ok("{}".into()));
+    for _ in 0..2 {
+        assert!(
+            oauth_call(&h, "tools/list", json!({}))
+                .await
+                .get("result")
+                .is_some()
+        );
+    }
+    let p = json!({"name":"muninn_recall","arguments":{"query":"synthetic"}});
+    assert!(
+        oauth_call(&h, "tools/call", p.clone())
+            .await
+            .get("result")
+            .is_some()
+    );
+    assert!(oauth_call(&h, "tools/call", p).await.get("error").is_some());
+}
+
+#[tokio::test]
+async fn oauth_missing_endpoint_never_uses_legacy_route() {
+    use ansible_mesh_core::mcp_route::{McpRouteRecord, McpRouteSecurity};
+    let mut h = oauth_harness(12, None);
+    h.state.routing_table.write().await.upsert_agent_routes(
+        "legacy",
+        vec![McpRouteRecord {
+            agent_id: "legacy".into(),
+            tool_name: "muninn_recall".into(),
+            description: "legacy fallback must not run".into(),
+            input_schema: json!({}),
+            target: McpRouteTarget::Philote {
+                agent_id: "legacy".into(),
+                target_node: None,
+            },
+            security: McpRouteSecurity {
+                auth: McpAuthScheme::None,
+                global_allotment: None,
+                require_approval: false,
+            },
+            updated_at: 1,
+        }],
+    );
+    let out = oauth_call(
+        &h,
+        "tools/call",
+        json!({"name":"muninn_recall","arguments":{"query":"synthetic"}}),
+    )
+    .await;
+    assert!(out.get("error").is_some());
+    assert!(h.inbound_rx.as_mut().unwrap().try_recv().is_err());
+}
+
+#[tokio::test]
+async fn oauth_refuses_exposure_mismatch_or_ceiling_below_declaration() {
+    for n in 0..3 {
+        let h = oauth_harness(0, None);
+        if n == 2 {
+            *h.state.ingress_tier.write().unwrap() = ExposureTier::Local;
+        } else {
+            let mut table = h.state.endpoint_table.write().await;
+            let mut cfg = table.config().unwrap().clone();
+            cfg.exposure = if n == 0 {
+                ExposureTier::Local
+            } else {
+                ExposureTier::Internet
+            };
+            table.update(cfg);
+        }
+        assert!(
+            oauth_call(&h, "tools/list", json!({}))
+                .await
+                .get("error")
+                .is_some()
+        );
+    }
+}
+#[tokio::test]
+async fn oauth_rechecks_time_only_grant_expiry_before_dispatch_and_release() {
+    for mode in [13, 14] {
+        let mut h = oauth_harness(mode, None);
+        {
+            let mut table = h.state.endpoint_table.write().await;
+            let mut cfg = table.config().unwrap().clone();
+            let Some(McpAuthScheme::BearerToken { grants }) = &mut cfg.default_auth else {
+                unreachable!()
+            };
+            grants[0].expires_at = Some(crate::oauth_recall::now() + 1);
+            table.update(cfg);
+        }
+        if mode == 14 {
+            h.spawn_stub(|_| DispatchOutcome::Ok("WITHHOLD_EXPIRED_GRANT_RESULT".into()));
+        }
+        let out = oauth_call(
+            &h,
+            "tools/call",
+            json!({"name":"muninn_recall","arguments":{"query":"synthetic"}}),
+        )
+        .await;
+        assert!(out.get("error").is_some());
+        assert!(!out.to_string().contains("WITHHOLD_EXPIRED_GRANT_RESULT"));
+        if mode == 13 {
+            assert!(h.inbound_rx.as_mut().unwrap().try_recv().is_err());
+        }
+    }
+}
+
+struct PrivateFixtureAuthority {
+    claims: egress_http_runner::transient::Claims,
+    denied: bool,
+}
+#[async_trait::async_trait]
+impl egress_http_runner::transient::Authority for PrivateFixtureAuthority {
+    async fn introspect(
+        &mut self,
+        token: &str,
+    ) -> Result<egress_http_runner::transient::Claims, egress_http_runner::transient::Refusal> {
+        assert_eq!(token, SYNTHETIC_OAUTH);
+        if self.denied {
+            Err(egress_http_runner::transient::Refusal::AuditRejected)
+        } else {
+            Ok(self.claims.clone())
+        }
+    }
+    fn abandon(&mut self) {}
+}
+#[tokio::test]
+async fn oauth_composes_real_private_socket_with_ingress_and_audit_refusal() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for denied in [false, true] {
+        let dir = std::fs::canonicalize("/tmp").unwrap().join(format!(
+            "oc{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        let path = dir.join("v.sock");
+        let listener =
+            egress_http_runner::transient::PrivateListener::bind(&path, uid, uid).unwrap();
+        let mut h = oauth_harness(0, None);
+        let mut inner = Arc::try_unwrap(h.state).ok().unwrap();
+        let mut r = Arc::try_unwrap(inner.oauth_recall.take().unwrap())
+            .ok()
+            .unwrap();
+        r.verifier = Arc::new(crate::oauth_recall::SocketVerifier {
+            path: path.clone(),
+            uid,
+        });
+        inner.oauth_recall = Some(Arc::new(r));
+        h.state = Arc::new(inner);
+        let now = crate::oauth_recall::now();
+        let mut authority = PrivateFixtureAuthority {
+            claims: egress_http_runner::transient::Claims {
+                active: true,
+                iss: "https://www.jaredlikes.com".into(),
+                aud: "https://mcp.jaredlikes.com/personal/mcp".into(),
+                sub: "synthetic-subject".into(),
+                client_id: "claude_muninn_recall_v1".into(),
+                scope: "memory:recall".into(),
+                iat: now,
+                exp: now + 600,
+            },
+            denied,
+        };
+        let server = tokio::spawn(async move {
+            for _ in 0..if denied { 1 } else { 2 } {
+                let mut s = listener.accept().await.unwrap();
+                egress_http_runner::transient::serve(&mut s, &mut authority)
+                    .await
+                    .unwrap();
+            }
+        });
+        if !denied {
+            h.spawn_stub(|e| {
+                assert!(!serde_json::to_string(e).unwrap().contains(SYNTHETIC_OAUTH));
+                DispatchOutcome::Ok("{\"synthetic\":true}".into())
+            });
+        }
+        let out = oauth_call(
+            &h,
+            "tools/call",
+            json!({"name":"muninn_recall","arguments":{"query":"synthetic"}}),
+        )
+        .await;
+        assert_eq!(out.get("error").is_some(), denied);
+        if denied {
+            assert!(h.inbound_rx.as_mut().unwrap().try_recv().is_err());
+        }
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 }
 

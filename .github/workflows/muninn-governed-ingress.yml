@@ -1,0 +1,54 @@
+name: Isolated governed Muninn ingress
+on:
+  push:
+    branches: [codex/muninn-governed-ingress]
+permissions:
+  contents: read
+jobs:
+  synthetic:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-governed-ingress'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      CARGO_INCREMENTAL: '0'
+      PHILOTIC_VAULT_KEYCHAIN: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Build reviewed guest source
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          cargo build --locked -p membrane-mcp -p membrane-mcp-client -p egress-http-runner
+      - name: Synthetic ingress, private transport and egress contracts
+        run: cargo test --locked -p membrane-mcp -p membrane-mcp-client -p egress-http-runner
+      - name: Harmless two-guest materialization fixture
+        run: cargo test --locked -p aiua absolute_guest_commands_and_targeted_reclaim_leave_other_guest_alive -- --nocapture
+      - name: Pin only the two changed guest executables
+        run: |
+          cargo build --locked --release -p membrane-mcp -p egress-http-runner
+          mkdir candidate-package
+          cp target/release/membrane-mcp target/release/egress-http-runner candidate-package/
+          printf '%s\n' "$GITHUB_SHA" > candidate-package/SOURCE
+          cd candidate-package
+          sha256sum membrane-mcp egress-http-runner SOURCE > SHA256SUMS
+      - name: Exact-source qualification receipt
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          pathlib.Path('candidate-package/qualification.json').write_text(json.dumps({
+            'source': os.environ['GITHUB_SHA'], 'syntheticOnly': True,
+            'guestBuild': 'passed', 'ingressEgressContracts': 'passed',
+            'twoGuestMaterializer': 'passed', 'productionAccess': False,
+            'installedB7Qualified': False, 'claudeLive': False,
+          }, sort_keys=True) + '\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: governed-ingress-candidate-${{ github.sha }}
+          path: candidate-package/
+          retention-days: 1
+          if-no-files-found: error

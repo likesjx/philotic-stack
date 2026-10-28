@@ -54,6 +54,7 @@ pub enum DispatchOutcome {
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
+    pub oauth_recall: Option<Arc<crate::oauth_recall::RecallResource>>,
     /// Legacy per-agent route table (UpdateMcpRoutes path).
     pub routing_table: SharedRoutingTable,
     /// Config-driven endpoint table (ProvisionMcpEndpoint path). Takes
@@ -101,6 +102,14 @@ pub type SharedState = Arc<MembraneState>;
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp).get(handle_mcp_sse))
+        .route(
+            "/personal/mcp",
+            post(crate::oauth_recall::handle).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/personal/mcp",
+            get(crate::oauth_recall::metadata),
+        )
         .route("/health", get(handle_health))
         .with_state(state)
 }
@@ -121,7 +130,7 @@ pub(crate) fn is_trusted_loopback(addr: &SocketAddr, headers: &HeaderMap) -> boo
 
 /// Run the listener-level ingress fence for a request. Returns `None` when the
 /// request may proceed, or a ready-to-send denial response.
-fn ingress_fence_gate(
+pub(crate) fn ingress_fence_gate(
     state: &SharedState,
     headers: &HeaderMap,
     is_loopback: bool,
@@ -252,7 +261,9 @@ pub(crate) async fn dispatch_rpc(
         "initialize" => handle_initialize(id, req.params),
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(state, id, auth_header, is_loopback).await,
-        "tools/call" => handle_tools_call(state, id, req.params, auth_header, is_loopback).await,
+        "tools/call" => {
+            handle_tools_call(state, id, req.params, auth_header, is_loopback, None).await
+        }
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 
@@ -261,7 +272,7 @@ pub(crate) async fn dispatch_rpc(
 
 // ── Method handlers ───────────────────────────────────────────────────────────
 
-fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
+pub(crate) fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     // Params are optional — tolerate clients that omit them entirely.
     let params: Option<InitializeParams> = params.and_then(|p| serde_json::from_value(p).ok());
 
@@ -429,12 +440,16 @@ async fn await_dispatch_outcome(
     }
 }
 
-async fn handle_tools_call(
+pub(crate) async fn handle_tools_call(
     state: &SharedState,
     id: Value,
     params: Option<Value>,
     auth_header: Option<&str>,
     is_loopback: bool,
+    oauth_caller: Option<(
+        crate::auth::CallerIdentity,
+        ansible_mesh_core::mcp_endpoint::McpEndpointConfig,
+    )>,
 ) -> JsonRpcResponse {
     let params: ToolCallParams = match params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
@@ -462,6 +477,20 @@ async fn handle_tools_call(
 
     // ── Config-driven path (McpEndpointConfig) ────────────────────────────
     let endpoint = state.endpoint_table.read().await;
+    if let Some((_, expected)) = &oauth_caller {
+        if endpoint.config() != Some(expected)
+            || state
+                .oauth_recall
+                .as_ref()
+                .is_none_or(|r| r.grant(expected, crate::oauth_recall::now()).is_err())
+        {
+            return JsonRpcResponse::err(
+                id,
+                error_code::PERMISSION_DENIED,
+                "OAuth endpoint changed",
+            );
+        }
+    }
     if endpoint.is_active() {
         let tool_spec = match endpoint.find_tool(tool_name) {
             Some(s) => s.clone(),
@@ -478,15 +507,19 @@ async fn handle_tools_call(
             .config()
             .map(|cfg| cfg.effective_auth(&tool_spec))
             .unwrap_or(McpAuthScheme::None);
-        let caller = match authorize_call(
-            tool_name,
-            &auth_scheme,
-            auth_header,
-            is_loopback,
-            &state.vault_cache,
-            state.vault.as_ref(),
-            &state.allotment,
-        ) {
+        let caller = match oauth_caller
+            .map(|(caller, _)| Ok(caller))
+            .unwrap_or_else(|| {
+                authorize_call(
+                    tool_name,
+                    &auth_scheme,
+                    auth_header,
+                    is_loopback,
+                    &state.vault_cache,
+                    state.vault.as_ref(),
+                    &state.allotment,
+                )
+            }) {
             Ok(c) => c,
             Err(e) => {
                 warn!(tool = tool_name, err = %e, "config-driven auth rejected");

@@ -1,6 +1,7 @@
 mod auth;
 #[cfg(test)]
 mod dispatch_tests;
+mod oauth_recall;
 mod protocol;
 mod routing;
 mod server;
@@ -28,6 +29,8 @@ use tracing::{error, warn};
 #[derive(Parser, Debug)]
 #[command(name = "membrane-mcp", about = "Philotic MCP membrane guest")]
 struct Args {
+    #[arg(long, env = "PHILOTIC_OAUTH_RECALL_PROFILE")]
+    oauth_recall_profile: Option<std::path::PathBuf>,
     #[arg(short, long, env = "MCP_PORT", default_value_t = 9100)]
     port: u16,
 
@@ -606,6 +609,12 @@ async fn main() -> Result<()> {
     let declared_exposure = Arc::new(std::sync::RwLock::new(None));
 
     let state = Arc::new(MembraneState {
+        oauth_recall: args
+            .oauth_recall_profile
+            .as_ref()
+            .map(|path| oauth_recall::RecallResource::load(path).map(Arc::new))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("OAuth recall profile refused"))?,
         routing_table: table,
         endpoint_table,
         vault_cache: VaultHashCache::new(),

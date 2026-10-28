@@ -1480,6 +1480,9 @@ version = "0.1.0"
 dependencies = [
  "ansible-mesh-core",
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "libc",
  "philotic-client",
  "reqwest",
  "serde",
@@ -2755,6 +2758,7 @@ dependencies = [
  "axum 0.7.9",
  "blake3",
  "clap",
+ "egress-http-runner",
  "hex",
  "membrane",
  "perimeter-core",

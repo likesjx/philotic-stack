@@ -21,6 +21,9 @@ use reqwest::{Method, StatusCode, Url};
 use tokio::net::lookup_host;
 use uuid::Uuid;
 
+pub mod introspection;
+pub mod transient;
+
 pub struct ExecutionContext<'a> {
     pub executor_node_id: &'a str,
     pub placement: EgressPlacementDecision,
@@ -37,6 +40,23 @@ pub async fn execute(
     binding: &IntegrationBinding,
     request: &HttpIntegrationRequest,
     context: ExecutionContext<'_>,
+) -> Result<HttpIntegrationResponse> {
+    execute_encoded(
+        binding,
+        request,
+        context,
+        encode_body(request.body.as_ref())?,
+        "application/json",
+    )
+    .await
+}
+
+async fn execute_encoded(
+    binding: &IntegrationBinding,
+    request: &HttpIntegrationRequest,
+    context: ExecutionContext<'_>,
+    body: Vec<u8>,
+    content_type: &str,
 ) -> Result<HttpIntegrationResponse> {
     let started_at_ms = unix_ms();
     let request_id = if context.correlation_id.is_empty() {
@@ -70,7 +90,6 @@ pub async fn execute(
             binding.binding_id
         );
     }
-    let body = encode_body(request.body.as_ref())?;
     if body.len() as u64 > target.max_request_bytes {
         bail!(
             "request body is {} bytes; binding limit is {}",
@@ -108,7 +127,7 @@ pub async fn execute(
             && current_method != Method::HEAD
         {
             builder = builder
-                .header("content-type", "application/json")
+                .header("content-type", content_type)
                 .body(current_body.clone());
         }
         let response = builder
@@ -586,6 +605,10 @@ fn inject_credential(
     })?;
     let value = binding.format.replacen("{}", secret, 1);
     insert_header(headers, &binding.header, &value)?;
+    // Header Debug representations must not reveal an injected credential.
+    if let Some(header) = headers.get_mut(&binding.header) {
+        header.set_sensitive(true);
+    }
     Ok(true)
 }
 
@@ -804,6 +827,66 @@ mod tests {
         assert!(wire_request.contains("x-request-tag: turn-1"));
         assert!(wire_request.contains("post /v1/forecast?zip=30309"));
         assert!(response.audit.credential_injected);
+    }
+
+    #[tokio::test]
+    async fn introspection_form_and_basic_match_issuer_contract_without_token_in_audit() {
+        let (address, server) = one_shot_server(r#"{"active":false}"#).await;
+        let mut binding = binding(address);
+        let IntegrationTarget::Http(target) = &mut binding.target else {
+            unreachable!()
+        };
+        target.credential.as_mut().unwrap().format = "Basic {}".into();
+        let token = "SYNTHETIC_access+token&=";
+        let secret = "S".repeat(43);
+        let (basic, body) =
+            crate::introspection::encode_inputs("synthetic_client", token, &secret).unwrap();
+        let request = HttpIntegrationRequest {
+            binding_id: "weather".into(),
+            method: "POST".into(),
+            path: "/v1/forecast".into(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let response = execute_encoded(
+            &binding,
+            &request,
+            ExecutionContext {
+                executor_node_id: "synthetic-node",
+                placement: EgressPlacementDecision::ExecuteLocal {
+                    audit_fallback: false,
+                },
+                credential: Some(&basic),
+                tool_name: "oauth.introspect",
+                agent_id: "synthetic",
+                caller_role: "mcp-membrane",
+                session_id: "content-free-audit",
+                turn_id: "synthetic-correlation",
+                correlation_id: "synthetic-correlation",
+            },
+            body,
+            "application/x-www-form-urlencoded",
+        )
+        .await
+        .unwrap();
+        let wire = server.await.unwrap();
+        assert!(wire
+            .to_ascii_lowercase()
+            .contains("content-type: application/x-www-form-urlencoded"));
+        assert!(wire.contains(&format!("authorization: Basic {basic}")));
+        assert!(wire.contains("token=SYNTHETIC_access%2Btoken%26%3D"));
+        let audit = serde_json::to_string(&response.audit).unwrap();
+        assert!(!audit.contains(token));
+        assert!(!audit.contains(&basic));
+        assert!(!audit.contains(&secret));
+        let mut headers = HeaderMap::new();
+        let IntegrationTarget::Http(t) = &binding.target else {
+            unreachable!()
+        };
+        inject_credential(t, &mut headers, Some(&basic)).unwrap();
+        assert!(headers["authorization"].is_sensitive());
+        assert!(!format!("{headers:?}").contains(&basic));
     }
 
     #[tokio::test]
