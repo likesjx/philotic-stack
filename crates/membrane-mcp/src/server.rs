@@ -97,6 +97,52 @@ impl std::fmt::Debug for MembraneState {
 
 pub type SharedState = Arc<MembraneState>;
 
+/// Own turn bookkeeping before enqueue as well as while awaiting the reply.
+/// HTTP deadline/client cancellation can drop either await. Cleanup stores only
+/// the opaque turn ID and cannot release an upstream result to a later request.
+struct TurnCleanup {
+    state: SharedState,
+    turn: String,
+}
+impl TurnCleanup {
+    fn new(state: &SharedState, turn: &str) -> Self {
+        Self {
+            state: state.clone(),
+            turn: turn.into(),
+        }
+    }
+}
+impl Drop for TurnCleanup {
+    fn drop(&mut self) {
+        let pending_done = if let Ok(mut pending) = self.state.pending_responses.try_lock() {
+            pending.remove(&self.turn);
+            true
+        } else {
+            false
+        };
+        let streams_done = if let Ok(mut streams) = self.state.streaming_buffers.try_lock() {
+            streams.remove(&self.turn);
+            true
+        } else {
+            false
+        };
+        if pending_done && streams_done {
+            return;
+        }
+        let state = self.state.clone();
+        let turn = self.turn.clone();
+        // Runtime shutdown also drops all maps; no recovery task is persisted.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut pending = state.pending_responses.lock().await;
+                let mut streams = state.streaming_buffers.lock().await;
+                pending.remove(&turn);
+                streams.remove(&turn);
+            });
+        }
+    }
+}
+
 // ── Router builder ────────────────────────────────────────────────────────────
 
 pub fn build_router(state: SharedState) -> Router {
@@ -104,7 +150,12 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/mcp", post(handle_mcp).get(handle_mcp_sse))
         .route(
             "/personal/mcp",
-            post(crate::oauth_recall::handle).layer(axum::extract::DefaultBodyLimit::max(8192)),
+            post(crate::oauth_recall::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(8192))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::oauth_recall::bounded_http,
+                )),
         )
         .route(
             "/.well-known/oauth-protected-resource/personal/mcp",
@@ -608,6 +659,7 @@ pub(crate) async fn handle_tools_call(
         };
 
         let (tx, rx) = oneshot::channel::<DispatchOutcome>();
+        let _cleanup = TurnCleanup::new(state, &turn_id);
         {
             let mut pending = state.pending_responses.lock().await;
             pending.insert(turn_id.clone(), tx);
@@ -740,6 +792,7 @@ pub(crate) async fn handle_tools_call(
     };
 
     let (tx, rx) = oneshot::channel::<DispatchOutcome>();
+    let _cleanup = TurnCleanup::new(state, &turn_id);
     {
         let mut pending = state.pending_responses.lock().await;
         pending.insert(turn_id.clone(), tx);

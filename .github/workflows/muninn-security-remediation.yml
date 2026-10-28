@@ -1,0 +1,44 @@
+name: Isolated Muninn security remediation
+on:
+  push:
+    branches: [codex/muninn-security-remediation]
+permissions:
+  contents: read
+jobs:
+  synthetic:
+    if: github.repository == 'likesjx/philotic-stack' && github.ref == 'refs/heads/codex/muninn-security-remediation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      CARGO_INCREMENTAL: '0'
+      PHILOTIC_VAULT_KEYCHAIN: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Pin isolated build toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Synthetic redaction, cancellation, load and existing recall contracts
+        run: cargo test --locked -p philotic-client -p egress-http-runner -p membrane-mcp -p membrane-mcp-client
+      - name: Ordinary guest builds, no execution or deployment
+        run: cargo build --locked -p membrane-mcp -p membrane-mcp-client -p egress-http-runner
+      - name: Receipt only, no executable artifact
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          pathlib.Path('security-qualification.json').write_text(json.dumps({
+            'source': os.environ['GITHUB_SHA'], 'syntheticOnly': True,
+            'crateTests': 'passed', 'ordinaryGuestBuilds': 'passed',
+            'verifierAuthorityImplemented': False, 'deploymentPermitted': False,
+            'productionAccess': False, 'claudeLive': False,
+          }, sort_keys=True) + '\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: muninn-security-qualification-${{ github.sha }}
+          path: security-qualification.json
+          retention-days: 1
+          if-no-files-found: error

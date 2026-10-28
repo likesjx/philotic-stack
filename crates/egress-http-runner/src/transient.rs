@@ -18,6 +18,37 @@ use tokio::{
 pub const DEADLINE: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 4096;
 
+/// Fail-fast concurrency and fixed-window request bound; no waiting queue,
+/// token cache, token-derived keys or per-IP allocation. One shared instance
+/// per resource, held for the whole operation including post-verification.
+pub struct Admission {
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    window: std::sync::Mutex<(std::time::Instant, usize)>,
+    burst: usize,
+}
+impl Admission {
+    pub fn new(concurrency: usize, burst: usize) -> Self {
+        assert!(concurrency > 0 && burst > 0);
+        Self {
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency)),
+            window: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+            burst,
+        }
+    }
+    pub fn enter(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        let mut window = self.window.lock().ok()?;
+        if window.0.elapsed() >= Duration::from_secs(1) {
+            *window = (std::time::Instant::now(), 0);
+        }
+        if window.1 >= self.burst {
+            return None;
+        }
+        window.1 += 1;
+        Some(permit)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Refusal {
@@ -233,6 +264,40 @@ pub async fn introspect_at(path: &Path, server_uid: u32, token: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_bounds_concurrency_and_rate_without_queue_or_token_state() {
+        let gate = Admission::new(1, 2);
+        let held = gate.enter().unwrap();
+        assert!(gate.enter().is_none());
+        drop(held);
+        drop(gate.enter().unwrap());
+        for _ in 0..100 {
+            assert!(gate.enter().is_none());
+        }
+        *gate.window.lock().unwrap() = (std::time::Instant::now() - Duration::from_secs(2), 2);
+        assert!(gate.enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn refused_audit_and_timeout_do_not_damage_independent_transport() {
+        let (mut ordinary, mut hotel) = UnixStream::pair().unwrap();
+        let mut a = authority();
+        a.refusal = Some(Refusal::AuditRejected);
+        assert!(exchange(br#"{"token":"synthetic"}"#, &mut a).await.is_ok());
+        let (mut slow, mut server) = UnixStream::pair().unwrap();
+        slow.write_all(&[0]).await.unwrap();
+        assert_eq!(
+            serve_with_deadline(&mut server, &mut a, Duration::from_millis(5)).await,
+            Err(Refusal::Timeout)
+        );
+        ordinary
+            .write_all(b"ordinary-still-connected")
+            .await
+            .unwrap();
+        let mut result = [0; 24];
+        hotel.read_exact(&mut result).await.unwrap();
+        assert_eq!(&result, b"ordinary-still-connected");
+    }
     struct Mock {
         calls: usize,
         abandon: bool,

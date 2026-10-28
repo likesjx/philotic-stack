@@ -100,6 +100,128 @@ fn rpc(method: &str, params: Value) -> JsonRpcRequest {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn oauth_http_limits_slow_bodies_before_extraction() {
+    use axum::{
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    let h = oauth_harness(0, None);
+    let app = crate::server::build_router(h.state.clone());
+    let mut request = Request::post("/personal/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from_stream(futures_util::stream::pending::<
+            Result<Vec<u8>, std::io::Error>,
+        >()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert!(h.state.pending_responses.lock().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn oauth_http_deadline_and_client_cancellation_release_turn_state() {
+    use axum::{
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    for cancel in [false, true] {
+        let mut h = oauth_harness(0, None);
+        let app = crate::server::build_router(h.state.clone());
+        let mut request = Request::post("/personal/mcp").header("content-type", "application/json")
+            .header("authorization", format!("Bearer {SYNTHETIC_OAUTH}"))
+            .body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"muninn_recall","arguments":{"query":"synthetic-only"}}}).to_string())).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+        let task = tokio::spawn(app.oneshot(request));
+        let envelope = h.inbound_rx.as_mut().unwrap().recv().await.unwrap();
+        h.state
+            .streaming_buffers
+            .lock()
+            .await
+            .insert(envelope.turn_id.clone(), "synthetic-partial".into());
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            tokio::time::advance(Duration::from_secs(16)).await;
+            assert_eq!(
+                task.await.unwrap().unwrap().status(),
+                StatusCode::GATEWAY_TIMEOUT
+            );
+        }
+        tokio::task::yield_now().await;
+        assert!(h.state.pending_responses.lock().await.is_empty());
+        assert!(h.state.streaming_buffers.lock().await.is_empty());
+        assert!(
+            h.state
+                .oauth_recall
+                .as_ref()
+                .unwrap()
+                .http_admission
+                .enter()
+                .is_some()
+        );
+        assert!(
+            h.state
+                .oauth_recall
+                .as_ref()
+                .unwrap()
+                .verification_admission
+                .enter()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn oauth_http_oversize_and_flood_leave_health_available() {
+    use axum::{
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    let h = oauth_harness(0, None);
+    let app = crate::server::build_router(h.state.clone());
+    let mut large = Request::post("/personal/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from("x".repeat(8193)))
+        .unwrap();
+    large
+        .extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+    assert_eq!(
+        app.clone().oneshot(large).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let resource = h.state.oauth_recall.as_ref().unwrap();
+    let held: Vec<_> = (0..8).map(|_| resource.http_admission.enter()).collect();
+    for _ in 0..50 {
+        let req = Request::post("/personal/mcp").body(Body::empty()).unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    let mut health = Request::get("/health").body(Body::empty()).unwrap();
+    health
+        .extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+    assert_eq!(app.oneshot(health).await.unwrap().status(), StatusCode::OK);
+    drop(held);
+}
+
 async fn call(
     state: &SharedState,
     req: JsonRpcRequest,
@@ -278,6 +400,8 @@ fn oauth_harness(mode: u8, budget: Option<McpCallAllotment>) -> Harness {
                 upstream_id: "synthetic-muninn".into(),
             },
             verifier: verifier.clone(),
+            http_admission: egress_http_runner::transient::Admission::new(8, 8),
+            verification_admission: egress_http_runner::transient::Admission::new(4, 4),
         }));
     // Assign the weak reference after the unique-Arc initialization above.
     *verifier.state.lock().unwrap() = Arc::downgrade(&h.state);
@@ -1017,6 +1141,38 @@ async fn deliver_accumulates_streaming_tokens_into_empty_final_reply() {
         DispatchOutcome::Ok(content) => assert_eq!(content, "hello"),
         other => panic!("expected Ok, got {other:?}"),
     }
+    assert!(h.state.streaming_buffers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn deliver_drops_orphan_streams_and_bounds_live_buffer() {
+    let h = harness(false, ExposureTier::Local, HashMap::new());
+    let mut guest = McpMembrane::new(9100, "mcp-membrane-test", h.state.clone());
+    guest
+        .deliver(OutboundReply::StreamingToken {
+            session_id: "synthetic".into(),
+            turn_id: "missing".into(),
+            token: "synthetic".into(),
+        })
+        .await
+        .unwrap();
+    assert!(h.state.streaming_buffers.lock().await.is_empty());
+    let (tx, rx) = oneshot::channel();
+    h.state
+        .pending_responses
+        .lock()
+        .await
+        .insert("bounded".into(), tx);
+    guest
+        .deliver(OutboundReply::StreamingToken {
+            session_id: "synthetic".into(),
+            turn_id: "bounded".into(),
+            token: "x".repeat(1024 * 1024 + 1),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(rx.await.unwrap(), DispatchOutcome::Err(_)));
+    assert!(h.state.pending_responses.lock().await.is_empty());
     assert!(h.state.streaming_buffers.lock().await.is_empty());
 }
 

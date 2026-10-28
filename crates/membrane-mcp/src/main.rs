@@ -348,8 +348,29 @@ impl MembraneGuest for McpMembrane {
                 // Accumulate streamed tokens so a terminal reply that carries no
                 // content of its own still yields the streamed text. True
                 // streaming over SSE is deferred; silent drop is not acceptable.
+                // Lock order matches cancellation cleanup. A cancelled HTTP
+                // receiver must not recreate an orphan stream buffer later.
+                let mut pending = self.state.pending_responses.lock().await;
                 let mut buffers = self.state.streaming_buffers.lock().await;
-                buffers.entry(turn_id).or_default().push_str(token);
+                if !pending
+                    .get(&turn_id)
+                    .is_some_and(|sender| !sender.is_closed())
+                {
+                    pending.remove(&turn_id);
+                    buffers.remove(&turn_id);
+                    return Ok(());
+                }
+                let buffer = buffers.entry(turn_id.clone()).or_default();
+                if buffer.len().saturating_add(token.len()) > 1024 * 1024 {
+                    buffers.remove(&turn_id);
+                    if let Some(sender) = pending.remove(&turn_id) {
+                        let _ = sender.send(server::DispatchOutcome::Err(
+                            "stream response exceeds limit".into(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                buffer.push_str(token);
                 return Ok(());
             }
             _ => {}

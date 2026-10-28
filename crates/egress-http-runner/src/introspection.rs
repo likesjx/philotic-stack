@@ -1,8 +1,9 @@
-//! Fixed introspection profile: private transport into the real egress guest.
+//! Fixed introspection contract retained for synthetic tests. Shared egress
+//! attachment is refused; the isolated authority transport remains disabled.
 //! No token-bearing task/session/mesh envelope is constructed here.
 use crate::{
-    transient::{Authority, Claims, Refusal},
     ExecutionContext,
+    transient::{Authority, Claims, Refusal},
 };
 use ansible_mesh_core::integration::{
     EgressPlacementDecision, HttpIntegrationAudit, HttpIntegrationRequest, IntegrationBinding,
@@ -17,6 +18,9 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Explicit isolated registration; never borrow the ordinary runner ID.
+    pub verifier_guest_id: String,
+    pub isolation: Isolation,
     pub socket_path: PathBuf,
     pub server_uid: u32,
     pub peer_uid: u32,
@@ -26,6 +30,38 @@ pub struct Profile {
     pub issuer: String,
     pub client_id: String,
     pub agent_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    DedicatedAccount,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Ordinary,
+    VerifierOnly,
+}
+pub fn execution_mode(
+    args: &[std::ffi::OsString],
+    profile: bool,
+) -> Result<ExecutionMode, Refusal> {
+    match (args, profile) {
+        ([], false) => Ok(ExecutionMode::Ordinary),
+        ([arg], true) if arg == "--oauth-verifier-only" => Ok(ExecutionMode::VerifierOnly),
+        _ => Err(Refusal::Refused),
+    }
+}
+
+/// Explicitly unavailable until a reviewed authenticated authority transport
+/// exists. Current hotel accepts only its own UID, auto-subscribes Register,
+/// and restricts audit to the shared egress role. A dedicated account cannot
+/// use it as-is. Never silently claim that role or widen socket permissions.
+pub async fn run_isolated(_profile: Profile, _guest_id: String) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "isolated verifier authority is not qualified; no IPC registration or socket creation attempted"
+    )
 }
 pub fn load_owned<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, Refusal> {
     use std::{
@@ -100,6 +136,8 @@ impl Profile {
         // Deployment supplies identities/references/revision, never invented
         // defaults. This version has exactly one issuer and one fixed action.
         if self.issuer != "https://www.jaredlikes.com"
+            || self.verifier_guest_id.is_empty()
+            || self.server_uid == 0
             || !self.socket_path.is_absolute()
             || self.server_uid != self.peer_uid
             || self.binding_revision == 0
@@ -353,6 +391,19 @@ pub(super) fn encode_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn shared_mode_refuses_profile_and_isolated_mode_cannot_register() {
+        assert_eq!(execution_mode(&[], false), Ok(ExecutionMode::Ordinary));
+        assert!(execution_mode(&[], true).is_err());
+        assert!(execution_mode(&["--oauth-verifier-only".into()], false).is_err());
+        assert_eq!(
+            execution_mode(&["--oauth-verifier-only".into()], true),
+            Ok(ExecutionMode::VerifierOnly)
+        );
+        let (p, _) = fixture();
+        assert!(run_isolated(p, "synthetic-only".into()).await.is_err());
+        assert!(!std::path::Path::new("/unbound/synthetic.sock").exists());
+    }
     use ansible_mesh_core::integration::*;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -360,6 +411,8 @@ mod tests {
     };
     fn fixture() -> (Profile, IntegrationBinding) {
         let p = Profile {
+            verifier_guest_id: "synthetic-isolated-verifier".into(),
+            isolation: Isolation::DedicatedAccount,
             socket_path: "/unbound/synthetic.sock".into(),
             server_uid: 1,
             peer_uid: 1,
@@ -443,7 +496,7 @@ mod tests {
         stream.read_exact(&mut bytes).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     struct SyntheticHttp;
     #[async_trait]
     impl ProfileExecutor for SyntheticHttp {
@@ -640,8 +693,10 @@ mod tests {
         }
         .with_subscriber(subscriber)
         .await;
-        assert!(!String::from_utf8_lossy(&logs.0.lock().unwrap())
-            .contains("DO_NOT_LOG_LATE_SYNTHETIC_SECRET"));
+        assert!(
+            !String::from_utf8_lossy(&logs.0.lock().unwrap())
+                .contains("DO_NOT_LOG_LATE_SYNTHETIC_SECRET")
+        );
         std::fs::remove_file(path).unwrap();
     }
     #[test]

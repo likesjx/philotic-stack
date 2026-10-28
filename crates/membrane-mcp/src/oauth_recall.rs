@@ -16,7 +16,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use egress_http_runner::transient::{Claims, Refusal};
+use egress_http_runner::transient::{Admission, Claims, Refusal};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -55,6 +55,8 @@ impl Verifier for SocketVerifier {
 pub struct RecallResource {
     pub profile: Profile,
     pub verifier: Arc<dyn Verifier>,
+    pub http_admission: Admission,
+    pub verification_admission: Admission,
 }
 impl RecallResource {
     pub fn load(path: &Path) -> Result<Self, Refusal> {
@@ -76,6 +78,8 @@ impl RecallResource {
                 uid: p.verifier_uid,
             }),
             profile: p,
+            http_admission: Admission::new(8, 8),
+            verification_admission: Admission::new(4, 4),
         })
     }
     fn claims_valid(&self, c: &Claims, now: u64) -> bool {
@@ -130,6 +134,26 @@ impl RecallResource {
         // Existing grant remains the principal and budget authority. OAuth does
         // not mint a new principal or fall back to an arbitrary token grant.
         Ok(grant)
+    }
+}
+
+/// Admission runs before JSON/body extraction. Slow bodies and verifier floods
+/// cannot allocate unbounded handler tasks or queue issuer calls. This is a
+/// global resource limit, not authentication or a substitute for proxy limits.
+pub async fn bounded_http(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(resource) = &state.oauth_recall else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(_permit) = resource.http_admission.enter() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(15), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
     }
 }
 pub(crate) fn now() -> u64 {
@@ -188,6 +212,20 @@ pub(crate) async fn dispatch(
     let Some(resource) = &state.oauth_recall else {
         return refused(id);
     };
+    let Some(_permit) = resource.verification_admission.enter() else {
+        return refused(id);
+    };
+    if !matches!(
+        req.method.as_str(),
+        "initialize"
+            | "ping"
+            | "notifications/initialized"
+            | "initialized"
+            | "tools/list"
+            | "tools/call"
+    ) {
+        return refused(id);
+    }
     let Some(token) = extract_bearer(header) else {
         return refused(id);
     };

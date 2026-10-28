@@ -1,16 +1,16 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ansible_mesh_core::integration::{
-    parse_projected_http_tool_name, EgressPlacementDecision, HttpIntegrationAudit,
-    HttpIntegrationRequest, IntegrationBinding, IntegrationTarget, OidcExchangeRequest,
+    EgressPlacementDecision, HttpIntegrationAudit, HttpIntegrationRequest, IntegrationBinding,
+    IntegrationTarget, OidcExchangeRequest, parse_projected_http_tool_name,
 };
 use anyhow::Result;
-use egress_http_runner::{execute, execute_oidc, ExecutionContext};
+use egress_http_runner::{ExecutionContext, execute, execute_oidc};
 use philotic_client::{
-    is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute,
-    TaskErrorPayload,
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
+    is_ipc_disconnect,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 const ROLE: &str = "egress-http-runner";
@@ -430,30 +430,27 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "egress_http_runner=info".into()),
         )
         .init();
-    // Optional reviewed non-secret profile. No socket/authority is added to
-    // existing runner installations unless this is explicitly configured.
-    let profile = std::env::var_os("PHILOTIC_OAUTH_INTROSPECTION_PROFILE")
-        .map(
-            |path| -> Result<egress_http_runner::introspection::Profile> {
-                let path = std::path::PathBuf::from(path);
-                let p = egress_http_runner::introspection::Profile::load(&path)
-                    .map_err(|_| anyhow::anyhow!("introspection profile source refused"))?;
-                anyhow::ensure!(p.node_id == local_node_id(), "introspection node mismatch");
-                Ok(p)
-            },
-        )
-        .transpose()?;
-    let private = profile
-        .as_ref()
-        .map(|p| {
-            egress_http_runner::transient::PrivateListener::bind(
-                &p.socket_path,
-                p.server_uid,
-                p.peer_uid,
-            )
-            .map_err(|_| anyhow::anyhow!("private introspection socket refused"))
-        })
-        .transpose()?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mode = egress_http_runner::introspection::execution_mode(
+        &args,
+        std::env::var_os("PHILOTIC_OAUTH_INTROSPECTION_PROFILE").is_some(),
+    )
+    .map_err(|_| {
+        anyhow::anyhow!("verifier requires explicit isolated mode; shared profile refused")
+    })?;
+    if mode == egress_http_runner::introspection::ExecutionMode::VerifierOnly {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("PHILOTIC_OAUTH_INTROSPECTION_PROFILE").expect("mode checked"),
+        );
+        let profile = egress_http_runner::introspection::Profile::load(&path)
+            .map_err(|_| anyhow::anyhow!("isolated verifier profile refused"))?;
+        anyhow::ensure!(
+            profile.node_id == local_node_id(),
+            "introspection node mismatch"
+        );
+        let guest_id = std::env::var("PHILOTIC_GUEST_ID")?;
+        return egress_http_runner::introspection::run_isolated(profile, guest_id).await;
+    }
     let guest_id = std::env::var("PHILOTIC_GUEST_ID").unwrap_or_else(|_| "egress-http".to_string());
     let identity = GuestIdentity {
         guest_id: guest_id.clone(),
@@ -467,28 +464,9 @@ async fn main() -> Result<()> {
     info!(guest_id, role = ROLE, "bounded HTTP runner listening");
 
     loop {
-        let incoming = tokio::select! {
-            message = ipc_client.recv_task() => message,
-            stream = async {
-                match &private {
-                    Some(listener) => listener.accept().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Ok(mut stream) = stream {
-                    let mut authority = egress_http_runner::introspection::RunnerAuthority { client: &mut ipc_client, profile: profile.as_ref().expect("listener has profile") };
-                    if let Err(reason) = egress_http_runner::transient::serve(&mut stream, &mut authority).await {
-                        warn!(?reason, "private introspection refused");
-                        if reason == egress_http_runner::transient::Refusal::Timeout {
-                            anyhow::bail!("private introspection deadline closed IPC authority");
-                        }
-                    }
-                } else {
-                    warn!("private introspection peer refused");
-                }
-                continue;
-            }
-        };
+        // Ordinary egress owns only its inbox. Never register a second client
+        // using this guest ID for verifier work or share its transport.
+        let incoming = ipc_client.recv_task().await;
         match incoming {
             Ok(IpcResponse::InboundTask { task_json, .. }) => {
                 match serde_json::from_str::<Value>(&task_json) {
@@ -499,8 +477,8 @@ async fn main() -> Result<()> {
                             warn!(%error, "HTTP integration call handling failed");
                         }
                     }
-                    Ok(task) => warn!(?task, "ignoring unsupported runner task"),
-                    Err(error) => warn!(%error, "invalid runner task JSON"),
+                    Ok(_) => warn!("ignoring unsupported runner task"),
+                    Err(_) => warn!("invalid runner task JSON"),
                 }
             }
             Ok(_) => {}

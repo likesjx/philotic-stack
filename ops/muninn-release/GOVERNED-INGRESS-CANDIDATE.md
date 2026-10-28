@@ -1,5 +1,10 @@
 # Existing ingress and issuer: local recall candidate
 
+**Historical candidate: deployment held.** Source `25cb3d0` passed its original
+synthetic suite but has unresolved secret logging, cancellation and shared
+authority/availability findings. See [SECURITY-REMEDIATION.md](SECURITY-REMEDIATION.md).
+The sections below describe the historical design, not deployment approval.
+
 This reconstructs the proposed integration on MBP from source
 `13c90b9f07af1bf74ea2de8a0d2c2603f24538f1`. It is not a transfer of mac-jane's
 unpublished candidate. No production operation, credential read, publication,

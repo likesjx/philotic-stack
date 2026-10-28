@@ -953,7 +953,7 @@ pub enum RestartReason {
 }
 
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
 #[serde(rename_all = "snake_case")]
 pub enum IpcRequest {
@@ -2697,7 +2697,7 @@ pub struct MemoryConfigRefresh {
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum IpcResponse {
     MemoryConfigRefreshReply {
@@ -3376,6 +3376,24 @@ impl Drop for MemoryRefreshGuard<'_> {
     }
 }
 
+// IPC payloads include secrets, user content and configuration. Debug must be
+// safe even at an unexpected/stale-frame or error logging site. Never format
+// field values here; serde remains the explicit wire serialization boundary.
+impl std::fmt::Debug for IpcRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpcRequest")
+            .field("kind", &std::mem::discriminant(self))
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for IpcResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpcResponse")
+            .field("kind", &std::mem::discriminant(self))
+            .finish_non_exhaustive()
+    }
+}
+
 impl PhiloticClient {
     /// Abandon a potentially partial operation. The transport cannot be reused,
     /// but already buffered pushes remain available before the disconnect error.
@@ -3528,8 +3546,12 @@ impl PhiloticClient {
         Self::connect_at(Self::socket_path(), identity).await
     }
 
-    /// Send an IPC request to the local Ansible and wait indefinitely for its reply.
+    /// Send an IPC request to the local Ansible. GetSecret has a five-second
+    /// cancellation-safe deadline; other legacy requests wait indefinitely.
     pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
+        if matches!(req, IpcRequest::GetSecret { .. }) {
+            return self.send_secret(req, Duration::from_secs(5)).await;
+        }
         if matches!(req, IpcRequest::RefreshMemoryConfig) {
             anyhow::bail!(
                 "Legacy memory refresh is ambiguous; use refresh_memory_config with a deadline"
@@ -3543,6 +3565,8 @@ impl PhiloticClient {
         self.read_matching_response(&req).await
     }
 
+    /// GetSecret additionally bounds the entire operation and closes the stream
+    /// on cancellation/deadline instead of using legacy stale-response recovery.
     /// Same contract as [`Self::send_request`], but bounds the wait for a reply to
     /// `timeout`. This exists because callers historically wrapped `send_request`
     /// in an external `tokio::time::timeout` — but dropping that future when the
@@ -3564,6 +3588,9 @@ impl PhiloticClient {
         req: IpcRequest,
         timeout: Duration,
     ) -> Result<IpcResponse> {
+        if matches!(req, IpcRequest::GetSecret { .. }) {
+            return self.send_secret(req, timeout).await;
+        }
         if matches!(req, IpcRequest::RefreshMemoryConfig) {
             anyhow::bail!(
                 "Legacy memory refresh is ambiguous; use refresh_memory_config with a deadline"
@@ -3608,6 +3635,47 @@ impl PhiloticClient {
                     timeout, req
                 )))
             }
+        }
+    }
+
+    /// Secrets never enter legacy stale-reply recovery. The guard also closes
+    /// on external cancellation or partial writes, before an audit can reuse
+    /// the transport. A fresh registration is an explicit caller decision.
+    async fn send_secret(&mut self, req: IpcRequest, deadline: Duration) -> Result<IpcResponse> {
+        self.ensure_connected()?;
+        let mut guard = MemoryRefreshGuard {
+            client: self,
+            completed: false,
+        };
+        if guard.client.pending_stale_responses != 0 {
+            anyhow::bail!("Secret IPC requires a synchronized connection");
+        }
+        let result = tokio::time::timeout(deadline, async {
+            let payload = serde_json::to_vec(&req)?;
+            guard.client.write_frame(&payload).await?;
+            let response = guard.client.read_matching_response(&req).await?;
+            match (&req, &response) {
+                (
+                    IpcRequest::GetSecret {
+                        secret_ref: expected,
+                    },
+                    IpcResponse::SecretData {
+                        secret_ref: actual, ..
+                    },
+                ) if expected == actual => Ok(response),
+                (_, IpcResponse::Standard { ok: false, .. }) => Ok(response),
+                _ => anyhow::bail!("Unexpected secret IPC reply"),
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(response)) => {
+                guard.completed = true;
+                Ok(response)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(elapsed) => Err(anyhow::Error::new(elapsed)
+                .context("Secret IPC deadline exceeded; reconnect required")),
         }
     }
 
@@ -4531,6 +4599,170 @@ mod tests {
             },
             peer,
         )
+    }
+
+    #[test]
+    fn ipc_debug_never_formats_payloads() {
+        let canary = "SYNTHETIC_CREDENTIAL_CANARY";
+        for rendered in [
+            format!(
+                "{:?}",
+                IpcResponse::SecretData {
+                    secret_ref: canary.into(),
+                    value_json: Some(canary.into())
+                }
+            ),
+            format!(
+                "{:?}",
+                IpcResponse::ConfigData {
+                    key: canary.into(),
+                    value_json: Some(canary.into())
+                }
+            ),
+            format!(
+                "{:?}",
+                IpcRequest::GetSecret {
+                    secret_ref: canary.into()
+                }
+            ),
+        ] {
+            assert!(
+                !rendered.contains(canary),
+                "IPC Debug exposed a synthetic payload"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_secret_request_closes_transport_before_audit() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        {
+            let operation = client.send_request_with_timeout(
+                IpcRequest::GetSecret {
+                    secret_ref: "synthetic-only".into(),
+                },
+                Duration::from_secs(1),
+            );
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = &mut operation => panic!("unexpected completion"),
+                _ = read_frame(&mut peer) => {},
+            }
+        }
+        assert!(client.stream.is_none());
+        assert!(
+            client
+                .send_request(IpcRequest::GetConfig {
+                    key: "audit-surrogate".into()
+                })
+                .await
+                .is_err()
+        );
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn secret_deadline_closes_transport_and_rejects_late_reply() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let (result, _) = tokio::join!(
+            client.send_request_with_timeout(
+                IpcRequest::GetSecret {
+                    secret_ref: "synthetic".into()
+                },
+                Duration::from_millis(5)
+            ),
+            read_frame(&mut peer),
+        );
+        assert!(is_ipc_timeout(&result.unwrap_err()));
+        assert!(client.stream.is_none());
+        assert_eq!(client.pending_stale_responses, 0);
+        assert!(peer.write_all(&[0, 0, 0, 2, b'{', b'}']).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn secret_reply_reference_mismatch_closes_transport() {
+        let (mut client, mut peer) = memory_refresh_pair();
+        let (reply, _) = tokio::join!(
+            client.send_request_with_timeout(
+                IpcRequest::GetSecret {
+                    secret_ref: "expected".into()
+                },
+                Duration::from_secs(1)
+            ),
+            async {
+                read_frame(&mut peer).await;
+                write_frame(
+                    &mut peer,
+                    &serde_json::to_vec(&IpcResponse::SecretData {
+                        secret_ref: "other".into(),
+                        value_json: Some("synthetic".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+            },
+        );
+        assert!(reply.is_err());
+        assert!(client.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_secret_logging_never_contains_canary() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Capture(Default::default());
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let (mut client, mut peer) = memory_refresh_pair();
+        client.pending_stale_responses = 1;
+        let canary = "SYNTHETIC_LATE_SECRET_CANARY";
+        let (reply, _) = tokio::join!(
+            client.send_request(IpcRequest::GetConfig {
+                key: "synthetic".into()
+            }),
+            async {
+                read_frame(&mut peer).await;
+                write_frame(
+                    &mut peer,
+                    &serde_json::to_vec(&IpcResponse::SecretData {
+                        secret_ref: canary.into(),
+                        value_json: Some(canary.into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+                write_frame(
+                    &mut peer,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "synthetic".into(),
+                        value_json: None,
+                    })
+                    .unwrap(),
+                )
+                .await;
+            },
+        );
+        assert!(reply.is_ok());
+        let bytes = sink.0.lock().unwrap();
+        let log = String::from_utf8_lossy(&bytes);
+        assert!(log.contains("Discarding stale IPC response"));
+        assert!(!log.contains(canary));
     }
 
     async fn memory_refresh_id(peer: &mut UnixStream) -> Uuid {
