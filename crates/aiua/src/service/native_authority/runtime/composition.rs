@@ -204,6 +204,15 @@ async fn composition(real: bool) {
     std::fs::write(&bundle, include_bytes!("mock_issuer.cjs")).unwrap();
     std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o444)).unwrap();
     let mut fixture_processes = Vec::new();
+    let mut unrelated = real.then(|| {
+        FixtureProcess(
+            std::process::Command::new("/bin/sleep")
+                .arg("120")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        )
+    });
     let mut issuer_args = vec![bundle.clone(), issuer_config.clone()];
     let mut issuer_environment = json!({"PERSONAL_OAUTH_NATIVE_MEMORY_RESOURCE":resource});
     if real {
@@ -313,7 +322,7 @@ async fn composition(real: bool) {
                 role: guest.into(),
                 config_json: worker.to_string(),
                 is_active: true,
-                active_pid: None,
+                active_pid: unrelated.as_ref().map(|p| p.0.id().to_string()),
                 last_active_at: None,
             })
             .unwrap();
@@ -425,6 +434,12 @@ async fn composition(real: bool) {
     })
     .await
     .unwrap();
+    if let Some(process) = &mut unrelated {
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "stale protected PID must not signal unrelated process"
+        );
+    }
     let denied_id = uuid::Uuid::new_v4().to_string();
     if real {
         let issued: Value = client
