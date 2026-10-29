@@ -1,0 +1,114 @@
+name: B7 native memory compatibility
+on:
+  pull_request:
+    branches: [codex/native-memory-b7-baseline]
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CI: 'true'
+      BASE_SHA: 5a08d74d944ece80940513a197c5ffa9f6f5c255
+      GUEST_SHA: 7399da86b061c3c01fd278fa631d030725720ae3
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 7399da86b061c3c01fd278fa631d030725720ae3
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 5a08d74d944ece80940513a197c5ffa9f6f5c255
+          path: baseline
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+      - name: Verify source and build narrow backport
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/b7-backport-target
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$GUEST_SHA"
+          test "$(git -C baseline rev-parse HEAD)" = "$BASE_SHA"
+          cargo test --locked -p ansible-mesh-core mcp_route::tests
+          cargo build --locked --release -p aiua
+          mkdir -p backport/bin fixture-bin dist
+          cp "$CARGO_TARGET_DIR/release/aiua" backport/bin/aiua
+          cp "$CARGO_TARGET_DIR/release/aiua" fixture-bin/aiua
+      - name: Provision through B7 hotel and capture with current guests
+        working-directory: candidate
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/native-guest-target
+        run: |
+          cargo build --locked -p native-memory
+          cp "$CARGO_TARGET_DIR/debug/native-memory" ../fixture-bin/native-memory
+          PHILOTIC_TEST_BIN_DIR="$GITHUB_WORKSPACE/fixture-bin" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture
+          cargo test --locked -p membrane-mcp
+      - name: Build original B7 rollback candidate
+        working-directory: baseline
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/b7-baseline-target
+        run: |
+          cargo test --locked -p ansible-mesh-core mcp_route::tests
+          cargo build --locked --release -p aiua
+          mkdir -p ../rollback/bin
+          cp "$CARGO_TARGET_DIR/release/aiua" ../rollback/bin/aiua
+      - name: Prove rollback binary rejects only the new route contract
+        working-directory: candidate
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/native-guest-target
+        run: |
+          set -euo pipefail
+          if cmp -s ../backport/bin/aiua ../rollback/bin/aiua; then
+            echo 'Backport and rollback binaries are identical; source isolation failed' >&2
+            exit 1
+          fi
+          cp "$CARGO_TARGET_DIR/debug/native-memory" ../rollback/bin/native-memory
+          PHILOTIC_EXPECT_NATIVE_ROUTE_REJECTION=1 PHILOTIC_TEST_BIN_DIR="$GITHUB_WORKSPACE/rollback/bin" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture
+          rm ../rollback/bin/native-memory
+      - name: Package verified source identities and rollback candidate
+        run: |
+          set -euo pipefail
+          TAG="v0.0.0-alpha.${GITHUB_RUN_NUMBER}"
+          for kind in backport rollback; do
+            if [ "$kind" = backport ]; then SHA="$HEAD_SHA"; else SHA="$BASE_SHA"; fi
+            python3 candidate/scripts/release-manifest.py generate --dir "$kind" --tag "$TAG" \
+              --sha "$SHA" --target x86_64-unknown-linux-gnu --require aiua
+            NAME="aiua-b7-$kind-$SHA-linux-x86_64"
+            tar -C "$kind" -czf "dist/$NAME.tar.gz" bin SHA256SUMS manifest.json
+            mkdir "verify-$kind"
+            tar -C "verify-$kind" -xzf "dist/$NAME.tar.gz"
+            python3 candidate/scripts/release-manifest.py verify --dir "verify-$kind"
+            (cd "verify-$kind" && sha256sum -c SHA256SUMS)
+            cp "$kind/manifest.json" "dist/$kind.manifest.json"
+          done
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          Path('dist/provenance.json').write_text(json.dumps({
+              'kind': 'unreleased-b7-backport-and-source-built-rollback',
+              'backport_sha': os.environ['HEAD_SHA'],
+              'baseline_sha': os.environ['BASE_SHA'],
+              'guest_test_sha': os.environ['GUEST_SHA'],
+              'target': 'x86_64-unknown-linux-gnu',
+              'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'rustc': subprocess.check_output(['rustc','--version'], text=True).strip(),
+              'installed_binary_reproduced': False,
+          }, indent=2)+'\n')
+          PY
+          (cd dist && sha256sum *.tar.gz *.json > SHA256SUMS)
+          cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-memory-b7-linux-${{ github.event.pull_request.head.sha }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
