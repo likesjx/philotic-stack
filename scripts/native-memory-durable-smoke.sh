@@ -37,11 +37,13 @@ docker run -d --pull never --name "$fixture" \
   --mount "type=volume,source=$volume,target=/var/lib/memgraph" \
   --tmpfs /var/log/memgraph:rw,uid=101,gid=103 \
   "$image" --log-level=WARNING --telemetry-enabled=false \
-  --storage-recover-on-startup=true --storage-wal-enabled=true \
+  --data-recovery-on-startup=true --storage-wal-enabled=true \
   --storage-wal-file-flush-every-n-tx=1 \
-  --storage-snapshot-interval-sec=0 --storage-snapshot-on-exit=false >/dev/null
+  --storage-snapshot-interval-sec=3600 --storage-snapshot-on-exit=false >/dev/null
+# Current flags: https://memgraph.com/docs/database-management/configuration
 ready() {
   for _ in {1..60}; do
+    [[ "$(docker inspect --format '{{.State.Running}}' "$fixture")" == true ]] || return 1
     if docker exec -i "$fixture" mgconsole --host 127.0.0.1 --port 7687 \
         <<< 'RETURN 1;' >/dev/null 2>&1; then return 0; fi
     sleep 1
@@ -57,7 +59,7 @@ timeout 600 cargo test --locked -p native-memory --test durable_memgraph \
 # Require actual non-empty snapshot AND WAL files before the crash, rather than
 # claiming durability solely from command-line flags or in-process reconnection.
 for directory in snapshots wal; do
-  files=$(docker exec "$fixture" find "/var/lib/memgraph/$directory" -type f -size +0c -print)
+  files=$(docker exec "$fixture" find /var/lib/memgraph -type f -path "*/$directory/*" -size +0c -print)
   [[ -n "$files" ]] || { echo "Missing non-empty $directory artifact" >&2; exit 1; }
   printf '%s\n' "$files"
 done

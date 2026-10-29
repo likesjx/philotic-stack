@@ -94,6 +94,9 @@ pub async fn resolve_native_response(
     let Some(expectation) = pending.get(turn).and_then(|p| p.native.as_ref()) else {
         return false;
     };
+    if expectation.authorize_return(&config, now).is_err() {
+        return false;
+    }
     let Ok(result) = expectation.verify(reply, &config.response_verifiers, now) else {
         return false;
     };

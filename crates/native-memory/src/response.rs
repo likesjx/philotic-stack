@@ -75,6 +75,28 @@ pub struct ResponseExpectation {
     envelope: Envelope,
 }
 impl ResponseExpectation {
+    /// Recheck ingress authority at disclosure time, not only at dispatch.
+    pub fn authorize_return(&self, config: &IngressConfig, now: u64) -> Result<()> {
+        let policy = Policy {
+            issuers: BTreeMap::from([(
+                config.issuer.clone(),
+                TrustedIssuer {
+                    key_id: config.key_id.clone(),
+                    public_key: SigningKey::from_bytes(&config.signing_seed)
+                        .verifying_key()
+                        .to_bytes(),
+                },
+            )]),
+            grants: config.grants.clone(),
+        };
+        verify(
+            &self.envelope,
+            &policy,
+            &self.envelope.claims.destination,
+            &self.envelope.claims.runner,
+            now,
+        )
+    }
     pub fn new(envelope: Envelope, verifiers: &[ResponseVerifier]) -> Result<Self> {
         let this = Self { envelope };
         this.verifier(verifiers)?;

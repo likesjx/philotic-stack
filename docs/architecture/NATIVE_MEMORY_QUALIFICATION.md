@@ -23,6 +23,8 @@ The domain-separated Ed25519 result signature binds the entire typed request env
 
 This provides integrity, not confidentiality. Local UDS smoke routing does not qualify remote mesh transport. Raw optional HMAC/TCP remains ineligible for private capture. Protected mutually authenticated ingress/hotel/backend transport and its exact deployment topology remain a release gate.
 
+Ingress also revalidates the saved request against current local grants and issuer policy before disclosing a signed result. Revocation while the request is pending leaves it unfulfilled even if the destination already committed; the immutable event remains available for authorized reconciliation. The membrane test exercises this boundary separately from response-key removal.
+
 Private config loading uses `O_NOFOLLOW`, file-descriptor metadata/permissions and a bounded read on Unix. An independent second reviewer found the prior pathname check/read race and generic completion bypass risk; these are addressed. The reviewer also caught an expired-envelope clock in the restart test, corrected before CI. This is a code review, not formal PR approval or a claim of security certification.
 
 ## Reproducible qualification

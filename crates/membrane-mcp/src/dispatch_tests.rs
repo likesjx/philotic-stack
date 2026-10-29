@@ -23,7 +23,23 @@ async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_on
             .verifying_key()
             .to_bytes(),
     }];
-    std::fs::write(&path,serde_json::to_vec(&json!({"issuer":"ingress","key_id":"key","signing_seed":vec![7;32],"grants":{},"response_verifiers":verifiers})).unwrap()).unwrap();
+    let grant = native_memory::Grant {
+        issuer: "ingress".into(),
+        reply_node: "ingress".into(),
+        reply_guest: "mcp".into(),
+        principal: "alice".into(),
+        owner: "alice".into(),
+        namespace: "notes".into(),
+        destination: "dest".into(),
+        runner: "memory".into(),
+        operations: vec!["recall".into()],
+        revision: 1,
+        expires_at: u64::MAX,
+        revoked: false,
+    };
+    let grants = std::collections::BTreeMap::from([("grant".into(), grant)]);
+    let mut config = json!({"issuer":"ingress","key_id":"key","signing_seed":vec![7;32],"grants":grants,"response_verifiers":verifiers});
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -33,9 +49,23 @@ async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_on
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    // Pending state is established only by authenticated dispatch in production;
-    // this fixture isolates completion-path attacks after that boundary.
-    let envelope:native_memory::Envelope=serde_json::from_value(json!({"claims":{"version":1,"issuer":"ingress","key_id":"key","caller":"alice","delegation":"grant","policy_revision":1,"destination":"dest","reply_node":"ingress","reply_guest":"mcp","runner":"memory","owner":"alice","namespace":"notes","operation":"recall","request_digest":vec![0;32],"issued_at":now,"expires_at":now+60,"nonce":"turn"},"request":{"event":"event","owner":"alice","namespace":"notes","provider":null,"command":{"operation":"recall","query":"synthetic","limit":1}},"signature":vec![0;64]})).unwrap();
+    let envelope = native_memory::Ingress::new(
+        "ingress".into(),
+        "key".into(),
+        ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+        grants,
+    )
+    .issue(
+        "grant",
+        native_memory::Command::Recall {
+            query: "synthetic".into(),
+            limit: 1,
+        },
+        "event".into(),
+        "turn".into(),
+        now,
+    )
+    .unwrap();
     let result = native_memory::Response {
         receipt: native_memory::Receipt {
             event: "event".into(),
@@ -49,7 +79,7 @@ async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_on
         .sign(&envelope, result, now)
         .unwrap();
     let mut h = harness(false, ExposureTier::Local, HashMap::new());
-    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(path);
+    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(path.clone());
     let (tx, mut rx) = oneshot::channel();
     h.state.pending_responses.lock().await.insert(
         "turn".into(),
@@ -109,6 +139,12 @@ async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_on
     let valid = message(
         json!({"action":"native_memory_response","turn_id":"turn","signed_response":signed}),
     );
+    config["grants"]["grant"]["revoked"] = true.into();
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(!guest.handle_push(&valid).await.unwrap());
+    assert_eq!(h.state.pending_responses.lock().await.len(), 1);
+    config["grants"]["grant"]["revoked"] = false.into();
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     assert!(guest.handle_push(&valid).await.unwrap());
     assert!(matches!(rx.await.unwrap(), DispatchOutcome::Ok(_)));
     assert!(!guest.handle_push(&valid).await.unwrap());
