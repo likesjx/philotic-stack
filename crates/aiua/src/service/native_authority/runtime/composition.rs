@@ -7,7 +7,19 @@ use ansible_mesh_core::{
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct FixtureProcess(std::process::Child);
+impl Drop for FixtureProcess {
+    fn drop(&mut self) {
+        // Each synthetic process owns a separate group, including hotel children.
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.0.wait();
+    }
+}
 
 struct SharedMaterializer(
     Arc<tokio::sync::Mutex<crate::service::guest_manager::LocalProcessMaterializer>>,
@@ -78,6 +90,16 @@ fn result(value: Value) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires explicit disposable CI Memgraph, Node and freshly built guest binaries"]
 async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
+    composition(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit CI: packaged aiua/guests, actual issuer bundle, disposable Mongo and Memgraph"]
+async fn packaged_hotel_real_issuer_native_capture_and_revocation() {
+    composition(true).await;
+}
+
+async fn composition(real: bool) {
     assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
     assert_eq!(
         std::env::var("PHILOTIC_NATIVE_OAUTH_COMPOSITION").as_deref(),
@@ -101,7 +123,7 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     let issuer_port = port();
     let mcp_port = port();
     let issuer = format!("https://127.0.0.1:{issuer_port}");
-    let token = "a".repeat(43);
+    let mut token = "a".repeat(43);
     let secret = "synthetic-introspection-secret-not-a-real-credential";
     let socket = root.join("hotel.sock");
     let control = root.join("control.sock");
@@ -176,11 +198,50 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     let issuer_config = root.join("issuer.json");
     json_file(
         &issuer_config,
-        json!({"port":issuer_port,"key":key,"cert":cert,"issuer":issuer,"resource":resource,"subject":subject,"token":token,"secret":secret}),
+        json!({"port":issuer_port,"authorityPort":port(),"key":key,"cert":cert,"issuer":issuer,"resource":resource,"subject":subject,"token":token,"secret":secret}),
     );
     let bundle = root.join("mock-issuer.cjs");
     std::fs::write(&bundle, include_bytes!("mock_issuer.cjs")).unwrap();
     std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let mut fixture_processes = Vec::new();
+    let mut issuer_args = vec![bundle.clone(), issuer_config.clone()];
+    let mut issuer_environment = json!({"PERSONAL_OAUTH_NATIVE_MEMORY_RESOURCE":resource});
+    if real {
+        let fixture = PathBuf::from(std::env::var("PHILOTIC_REAL_ISSUER_FIXTURE").unwrap());
+        let authority = PathBuf::from(std::env::var("PHILOTIC_REAL_ISSUER_BUNDLE").unwrap());
+        assert!(
+            std::process::Command::new(&node)
+                .env_clear()
+                .env("CI", "true")
+                .env("PATH", "/usr/bin:/bin")
+                .args([
+                    fixture.as_os_str(),
+                    std::ffi::OsStr::new("prepare"),
+                    issuer_config.as_os_str()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::copy(authority, &bundle).unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o444)).unwrap();
+        issuer_args = vec![bundle.clone(), root.join("authority.json")];
+        issuer_environment["MONGODB_URI"] = json!("mongodb://127.0.0.1:27018");
+        fixture_processes.push(FixtureProcess(
+            std::process::Command::new(&node)
+                .env_clear()
+                .env("CI", "true")
+                .args([
+                    fixture.as_os_str(),
+                    std::ffi::OsStr::new("serve"),
+                    issuer_config.as_os_str(),
+                ])
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        ));
+    }
     let (mcp_bin, mcp_sha) = artifact(&binaries.join("membrane-mcp"), &root.join("membrane"));
     let (runner_bin, runner_sha) = artifact(&binaries.join("native-memory"), &root.join("runner"));
     let (node_bin, node_sha) = artifact(&node, &root.join("node"));
@@ -190,7 +251,7 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
         json!({"guest":runner,"agent":"fixture-runner","roles":["native-memory-runner"],"command":runner_bin,"sha256":runner_sha,
           "args":["--node",hotel,"--guest",runner,"--socket",socket,"--policy",policy,"--response-signing-config",signer,"--memgraph-config",graph,"--authority-socket",control],"environment":{}}),
         json!({"guest":"issuer","agent":"fixture-issuer","roles":["issuer"],"command":node_bin,"sha256":node_sha,
-          "args":[bundle,issuer_config],"environment":{"PERSONAL_OAUTH_NATIVE_MEMORY_RESOURCE":resource},
+          "args":issuer_args,"environment":issuer_environment,
           "artifacts":[{"path":bundle,"sha256":format!("{:x}",Sha256::digest(std::fs::read(&bundle).unwrap()))}]}),
     ];
     let journal = root.join("journal");
@@ -208,8 +269,12 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
         "introspection_secret_file":secret_file,"introspection_ca_file":cert,
         "binding":{"issuer":issuer,"resource":resource,"client_id":"fixture-dot","subject":subject,"grant_version":"0:7","owner":subject,"namespace":"native-oauth-synthetic","operations":["remember","recall"]},"workers":workers}),
     );
-    let runtime = Runtime::load(&config, hotel).await.unwrap();
-    let store = SqliteGraphStorage::open(":memory:").unwrap();
+    let db_path = if real {
+        root.join("aiua_context.db")
+    } else {
+        PathBuf::from(":memory:")
+    };
+    let store = SqliteGraphStorage::open(&db_path).unwrap();
     let domain = Arc::new(GraphDomain::new(Arc::new(store.adapter())));
     domain
         .upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
@@ -223,16 +288,22 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
             active_pid: None,
         })
         .unwrap();
-    let materializer = Arc::new(tokio::sync::Mutex::new(
-        crate::service::guest_manager::LocalProcessMaterializer::new(":memory:")
-            .with_hotel_socket(socket.to_str().unwrap())
-            .with_native_authority(runtime),
-    ));
-    let manager = Arc::new(crate::service::guest_manager::GuestManager::new(
-        hotel,
-        domain.clone(),
-        Box::new(SharedMaterializer(materializer.clone())),
-    ));
+    let materializer = if real {
+        None
+    } else {
+        Some(Arc::new(tokio::sync::Mutex::new(
+            crate::service::guest_manager::LocalProcessMaterializer::new(":memory:")
+                .with_hotel_socket(socket.to_str().unwrap())
+                .with_native_authority(Runtime::load(&config, hotel).await.unwrap()),
+        )))
+    };
+    let manager = materializer.as_ref().map(|materializer| {
+        Arc::new(crate::service::guest_manager::GuestManager::new(
+            hotel,
+            domain.clone(),
+            Box::new(SharedMaterializer(materializer.clone())),
+        ))
+    });
     for guest in ["issuer", runner] {
         let worker = workers.iter().find(|w| w["guest"] == guest).unwrap();
         domain
@@ -249,9 +320,30 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let server = crate::service::ipc::IpcServer::new(socket.to_str().unwrap(), hotel, tx, domain)
-        .with_materialization_requester(manager.clone());
-    let server = tokio::spawn(async move { server.run().await });
+    let server = if let Some(manager) = &manager {
+        let server =
+            crate::service::ipc::IpcServer::new(socket.to_str().unwrap(), hotel, tx, domain)
+                .with_materialization_requester(manager.clone());
+        Some(tokio::spawn(async move { server.run().await }))
+    } else {
+        let log = std::fs::File::create(root.join("hotel.log")).unwrap();
+        fixture_processes.push(FixtureProcess(
+            std::process::Command::new(binaries.join("aiua"))
+                .env_clear()
+                .env("CI", "true")
+                .env("PHILOTIC_HOTEL_SOCKET", &socket)
+                .env("PHILOTIC_LOG_DIR", root.join("logs"))
+                .current_dir(root)
+                .args(["--hotel", hotel, "--native-authority-config"])
+                .arg(&config)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        ));
+        None
+    };
     let mut probe = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(c) = PhiloticClient::connect_at(
@@ -294,8 +386,10 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
             {"action_pattern":"native-memory.remember","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null},
             {"action_pattern":"native-memory.recall","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null}
         ],"updated_at":0})).unwrap();
-    for guest in ["issuer", runner] {
-        assert!(manager.ensure_guest_active(guest).await.unwrap());
+    if let Some(manager) = &manager {
+        for guest in ["issuer", runner] {
+            assert!(manager.ensure_guest_active(guest).await.unwrap());
+        }
     }
     assert!(matches!(
         probe
@@ -328,6 +422,39 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     })
     .await
     .unwrap();
+    if real {
+        let issued: Value = client
+            .post(format!("{issuer}/test/issue"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        token = issued["token"]
+            .as_str()
+            .expect("actual PKCE/consent token issuance")
+            .into();
+        let readonly: Value = client
+            .post(format!("{issuer}/test/issue"))
+            .header("x-read-only", "1")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let denied = rpc(
+            &client,
+            &url,
+            readonly["token"].as_str().unwrap(),
+            "native-memory.remember",
+            "readonly-denied",
+            json!({"operation":"remember"}),
+        )
+        .await;
+        assert_eq!(denied["error"]["code"], -32001);
+    }
     let event = uuid::Uuid::new_v4().to_string();
     let remember = json!({"operation":"remember","id":event,"subject":subject,"content":"Synthetic violet lantern","source":"synthetic://oauth","source_version":"1","lineage":"independent"});
     for rejected in [
@@ -414,14 +541,18 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
         .await["error"]["code"],
         -32001
     );
-    for guest in [membrane, runner, "issuer"] {
-        materializer
-            .lock()
-            .await
-            .reclaim_guest(guest)
-            .await
-            .unwrap();
+    if let Some(materializer) = materializer {
+        for guest in [membrane, runner, "issuer"] {
+            materializer
+                .lock()
+                .await
+                .reclaim_guest(guest)
+                .await
+                .unwrap();
+        }
     }
-    server.abort();
+    if let Some(server) = server {
+        server.abort();
+    }
     drain.abort();
 }
