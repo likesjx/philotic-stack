@@ -80,6 +80,11 @@ async fn native_memory_authenticated_membrane_router_two_hotel_roundtrip() {
     let grants = BTreeMap::from([("caller-1".into(), grant)]);
     let config = dir.path().join("synthetic-issuer.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"issuer":"test-node","key_id":"test-key","signing_seed":vec![7;32],"grants":grants})).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let policy = Policy {
         issuers: BTreeMap::from([(
             "test-node".into(),

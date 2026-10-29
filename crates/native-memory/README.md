@@ -16,7 +16,7 @@ The native tests use synthetic keys and temporary SQLite files. The binary smoke
 
 ## Fixed tools
 
-Local validation on 2026-10-29: **645 passed, 0 failed, 2 existing ignored fixture helpers** across the four affected packages. The new crate has 10 acceptance tests including its binary smoke; the membrane package has 32 tests including the assembled native path. Formatting/diff checks pass. Native-memory Clippy passes with `-D warnings`; affected-package Clippy passes the repository ratchet, retaining seven existing membrane-mcp warnings. The first binary smoke failure was a test-harness nonblocking accepted socket on macOS; setting that fixture socket to blocking fixed it. No installed runtime was touched. Confidence: test-green plus a disposable binary smoke, not live-green.
+Local validation on 2026-10-29: **650 passed, 0 failed, 2 existing ignored fixture helpers** across the four affected packages. The new crate has 15 acceptance tests including its binary smoke; the membrane package has 32 tests including the assembled native path. Formatting/diff checks pass. Native-memory Clippy passes with `-D warnings`; affected-package Clippy passes the repository ratchet, retaining seven existing membrane-mcp warnings. The first binary smoke failure was a test-harness nonblocking accepted socket on macOS; setting that fixture socket to blocking fixed it. No installed runtime was touched. Confidence: test-green plus a disposable binary smoke, not live-green.
 
 Two endpoint-config routes use target `{"kind":"native_memory","runner_id":"memory-1","target_node":"memory-hotel"}` and matching actions `native-memory.remember` and `native-memory.recall`. They require explicit BearerToken authentication and operator-provisioned preapproval; loopback `None` authentication is rejected for native routes. Legacy dynamic route tables cannot invoke this target.
 
@@ -44,10 +44,12 @@ Reusable external bearer, issuer private key, master/backend/provider credential
 
 ## Runtime entrypoints (not installed or invoked against live hotels)
 
-Ingress: `membrane-mcp --native-memory-config <local-issuer-file>` in addition to existing IPC/listener args. This file contains a signing seed and local token-ID→grant map; keep it outside routed config and restrict access. It is reread for every native call. No default issuer or grant exists.
+Ingress: `membrane-mcp --native-memory-config <local-issuer-file>` in addition to existing IPC/listener args. This file contains a signing seed and local token-ID→grant map; keep it outside routed config. Loading rejects symlinks, files over 1 MiB and group/world Unix permissions. It is reread for every native call. No default issuer or grant exists.
 
 Destination: `native-memory --socket <local-hotel-socket> --node <destination-node> --guest <runner-id> --database <private-sqlite-path> --policy <local-public-policy-file>`. Policy contains pinned public keys and matching grants only. No GetSecret, FetchMemoryConfig or backend/provider network call occurs. No service definition, real signing key, persistent grant, route provisioning, installation or restart is performed here.
 
 Cancellation is implemented at library checkpoints before execution and commit; the current guest does not wire remote cancellation notifications. A timed-out caller must retry its stable event ID to reconcile a possibly committed outcome. End-to-end cancellation, restart fault injection, resource retention limits, transport confidentiality, supervisor configuration and real hotel/connector qualification remain gates.
 
 See [proposal and rollout effects](../../docs/architecture/NATIVE_MEMORY_CAPTURE_PROPOSAL.md). The separate 35-test cognition experiment stays unchanged outside this branch; this capture slice adds no source-derived algorithms.
+
+See the [adversarial review and next qualification plan](../../docs/architecture/NATIVE_MEMORY_CAPTURE_REVIEW.md), including the unresolved response-integrity activation blocker.

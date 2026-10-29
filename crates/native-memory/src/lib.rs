@@ -259,6 +259,23 @@ pub struct IngressConfig {
     pub grants: BTreeMap<String, Grant>,
 }
 impl IngressConfig {
+    /// Opt-in local signing config. Reject group/world access and symlinks on
+    /// Unix instead of relying on operators to remember a private umask.
+    pub fn load(path: &Path) -> Result<Self> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| Error::Unavailable)?;
+        if !metadata.file_type().is_file() || metadata.len() > 1_048_576 {
+            return Err(Error::Denied);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(Error::Denied);
+            }
+        }
+        serde_json::from_slice(&std::fs::read(path).map_err(|_| Error::Unavailable)?)
+            .map_err(|_| Error::Invalid)
+    }
     pub fn into_ingress(self) -> Ingress {
         Ingress::new(
             self.issuer,
@@ -483,6 +500,9 @@ impl Runner {
         }
         let (policy, now) = current()?;
         verify(e, &policy, &self.destination, &self.runner, now)?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
         tx.commit().map_err(|_| Error::Unavailable)?;
         Ok(Response {
             receipt,

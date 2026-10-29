@@ -591,10 +591,7 @@ async fn handle_tools_call(
                     .native_memory_config
                     .as_ref()
                     .ok_or(native_memory::Error::Unavailable)?;
-                let config: native_memory::IngressConfig = serde_json::from_slice(
-                    &std::fs::read(path).map_err(|_| native_memory::Error::Unavailable)?,
-                )
-                .map_err(|_| native_memory::Error::Invalid)?;
+                let config = native_memory::IngressConfig::load(path)?;
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Arguments {

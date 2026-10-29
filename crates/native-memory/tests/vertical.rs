@@ -476,3 +476,188 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
         send(&mut peer, &IpcResponse::success("routed", None));
     }
 }
+
+#[test]
+fn cancellation_during_final_policy_reload_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut runner = open(&path);
+    let (ingress, policy) = setup();
+    let envelope = issue(&ingress, "event", "nonce", command());
+    let cancelled = AtomicBool::new(false);
+    let mut calls = 0;
+    let result = runner.execute_current(
+        &envelope,
+        || {
+            calls += 1;
+            if calls == 2 {
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok((policy.clone(), 100))
+        },
+        &cancelled,
+    );
+    assert_eq!(result, Err(Error::Cancelled));
+    let db = rusqlite::Connection::open(path).unwrap();
+    for table in ["observations", "receipts", "nonces"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[test]
+fn typed_json_normalizes_order_but_rejects_duplicates_and_unknown_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = open(&dir.path().join("db"));
+    let (ingress, policy) = setup();
+    let envelope = issue(&ingress, "event", "nonce", command());
+    // Value maps reorder struct fields; pretty JSON changes whitespace only.
+    let value = serde_json::to_value(&envelope).unwrap();
+    let reordered = serde_json::to_vec_pretty(&value).unwrap();
+    assert!(
+        runner
+            .execute_wire(&reordered, &policy, 100, &AtomicBool::new(false))
+            .is_ok()
+    );
+    let original = serde_json::to_string(&envelope).unwrap();
+    let duplicate = original.replacen(
+        "\"event\":\"event\"",
+        "\"event\":\"event\",\"event\":\"event\"",
+        1,
+    );
+    assert_ne!(original, duplicate);
+    assert_eq!(
+        runner.execute_wire(duplicate.as_bytes(), &policy, 100, &AtomicBool::new(false)),
+        Err(Error::Invalid)
+    );
+    let mut unknown = value;
+    unknown["request"]["role"] = serde_json::json!("owner");
+    assert_eq!(
+        runner.execute_wire(
+            &serde_json::to_vec(&unknown).unwrap(),
+            &policy,
+            100,
+            &AtomicBool::new(false)
+        ),
+        Err(Error::Invalid)
+    );
+}
+
+#[test]
+fn every_signed_authority_pin_rejects_tampering() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = open(&dir.path().join("db"));
+    let (ingress, policy) = setup();
+    let original = serde_json::to_value(issue(&ingress, "event", "nonce", command())).unwrap();
+    for field in [
+        "issuer",
+        "key_id",
+        "caller",
+        "delegation",
+        "destination",
+        "runner",
+        "reply_node",
+        "reply_guest",
+        "owner",
+        "namespace",
+        "operation",
+        "nonce",
+    ] {
+        let mut value = original.clone();
+        value["claims"][field] = serde_json::json!("tampered");
+        assert!(
+            runner
+                .execute_wire(
+                    &serde_json::to_vec(&value).unwrap(),
+                    &policy,
+                    100,
+                    &AtomicBool::new(false)
+                )
+                .is_err(),
+            "{field}"
+        );
+    }
+    for field in ["version", "policy_revision", "issued_at", "expires_at"] {
+        let mut value = original.clone();
+        value["claims"][field] = serde_json::json!(999);
+        assert!(
+            runner
+                .execute_wire(
+                    &serde_json::to_vec(&value).unwrap(),
+                    &policy,
+                    100,
+                    &AtomicBool::new(false)
+                )
+                .is_err(),
+            "{field}"
+        );
+    }
+    for field in [
+        "id",
+        "subject",
+        "content",
+        "source",
+        "source_version",
+        "lineage",
+    ] {
+        let mut value = original.clone();
+        value["request"]["command"][field] = serde_json::json!("tampered");
+        assert_eq!(
+            runner.execute_wire(
+                &serde_json::to_vec(&value).unwrap(),
+                &policy,
+                100,
+                &AtomicBool::new(false)
+            ),
+            Err(Error::Denied),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn trusted_issuer_cannot_use_another_issuers_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = open(&dir.path().join("db"));
+    let (_, mut policy) = setup();
+    let key = SigningKey::from_bytes(&[8; 32]);
+    policy.issuers.insert(
+        "foreign-issuer".into(),
+        TrustedIssuer {
+            key_id: "foreign-key".into(),
+            public_key: key.verifying_key().to_bytes(),
+        },
+    );
+    let mut foreign_grants = policy.grants.clone();
+    foreign_grants.get_mut("caller-1").unwrap().issuer = "foreign-issuer".into();
+    let foreign = Ingress::new(
+        "foreign-issuer".into(),
+        "foreign-key".into(),
+        key,
+        foreign_grants,
+    );
+    let envelope = issue(&foreign, "event", "nonce", command());
+    assert_eq!(
+        runner.execute(&envelope, &policy, 100, &AtomicBool::new(false)),
+        Err(Error::Denied)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn signing_config_rejects_public_permissions_and_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issuer.json");
+    let (_, policy) = setup();
+    std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"issuer":"ingress-hotel","key_id":"test-key","signing_seed":vec![7;32],"grants":policy.grants})).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(IngressConfig::load(&path), Err(Error::Denied)));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(IngressConfig::load(&path).is_ok());
+    let link = dir.path().join("link");
+    symlink(&path, &link).unwrap();
+    assert!(matches!(IngressConfig::load(&link), Err(Error::Denied)));
+}
