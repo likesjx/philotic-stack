@@ -1,5 +1,12 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Native memory B7 compatibility backport — 2026-10-29
+
+- Scope: exact B7 base 5a08d74 plus NativeMemory route enum support, separate from broader hotel upgrades. Related native guests: PR #683 at 047f93cc. See [compatibility/rollback record](architecture/NATIVE_MEMORY_B7_BACKPORT.md).
+- Linux qualification: dedicated exact-head CI builds the backport, exercises true endpoint provisioning/persistence/startup replay and synthetic capture/recall with current guests, preserves legacy route contracts, and packages source-built backport/rollback candidates with hashes. Exact CI/artifact outcome is recorded in the draft PR.
+- Authority: local tests, publication and candidate packaging; necessary scoped restarts approved for today only after qualification. No production writes, install, keys/grants, security/network/schema changes or route repair performed. No private memory access or telemetry writes. No broad upgrade or merge implied.
+- Remaining: confirm node/owner/database metadata through existing authorized operator surfaces, qualify final production configuration and rollback backup, resolve actual dot exposure. Hotel restart can interrupt attached guests; original B7 requires native routes removed before rollback. Source-built rollback does not reproduce the installed artifact.
+
 - [x] Inspect the `openclaw-plugin-ansible` repository and identify the rust port branch.
 - [x] Understand the current architecture of the ansible mesh.
 - [x] Design the separation of the stack into independently addressable units:
