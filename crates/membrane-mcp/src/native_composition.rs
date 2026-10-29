@@ -395,6 +395,42 @@ async fn real_hotels_native_runner_authenticated_mcp_composition() {
     };
     legacy.tools.truncate(1);
     legacy.preapproval_rules.clear();
+    if std::env::var("PHILOTIC_EXPECT_NATIVE_ROUTE_REJECTION").as_deref() == Ok("1") {
+        // Negative control for an original B7 binary, not merely its source enum.
+        // Establish working IPC/provisioning before sending the unsupported variant.
+        assert!(matches!(
+            source_probe
+                .send_request(IpcRequest::ProvisionMcpEndpoint { config: legacy })
+                .await
+                .unwrap(),
+            IpcResponse::McpEndpointProvisioned { .. }
+        ));
+        let rejected = source_probe
+            .send_request_with_timeout(
+                IpcRequest::ProvisionMcpEndpoint { config },
+                Duration::from_secs(3),
+            )
+            .await;
+        assert!(
+            matches!(rejected,
+            Ok(IpcResponse::Standard { ok: false, ref code, ref message, .. })
+                if code == "MALFORMED_PAYLOAD" && message.contains("unknown variant `native_memory`")),
+            "negative control requires explicit native route decoding rejection, not timeout/disconnection: {rejected:?}"
+        );
+        let status = source_probe
+            .send_request(IpcRequest::GetMcpEndpointStatus {
+                endpoint_id: "fixture".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, IpcResponse::Standard { ok: true, data: Some(ref data), .. }
+            if data["config"].is_null()),
+            "rejected native config must not persist: {status:?}"
+        );
+        eprintln!("Original B7 binary rejected native_memory after accepting legacy endpoint");
+        return;
+    }
     let mut wrong_owner = config.clone();
     wrong_owner.owner_agent_id = "not-the-registered-owner".into();
     assert!(matches!(
