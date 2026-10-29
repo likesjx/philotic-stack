@@ -73,17 +73,17 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           python3 -m unittest discover -s scripts/tests -p 'test_release*.py'
           scripts/release-packages.sh required-bins --platform linux | grep -Fx native-memory
-          cargo build --locked --release --target "$TARGET" -p native-memory -p membrane-mcp --bins
+          cargo build --locked --release --target "$TARGET" -p aiua -p native-memory -p membrane-mcp --bins
       - name: Assemble and verify candidate archive
         run: |
           set -euo pipefail
           mkdir -p stage/bin dist unpacked
-          cp "target/$TARGET/release/native-memory" "target/$TARGET/release/membrane-mcp" stage/bin/
+          cp "target/$TARGET/release/aiua" "target/$TARGET/release/native-memory" "target/$TARGET/release/membrane-mcp" stage/bin/
           chmod 755 stage/bin/*
           # Candidate metadata only: this does not create a Git tag or release.
           TAG="v0.0.0-alpha.${GITHUB_RUN_NUMBER}"
           python3 scripts/release-manifest.py generate --dir stage --tag "$TAG" \
-            --sha "$SOURCE_SHA" --target "$TARGET" --require native-memory membrane-mcp
+            --sha "$SOURCE_SHA" --target "$TARGET" --require aiua native-memory membrane-mcp
           python3 - <<'PY'
           import json, os, subprocess
           from pathlib import Path

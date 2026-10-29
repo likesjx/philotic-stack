@@ -92,7 +92,9 @@ confidentiality. Remote authority unavailability must deny new commit/release.
 Local ordering boundary: issuer mutations using the enrolled authority worker
 hold the same journal lock as native commit and release. A commit reserved before
 revocation can finish; revocation waits and cannot promise retroactive rollback.
-Direct out-of-band issuer/database mutation is not covered by this guarantee.
+Direct database/admin writes, uncoordinated issuer instances and upstream
+identity-provider changes are not serialized by this fence. Fresh introspection
+can observe them but does not make them atomic with COMMIT.
 The local runner holds its reservation from validation through database commit
 acknowledgement; generation retirement uses that same fence. A crash/unknown
 acknowledgement leaves a durable dirty marker and prevents automatic recovery.

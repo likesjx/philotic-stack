@@ -402,7 +402,7 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
             .status()
             .is_success()
     );
-    assert!(
+    assert_eq!(
         rpc(
             &client,
             &url,
@@ -411,9 +411,8 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
             "revoked",
             json!({"operation":"recall","query":"violet","limit":10})
         )
-        .await
-        .get("error")
-        .is_some()
+        .await["error"]["code"],
+        -32001
     );
     for guest in [membrane, runner, "issuer"] {
         materializer
