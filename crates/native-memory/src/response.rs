@@ -1,5 +1,8 @@
 //! Authenticated result binding. This provides integrity, NOT confidentiality.
 use super::*;
+pub fn request_binding(envelope: &Envelope) -> Result<[u8; 32]> {
+    digest(envelope)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

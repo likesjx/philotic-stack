@@ -182,6 +182,21 @@ async fn native_memgraph_capture_transaction_acceptance() {
         Error::Denied
     );
     // Verify all three writes rolled back together, and exact retries did not
+    // The hotel control reservation is checked asynchronously after staging and
+    // before COMMIT. A denied permit must roll back observation/receipt/nonce.
+    assert_eq!(
+        runner
+            .execute_authorized(
+                &rollback,
+                || Ok((policy.clone(), 100)),
+                &cancel,
+                async || Err(Error::Denied)
+            )
+            .await
+            .unwrap_err(),
+        Error::Denied
+    );
+    // Verify all three writes rolled back together, and exact retries did not
     // duplicate observations. Counts include the one committed recall receipt.
     for (label, expected) in [
         ("NativeMemoryObservation", 1),

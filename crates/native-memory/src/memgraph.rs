@@ -100,8 +100,18 @@ impl MemgraphRunner {
     pub async fn execute_current(
         &self,
         e: &Envelope,
+        current: impl FnMut() -> Result<(Policy, u64)>,
+        cancelled: &AtomicBool,
+    ) -> Result<Response> {
+        self.execute_authorized(e, current, cancelled, async || Ok(()))
+            .await
+    }
+    pub async fn execute_authorized(
+        &self,
+        e: &Envelope,
         mut current: impl FnMut() -> Result<(Policy, u64)>,
         cancelled: &AtomicBool,
+        mut before_commit: impl AsyncFnMut() -> Result<()>,
     ) -> Result<Response> {
         if cancelled.load(Ordering::SeqCst) {
             return Err(Error::Cancelled);
@@ -130,12 +140,16 @@ impl MemgraphRunner {
         });
         match outcome {
             Ok(response) => {
+                if let Err(error) = before_commit().await {
+                    tx.rollback().await.map_err(|_| Error::Uncertain)?;
+                    return Err(error);
+                }
                 // A lost COMMIT response is ambiguous; never report committed on error.
                 tx.commit().await.map_err(|_| Error::Uncertain)?;
                 Ok(response)
             }
             Err(error) => {
-                let _ = tx.rollback().await;
+                tx.rollback().await.map_err(|_| Error::Uncertain)?;
                 Err(error)
             }
         }

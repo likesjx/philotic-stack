@@ -10,7 +10,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(unix)]
+pub mod authority_control;
 pub mod memgraph;
+pub mod oauth;
 pub mod response;
 
 pub const ROLE: &str = "native-memory-runner";
@@ -126,12 +129,15 @@ pub struct Envelope {
 pub struct RoutedRequest {
     pub action: String,
     pub signed_request: Envelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_handle: Option<String>,
 }
 impl RoutedRequest {
     pub fn new(signed_request: Envelope) -> Self {
         Self {
             action: "native_memory_request".into(),
             signed_request,
+            authority_handle: None,
         }
     }
 }
@@ -192,6 +198,11 @@ pub struct TrustedIssuer {
 pub struct Policy {
     pub issuers: BTreeMap<String, TrustedIssuer>,
     pub grants: BTreeMap<String, Grant>,
+}
+impl Policy {
+    pub fn load(path: &Path) -> Result<Self> {
+        load_private_json(path)
+    }
 }
 
 /// Ingress holds signing material locally. Caller IDs must be results of external
@@ -273,6 +284,8 @@ impl Ingress {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngressConfig {
+    #[serde(default)]
+    pub oauth: Option<oauth::ResourceConfig>,
     pub issuer: String,
     pub key_id: String,
     pub signing_seed: [u8; 32],
@@ -284,7 +297,11 @@ impl IngressConfig {
     /// Opt-in local signing config. Reject group/world access and symlinks on
     /// Unix instead of relying on operators to remember a private umask.
     pub fn load(path: &Path) -> Result<Self> {
-        load_private_json(path)
+        let config: Self = load_private_json(path)?;
+        if let Some(oauth) = &config.oauth {
+            oauth.validate()?;
+        }
+        Ok(config)
     }
     pub fn into_ingress(self) -> Ingress {
         Ingress::new(
@@ -518,6 +535,33 @@ impl Runner {
             receipt,
             observations,
         })
+    }
+}
+/// Constructed only after signature, local receiver policy and request checks.
+/// Never deserialize this from a routed task or caller JSON.
+pub struct VerifiedRequest {
+    envelope: Envelope,
+    binding: [u8; 32],
+}
+impl VerifiedRequest {
+    pub fn validate(
+        e: &Envelope,
+        policy: &Policy,
+        destination: &str,
+        runner: &str,
+        now: u64,
+    ) -> Result<Self> {
+        verify(e, policy, destination, runner, now)?;
+        Ok(Self {
+            envelope: e.clone(),
+            binding: digest(e)?,
+        })
+    }
+    pub fn envelope(&self) -> &Envelope {
+        &self.envelope
+    }
+    pub fn binding(&self) -> [u8; 32] {
+        self.binding
     }
 }
 fn verify(e: &Envelope, p: &Policy, destination: &str, runner: &str, now: u64) -> Result<()> {

@@ -6,6 +6,8 @@ on:
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'crates/native-memory/**'
+      - 'crates/aiua/src/service/native_authority/**'
+      - 'crates/aiua/src/service/native_authority.rs'
       - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
@@ -40,7 +42,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: '0'
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
-  MEMGRAPH_IMAGE: memgraph/memgraph@sha256:bd01a159023283b56b807943ed28225c8f662920b64317f26da7d9f0f5b19de4
+  MEMGRAPH_IMAGE: memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27
 
 jobs:
   capture-memgraph:
@@ -67,6 +69,10 @@ jobs:
           key: lifegraph-capture-memgraph-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             lifegraph-capture-memgraph-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
       - name: Start disposable empty Memgraph
         run: |
@@ -102,7 +108,12 @@ jobs:
         run: cargo test --locked -p native-memory --test memgraph -- --ignored --test-threads=1
 
       - name: Build native two-hotel composition
-        run: cargo build --locked -p aiua -p native-memory
+        run: cargo build --locked -p aiua -p native-memory -p membrane-mcp
+
+      - name: Hotel-owned OAuth capture, recall and coordinated revocation
+        env:
+          PHILOTIC_NATIVE_OAUTH_COMPOSITION: '1'
+        run: NODE_TEST_EXECUTABLE="$(command -v node)" PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p aiua same_hotel_oauth_http_capture_recall_and_coordinated_revocation -- --ignored --nocapture
 
       - name: HTTP MCP through real hotels into Memgraph
         env:

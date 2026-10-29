@@ -350,6 +350,7 @@ fn harness(static_mode: bool, tier: ExposureTier, vault: HashMap<String, [u8; 32
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let state = Arc::new(MembraneState {
         native_memory_config: None,
+        native_pending: Default::default(),
         routing_table: new_shared_table(),
         endpoint_table: new_shared_endpoint_table(),
         vault_cache: VaultHashCache::new(),

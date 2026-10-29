@@ -20,6 +20,7 @@ ansible-mesh-core = { path = "../ansible-mesh-core" }
 prompt-guard = { path = "../prompt-guard" }
 perimeter-core = { path = "../perimeter-core" }
 memory-core = { path = "../memory-core" }
+native-memory = { path = "../native-memory" }
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
@@ -43,3 +44,6 @@ hex = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 webrtc = "0.17.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -5,6 +5,7 @@ edition = "2021"
 description = "Core mesh beacon types and transport"
 
 [dependencies]
+libc = "0.2"
 philotic-primitives-mesh = { path = "../philotic-primitives-mesh" }
 aes-gcm = "0.10"
 

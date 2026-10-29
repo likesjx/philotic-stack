@@ -7,6 +7,8 @@ on:
       - 'crates/membrane/**'
       - 'crates/membrane-mcp/**'
       - 'crates/ansible-mesh-core/**'
+      - 'crates/aiua/**'
+      - 'crates/data-memorygraphrag/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'release/packages.toml'
@@ -31,9 +33,16 @@ jobs:
           toolchain: '1.94.1'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - run: cargo fmt --check -p native-memory -p membrane -p membrane-mcp -p ansible-mesh-core
       - run: cargo test --locked -p native-memory -p membrane -p membrane-mcp
       - run: cargo test --locked -p ansible-mesh-core --lib
+      - run: cargo test --locked -p aiua native_authority
+      - run: cargo test --locked -p aiua concrete_child_retirement_and_replacement
+      - run: NODE_TEST_EXECUTABLE="$(command -v node)" cargo test --locked -p aiua sealed_node_bundle_survives_source_replacement_and_cannot_be_written -- --ignored --nocapture
+      - run: cargo check --locked -p data-memorygraphrag --all-targets
       - run: cargo clippy --locked -p native-memory -p membrane -p membrane-mcp -p ansible-mesh-core --all-targets
       - name: Build disposable hotel composition
         run: cargo build --locked -p aiua -p native-memory

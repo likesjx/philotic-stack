@@ -55,6 +55,31 @@ pub struct PendingResponse {
     pub sender: oneshot::Sender<DispatchOutcome>,
     pub native: Option<native_memory::response::ResponseExpectation>,
 }
+#[derive(Clone)]
+pub struct NativePending {
+    request_id: Value,
+    token_hash: [u8; 32],
+    handle: String,
+    config: native_memory::oauth::ResourceConfig,
+    expires_at: u64,
+}
+async fn cancel_native(state: &MembraneState, pending: &NativePending) -> Option<bool> {
+    use native_memory::authority_control::{Client, Reply, Request};
+    let mut client = Client::connect(&pending.config.authority_socket)
+        .await
+        .ok()?;
+    match client
+        .send(&Request::Cancel {
+            guest: state.guest_id.clone(),
+            handle: pending.handle.clone(),
+        })
+        .await
+        .ok()?
+    {
+        Reply::Cancelled { committed } => Some(committed),
+        _ => None,
+    }
+}
 impl From<oneshot::Sender<DispatchOutcome>> for PendingResponse {
     fn from(sender: oneshot::Sender<DispatchOutcome>) -> Self {
         Self {
@@ -113,6 +138,7 @@ pub async fn resolve_native_response(
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
+    pub native_pending: Arc<Mutex<HashMap<String, NativePending>>>,
     /// Opt-in local file, reread per native call for revocation. Never logged/routed.
     pub native_memory_config: Option<std::path::PathBuf>,
     /// Legacy per-agent route table (UpdateMcpRoutes path).
@@ -161,9 +187,30 @@ pub type SharedState = Arc<MembraneState>;
 
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(native_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/*suffix",
+            get(native_resource_metadata),
+        )
         .route("/mcp", post(handle_mcp).get(handle_mcp_sse))
         .route("/health", get(handle_health))
         .with_state(state)
+}
+fn native_oauth(state: &MembraneState) -> Option<native_memory::oauth::ResourceConfig> {
+    state
+        .native_memory_config
+        .as_ref()
+        .and_then(|p| native_memory::IngressConfig::load(p).ok())
+        .and_then(|c| c.oauth)
+}
+async fn native_resource_metadata(State(state): State<SharedState>) -> axum::response::Response {
+    match native_oauth(&state) {
+        Some(c)=>(StatusCode::OK,axum::Json(json!({"resource":c.resource,"authorization_servers":[c.issuer],"scopes_supported":[native_memory::oauth::RECALL,native_memory::oauth::REMEMBER],"bearer_methods_supported":["header"]}))).into_response(),
+        None=>StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // ── Ingress fence helper ──────────────────────────────────────────────────────
@@ -282,15 +329,59 @@ pub(crate) async fn dispatch_rpc(
                 "id": req.id,
                 "error": { "code": -32001, "message": message }
             });
+            let mut challenge = HeaderMap::new();
+            if status == 401 {
+                if let Some(c) = native_oauth(state) {
+                    if let Ok(value) = HeaderValue::from_str(&format!(
+                        "Bearer resource_metadata=\"{}\"",
+                        c.metadata_url
+                    )) {
+                        challenge.insert("www-authenticate", value);
+                    }
+                }
+            }
             return (
                 axum::http::StatusCode::from_u16(status)
                     .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+                challenge,
                 axum::Json(body),
             )
                 .into_response();
         }
     }
 
+    if req.method == "notifications/cancelled" {
+        if let (Some(token), Some(request_id)) = (
+            extract_bearer(auth_header),
+            req.params.as_ref().and_then(|p| p.get("requestId")),
+        ) {
+            let hash = *blake3::hash(token.as_bytes()).as_bytes();
+            let selected: Vec<_> = state
+                .native_pending
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, p)| p.token_hash == hash && p.request_id == *request_id)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (turn, pending) in selected {
+                if let Some(committed) = cancel_native(state, &pending).await {
+                    state.native_pending.lock().await.remove(&turn);
+                    if let Some(response) = state.pending_responses.lock().await.remove(&turn) {
+                        let _ = response.sender.send(DispatchOutcome::Err(
+                            if committed {
+                                "cancelled after commit; write remains committed"
+                            } else {
+                                "cancelled before commit"
+                            }
+                            .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        return (StatusCode::ACCEPTED, "").into_response();
+    }
     match req.method.as_str() {
         // Notifications — JSON-RPC spec: MUST NOT send a response.
         // "notifications/initialized" is the spec name; bare "initialized" is
@@ -309,7 +400,7 @@ pub(crate) async fn dispatch_rpc(
         return (StatusCode::ACCEPTED, "").into_response();
     }
 
-    let resp = match req.method.as_str() {
+    let mut resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(state, id, auth_header, is_loopback).await,
@@ -317,6 +408,45 @@ pub(crate) async fn dispatch_rpc(
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 
+    if resp
+        .error
+        .as_ref()
+        .is_some_and(|e| e.code == error_code::PERMISSION_DENIED)
+    {
+        if let Some(c) = native_oauth(state) {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) =
+                HeaderValue::from_str(&format!("Bearer resource_metadata=\"{}\"", c.metadata_url))
+            {
+                headers.insert("www-authenticate", value);
+            }
+            return (StatusCode::UNAUTHORIZED, headers, axum::Json(resp)).into_response();
+        }
+    }
+    if let Some((client, turn, digest, deadline)) = resp.native_release.take() {
+        let Ok(bytes) = serde_json::to_vec(&resp) else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let pending = state.native_pending.clone();
+        use futures_util::StreamExt;
+        let stream =
+            crate::native_release::stream(axum::body::Bytes::from(bytes), client, digest, deadline)
+                .chain(futures_util::stream::once(async move {
+                    pending.lock().await.remove(&turn);
+                    Ok(axum::body::Bytes::new())
+                }));
+        // Linearization: the complete response data frame is handed to HTTP
+        // while the hotel fence is still held. Only the following poll releases
+        // it. Disconnect/drop before completion leaves uncertainty, not a retry.
+        return (
+            [
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+            ],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
+    }
     axum::Json(resp).into_response()
 }
 
@@ -361,24 +491,36 @@ async fn handle_tools_list(
 ) -> JsonRpcResponse {
     // Prefer config-driven endpoint table; fall back to legacy route table.
     let endpoint = state.endpoint_table.read().await;
+    let oauth = native_oauth(state);
     let tools: Vec<McpToolDescriptor> = if let Some(cfg) = endpoint.config() {
         let bearer = extract_bearer(auth_header);
         cfg.tools
             .iter()
-            .filter(|tool| match cfg.effective_auth(tool) {
-                McpAuthScheme::BearerToken { grants } => bearer
-                    .and_then(|token| {
-                        verify_bearer_token(
-                            &tool.name,
-                            token,
-                            &grants,
-                            &state.vault_cache,
-                            state.vault.as_ref(),
-                        )
-                        .ok()
-                    })
-                    .is_some(),
-                McpAuthScheme::None => is_loopback,
+            .filter(|tool| {
+                if oauth.is_some()
+                    && matches!(
+                        tool.name.as_str(),
+                        "native-memory.remember" | "native-memory.recall"
+                    )
+                {
+                    true
+                } else {
+                    match cfg.effective_auth(tool) {
+                        McpAuthScheme::BearerToken { grants } => bearer
+                            .and_then(|token| {
+                                verify_bearer_token(
+                                    &tool.name,
+                                    token,
+                                    &grants,
+                                    &state.vault_cache,
+                                    state.vault.as_ref(),
+                                )
+                                .ok()
+                            })
+                            .is_some(),
+                        McpAuthScheme::None => is_loopback,
+                    }
+                }
             })
             .map(|t| McpToolDescriptor {
                 name: t.name.clone(),
@@ -407,7 +549,22 @@ async fn handle_tools_list(
         })
     };
 
-    JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
+    let mut result = serde_json::to_value(ToolsListResult { tools }).unwrap();
+    if oauth.is_some() {
+        if let Some(tools) = result["tools"].as_array_mut() {
+            for tool in tools {
+                let scope = match tool["name"].as_str() {
+                    Some("native-memory.remember") => Some(native_memory::oauth::REMEMBER),
+                    Some("native-memory.recall") => Some(native_memory::oauth::RECALL),
+                    _ => None,
+                };
+                if let Some(scope) = scope {
+                    tool["securitySchemes"] = json!([{"type":"oauth2","scopes":[scope]}]);
+                }
+            }
+        }
+    }
+    JsonRpcResponse::ok(id, result)
 }
 
 /// Map a classified auth failure to its MCP error code.
@@ -519,6 +676,7 @@ async fn handle_tools_call(
     }
 
     let tool_name = &params.name;
+    let oauth = native_oauth(state);
     let args = params.arguments.unwrap_or(json!({}));
 
     // ── Config-driven path (McpEndpointConfig) ────────────────────────────
@@ -539,15 +697,32 @@ async fn handle_tools_call(
             .config()
             .map(|cfg| cfg.effective_auth(&tool_spec))
             .unwrap_or(McpAuthScheme::None);
-        let caller = match authorize_call(
-            tool_name,
-            &auth_scheme,
-            auth_header,
-            is_loopback,
-            &state.vault_cache,
-            state.vault.as_ref(),
-            &state.allotment,
-        ) {
+        let caller = match if let Some(c) = &oauth {
+            if !matches!(
+                tool_name.as_str(),
+                "native-memory.remember" | "native-memory.recall"
+            ) || extract_bearer(auth_header).is_none()
+            {
+                Err(AuthError::Missing(
+                    "native OAuth authentication required".into(),
+                ))
+            } else {
+                Ok(crate::auth::CallerIdentity {
+                    token_id: c.grant_id.clone(),
+                    scopes: vec![],
+                })
+            }
+        } else {
+            authorize_call(
+                tool_name,
+                &auth_scheme,
+                auth_header,
+                is_loopback,
+                &state.vault_cache,
+                state.vault.as_ref(),
+                &state.allotment,
+            )
+        } {
             Ok(c) => c,
             Err(e) => {
                 warn!(tool = tool_name, err = %e, "config-driven auth rejected");
@@ -564,6 +739,9 @@ async fn handle_tools_call(
         };
 
         let preapproved = endpoint.is_preapproved(&inbound.action);
+        if oauth.is_some() && inbound.target_kind != "native_memory" {
+            return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, "native resource only");
+        }
         drop(endpoint);
 
         // Pre-approval rules are the only approval bypass. Loopback callers get
@@ -636,6 +814,7 @@ async fn handle_tools_call(
         };
 
         let mut native_expectation = None;
+        let mut native_permit = None;
         if inbound.target_kind == "native_memory" {
             // Native memory has a separate local issuer/grant policy. A bearer
             // token_id by itself is not delegated authority at the destination.
@@ -696,8 +875,78 @@ async fn handle_tools_call(
                     return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, e.to_string());
                 }
             };
-            envelope.content = serde_json::to_string(&native_memory::RoutedRequest::new(signed))
-                .expect("native envelope serialization");
+            let mut routed = native_memory::RoutedRequest::new(signed);
+            if let Some(c) = &oauth {
+                use native_memory::authority_control::{Client, Reply, Request};
+                let Some(token) = extract_bearer(auth_header) else {
+                    return JsonRpcResponse::err(
+                        id,
+                        error_code::PERMISSION_DENIED,
+                        "native OAuth required",
+                    );
+                };
+                let admitted = async {
+                    let mut client = Client::connect(&c.authority_socket).await?;
+                    let reply = client
+                        .send(&Request::Admit {
+                            guest: state.guest_id.clone(),
+                            token: token.into(),
+                            envelope: Box::new(routed.signed_request.clone()),
+                        })
+                        .await?;
+                    match reply {
+                        Reply::Permit { handle } => Ok(handle),
+                        _ => Err(native_memory::Error::Denied),
+                    }
+                }
+                .await;
+                let Ok(handle) = admitted else {
+                    return JsonRpcResponse::err(
+                        id,
+                        error_code::PERMISSION_DENIED,
+                        "native OAuth denied",
+                    );
+                };
+                let digest = match native_memory::response::request_binding(&routed.signed_request)
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            error_code::PERMISSION_DENIED,
+                            "native request invalid",
+                        );
+                    }
+                };
+                native_permit = Some((handle.clone(), digest));
+                let token_hash = *blake3::hash(token.as_bytes()).as_bytes();
+                let mut pending = state.native_pending.lock().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|v| v.as_secs())
+                    .unwrap_or(0);
+                pending.retain(|_, p| p.expires_at > now);
+                if pending.len() >= 128 {
+                    return JsonRpcResponse::err(
+                        id,
+                        error_code::DISPATCH_ERROR,
+                        "native request capacity",
+                    );
+                }
+                pending.insert(
+                    turn_id.clone(),
+                    NativePending {
+                        request_id: id.clone(),
+                        token_hash,
+                        handle: handle.clone(),
+                        config: c.clone(),
+                        expires_at: routed.signed_request.claims.expires_at,
+                    },
+                );
+                routed.authority_handle = Some(handle);
+            }
+            envelope.content =
+                serde_json::to_string(&routed).expect("native envelope serialization");
             envelope.raw_transport = json!({"transport":"mcp","target_kind":"native_memory","target_id":inbound.target_id,"target_node":inbound.target_node});
         }
 
@@ -720,7 +969,7 @@ async fn handle_tools_call(
             return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
         }
 
-        return await_dispatch_outcome(
+        let mut response = await_dispatch_outcome(
             state,
             id,
             tool_name,
@@ -734,6 +983,51 @@ async fn handle_tools_call(
             },
         )
         .await;
+        if let (Some(c), Some((handle, digest))) = (&oauth, native_permit) {
+            use native_memory::authority_control::{Client, Reply, Request};
+            let released = async {
+                let mut client = Client::connect(&c.authority_socket).await?;
+                // Conservative bound starts before the hotel acquires its five-second lease.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                if response.error.is_some() {
+                    let _ = client
+                        .send(&Request::Cancel {
+                            guest: state.guest_id.clone(),
+                            handle,
+                        })
+                        .await;
+                    return Err(native_memory::Error::Denied);
+                }
+                if !matches!(
+                    client
+                        .send(&Request::Release {
+                            guest: state.guest_id.clone(),
+                            handle,
+                            digest
+                        })
+                        .await?,
+                    Reply::Ready
+                ) {
+                    return Err(native_memory::Error::Denied);
+                }
+                Ok((client, deadline))
+            }
+            .await;
+            match released {
+                Ok((client, deadline)) => {
+                    response.native_release = Some((client, turn_id.clone(), digest, deadline))
+                }
+                Err(_) => {
+                    state.native_pending.lock().await.remove(&turn_id);
+                    return JsonRpcResponse::err(
+                        response.id,
+                        error_code::PERMISSION_DENIED,
+                        "native result release denied",
+                    );
+                }
+            }
+        }
+        return response;
     }
     drop(endpoint);
 

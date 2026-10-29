@@ -76,6 +76,8 @@ fn stdout_line_is_health_signal(line: &str) -> bool {
 
 /// A Universal Materializer backed by the local OS Process space.
 pub struct LocalProcessMaterializer {
+    native_runtime: Option<Arc<super::native_authority::runtime::Runtime>>,
+    protected_children: HashMap<String, super::protected_local_guest::ProtectedLocalGuest>,
     children: HashMap<String, tokio::process::Child>,
     db_path: String,
     hotel_socket: Option<String>,
@@ -85,11 +87,20 @@ pub struct LocalProcessMaterializer {
 impl LocalProcessMaterializer {
     pub fn new(db_path: impl Into<String>) -> Self {
         Self {
+            native_runtime: None,
+            protected_children: HashMap::new(),
             children: HashMap::new(),
             db_path: db_path.into(),
             hotel_socket: None,
             stderr_tx: None,
         }
+    }
+    pub fn with_native_authority(
+        mut self,
+        runtime: Arc<super::native_authority::runtime::Runtime>,
+    ) -> Self {
+        self.native_runtime = Some(runtime);
+        self
     }
 
     /// Supply the hotel's IPC socket path so all spawned guests receive
@@ -155,6 +166,10 @@ impl Materializer for LocalProcessMaterializer {
         guest_id: &str,
         config_json: &serde_json::Value,
     ) -> Result<String> {
+        if let Some(child) = self.protected_children.get(guest_id) {
+            anyhow::ensure!(child.exited().await?, "protected child already live");
+        }
+        self.protected_children.remove(guest_id);
         let tracked_child_is_live = if let Some(child) = self.children.get_mut(guest_id) {
             child.try_wait()?.is_none()
         } else {
@@ -213,6 +228,16 @@ impl Materializer for LocalProcessMaterializer {
             command.stderr(std::process::Stdio::piped());
             command.stdout(std::process::Stdio::piped());
 
+            let protected = if let Some(runtime) = &self.native_runtime {
+                if runtime.selected(guest_id) {
+                    Some(runtime.prepare(guest_id, config_json, &mut command)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let mut child = command.spawn().with_context(|| {
                 format!(
                     "Failed to spawn OS child process for guest '{}' using command '{}'",
@@ -268,7 +293,20 @@ impl Materializer for LocalProcessMaterializer {
                 });
             }
 
-            self.children.insert(guest_id.to_string(), child);
+            if let Some(principal) = protected {
+                let runtime = self.native_runtime.as_ref().unwrap();
+                let protected = super::protected_local_guest::ProtectedLocalGuest::adopt(
+                    child,
+                    runtime.launches.clone(),
+                    guest_id,
+                    unsafe { libc::geteuid() },
+                    principal,
+                )?
+                .with_native_authority(runtime.authority.clone())?;
+                self.protected_children.insert(guest_id.into(), protected);
+            } else {
+                self.children.insert(guest_id.to_string(), child);
+            }
 
             Ok(child_pid.to_string())
         } else {
@@ -277,6 +315,17 @@ impl Materializer for LocalProcessMaterializer {
     }
 
     async fn reclaim_guest(&mut self, guest_id: &str) -> Result<()> {
+        if let Some(child) = self.protected_children.remove(guest_id) {
+            child.stop().await?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self
+                .native_runtime
+                .as_ref()
+                .is_some_and(|r| r.selected(guest_id)),
+            "no owned protected child; refusing PID fallback"
+        );
         if let Some(mut child) = self.children.remove(guest_id) {
             let pid = child.id().unwrap_or(0);
             match child.start_kill() {
@@ -323,6 +372,23 @@ impl Materializer for LocalProcessMaterializer {
     }
 
     async fn check_status(&mut self, guest_id: &str, active_id: &str) -> Result<bool> {
+        if self
+            .native_runtime
+            .as_ref()
+            .is_some_and(|r| r.selected(guest_id) && !r.healthy())
+        {
+            anyhow::bail!("native coordinator failed; protected guest readiness denied");
+        }
+        if let Some(child) = self.protected_children.get(guest_id) {
+            return Ok(!child.exited().await?);
+        }
+        if self
+            .native_runtime
+            .as_ref()
+            .is_some_and(|r| r.selected(guest_id))
+        {
+            return Ok(false);
+        }
         if let Some(child) = self.children.get_mut(guest_id) {
             match child
                 .try_wait()

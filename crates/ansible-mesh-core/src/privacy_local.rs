@@ -84,24 +84,49 @@ impl LocalLaunchRegistry {
         principal: LaunchPrincipal,
         process: Arc<dyn SupervisedProcess>,
     ) -> Result<Uuid> {
+        self.attach_mode(guest, uid, principal, process, true)
+    }
+    /// Hotel-owned protected guests require explicit fenced retirement before
+    /// replacement; checking absence and insertion share the registry lock.
+    pub fn attach_new(
+        &self,
+        guest: &str,
+        uid: u32,
+        principal: LaunchPrincipal,
+        process: Arc<dyn SupervisedProcess>,
+    ) -> Result<Uuid> {
+        self.attach_mode(guest, uid, principal, process, false)
+    }
+    fn attach_mode(
+        &self,
+        guest: &str,
+        uid: u32,
+        principal: LaunchPrincipal,
+        process: Arc<dyn SupervisedProcess>,
+        replace: bool,
+    ) -> Result<Uuid> {
         if guest.trim().is_empty() || guest.len() > 512 || !process.alive()? || process.pid()? == 0
         {
             bail!("invalid supervised launch");
         }
         AuthenticatedAgent::from_server(&principal).map_err(|_| anyhow!("invalid principal"))?;
         let generation = Uuid::new_v4();
-        self.launches
+        let mut launches = self
+            .launches
             .lock()
-            .map_err(|_| anyhow!("launch lock poisoned"))?
-            .insert(
-                guest.into(),
-                Launch {
-                    generation,
-                    uid,
-                    principal,
-                    process,
-                },
-            );
+            .map_err(|_| anyhow!("launch lock poisoned"))?;
+        if !replace && launches.contains_key(guest) {
+            bail!("fenced retirement required before replacement");
+        }
+        launches.insert(
+            guest.into(),
+            Launch {
+                generation,
+                uid,
+                principal,
+                process,
+            },
+        );
         Ok(generation)
     }
     pub fn retire(&self, guest: &str, generation: Uuid) -> Result<()> {

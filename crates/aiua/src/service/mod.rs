@@ -15,6 +15,7 @@ pub mod lease_handlers;
 pub mod mesh_dispatcher;
 pub mod mesh_runtime;
 pub mod model_catalog_sync;
+pub mod native_authority;
 pub mod operator_surface;
 pub mod perimeter;
 pub mod protected_local_guest;

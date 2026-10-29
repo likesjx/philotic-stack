@@ -695,6 +695,9 @@ async fn handle_operator_surface_query_task(
 #[derive(Parser, Debug)]
 #[command(author, version = env!("PHILOTIC_VERSION_DISPLAY"), about, long_about = None)]
 struct Args {
+    /// Private opt-in native OAuth coordinator config; uses hotel-owned guests.
+    #[arg(long)]
+    native_authority_config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -8249,11 +8252,16 @@ async fn hotel_main() -> Result<()> {
     };
 
     // Abstracted Universal Materializer with trait-object storage
-    let materializer = Box::new(
+    let mut materializer =
         crate::service::guest_manager::LocalProcessMaterializer::new(db_path.to_string_lossy())
             .with_hotel_socket(&hotel.ipc_socket_path)
-            .with_stderr_sink(stderr_tx),
-    );
+            .with_stderr_sink(stderr_tx);
+    if let Some(path) = &args.native_authority_config {
+        let native =
+            crate::service::native_authority::runtime::Runtime::load(path, &caps.node_id).await?;
+        materializer = materializer.with_native_authority(native);
+    }
+    let materializer = Box::new(materializer);
     let mut guest_manager_inner = crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
         graph_domain_arc.clone(),

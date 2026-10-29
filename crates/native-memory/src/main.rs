@@ -31,6 +31,9 @@ struct Args {
     /// Private local result-signing key; never routed or fetched from a vault.
     #[arg(long)]
     response_signing_config: PathBuf,
+    /// Opt-in hotel OAuth enforcer. Every task then requires a live bound permit.
+    #[arg(long, conflicts_with = "sqlite_fixture")]
+    authority_socket: Option<PathBuf>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -58,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ipc = PhiloticClient::connect_at(
         &args.socket,
         GuestIdentity {
-            guest_id: args.guest,
+            guest_id: args.guest.clone(),
             role: ROLE.into(),
             supported_tools: vec![
                 "native-memory.remember".into(),
@@ -81,6 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if task.action != "native_memory_request" {
             continue;
         }
+        if task.authority_handle.is_some() && args.authority_socket.is_none() {
+            continue;
+        }
         let envelope = task.signed_request;
         let current = || {
             let policy: Policy = serde_json::from_slice(
@@ -90,13 +96,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((policy, now()))
         };
         let cancelled = AtomicBool::new(false);
+        let mut reservation = if let Some(path) = &args.authority_socket {
+            use native_memory::authority_control::{Client, Reply, Request};
+            let Some(handle) = task.authority_handle else {
+                continue;
+            };
+            let Ok((policy, time)) = current() else {
+                continue;
+            };
+            let Ok(verified) = native_memory::VerifiedRequest::validate(
+                &envelope,
+                &policy,
+                &args.node,
+                &args.guest,
+                time,
+            ) else {
+                continue;
+            };
+            let Ok(mut client) = Client::connect(path).await else {
+                continue;
+            };
+            if !matches!(
+                client
+                    .send(&Request::Reserve {
+                        guest: args.guest.clone(),
+                        handle,
+                        digest: verified.binding()
+                    })
+                    .await,
+                Ok(Reply::Ready)
+            ) {
+                continue;
+            }
+            Some((client, verified.binding()))
+        } else {
+            None
+        };
         let result = if let Some(graph) = &graph {
-            graph.execute_current(&envelope, current, &cancelled).await
+            if let Some((client, digest)) = &mut reservation {
+                graph
+                    .execute_authorized(&envelope, current, &cancelled, async || {
+                        client.validate(*digest).await
+                    })
+                    .await
+            } else {
+                graph.execute_current(&envelope, current, &cancelled).await
+            }
         } else if let Some(fixture) = &mut fixture {
             fixture.execute_current(&envelope, current, &cancelled)
         } else {
             Err(native_memory::Error::Unavailable)
         };
+        if let Some((client, _)) = reservation {
+            if matches!(result, Err(native_memory::Error::Uncertain)) {
+                continue;
+            }
+            if client.finish(result.is_ok()).await.is_err() {
+                continue;
+            }
+        }
         // Never send even an error to an unverified return route. Valid failures
         // are bounded by the ingress timeout; success uses the signed route only.
         let Ok(response) = result else { continue };

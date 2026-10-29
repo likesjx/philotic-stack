@@ -9,16 +9,17 @@ use neo4rs::{ConfigBuilder, Graph, Txn, query};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::task::JoinSet;
 
 const NODES: &str = "MATCH (n) WHERE n.id IN $ids RETURN n.id AS id, labels(n) AS labels, n.claim_summary AS summary, n.source_policy_manifest AS sources LIMIT 2049";
@@ -34,110 +35,7 @@ pub enum OwnerRole {
     Issuer,
 }
 
-// Durable uncertainty marker, not a policy/grant database. The operator must
-// preprovision a private clean marker and explicitly reconcile dirty recovery.
-// File lock prevents two daemons from owning this journal concurrently.
-struct Journal {
-    file: File,
-    path: PathBuf,
-    uid: u32,
-    device: u64,
-    inode: u64,
-    poisoned: bool,
-}
-impl Journal {
-    fn open(path: &Path, uid: u32) -> Result<Self> {
-        let before = std::fs::symlink_metadata(path)?;
-        let parent =
-            std::fs::symlink_metadata(path.parent().ok_or_else(|| anyhow!("owner unavailable"))?)?;
-        if !path.is_absolute()
-            || !before.is_file()
-            || before.uid() != uid
-            || before.mode() & 0o077 != 0
-            || !parent.is_dir()
-            || parent.uid() != uid
-            || parent.mode() & 0o077 != 0
-        {
-            bail!("owner unavailable");
-        }
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        file.try_lock().map_err(|_| anyhow!("owner unavailable"))?;
-        let after = file.metadata()?;
-        if after.dev() != before.dev() || after.ino() != before.ino() {
-            bail!("owner unavailable");
-        }
-        let mut value = Vec::new();
-        (&mut file).take(7).read_to_end(&mut value)?;
-        if value != b"clean\n" {
-            bail!("owner recovery required");
-        }
-        Ok(Self {
-            file,
-            path: path.into(),
-            uid,
-            device: after.dev(),
-            inode: after.ino(),
-            poisoned: false,
-        })
-    }
-    fn validate(&self) -> Result<()> {
-        let s = std::fs::symlink_metadata(&self.path)?;
-        if self.poisoned
-            || !s.is_file()
-            || s.uid() != self.uid
-            || s.mode() & 0o077 != 0
-            || s.dev() != self.device
-            || s.ino() != self.inode
-        {
-            bail!("owner unavailable");
-        }
-        Ok(())
-    }
-    fn mark(&mut self, clean: bool) -> Result<()> {
-        self.validate()?;
-        let result = (|| -> Result<()> {
-            self.file.seek(SeekFrom::Start(0))?;
-            self.file
-                .write_all(if clean { b"clean\n" } else { b"dirty\n" })?;
-            self.file.set_len(6)?;
-            self.file.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.poison();
-        }
-        result
-    }
-    fn poison(&mut self) {
-        self.poisoned = true;
-    } // dirty marker remains durable
-}
-
-// An aborted/panicking task cannot bypass async cleanup and silently reopen
-// admission in the same daemon. Drop is deliberately conservative; only an
-// acknowledged clean completion can disarm the durable uncertainty guard.
-struct Fence {
-    journal: OwnedMutexGuard<Journal>,
-    complete: bool,
-}
-impl std::ops::Deref for Fence {
-    type Target = Journal;
-    fn deref(&self) -> &Journal {
-        &self.journal
-    }
-}
-impl std::ops::DerefMut for Fence {
-    fn deref_mut(&mut self) -> &mut Journal {
-        &mut self.journal
-    }
-}
-impl Drop for Fence {
-    fn drop(&mut self) {
-        if !self.complete {
-            self.journal.poison();
-        }
-    }
-}
+use ansible_mesh_core::authority_fence::{Fence, Journal};
 
 pub struct ReadOwner {
     hotel: String,
@@ -347,10 +245,7 @@ impl ReadOwner {
                         if *self.stopping.borrow() {
                             bail!("owner stopping");
                         }
-                        let mut lock = Fence {
-                            journal: lock,
-                            complete: false,
-                        };
+                        let mut lock = Fence::new(lock);
                         lock.mark(false)?;
                         lease_deadline = Some(Instant::now() + Duration::from_secs(5));
                         gate = Some(lock);
@@ -420,8 +315,7 @@ impl ReadOwner {
                             unknown = false;
                         }
                         peer.principal()?;
-                        gate.as_mut().unwrap().mark(true)?;
-                        gate.as_mut().unwrap().complete = true;
+                        gate.as_mut().unwrap().finish()?;
                         mode = "";
                         lease_deadline = None;
                         drop(gate.take());
@@ -454,10 +348,8 @@ impl ReadOwner {
             Ok(())
         };
         if let Some(mut lock) = gate.take() {
-            if mode != "snapshot" || rollback.is_err() || unknown || lock.mark(true).is_err() {
+            if mode != "snapshot" || rollback.is_err() || unknown || lock.finish().is_err() {
                 lock.poison();
-            } else {
-                lock.complete = true;
             }
         }
         outcome
@@ -664,10 +556,7 @@ mod tests {
         let task_journal = journal.clone();
         let task_ready = ready.clone();
         let task = tokio::spawn(async move {
-            let mut fence = Fence {
-                journal: task_journal.lock_owned().await,
-                complete: false,
-            };
+            let mut fence = Fence::new(task_journal.lock_owned().await);
             fence.mark(false).unwrap();
             task_ready.notify_one();
             std::future::pending::<()>().await;
@@ -845,7 +734,7 @@ mod tests {
         std::fs::write(f.dir.join("start-abort"), b"synthetic").unwrap();
         wait_child(&c).await;
         for _ in 0..100 {
-            if owner.journal.lock().await.poisoned {
+            if owner.journal.lock().await.is_poisoned() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -1,6 +1,7 @@
 mod auth;
 #[cfg(test)]
 mod dispatch_tests;
+mod native_release;
 mod protocol;
 mod routing;
 mod server;
@@ -630,6 +631,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(MembraneState {
         native_memory_config: args.native_memory_config.clone(),
+        native_pending: Default::default(),
         routing_table: table,
         endpoint_table,
         vault_cache: VaultHashCache::new(),
