@@ -1,6 +1,6 @@
 # Native memory OAuth implementation checkpoint
 
-Status: local contract implementation, **activation disabled**, 2026-10-29.
+Status: synthetic same-hotel qualification passed, **not deployed**, 2026-10-29.
 Base: philotic-stack 7399da86; paired issuer base jaredlikes-com d1afd9f794bfb38a412618ff80b98967abddc01c.
 
 ## Current checkpoint (supersedes earlier evidence below)
@@ -16,14 +16,17 @@ handoff; delayed first polling revalidates and has a conservative deadline.
 No OAuth bearer is put in routed tasks. Those carry the signed envelope and an
 opaque request-bound permit handle. Reusable credentials stay local.
 
-This implementation is not yet runtime-qualified or published. It requires a
+Drafts: philotic-stack #685 and jaredlikes-com #44. This implementation requires a
 same-hotel membrane, runner and issuer authority worker. General cross-hotel OAuth
 fencing is not implemented. The new protected runtime is Linux-only; the existing
-Mac interactive bearer test remains unchanged. The issuer activation gate still
-returns 503 until composition qualification is complete.
+Mac interactive bearer test remains unchanged. Issuer db40a95 replaces the blanket
+503 gate with explicit native resource configuration requiring a configured
+local coordinator or pinned remote writer authority. Configuration validation
+does not prove live enrollment or that the writer shares this hotel's journal.
+No live configuration or resource admission was created.
 
 Current evidence: issuer typecheck passed; policy/coordination/authority suite
-63 passed and 2 skipped after locked dependency installation. Linux cargo check
+67 passed and 2 skipped, including three runtime configuration tests. Linux cargo check
 passed for aiua, membrane-mcp, native-memory and data-memorygraphrag. Six hotel
 authority tests passed on Linux, including two actual owned child processes using
 the private control protocol (mock issuer/storage). Two durable-journal tests
@@ -32,16 +35,33 @@ enrollment/retirement/replacement passed on macOS, including denial before adopt
 Membrane suite: 35 passed, 1 ignored; native-memory: 23 passed, 3 database cases
 ignored. Native-memory all-target Clippy with warnings denied passed. Two HTTP
 release-stream tests verify expiry/denial and drop semantics. The Linux-only
-full HTTP/OAuth/hotel/Memgraph fixture compiles but is not yet executed; sealed
-Node bundle execution and complete composition remain CI qualification gates.
+full HTTP/OAuth/hotel/Memgraph fixture passed at 2e79e853 in run 40955062647:
+normal ProvisionMcpEndpoint materialization, real membrane and runner processes,
+remember, duplicate-event receipt, recall, seven authority denials and coordinated
+revocation. Its HTTPS issuer is synthetic; this is not a live OAuth consent test.
+The same run passed snapshot/WAL SIGKILL recovery with pinned MAGE 3.10.1 and
+per-transaction WAL flush. Physical power loss is not qualified. Run 40955062562
+passed capture tests including sealed Node execution and two-hotel bearer capture.
+Paired issuer run 40955267558 passed real issuer/legacy-gateway composed acceptance
+at 7799785 on Ubuntu 22.04. Exact final-head CI must still be consulted in the PRs.
 Earlier evidence below is historical, not proof for later changes.
 
 The independent reviewer found delayed HTTP polling could release cached bytes
 after lease expiry; immediate validation and an absolute handoff bound were added.
-Executable and issuer bundle admission is being strengthened with Linux sealed
-snapshots and Node preserve-symlinks-main. Actual Node FD loading, process startup,
-crash/replacement, and complete hotel-managed OAuth/Memgraph composition remain
-qualification work. No production credentials, grants, services or routes changed.
+Executable and issuer bundle admission uses Linux sealed snapshots and Node
+preserve-symlinks-main. Independent review found no further critical source-level
+bypass; this is bounded review, not a security certification. No production
+credentials, grants, services or routes changed.
+
+Fixture defects corrected during qualification: unsupported wildcard preapproval,
+assumed schema left by a preceding test (which actually deletes it), stale
+durability image pin, and non-atomic child fixture handle-file publication.
+The old issuer package workflow separately remains failed at startup. It installs
+historical issuer 6d840816 and supervisor f22c7271, not this native hotel package,
+and explicitly blocks an unqualified legacy HTTP handoff case. Its failure is not
+counted as a pass or native runtime qualification. The pinned Mongo image refused
+the Ubuntu 24.04 runner kernel (SERVER-121912); Ubuntu 22.04 restored real composed
+issuer tests without disabling Mongo's compatibility guard.
 
 ## Implemented
 
@@ -61,8 +81,9 @@ not fetch introspection, authenticate an HTTP request, identify a token family,
 sign a native request, or install a runtime route. Its public deserialization
 types are data contracts, not proof of authority.
 
-The issuer runtime explicitly rejects attempted native-resource activation with
-503. No native env setting, real admission, credential, listener or service changed.
+The issuer defaults to no native resource; explicit configuration without a writer
+coordinator fails closed. No native env setting, real admission, credential,
+listener or service changed.
 
 ## Earlier architecture assessment (decision now made above)
 
