@@ -25,12 +25,21 @@ There is no endpoint table injection. The synthetic bearer resolver and manually
 started runtime remain test scaffolding. Smoke mode disables materialization;
 successful provisioning does not claim production guest spawning or vault setup.
 
-The workflow pins guest/test source to 047f93ccea925ae2509de98add68cd4907130ef4.
+The workflow pins guest/test source to 7399da86b061c3c01fd278fa631d030725720ae3.
 It also builds original B7 as a separate source-built rollback candidate, runs
 legacy route tests, and packages both with the existing candidate release-manifest
 tool. Full SHAs, hashes, compiler and run provenance accompany the archives.
 No release tag is created. Artifact retention is 14 days. This does not reproduce
 or attest the installed Linux hash, nor identify the executable of a running process.
+
+Run 40902121996 / artifact 12910732094 is unqualified: independent download
+verification found identical backport and rollback binaries. Logs showed stale
+Cargo output reuse across workspaces despite distinct source checkouts. Do not
+deploy either file from that artifact. The corrected workflow uses separate fresh
+target directories for backport, baseline and guests, prohibits identical hotel
+bytes, and executes original B7 as a negative control: legacy provisioning must
+succeed, native provisioning must return MALFORMED_PAYLOAD with the explicit
+unknown-native_memory variant message, and no native config may persist.
 
 # Rollout and rollback effects
 
