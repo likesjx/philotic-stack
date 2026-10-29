@@ -1332,7 +1332,7 @@ impl GuestManager {
             .materializer
             .lock()
             .await
-            .reclaim_untracked(&rec.guest_id, active_pid)
+            .reclaim_untracked(&rec.guest_id, &active_pid)
             .await;
         Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
 
