@@ -332,6 +332,16 @@ impl MembraneGuest for McpMembrane {
 
     async fn deliver(&mut self, reply: OutboundReply) -> Result<()> {
         let turn_id = reply.turn_id().to_string();
+        if self
+            .state
+            .pending_responses
+            .lock()
+            .await
+            .get(&turn_id)
+            .is_some_and(|p| p.native.is_some())
+        {
+            return Ok(());
+        }
 
         match &reply {
             OutboundReply::ApprovalRequired { .. } => {
@@ -355,10 +365,7 @@ impl MembraneGuest for McpMembrane {
             _ => {}
         }
 
-        let sender = {
-            let mut pending = self.state.pending_responses.lock().await;
-            pending.remove(&turn_id)
-        };
+        let sender = server::take_unsigned_response(&self.state, &turn_id).await;
         let streamed = {
             let mut buffers = self.state.streaming_buffers.lock().await;
             buffers.remove(&turn_id)
@@ -417,6 +424,22 @@ impl MembraneGuest for McpMembrane {
         };
 
         match action {
+            "native_memory_response" => {
+                let Some(turn_id) = payload.get("turn_id").and_then(|v| v.as_str()) else {
+                    return Ok(false);
+                };
+                let Some(reply) = payload.get("signed_response") else {
+                    return Ok(false);
+                };
+                let Ok(reply) = serde_json::from_value(reply.clone()) else {
+                    return Ok(false);
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Ok(server::resolve_native_response(&self.state, turn_id, &reply, now).await)
+            }
             "datasource_response" => {
                 let Some(turn_id) = payload
                     .get("turn_id")
@@ -444,10 +467,7 @@ impl MembraneGuest for McpMembrane {
                         return Ok(false);
                     };
 
-                let sender = {
-                    let mut pending = self.state.pending_responses.lock().await;
-                    pending.remove(&turn_id)
-                };
+                let sender = server::take_unsigned_response(&self.state, &turn_id).await;
 
                 if let Some(tx) = sender {
                     let _ = tx.send(outcome);

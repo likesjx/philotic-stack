@@ -5,6 +5,114 @@
 use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use crate::protocol::JsonRpcRequest;
 use crate::routing::{new_shared_endpoint_table, new_shared_table};
+use crate::server;
+#[cfg(unix)]
+#[path = "native_composition.rs"]
+mod native_composition;
+
+#[tokio::test]
+async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_once() {
+    use native_memory::response::{ResponseExpectation, ResponseSigner, ResponseVerifier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issuer.json");
+    let verifiers = vec![ResponseVerifier {
+        destination: "dest".into(),
+        runner: "memory".into(),
+        key_id: "result-key".into(),
+        public_key: ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+            .verifying_key()
+            .to_bytes(),
+    }];
+    std::fs::write(&path,serde_json::to_vec(&json!({"issuer":"ingress","key_id":"key","signing_seed":vec![7;32],"grants":{},"response_verifiers":verifiers})).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Pending state is established only by authenticated dispatch in production;
+    // this fixture isolates completion-path attacks after that boundary.
+    let envelope:native_memory::Envelope=serde_json::from_value(json!({"claims":{"version":1,"issuer":"ingress","key_id":"key","caller":"alice","delegation":"grant","policy_revision":1,"destination":"dest","reply_node":"ingress","reply_guest":"mcp","runner":"memory","owner":"alice","namespace":"notes","operation":"recall","request_digest":vec![0;32],"issued_at":now,"expires_at":now+60,"nonce":"turn"},"request":{"event":"event","owner":"alice","namespace":"notes","provider":null,"command":{"operation":"recall","query":"synthetic","limit":1}},"signature":vec![0;64]})).unwrap();
+    let result = native_memory::Response {
+        receipt: native_memory::Receipt {
+            event: "event".into(),
+            operation: "recall".into(),
+            status: "committed".into(),
+            committed_at: now,
+        },
+        observations: vec![],
+    };
+    let signed = ResponseSigner::new("result-key".into(), [8; 32])
+        .sign(&envelope, result, now)
+        .unwrap();
+    let mut h = harness(false, ExposureTier::Local, HashMap::new());
+    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(path);
+    let (tx, mut rx) = oneshot::channel();
+    h.state.pending_responses.lock().await.insert(
+        "turn".into(),
+        server::PendingResponse {
+            sender: tx,
+            native: Some(ResponseExpectation::new(envelope, &verifiers).unwrap()),
+        },
+    );
+    let mut guest = McpMembrane::new(9100, "mcp", h.state.clone());
+    for reply in [
+        OutboundReply::StreamingToken {
+            session_id: "s".into(),
+            turn_id: "turn".into(),
+            token: "forged".into(),
+        },
+        OutboundReply::Text {
+            session_id: "s".into(),
+            turn_id: "turn".into(),
+            content: "forged".into(),
+            reply_to: None,
+        },
+        OutboundReply::Error {
+            session_id: "s".into(),
+            turn_id: "turn".into(),
+            message: "forged".into(),
+        },
+    ] {
+        guest.deliver(reply).await.unwrap();
+    }
+    let message = |payload: Value| philotic_client::IpcResponse::InboundTask {
+        source_node: "untrusted".into(),
+        task_id: uuid::Uuid::new_v4(),
+        task_json: payload.to_string(),
+    };
+    guest
+        .handle_push(&message(
+            json!({"action":"datasource_response","turn_id":"turn","result":"forged"}),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(h.state.streaming_buffers.lock().await.is_empty());
+    let mut forged = signed.clone();
+    forged.result.receipt.status = "forged".into();
+    assert!(
+        !guest
+            .handle_push(&message(
+                json!({"action":"native_memory_response","turn_id":"turn","signed_response":forged})
+            ))
+            .await
+            .unwrap()
+    );
+    assert_eq!(h.state.pending_responses.lock().await.len(), 1);
+    let valid = message(
+        json!({"action":"native_memory_response","turn_id":"turn","signed_response":signed}),
+    );
+    assert!(guest.handle_push(&valid).await.unwrap());
+    assert!(matches!(rx.await.unwrap(), DispatchOutcome::Ok(_)));
+    assert!(!guest.handle_push(&valid).await.unwrap());
+}
 use crate::server::{DispatchOutcome, MembraneState, SharedState, dispatch_rpc};
 use crate::{ListenerManager, McpMembrane};
 use ansible_mesh_core::ExposureTier;
@@ -79,7 +187,7 @@ async fn native_memory_authenticated_membrane_router_two_hotel_roundtrip() {
     };
     let grants = BTreeMap::from([("caller-1".into(), grant)]);
     let config = dir.path().join("synthetic-issuer.json");
-    std::fs::write(&config,serde_json::to_vec(&json!({"issuer":"test-node","key_id":"test-key","signing_seed":vec![7;32],"grants":grants})).unwrap()).unwrap();
+    std::fs::write(&config,serde_json::to_vec(&json!({"issuer":"test-node","key_id":"test-key","signing_seed":vec![7;32],"grants":grants,"response_verifiers":[{"destination":"memory-hotel","runner":"memory-1","key_id":"result-key","public_key":ed25519_dalek::SigningKey::from_bytes(&[8;32]).verifying_key().to_bytes()}]})).unwrap()).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -147,13 +255,21 @@ async fn native_memory_authenticated_membrane_router_two_hotel_roundtrip() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        match runner.lock().unwrap().execute_wire(
-            task_json.as_bytes(),
+        let routed: native_memory::RoutedRequest = serde_json::from_str(&task_json).unwrap();
+        match runner.lock().unwrap().execute(
+            &routed.signed_request,
             &policy,
             now,
             &std::sync::atomic::AtomicBool::new(false),
         ) {
-            Ok(response) => DispatchOutcome::Ok(serde_json::to_string(&response).unwrap()),
+            Ok(response) => {
+                let envelope = routed.signed_request;
+                let signed =
+                    native_memory::response::ResponseSigner::new("result-key".into(), [8; 32])
+                        .sign(&envelope, response, now)
+                        .unwrap();
+                DispatchOutcome::Ok(serde_json::to_string(&signed).unwrap())
+            }
             Err(e) => DispatchOutcome::Err(e.to_string()),
         }
     });
@@ -229,9 +345,28 @@ impl Harness {
         let state = self.state.clone();
         tokio::spawn(async move {
             while let Some(env) = rx.recv().await {
-                let tx = { state.pending_responses.lock().await.remove(&env.turn_id) };
-                if let Some(tx) = tx {
-                    let _ = tx.send(outcome(&env));
+                let result = outcome(&env);
+                if state
+                    .pending_responses
+                    .lock()
+                    .await
+                    .get(&env.turn_id)
+                    .is_some_and(|p| p.native.is_some())
+                {
+                    if let DispatchOutcome::Ok(value) = result {
+                        let reply = serde_json::from_str(&value).unwrap();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        assert!(
+                            server::resolve_native_response(&state, &env.turn_id, &reply, now)
+                                .await
+                        );
+                    }
+                } else if let Some(tx) = server::take_unsigned_response(&state, &env.turn_id).await
+                {
+                    let _ = tx.send(result);
                 }
             }
         });
@@ -734,7 +869,7 @@ async fn deliver_accumulates_streaming_tokens_into_empty_final_reply() {
         .pending_responses
         .lock()
         .await
-        .insert("turn-1".into(), tx);
+        .insert("turn-1".into(), tx.into());
 
     for token in ["hel", "lo"] {
         guest
@@ -773,7 +908,7 @@ async fn deliver_error_reply_yields_err_outcome() {
         .pending_responses
         .lock()
         .await
-        .insert("turn-2".into(), tx);
+        .insert("turn-2".into(), tx.into());
 
     guest
         .deliver(OutboundReply::Error {

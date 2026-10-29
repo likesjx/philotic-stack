@@ -6,6 +6,7 @@ on:
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'crates/native-memory/**'
+      - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
       - 'vendor/neo4rs/**'
@@ -17,6 +18,7 @@ on:
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'crates/native-memory/**'
+      - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
       - 'vendor/neo4rs/**'
@@ -99,6 +101,14 @@ jobs:
           PHILOTIC_SYNTHETIC_NATIVE_MEMGRAPH: '1'
         run: cargo test --locked -p native-memory --test memgraph -- --ignored --test-threads=1
 
+      - name: Build native two-hotel composition
+        run: cargo build --locked -p aiua -p native-memory
+
+      - name: HTTP MCP through real hotels into Memgraph
+        env:
+          PHILOTIC_SYNTHETIC_NATIVE_COMPOSITION_MEMGRAPH: '1'
+        run: PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture
+
       - name: Capture adapter, role edge, replay and operator close acceptance
         env:
           PHILOTIC_SYNTHETIC_CAPTURE_MEMGRAPH_ACCEPTANCE: '1'
@@ -111,6 +121,10 @@ jobs:
       - name: Stop disposable Memgraph
         if: always()
         run: docker rm -f lifegraph-capture-memgraph >/dev/null 2>&1 || true
+
+      - name: Native snapshot and WAL abrupt restart qualification
+        timeout-minutes: 15
+        run: bash scripts/native-memory-durable-smoke.sh
 
       - name: Save cargo cache
         if: always()

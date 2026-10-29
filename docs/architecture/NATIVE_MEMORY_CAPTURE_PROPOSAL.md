@@ -39,6 +39,8 @@ Accepted for this bounded capture slice. Implementation includes real signature 
 | R12 Sharding | Conditional, no implementation |
 | R13 Feature inventory | NLP extraction, semantic links, graph embeddings and sleep consolidation explicitly later |
 | R14 Receipts/decisions | Atomic local operation receipts/replay records; remote operational qualification later |
+| R15 Semantic enrichment | Future semantic/NLP extraction, relevance and graphRAG qualification; not part of source capture |
+| R16 Obsidian originals | Future original-document ingestion/reconciliation with stable IDs/provenance; no personal vault accessed |
 
 ## Concrete rollout effects — not authorized by publication alone
 

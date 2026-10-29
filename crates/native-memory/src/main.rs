@@ -1,6 +1,6 @@
 //! Explicitly configured native runner. No secret fetching or automatic startup.
 use clap::Parser;
-use native_memory::{Envelope, MAX_WIRE, Policy, ROLE, Runner};
+use native_memory::{MAX_WIRE, Policy, ROLE, RoutedRequest, Runner};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::{
     path::PathBuf,
@@ -28,6 +28,9 @@ struct Args {
     /// Local public-key pins and grants; reread for every task. Contains no secrets.
     #[arg(long)]
     policy: PathBuf,
+    /// Private local result-signing key; never routed or fetched from a vault.
+    #[arg(long)]
+    response_signing_config: PathBuf,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -72,9 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if task_json.len() > MAX_WIRE {
             continue;
         }
-        let Ok(envelope) = serde_json::from_str::<Envelope>(&task_json) else {
+        let Ok(task) = serde_json::from_str::<RoutedRequest>(&task_json) else {
             continue;
         };
+        if task.action != "native_memory_request" {
+            continue;
+        }
+        let envelope = task.signed_request;
         let current = || {
             let policy: Policy = serde_json::from_slice(
                 &std::fs::read(&args.policy).map_err(|_| native_memory::Error::Unavailable)?,
@@ -93,7 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Never send even an error to an unverified return route. Valid failures
         // are bounded by the ingress timeout; success uses the signed route only.
         let Ok(response) = result else { continue };
-        let payload = serde_json::json!({"action":"datasource_response","turn_id":envelope.claims.nonce,"result":response});
+        let Ok(signer) =
+            native_memory::response::ResponseSigner::load(&args.response_signing_config)
+        else {
+            continue;
+        };
+        let Ok(response) = signer.sign(&envelope, response, now()) else {
+            continue;
+        };
+        let payload = serde_json::json!({"action":"native_memory_response","turn_id":envelope.claims.nonce,"signed_response":response});
         ipc.send_request(IpcRequest::EmitTask {
             target_node: envelope.claims.reply_node,
             target_role: "mcp-membrane".into(),

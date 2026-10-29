@@ -15,7 +15,7 @@ permissions:
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       CI: 'true'
     steps:
@@ -32,3 +32,7 @@ jobs:
       - run: cargo test --locked -p native-memory -p membrane -p membrane-mcp
       - run: cargo test --locked -p ansible-mesh-core --lib
       - run: cargo clippy --locked -p native-memory -p membrane -p membrane-mcp -p ansible-mesh-core --all-targets
+      - name: Build disposable hotel composition
+        run: cargo build --locked -p aiua -p native-memory
+      - name: Real hotels and signed native runner through HTTP MCP
+        run: PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture

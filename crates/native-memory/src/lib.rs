@@ -11,6 +11,7 @@ use std::{
 };
 
 pub mod memgraph;
+pub mod response;
 
 pub const ROLE: &str = "native-memory-runner";
 pub const MAX_WIRE: usize = 65536;
@@ -118,6 +119,21 @@ pub struct Envelope {
     pub claims: Claims,
     pub request: Request,
     pub signature: Vec<u8>,
+}
+/// Hotel delivery metadata belongs outside the strict signed envelope. Unknown
+/// outer transport fields are ignored and never participate in authorization.
+#[derive(Serialize, Deserialize)]
+pub struct RoutedRequest {
+    pub action: String,
+    pub signed_request: Envelope,
+}
+impl RoutedRequest {
+    pub fn new(signed_request: Envelope) -> Self {
+        Self {
+            action: "native_memory_request".into(),
+            signed_request,
+        }
+    }
 }
 impl std::fmt::Debug for Envelope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -261,6 +277,8 @@ pub struct IngressConfig {
     pub key_id: String,
     pub signing_seed: [u8; 32],
     pub grants: BTreeMap<String, Grant>,
+    #[serde(default)]
+    pub response_verifiers: Vec<response::ResponseVerifier>,
 }
 impl IngressConfig {
     /// Opt-in local signing config. Reject group/world access and symlinks on
@@ -547,7 +565,16 @@ fn verify(e: &Envelope, p: &Policy, destination: &str, runner: &str, now: u64) -
 
 /// Read local secret-bearing config without following a symlink.
 pub(crate) fn load_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| Error::Unavailable)?;
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|_| Error::Denied)?;
+    let metadata = file.metadata().map_err(|_| Error::Unavailable)?;
     if !metadata.file_type().is_file() || metadata.len() > 1_048_576 {
         return Err(Error::Denied);
     }
@@ -558,6 +585,12 @@ pub(crate) fn load_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> 
             return Err(Error::Denied);
         }
     }
-    serde_json::from_slice(&std::fs::read(path).map_err(|_| Error::Unavailable)?)
-        .map_err(|_| Error::Invalid)
+    let mut bytes = Vec::new();
+    file.take(1_048_577)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::Unavailable)?;
+    if bytes.len() > 1_048_576 {
+        return Err(Error::Denied);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)
 }

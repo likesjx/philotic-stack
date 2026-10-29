@@ -374,6 +374,15 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
     let socket = dir.path().join("ipc");
     let database = dir.path().join("db");
     let config = dir.path().join("policy.json");
+    let signing_config = dir.path().join("response.json");
+    std::fs::write(
+        &signing_config,
+        serde_json::to_vec(&serde_json::json!({"key_id":"result-key","signing_seed":vec![8;32]}))
+            .unwrap(),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&signing_config, std::fs::Permissions::from_mode(0o600)).unwrap();
     let (_, mut policy) = setup();
     policy.grants.get_mut("caller-1").unwrap().expires_at = u64::MAX;
     std::fs::write(&config, serde_json::to_vec(&policy).unwrap()).unwrap();
@@ -387,6 +396,8 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
     listener.set_nonblocking(true).unwrap();
     let mut child = Child(
         std::process::Command::new(env!("CARGO_BIN_EXE_native-memory"))
+            .arg("--response-signing-config")
+            .arg(&signing_config)
             .args([
                 "--socket",
                 socket.to_str().unwrap(),
@@ -443,7 +454,7 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
             &IpcResponse::InboundTask {
                 source_node: "ingress-hotel".into(),
                 task_id: uuid::Uuid::new_v4(),
-                task_json: serde_json::to_string(&envelope).unwrap(),
+                task_json: serde_json::to_string(&RoutedRequest::new(envelope.clone())).unwrap(),
             },
         );
         let IpcRequest::EmitTask {
@@ -458,7 +469,16 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
         assert_eq!(target_node, "ingress-hotel");
         assert_eq!(target_guest_id.as_deref(), Some("membrane-1"));
         let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap();
-        let result: Response = serde_json::from_value(payload["result"].clone()).unwrap();
+        let signed: response::SignedResponse =
+            serde_json::from_value(payload["signed_response"].clone()).unwrap();
+        let verifiers = [response::ResponseVerifier {
+            destination: "memory-hotel".into(),
+            runner: "memory-1".into(),
+            key_id: "result-key".into(),
+            public_key: SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes(),
+        }];
+        let expectation = response::ResponseExpectation::new(envelope.clone(), &verifiers).unwrap();
+        let result = expectation.verify(&signed, &verifiers, now).unwrap();
         assert_eq!(result.receipt.status, "committed");
         if event == "recall" {
             assert_eq!(result.observations.len(), 1);

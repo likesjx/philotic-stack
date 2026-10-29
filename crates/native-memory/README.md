@@ -2,6 +2,8 @@
 
 Client-neutral capture contract: Percival/dot is the first intended client, Claude follows through the same membrane contract. No callable dot connector has been discovered or installed. Shell test access is not client tool access.
 
+Current follow-up: [signed responses, real hotel composition and durable Memgraph restart](../../docs/architecture/NATIVE_MEMORY_QUALIFICATION.md). This supersedes the initial unsigned-response finding; protected remote transport remains unqualified.
+
 `membrane-mcp` authenticates its existing per-route bearer credential locally, resolves a **separate local** native delegation grant, signs a normalized request, and sends it through `membrane::runtime::build_inbound_request` as an `EmitTask` pinned to the destination hotel and `native-memory-runner` guest. `native-memory` independently verifies Ed25519 signatures and local policy, then remembers/recalls private source observations. No Muninn authentication/backend hop or paid provider is involved.
 
 ## Reproduce
@@ -46,7 +48,7 @@ Reusable external bearer, issuer private key, master/backend/provider credential
 
 Ingress: `membrane-mcp --native-memory-config <local-issuer-file>` in addition to existing IPC/listener args. This file contains a signing seed and local token-ID→grant map; keep it outside routed config. Loading rejects symlinks, files over 1 MiB and group/world Unix permissions. It is reread for every native call. No default issuer or grant exists.
 
-Destination: `native-memory --socket <local-hotel-socket> --node <destination-node> --guest <runner-id> --memgraph-config <private-local-bolt-config> --policy <local-public-policy-file>`. Policy contains pinned public keys and matching grants only. No GetSecret, FetchMemoryConfig or backend/provider network call occurs. No service definition, real signing key, persistent grant, route provisioning, installation or restart is performed here.
+Destination: `native-memory --socket <local-hotel-socket> --node <destination-node> --guest <runner-id> --memgraph-config <private-local-bolt-config> --policy <local-public-policy-file> --response-signing-config <private-result-signing-file>`. Policy contains pinned request public keys and matching grants only. The private result-signing file contains `key_id` and `signing_seed`; ingress `response_verifiers` pins destination/runner/key ID/public key. No GetSecret, FetchMemoryConfig or provider call occurs. Memgraph uses explicitly supplied local Bolt configuration. No production key, grant, route, installation or restart is performed here.
 
 Cancellation is implemented at library checkpoints before execution and commit; the current guest does not wire remote cancellation notifications. A timed-out caller must retry its stable event ID to reconcile a possibly committed outcome. End-to-end cancellation, restart fault injection, resource retention limits, transport confidentiality, supervisor configuration and real hotel/connector qualification remain gates.
 

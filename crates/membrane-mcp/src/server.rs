@@ -51,6 +51,62 @@ pub enum DispatchOutcome {
     Err(String),
 }
 
+pub struct PendingResponse {
+    pub sender: oneshot::Sender<DispatchOutcome>,
+    pub native: Option<native_memory::response::ResponseExpectation>,
+}
+impl From<oneshot::Sender<DispatchOutcome>> for PendingResponse {
+    fn from(sender: oneshot::Sender<DispatchOutcome>) -> Self {
+        Self {
+            sender,
+            native: None,
+        }
+    }
+}
+
+/// All unsigned completion paths must use this gate. Invalid native responses
+/// leave the pending request intact for a legitimate signed result or timeout.
+pub async fn take_unsigned_response(
+    state: &MembraneState,
+    turn: &str,
+) -> Option<oneshot::Sender<DispatchOutcome>> {
+    let mut pending = state.pending_responses.lock().await;
+    if pending.get(turn).is_some_and(|p| p.native.is_some()) {
+        return None;
+    }
+    pending.remove(turn).map(|p| p.sender)
+}
+pub async fn resolve_native_response(
+    state: &MembraneState,
+    turn: &str,
+    reply: &native_memory::response::SignedResponse,
+    now: u64,
+) -> bool {
+    let Ok(config) = state
+        .native_memory_config
+        .as_ref()
+        .ok_or(())
+        .and_then(|path| native_memory::IngressConfig::load(path).map_err(|_| ()))
+    else {
+        return false;
+    };
+    let mut pending = state.pending_responses.lock().await;
+    let Some(expectation) = pending.get(turn).and_then(|p| p.native.as_ref()) else {
+        return false;
+    };
+    let Ok(result) = expectation.verify(reply, &config.response_verifiers, now) else {
+        return false;
+    };
+    let Ok(result) = serde_json::to_string(&result) else {
+        return false;
+    };
+    if let Some(p) = pending.remove(turn) {
+        let _ = p.sender.send(DispatchOutcome::Ok(result));
+        return true;
+    }
+    false
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
@@ -73,7 +129,7 @@ pub struct MembraneState {
     /// Channel into the runtime's IPC dispatch loop.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// Pending tool-call responses keyed by turn_id.
-    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<DispatchOutcome>>>>,
+    pub pending_responses: Arc<Mutex<HashMap<String, PendingResponse>>>,
     /// Accumulated streaming tokens keyed by turn_id, folded into the final
     /// result when the terminal reply carries no content of its own.
     pub streaming_buffers: Arc<Mutex<HashMap<String, String>>>,
@@ -576,6 +632,7 @@ async fn handle_tools_call(
             extra: serde_json::Map::new(),
         };
 
+        let mut native_expectation = None;
         if inbound.target_kind == "native_memory" {
             // Native memory has a separate local issuer/grant policy. A bearer
             // token_id by itself is not delegated authority at the destination.
@@ -586,12 +643,13 @@ async fn handle_tools_call(
                     "native memory requires explicit bearer auth and preapproval",
                 );
             }
-            let issued = (|| -> Result<native_memory::Envelope, native_memory::Error> {
+            let issued = (|| -> Result<_, native_memory::Error> {
                 let path = state
                     .native_memory_config
                     .as_ref()
                     .ok_or(native_memory::Error::Unavailable)?;
                 let config = native_memory::IngressConfig::load(path)?;
+                let verifiers = config.response_verifiers.clone();
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Arguments {
@@ -622,23 +680,34 @@ async fn handle_tools_call(
                 {
                     return Err(native_memory::Error::Denied);
                 }
-                Ok(signed)
+                let expectation =
+                    native_memory::response::ResponseExpectation::new(signed.clone(), &verifiers)?;
+                Ok((signed, expectation))
             })();
             let signed = match issued {
-                Ok(signed) => signed,
+                Ok((signed, expectation)) => {
+                    native_expectation = Some(expectation);
+                    signed
+                }
                 Err(e) => {
                     return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, e.to_string());
                 }
             };
-            envelope.content =
-                serde_json::to_string(&signed).expect("native envelope serialization");
+            envelope.content = serde_json::to_string(&native_memory::RoutedRequest::new(signed))
+                .expect("native envelope serialization");
             envelope.raw_transport = json!({"transport":"mcp","target_kind":"native_memory","target_id":inbound.target_id,"target_node":inbound.target_node});
         }
 
         let (tx, rx) = oneshot::channel::<DispatchOutcome>();
         {
             let mut pending = state.pending_responses.lock().await;
-            pending.insert(turn_id.clone(), tx);
+            pending.insert(
+                turn_id.clone(),
+                PendingResponse {
+                    sender: tx,
+                    native: native_expectation,
+                },
+            );
         }
 
         if let Err(e) = state.inbound_tx.send(envelope).await {
@@ -771,7 +840,7 @@ async fn handle_tools_call(
     let (tx, rx) = oneshot::channel::<DispatchOutcome>();
     {
         let mut pending = state.pending_responses.lock().await;
-        pending.insert(turn_id.clone(), tx);
+        pending.insert(turn_id.clone(), tx.into());
     }
 
     if let Err(e) = state.inbound_tx.send(envelope).await {

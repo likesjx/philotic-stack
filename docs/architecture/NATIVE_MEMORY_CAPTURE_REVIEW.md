@@ -11,6 +11,8 @@ task_refs: [../task.md]
 
 # Review disposition
 
+Follow-up: [NATIVE_MEMORY_QUALIFICATION.md](NATIVE_MEMORY_QUALIFICATION.md) records the independent second-reviewer pass, signed-result fix, descriptor-based config loading, real hotel composition and crash-recovery qualification. The initial unsigned-response and pathname-race findings below are superseded by those fixes. Protected remote transport remains a release gate.
+
 A separate adversarial self-review of PR #683 was performed after implementation. This is not a second-person review or formal PR approval. Publication remains a draft; activation is blocked on response integrity and protected transport. The initial exact head `1e48d646bad611311b46530899bb0ea6ee2782c8` passed repository macOS workspace tests, Linux compile, workspace Clippy ratchet, formatting and worktree safety, plus the dedicated native capture workflow.
 
 ## Findings and evidence
