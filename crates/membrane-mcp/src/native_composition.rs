@@ -364,10 +364,86 @@ async fn real_hotels_native_runner_authenticated_mcp_composition() {
             handler: None,
         })
         .collect();
-    h.set_endpoint(endpoint_with(tools, None)).await;
     let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
+    // Use the hotel's typed, persisted provisioning path, not endpoint-table injection.
+    // Smoke hotels deliberately disable guest materialization; the production guest
+    // runtime below replays this config through GetMcpEndpointStatus on startup.
+    let mut config = endpoint_with(tools, None);
+    config.endpoint_id = "fixture".into();
+    config.owner_agent_id = "fixture-source-probe".into();
+    config.port = port;
+    config.preapproval_rules = ["remember", "recall"]
+        .into_iter()
+        .map(|op| McpPreapprovalRule {
+            action_pattern: format!("native-memory.{op}"),
+            target: None,
+            approved_by_turn: "synthetic-provision".into(),
+            approved_at: 0,
+            expires_at: None,
+        })
+        .collect();
+    let mut legacy = config.clone();
+    legacy.endpoint_id = "unrelated-fixture".into();
+    legacy.tools[0].inbound_transform = McpInboundTransform::FieldMap {
+        action: "synthetic.legacy".into(),
+        target: McpRouteTarget::Datasource {
+            datasource_id: "synthetic-legacy".into(),
+        },
+        mappings: vec![],
+    };
+    legacy.tools.truncate(1);
+    legacy.preapproval_rules.clear();
+    let mut wrong_owner = config.clone();
+    wrong_owner.owner_agent_id = "not-the-registered-owner".into();
+    assert!(matches!(
+        source_probe
+            .send_request(IpcRequest::ProvisionMcpEndpoint {
+                config: wrong_owner
+            })
+            .await
+            .unwrap(),
+        IpcResponse::Standard { ok: false, .. }
+    ));
+    for endpoint in [&legacy, &config] {
+        let result = source_probe
+            .send_request(IpcRequest::ProvisionMcpEndpoint {
+                config: endpoint.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                IpcResponse::McpEndpointProvisioned {
+                    materialized: false,
+                    ..
+                }
+            ),
+            "smoke provision must persist config without spawning guests: {result:?}"
+        );
+    }
+    for endpoint in [&legacy, &config] {
+        let stored = source_probe
+            .send_request(IpcRequest::GetMcpEndpointStatus {
+                endpoint_id: endpoint.endpoint_id.clone(),
+            })
+            .await
+            .unwrap();
+        let IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        } = stored
+        else {
+            panic!("expected persisted endpoint config: {stored:?}")
+        };
+        assert_eq!(
+            serde_json::from_value::<McpEndpointConfig>(data["config"].clone()).unwrap(),
+            *endpoint
+        );
+    }
     let runtime = membrane::MembraneRuntime::new(a.to_str().unwrap(), GUEST, SOURCE)
         .with_inbound_rx(h.inbound_rx.take().unwrap());
     let _runtime = Task(tokio::spawn(runtime.run(McpMembrane::new(
