@@ -394,7 +394,7 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
                 "memory-hotel",
                 "--guest",
                 "memory-1",
-                "--database",
+                "--sqlite-fixture",
                 database.to_str().unwrap(),
                 "--policy",
                 config.to_str().unwrap(),

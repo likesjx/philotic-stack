@@ -10,6 +10,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+pub mod memgraph;
+
 pub const ROLE: &str = "native-memory-runner";
 pub const MAX_WIRE: usize = 65536;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +23,8 @@ pub enum Error {
     Replay,
     Conflict,
     Unavailable,
+    /// COMMIT was sent but its acknowledgement was not established. Retry the same event.
+    Uncertain,
     Cancelled,
 }
 impl std::fmt::Display for Error {
@@ -262,19 +266,7 @@ impl IngressConfig {
     /// Opt-in local signing config. Reject group/world access and symlinks on
     /// Unix instead of relying on operators to remember a private umask.
     pub fn load(path: &Path) -> Result<Self> {
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| Error::Unavailable)?;
-        if !metadata.file_type().is_file() || metadata.len() > 1_048_576 {
-            return Err(Error::Denied);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err(Error::Denied);
-            }
-        }
-        serde_json::from_slice(&std::fs::read(path).map_err(|_| Error::Unavailable)?)
-            .map_err(|_| Error::Invalid)
+        load_private_json(path)
     }
     pub fn into_ingress(self) -> Ingress {
         Ingress::new(
@@ -551,4 +543,21 @@ fn verify(e: &Envelope, p: &Policy, destination: &str, runner: &str, now: u64) -
         return Err(Error::Denied);
     }
     Ok(())
+}
+
+/// Read local secret-bearing config without following a symlink.
+pub(crate) fn load_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| Error::Unavailable)?;
+    if !metadata.file_type().is_file() || metadata.len() > 1_048_576 {
+        return Err(Error::Denied);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Denied);
+        }
+    }
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| Error::Unavailable)?)
+        .map_err(|_| Error::Invalid)
 }

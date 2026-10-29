@@ -15,7 +15,7 @@ Capture a scoped original observation and verify recall through external membran
 
 ## Core Recommendation
 
-Reuse membrane bearer checking and `EmitTask`, add an explicit `NativeMemory` target, and verify narrowly delegated authority again at the destination. Reusable credentials remain local. Short-lived signatures do not replace protected transport. Store source observations with stable IDs and provenance before adding semantic enrichment. SQLite provides an interim transactional adapter for this slice; LifeGraph/Memgraph remains the intended graph backend.
+Reuse membrane bearer checking and `EmitTask`, add an explicit `NativeMemory` target, and verify narrowly delegated authority again at the destination. Reusable credentials remain local. Short-lived signatures do not replace protected transport. Store source observations with stable IDs and provenance before adding semantic enrichment. Memgraph is the required live backend. SQLite is retained only as a synthetic contract-test fixture; no SQLite activation is planned.
 
 ## Disposition / Current Slice
 
@@ -44,10 +44,14 @@ Accepted for this bounded capture slice. Implementation includes real signature 
 
 Proposed artifacts: rebuilt `membrane-mcp` at the chosen ingress hotel (intended VPS ingress) and new `native-memory` guest at the chosen destination (intended mbp-jane). New endpoint tool names: `native-memory.remember`, `native-memory.recall`, exposed through the existing MCP `/mcp` endpoint only after explicit configuration. No endpoint is provisioned by this PR.
 
-Before any production step, agree exact installed binary paths, service names, local socket, owner-only SQLite path, source namespace, issuer/key identity, destination/guest IDs and connector destination. Activation requires a local signing key at ingress, public-key pin plus narrow delegation grants at destination, native endpoint grants/preapproval, persistent observation storage and process installation/start/reload. These are specific persistent credential/grant/private-data effects requiring action-time approval. Protected transport and response integrity must be qualified first; no security/network settings are changed here. Parent found no eligible callable dot memory connector; do not call engineering tests dot acceptance.
+Before any production step, agree exact installed binary paths, service names, local socket, Memgraph database/schema and local Bolt configuration, source namespace, issuer/key identity, destination/guest IDs and connector destination. Activation requires a local signing key at ingress, public-key pin plus narrow delegation grants at destination, native endpoint grants/preapproval, persistent Memgraph observation/receipt/replay storage and process installation/start/reload. These are specific persistent credential/grant/private-data effects requiring action-time approval. Protected transport and response integrity must be qualified first; no security/network settings are changed here. Parent found no eligible callable dot memory connector; do not call engineering tests dot acceptance.
 
-Rollback: disable native endpoint routes and issuer grants, stop only the new native guest, restore the previous membrane artifact/config if changed, retain the private SQLite file for reconciliation. Do not delete observations or receipts as rollback. Existing Muninn-backed tools and unrelated agents remain unchanged. No merge/deployment is implied by the draft PR.
+Rollback: disable native endpoint routes and issuer grants, stop only the new native guest, restore the previous membrane artifact/config if changed, retain private graph observations and receipts for reconciliation. Do not delete observations or receipts as rollback. Existing Muninn-backed tools and unrelated agents remain unchanged. No merge/deployment is implied by the draft PR.
 
 ## Evidence boundaries and next work
 
 See crate README for commands, operation schema and limitations. Publication/CI evidence is reported with exact SHA. Next local qualification is actual disposable aiua hotel composition plus protected transport and supported dot connector setup; live capture only after those gaps and specific activation effects are approved. Real LifeGraph persistence comes later with its own schema/transaction tests. No paid model/provider calls, source-derived Muninn translation or legal-clearance claim.
+
+## Memgraph correction
+
+The initial SQLite fixture isolated auth/durability tests; it was not a technical Memgraph limitation. The native adapter now uses existing neo4rs and a single verified Memgraph transaction for observations, event receipts and nonces. The disposable graph CI test must pass; WAL/restart durability and actual hotel/client composition remain separate acceptance gates. SQLite tests cannot substitute for these.

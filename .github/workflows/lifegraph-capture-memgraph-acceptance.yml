@@ -5,6 +5,7 @@ on:
     branches: [develop, main]
     paths:
       - 'crates/data-memorygraphrag/**'
+      - 'crates/native-memory/**'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
       - 'vendor/neo4rs/**'
@@ -15,6 +16,7 @@ on:
     branches: [develop]
     paths:
       - 'crates/data-memorygraphrag/**'
+      - 'crates/native-memory/**'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
       - 'vendor/neo4rs/**'
@@ -91,6 +93,11 @@ jobs:
             sleep 1
           done
           "$ready" || { docker logs lifegraph-capture-memgraph; exit 1; }
+
+      - name: Native signed observation transaction acceptance
+        env:
+          PHILOTIC_SYNTHETIC_NATIVE_MEMGRAPH: '1'
+        run: cargo test --locked -p native-memory --test memgraph -- --ignored --test-threads=1
 
       - name: Capture adapter, role edge, replay and operator close acceptance
         env:

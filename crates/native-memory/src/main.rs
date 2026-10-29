@@ -17,7 +17,14 @@ struct Args {
     #[arg(long)]
     guest: String,
     #[arg(long)]
-    database: PathBuf,
+    sqlite_fixture: Option<PathBuf>,
+    /// Local private Bolt config. No credential discovery; no schema auto-creation.
+    #[arg(
+        long,
+        conflicts_with = "sqlite_fixture",
+        required_unless_present = "sqlite_fixture"
+    )]
+    memgraph_config: Option<PathBuf>,
     /// Local public-key pins and grants; reread for every task. Contains no secrets.
     #[arg(long)]
     policy: PathBuf,
@@ -31,7 +38,20 @@ fn now() -> u64 {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut runner = Runner::open(&args.database, args.node, args.guest.clone())?;
+    let mut fixture = args
+        .sqlite_fixture
+        .as_ref()
+        .map(|path| Runner::open(path, args.node.clone(), args.guest.clone()))
+        .transpose()?;
+    let graph = if let Some(path) = &args.memgraph_config {
+        Some(
+            native_memory::memgraph::MemgraphConfig::load(path)?
+                .connect(args.node.clone(), args.guest.clone())
+                .await?,
+        )
+    } else {
+        None
+    };
     let mut ipc = PhiloticClient::connect_at(
         &args.socket,
         GuestIdentity {
@@ -55,17 +75,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Ok(envelope) = serde_json::from_str::<Envelope>(&task_json) else {
             continue;
         };
-        let result = runner.execute_current(
-            &envelope,
-            || {
-                let policy: Policy = serde_json::from_slice(
-                    &std::fs::read(&args.policy).map_err(|_| native_memory::Error::Unavailable)?,
-                )
-                .map_err(|_| native_memory::Error::Invalid)?;
-                Ok((policy, now()))
-            },
-            &AtomicBool::new(false),
-        );
+        let current = || {
+            let policy: Policy = serde_json::from_slice(
+                &std::fs::read(&args.policy).map_err(|_| native_memory::Error::Unavailable)?,
+            )
+            .map_err(|_| native_memory::Error::Invalid)?;
+            Ok((policy, now()))
+        };
+        let cancelled = AtomicBool::new(false);
+        let result = if let Some(graph) = &graph {
+            graph.execute_current(&envelope, current, &cancelled).await
+        } else if let Some(fixture) = &mut fixture {
+            fixture.execute_current(&envelope, current, &cancelled)
+        } else {
+            Err(native_memory::Error::Unavailable)
+        };
         // Never send even an error to an unverified return route. Valid failures
         // are bounded by the ingress timeout; success uses the signed route only.
         let Ok(response) = result else { continue };

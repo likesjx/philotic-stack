@@ -62,3 +62,7 @@ The approval request must enumerate these exact resolved effects:
 - Register the supported client MCP connection with only these tools and approve one user-selected harmless observation for first capture. No broad agent grants, production migration, canonical goal edits or paid provider use.
 
 Do not activate until response/transport qualification is complete and the resolved effects are specifically approved. Rollback disables these two routes and issuer grants, stops only the new guest, and restores the previous selected membrane artifact/config. Retain SQLite observations/receipts for reconciliation; do not delete private data as rollback. No unrelated agent restart, merge or deployment occurred.
+
+## Updated backend decision
+
+User reaffirmed Memgraph before live rollout. SQLite effects above are historical fixture discussion and are withdrawn from the activation proposal. The next approval package must resolve the exact Memgraph database/schema, local Bolt credential custody, three unique key constraints, durability settings and retention/rollback effects. Do not create them on an existing graph without specific approval. Native Memgraph observation, receipt and replay writes share one transaction; the disposable CI job disables WAL/snapshots, so atomicity tests do not prove crash durability. No personal graph is accessed.
