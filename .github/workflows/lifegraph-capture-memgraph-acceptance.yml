@@ -114,12 +114,31 @@ jobs:
       - name: Build native two-hotel composition
         run: cargo build --locked -p aiua -p native-memory -p membrane-mcp
 
-      # Native transaction acceptance above creates/verifies the three native
-      # unique constraints. All rows in this container are synthetic fixtures.
+      # The preceding fixture removes its constraints. Provision this fixture's
+      # schema explicitly; the production runner never creates schema itself.
+      - name: Prepare OAuth synthetic schema
+        run: |
+          docker exec -i lifegraph-capture-memgraph mgconsole --host 127.0.0.1 --port 7687 <<'CYPHER'
+          CREATE CONSTRAINT ON (n:NativeMemoryObservation) ASSERT n.key IS UNIQUE;
+          CREATE CONSTRAINT ON (n:NativeMemoryReceipt) ASSERT n.key IS UNIQUE;
+          CREATE CONSTRAINT ON (n:NativeMemoryNonce) ASSERT n.key IS UNIQUE;
+          CYPHER
+
       - name: Hotel-owned OAuth capture, recall and coordinated revocation
         env:
           PHILOTIC_NATIVE_OAUTH_COMPOSITION: '1'
         run: NODE_TEST_EXECUTABLE="$(command -v node)" PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p aiua same_hotel_oauth_http_capture_recall_and_coordinated_revocation -- --ignored --nocapture
+
+      - name: Retire OAuth synthetic schema
+        run: |
+          docker exec -i lifegraph-capture-memgraph mgconsole --host 127.0.0.1 --port 7687 <<'CYPHER'
+          MATCH (n:NativeMemoryObservation) DELETE n;
+          MATCH (n:NativeMemoryReceipt) DELETE n;
+          MATCH (n:NativeMemoryNonce) DELETE n;
+          DROP CONSTRAINT ON (n:NativeMemoryObservation) ASSERT n.key IS UNIQUE;
+          DROP CONSTRAINT ON (n:NativeMemoryReceipt) ASSERT n.key IS UNIQUE;
+          DROP CONSTRAINT ON (n:NativeMemoryNonce) ASSERT n.key IS UNIQUE;
+          CYPHER
 
       - name: HTTP MCP through real hotels into Memgraph
         env:
