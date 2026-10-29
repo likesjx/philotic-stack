@@ -51,7 +51,17 @@ Exact head, commands and terminal CI evidence are recorded in the PR and executo
 
 The tested surface is Streamable HTTP MCP `/mcp` with `initialize`, `tools/list` and `tools/call`, using only `native-memory.remember` and `native-memory.recall`. The supported OpenAI MCP configuration route is documented in [OpenAI MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli). Parent plugin discovery found no installed memory connector. HTTP fixture success does not make these tools callable from Percival/dot; its actual registration, reachability, authentication and user-authorized harmless capture must still be verified. Claude follows through the same contract.
 
-## Minimal activation package — unresolved, no production action requested yet
+## Candidate packaging and activation — no production action requested
+
+`release/packages.toml` includes native-memory as a required Linux binary; macOS shipping is not added by this slice. The exact-head Native Memory Capture workflow builds a scoped release-profile Linux candidate containing only native-memory and membrane-mcp after capture checks pass. It reuses release-manifest.py, verifies the unpacked archive, and uploads checksums, full source SHA, target, build time and workflow/run provenance. Candidate metadata uses v0.0.0-alpha.<run-number> solely for the existing manifest format: no Git tag, GitHub release, install or production publication is performed. GitHub Actions retains the artifact for 14 days. Checksums detect byte changes; they are not independent signed provenance or a deployment authorization.
+
+Retrieve the exact run's artifact named `native-memory-linux-x86_64-<full-head-sha>` with `gh run download <run-id> --repo likesjx/philotic-stack --name <artifact-name> --dir <empty-directory>`. Verify outer SHA256SUMS, unpack the tarball into a separate empty directory, then run release-manifest.py verify and compare manifest.sha with the reviewed head. Run/artifact IDs, expiry and hashes are reported in executor closeout after upload, not guessed before CI completes.
+
+The accepted first topology is VPS-local ingress and runner, with central Memgraph on that VPS. This removes a laptop dependency and remote hotel hop. Source supports same-node EmitTask routing and explicit component executable/arguments. ProvisionMcpEndpoint currently writes empty args; activation must preserve the native config argument via RegisterComponent. Re-provisioning can overwrite it. Only new guests should be started; installed hotel compatibility remains unverified.
+
+Read-only SSH metadata verification to jane-vps was blocked before connection by the execution environment (`Operation not permitted`, port 22). No retry, alternate route, secret reads or remote mutation followed. Live node/owner IDs, installed versions, port ownership, database/privileges/durability and local Bolt transport remain unknown. Port 8913 is withdrawn, not presumed free. No security mutation approval is requested until those facts resolve. Source locations are philotic-hotel.service, /run/philotic/vps-jane.sock, philotic-memgraph.service and /opt/philotic/data/memgraph; these are not live verification.
+
+Official documentation supports custom MCP plugins on named ChatGPT/Codex surfaces, but does not establish dot-specific availability or this account's bearer compatibility. Conversation plugin selection is not proof of callable dot tools. No account or authentication changes were made.
 
 Artifacts are the exact reviewed build of `membrane-mcp` at one selected ingress and `native-memory` at one selected destination. The scope is two preapproved authenticated MCP tools and one verified principal's source-observation namespace. No general agent grants or canonical fact/goal mutation.
 

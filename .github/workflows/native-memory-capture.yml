@@ -9,6 +9,9 @@ on:
       - 'crates/ansible-mesh-core/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'release/packages.toml'
+      - 'scripts/release-manifest.py'
+      - 'scripts/release-packages.sh'
       - '.github/workflows/native-memory-capture.yml'
 permissions:
   contents: read
@@ -36,3 +39,67 @@ jobs:
         run: cargo build --locked -p aiua -p native-memory
       - name: Real hotels and signed native runner through HTTP MCP
         run: PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture
+  package-linux:
+    needs: capture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      PHILOTIC_BUILD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.1'
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-memory-release-linux
+      - name: Verify release tooling and build scoped binaries
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 -m unittest discover -s scripts/tests -p 'test_release*.py'
+          scripts/release-packages.sh required-bins --platform linux | grep -Fx native-memory
+          cargo build --locked --release --target "$TARGET" -p native-memory -p membrane-mcp --bins
+      - name: Assemble and verify candidate archive
+        run: |
+          set -euo pipefail
+          mkdir -p stage/bin dist unpacked
+          cp "target/$TARGET/release/native-memory" "target/$TARGET/release/membrane-mcp" stage/bin/
+          chmod 755 stage/bin/*
+          # Candidate metadata only: this does not create a Git tag or release.
+          TAG="v0.0.0-alpha.${GITHUB_RUN_NUMBER}"
+          python3 scripts/release-manifest.py generate --dir stage --tag "$TAG" \
+            --sha "$SOURCE_SHA" --target "$TARGET" --require native-memory membrane-mcp
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          Path('stage/provenance.json').write_text(json.dumps({
+              'kind': 'unreleased-native-memory-candidate',
+              'sha': os.environ['SOURCE_SHA'],
+              'target': os.environ['TARGET'],
+              'workflow': '.github/workflows/native-memory-capture.yml',
+              'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+          }, indent=2) + '\n')
+          PY
+          NAME="native-memory-${SOURCE_SHA}-linux-x86_64"
+          tar -C stage -czf "dist/$NAME.tar.gz" bin SHA256SUMS manifest.json provenance.json
+          tar -C unpacked -xzf "dist/$NAME.tar.gz"
+          python3 scripts/release-manifest.py verify --dir unpacked
+          python3 scripts/release-manifest.py check-metadata --manifest unpacked/manifest.json --tag "$TAG" --target "$TARGET"
+          (cd unpacked && sha256sum -c SHA256SUMS)
+          cp stage/manifest.json stage/provenance.json dist/
+          (cd dist && sha256sum *.tar.gz manifest.json provenance.json > SHA256SUMS)
+          cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-memory-linux-x86_64-${{ github.event.pull_request.head.sha }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
