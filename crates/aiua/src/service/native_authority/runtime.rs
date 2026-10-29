@@ -363,10 +363,31 @@ impl Runtime {
             .workers
             .get(guest)
             .ok_or_else(|| anyhow!("unknown protected worker"))?;
+        // ProvisionMcpEndpoint writes this generic launch request. It selects
+        // an already configured protected guest, never new launch authority.
+        // Only the private manifest supplies executable/args/environment.
+        let generated_membrane = guest == self.authority.membrane
+            && config.as_object().is_some_and(|m| m.len() == 3)
+            && config.get("command").and_then(|v| v.as_str()) == Some("membrane-mcp")
+            && config.get("args") == Some(&serde_json::json!([]))
+            && config
+                .get("env")
+                .and_then(|v| v.as_object())
+                .is_some_and(|env| {
+                    env.len() == 4
+                        && env.get("MCP_PORT").and_then(|v| v.as_str())
+                            == argument(worker, "--port").ok()
+                        && env.get("PHILOTIC_HOTEL_SOCKET").and_then(|v| v.as_str())
+                            == argument(worker, "--ipc-socket").ok()
+                        && env.get("PHILOTIC_GUEST_ID").and_then(|v| v.as_str()) == Some(guest)
+                        && env.get("PHILOTIC_NODE_ID").and_then(|v| v.as_str())
+                            == Some(self.authority.hotel.as_str())
+                });
         ensure!(
             worker.command.is_absolute()
-                && config.get("command").and_then(|v| v.as_str()) == worker.command.to_str()
-                && config.get("args") == Some(&serde_json::to_value(&worker.args)?),
+                && (generated_membrane
+                    || (config.get("command").and_then(|v| v.as_str()) == worker.command.to_str()
+                        && config.get("args") == Some(&serde_json::to_value(&worker.args)?))),
             "protected launch command mismatch"
         );
         ensure!(self.healthy(), "native coordinator unavailable");

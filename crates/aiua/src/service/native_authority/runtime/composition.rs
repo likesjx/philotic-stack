@@ -9,6 +9,22 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+struct SharedMaterializer(
+    Arc<tokio::sync::Mutex<crate::service::guest_manager::LocalProcessMaterializer>>,
+);
+#[async_trait::async_trait]
+impl Materializer for SharedMaterializer {
+    async fn spawn_guest(&mut self, guest: &str, config: &Value) -> Result<String> {
+        self.0.lock().await.spawn_guest(guest, config).await
+    }
+    async fn reclaim_guest(&mut self, guest: &str) -> Result<()> {
+        self.0.lock().await.reclaim_guest(guest).await
+    }
+    async fn check_status(&mut self, guest: &str, active: &str) -> Result<bool> {
+        self.0.lock().await.check_status(guest, active).await
+    }
+}
+
 fn json_file(path: &Path, value: Value) {
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -195,9 +211,46 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     let runtime = Runtime::load(&config, hotel).await.unwrap();
     let store = SqliteGraphStorage::open(":memory:").unwrap();
     let domain = Arc::new(GraphDomain::new(Arc::new(store.adapter())));
+    domain
+        .upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
+            hotel_name: hotel.into(),
+            capabilities: serde_json::from_value(json!({"node_id":hotel,"roles":[]})).unwrap(),
+            mesh_host: None,
+            mesh_port: 0,
+            blob_port: 0,
+            execution_port: 0,
+            ipc_socket_path: socket.to_str().unwrap().into(),
+            active_pid: None,
+        })
+        .unwrap();
+    let materializer = Arc::new(tokio::sync::Mutex::new(
+        crate::service::guest_manager::LocalProcessMaterializer::new(":memory:")
+            .with_hotel_socket(socket.to_str().unwrap())
+            .with_native_authority(runtime),
+    ));
+    let manager = Arc::new(crate::service::guest_manager::GuestManager::new(
+        hotel,
+        domain.clone(),
+        Box::new(SharedMaterializer(materializer.clone())),
+    ));
+    for guest in ["issuer", runner] {
+        let worker = workers.iter().find(|w| w["guest"] == guest).unwrap();
+        domain
+            .upsert_guest(&ansible_mesh_core::storage::GuestRecord {
+                hotel_name: hotel.into(),
+                guest_id: guest.into(),
+                role: guest.into(),
+                config_json: worker.to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .unwrap();
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let server = crate::service::ipc::IpcServer::new(socket.to_str().unwrap(), hotel, tx, domain);
+    let server = crate::service::ipc::IpcServer::new(socket.to_str().unwrap(), hotel, tx, domain)
+        .with_materialization_requester(manager.clone());
     let server = tokio::spawn(async move { server.run().await });
     let mut probe = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -218,7 +271,7 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     })
     .await
     .unwrap();
-    for (guest, role) in [(membrane, "membrane"), (runner, "native-memory-runner")] {
+    for (guest, role) in [(membrane, "mcp-membrane"), (runner, "native-memory-runner")] {
         assert!(matches!(
             probe
                 .send_request(IpcRequest::SeedRemoteIncarnation {
@@ -238,20 +291,19 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
         "outbound_transform":{"kind":"pass_through"},"auth":{"scheme":"bearer_token","grants":[{"token_id":"fixture","vault_ref":"unused-in-oauth-mode","scopes":[]}]}})).collect();
     let endpoint=serde_json::from_value(json!({"endpoint_id":"native-fixture","owner_agent_id":"fixture-owner","port":mcp_port,"path":null,"exposure":"local","tools":tools,"default_auth":null,"allow_unauthenticated":false,
         "preapproval_rules":[{"action_pattern":"native-memory.*","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null}],"updated_at":0})).unwrap();
+    for guest in ["issuer", runner] {
+        assert!(manager.ensure_guest_active(guest).await.unwrap());
+    }
     assert!(matches!(
         probe
             .send_request(IpcRequest::ProvisionMcpEndpoint { config: endpoint })
             .await
             .unwrap(),
-        IpcResponse::McpEndpointProvisioned { .. }
+        IpcResponse::McpEndpointProvisioned {
+            materialized: true,
+            ..
+        }
     ));
-    let mut materializer = crate::service::guest_manager::LocalProcessMaterializer::new(":memory:")
-        .with_hotel_socket(socket.to_str().unwrap())
-        .with_native_authority(runtime);
-    for guest in ["issuer", runner, membrane] {
-        let worker = workers.iter().find(|w| w["guest"] == guest).unwrap();
-        materializer.spawn_guest(guest, worker).await.unwrap();
-    }
     let url = format!("http://127.0.0.1:{mcp_port}/mcp");
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -275,7 +327,15 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
     .unwrap();
     let event = uuid::Uuid::new_v4().to_string();
     let remember = json!({"operation":"remember","id":event,"subject":subject,"content":"Synthetic violet lantern","source":"synthetic://oauth","source_version":"1","lineage":"independent"});
-    for rejected in ["u".repeat(43), "s".repeat(43), "r".repeat(43), "z".repeat(43)] {
+    for rejected in [
+        "u".repeat(43),
+        "s".repeat(43),
+        "r".repeat(43),
+        "c".repeat(43),
+        "e".repeat(43),
+        "v".repeat(43),
+        "z".repeat(43),
+    ] {
         let denied = rpc(
             &client,
             &url,
@@ -353,7 +413,12 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
         .is_some()
     );
     for guest in [membrane, runner, "issuer"] {
-        materializer.reclaim_guest(guest).await.unwrap();
+        materializer
+            .lock()
+            .await
+            .reclaim_guest(guest)
+            .await
+            .unwrap();
     }
     server.abort();
     drain.abort();

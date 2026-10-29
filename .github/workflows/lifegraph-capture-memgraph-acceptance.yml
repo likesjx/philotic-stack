@@ -6,8 +6,8 @@ on:
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'crates/native-memory/**'
-      - 'crates/aiua/src/service/native_authority/**'
-      - 'crates/aiua/src/service/native_authority.rs'
+      - 'crates/aiua/**'
+      - 'crates/membrane-mcp/**'
       - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
@@ -20,6 +20,8 @@ on:
     paths:
       - 'crates/data-memorygraphrag/**'
       - 'crates/native-memory/**'
+      - 'crates/aiua/**'
+      - 'crates/membrane-mcp/**'
       - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
@@ -88,8 +90,10 @@ jobs:
             --tmpfs /var/log/memgraph:rw,uid=101,gid=103 \
             "$MEMGRAPH_IMAGE" \
             --log-level=WARNING \
-            --storage-wal-enabled=false \
-            --storage-snapshot-interval-sec=0 \
+            --storage-wal-enabled=true \
+            --storage-wal-file-flush-every-n-tx=1 \
+            --storage-snapshot-interval-sec=300 \
+            --storage-snapshot-on-exit=true \
             --telemetry-enabled=false
 
           ready=false
@@ -110,6 +114,8 @@ jobs:
       - name: Build native two-hotel composition
         run: cargo build --locked -p aiua -p native-memory -p membrane-mcp
 
+      # Native transaction acceptance above creates/verifies the three native
+      # unique constraints. All rows in this container are synthetic fixtures.
       - name: Hotel-owned OAuth capture, recall and coordinated revocation
         env:
           PHILOTIC_NATIVE_OAUTH_COMPOSITION: '1'

@@ -7,6 +7,7 @@ const c = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 let active = true;
 const issued = Math.floor(Date.now()/1000);
 const readOnly = 'r'.repeat(43), wrongAudience = 'u'.repeat(43), wrongSubject = 's'.repeat(43);
+const wrongClient = 'c'.repeat(43), expired = 'e'.repeat(43), changedVersion = 'v'.repeat(43);
 function frame(socket, value) {
   const bytes = Buffer.from(JSON.stringify(value));
   const header = Buffer.alloc(4); header.writeUInt32BE(bytes.length);
@@ -44,8 +45,8 @@ https.createServer({ key: fs.readFileSync(c.key), cert: fs.readFileSync(c.cert) 
   }
   let body = ''; for await (const bytes of req) { body += bytes; if (body.length > 8192) { res.statusCode = 400; res.end('{}'); return; } }
   const token = new URLSearchParams(body).get('token');
-  if (!active || ![c.token, readOnly, wrongAudience, wrongSubject].includes(token)) { res.end('{"active":false}'); return; }
+  if (!active || ![c.token, readOnly, wrongAudience, wrongSubject, wrongClient, expired, changedVersion].includes(token)) { res.end('{"active":false}'); return; }
   res.end(JSON.stringify({ active: true, iss:c.issuer, aud:token===wrongAudience?'https://wrong.example/mcp':c.resource,
-    sub:token===wrongSubject?'other':c.subject, client_id:'fixture-dot', grant_version:'0:7',
-    scope: token===readOnly?'native-memory:recall':'native-memory:remember native-memory:recall', iat:issued,exp:issued+300 }));
+    sub:token===wrongSubject?'other':c.subject, client_id:token===wrongClient?'other':'fixture-dot', grant_version:token===changedVersion?'0:8':'0:7',
+    scope: token===readOnly?'native-memory:recall':'native-memory:remember native-memory:recall', iat:issued,exp:token===expired?issued:issued+300 }));
 }).listen(c.port, '127.0.0.1');
