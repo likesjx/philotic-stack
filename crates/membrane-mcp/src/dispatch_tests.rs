@@ -41,9 +41,158 @@ struct Harness {
     inbound_rx: Option<mpsc::Receiver<InboundEnvelope>>,
 }
 
+#[tokio::test]
+async fn native_memory_authenticated_membrane_router_two_hotel_roundtrip() {
+    use native_memory::{Grant, Policy, Runner, TrustedIssuer};
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().unwrap();
+    let bearer = "SYNTHETIC-EXTERNAL-BEARER-CANARY";
+    let mut vault = HashMap::new();
+    // Use an opaque token ID unrelated to the actual reusable credential.
+    vault.insert(
+        "fixture-hash".into(),
+        *blake3::hash(bearer.as_bytes()).as_bytes(),
+    );
+    let auth = McpAuthScheme::BearerToken {
+        grants: vec![McpTokenGrant {
+            token_id: "caller-1".into(),
+            vault_ref: "fixture-hash".into(),
+            scopes: vec![],
+            expires_at: None,
+            allotment: None,
+        }],
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let grant = Grant {
+        issuer: "test-node".into(),
+        reply_node: "test-node".into(),
+        reply_guest: "mcp-membrane-test".into(),
+        principal: "alice".into(),
+        owner: "alice".into(),
+        namespace: "notes".into(),
+        destination: "memory-hotel".into(),
+        runner: "memory-1".into(),
+        operations: vec!["remember".into(), "recall".into()],
+        revision: 1,
+        expires_at: u64::MAX,
+        revoked: false,
+    };
+    let grants = BTreeMap::from([("caller-1".into(), grant)]);
+    let config = dir.path().join("synthetic-issuer.json");
+    std::fs::write(&config,serde_json::to_vec(&json!({"issuer":"test-node","key_id":"test-key","signing_seed":vec![7;32],"grants":grants})).unwrap()).unwrap();
+    let policy = Policy {
+        issuers: BTreeMap::from([(
+            "test-node".into(),
+            TrustedIssuer {
+                key_id: "test-key".into(),
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )]),
+        grants,
+    };
+    let mut h = harness(false, ExposureTier::Local, vault);
+    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(config);
+    let tools = ["remember", "recall"]
+        .into_iter()
+        .map(|op| McpToolSpec {
+            name: format!("native-memory.{op}"),
+            description: "synthetic native memory".into(),
+            input_schema: json!({"type":"object"}),
+            inbound_transform: McpInboundTransform::FieldMap {
+                action: format!("native-memory.{op}"),
+                target: McpRouteTarget::NativeMemory {
+                    runner_id: "memory-1".into(),
+                    target_node: "memory-hotel".into(),
+                },
+                mappings: vec![],
+            },
+            outbound_transform: McpOutboundTransform::PassThrough,
+            auth: Some(auth.clone()),
+            handler: None,
+        })
+        .collect();
+    h.set_endpoint(endpoint_with(tools, None)).await;
+    let path = dir.path().join("memory.db");
+    let runner = std::sync::Mutex::new(
+        Runner::open(&path, "memory-hotel".into(), "memory-1".into()).unwrap(),
+    );
+    h.spawn_stub(move |env| {
+        // Actual membrane -> hotel EmitTask composition; destination hotel mocked.
+        let request = membrane::runtime::build_inbound_request(env, "test-node");
+        let philotic_client::IpcRequest::EmitTask {
+            target_node,
+            target_role,
+            target_guest_id,
+            task_json,
+        } = request
+        else {
+            panic!("must route")
+        };
+        assert_eq!(target_node, "memory-hotel");
+        assert_eq!(target_role, native_memory::ROLE);
+        assert_eq!(target_guest_id.as_deref(), Some("memory-1"));
+        assert!(!task_json.contains(bearer));
+        assert!(
+            !serde_json::to_string(&env.raw_transport)
+                .unwrap()
+                .contains(bearer)
+        );
+        assert!(!task_json.contains("signing_seed"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        match runner.lock().unwrap().execute_wire(
+            task_json.as_bytes(),
+            &policy,
+            now,
+            &std::sync::atomic::AtomicBool::new(false),
+        ) {
+            Ok(response) => DispatchOutcome::Ok(serde_json::to_string(&response).unwrap()),
+            Err(e) => DispatchOutcome::Err(e.to_string()),
+        }
+    });
+    let command = json!({"operation":"remember","id":"note-1","subject":"practice","content":"harmless blue notebook","source":"synthetic://dot","source_version":"1","lineage":"source-1"});
+    let args = json!({"event":"remember-1","command":command});
+    let (_, denied) = call(
+        &h.state,
+        rpc(
+            "tools/call",
+            json!({"name":"native-memory.remember","arguments":args}),
+        ),
+        Some("Bearer wrong"),
+        true,
+    )
+    .await;
+    assert!(denied.get("error").is_some());
+    let (_, remember) = call(
+        &h.state,
+        rpc(
+            "tools/call",
+            json!({"name":"native-memory.remember","arguments":args}),
+        ),
+        Some(&format!("Bearer {bearer}")),
+        true,
+    )
+    .await;
+    assert!(
+        remember["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("committed")
+    );
+    let(_,recall)=call(&h.state,rpc("tools/call",json!({"name":"native-memory.recall","arguments":{"event":"recall-1","command":{"operation":"recall","query":"notebook","limit":5}}})),Some(&format!("Bearer {bearer}")),true).await;
+    let text = recall["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("harmless blue notebook"));
+    assert!(text.contains("authenticated_writer"));
+    let db = std::fs::read(path).unwrap();
+    assert!(!db.windows(bearer.len()).any(|w| w == bearer.as_bytes()));
+}
+
 fn harness(static_mode: bool, tier: ExposureTier, vault: HashMap<String, [u8; 32]>) -> Harness {
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let state = Arc::new(MembraneState {
+        native_memory_config: None,
         routing_table: new_shared_table(),
         endpoint_table: new_shared_endpoint_table(),
         vault_cache: VaultHashCache::new(),

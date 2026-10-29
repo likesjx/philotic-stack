@@ -54,6 +54,8 @@ pub enum DispatchOutcome {
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
+    /// Opt-in local file, reread per native call for revocation. Never logged/routed.
+    pub native_memory_config: Option<std::path::PathBuf>,
     /// Legacy per-agent route table (UpdateMcpRoutes path).
     pub routing_table: SharedRoutingTable,
     /// Config-driven endpoint table (ProvisionMcpEndpoint path). Takes
@@ -529,7 +531,7 @@ async fn handle_tools_call(
             "dispatching via transform engine"
         );
 
-        let envelope = InboundEnvelope {
+        let mut envelope = InboundEnvelope {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             sender: SenderInfo {
@@ -573,6 +575,68 @@ async fn handle_tools_call(
             target_guest_id: None,
             extra: serde_json::Map::new(),
         };
+
+        if inbound.target_kind == "native_memory" {
+            // Native memory has a separate local issuer/grant policy. A bearer
+            // token_id by itself is not delegated authority at the destination.
+            if !matches!(auth_scheme, McpAuthScheme::BearerToken { .. }) || !preapproved {
+                return JsonRpcResponse::err(
+                    id,
+                    error_code::INVALID_PARAMS,
+                    "native memory requires explicit bearer auth and preapproval",
+                );
+            }
+            let issued = (|| -> Result<native_memory::Envelope, native_memory::Error> {
+                let path = state
+                    .native_memory_config
+                    .as_ref()
+                    .ok_or(native_memory::Error::Unavailable)?;
+                let config: native_memory::IngressConfig = serde_json::from_slice(
+                    &std::fs::read(path).map_err(|_| native_memory::Error::Unavailable)?,
+                )
+                .map_err(|_| native_memory::Error::Invalid)?;
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Arguments {
+                    event: String,
+                    command: native_memory::Command,
+                }
+                // Use the exact caller args, not an authority-bearing field map.
+                let input: Arguments = serde_json::from_value(args.clone())
+                    .map_err(|_| native_memory::Error::Invalid)?;
+                if inbound.action != format!("native-memory.{}", input.command.operation()) {
+                    return Err(native_memory::Error::Denied);
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| native_memory::Error::Unavailable)?
+                    .as_secs();
+                let signed = config.into_ingress().issue(
+                    &caller.token_id,
+                    input.command,
+                    input.event,
+                    turn_id.clone(),
+                    now,
+                )?;
+                if Some(signed.claims.destination.as_str()) != inbound.target_node.as_deref()
+                    || signed.claims.runner != inbound.target_id
+                    || signed.claims.reply_node != state.node_id
+                    || signed.claims.reply_guest != state.guest_id
+                {
+                    return Err(native_memory::Error::Denied);
+                }
+                Ok(signed)
+            })();
+            let signed = match issued {
+                Ok(signed) => signed,
+                Err(e) => {
+                    return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, e.to_string());
+                }
+            };
+            envelope.content =
+                serde_json::to_string(&signed).expect("native envelope serialization");
+            envelope.raw_transport = json!({"transport":"mcp","target_kind":"native_memory","target_id":inbound.target_id,"target_node":inbound.target_node});
+        }
 
         let (tx, rx) = oneshot::channel::<DispatchOutcome>();
         {
@@ -639,6 +703,7 @@ async fn handle_tools_call(
     if matches!(
         route.record.target,
         ansible_mesh_core::mcp_route::McpRouteTarget::McpUpstream { .. }
+            | ansible_mesh_core::mcp_route::McpRouteTarget::NativeMemory { .. }
     ) {
         return JsonRpcResponse::err(
             id,

@@ -40,6 +40,11 @@ pub struct McpRouteRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpRouteTarget {
+    /// Fixed native memory runner, with signed delegated authority. Config-driven only.
+    NativeMemory {
+        runner_id: String,
+        target_node: String,
+    },
     /// Route to a running philote (cognitive loop guest).
     /// `target_node` pins the dispatch to a specific hotel node_id for cross-hotel routing.
     /// When absent the dispatch is local (same hotel as membrane-mcp).

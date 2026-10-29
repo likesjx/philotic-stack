@@ -1,0 +1,22 @@
+[package]
+name = "native-memory"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ed25519-dalek = "2"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+philotic-client = { path = "../philotic-client" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

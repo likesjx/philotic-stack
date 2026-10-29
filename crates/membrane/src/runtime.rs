@@ -272,7 +272,10 @@ fn refusal_push(
         .raw_transport
         .get("target_kind")
         .and_then(|v| v.as_str());
-    if !matches!(target_kind, Some("mcp_upstream" | "datasource")) {
+    if !matches!(
+        target_kind,
+        Some("mcp_upstream" | "datasource" | "native_memory")
+    ) {
         return None;
     }
     warn!(code, turn_id = %envelope.turn_id, "hotel refused tool dispatch; failing the call fast");
@@ -297,7 +300,7 @@ fn refusal_push(
 /// `CreateTask` is a ROLE broadcast — every `agent` guest on the hotel receives
 /// it. Live 2026-09-05 an MCP `tools/call` aimed at one agent was answered by
 /// all eight philotes on mac-jane and the first reply (a different agent's) won.
-fn build_inbound_request(
+pub fn build_inbound_request(
     envelope: &InboundEnvelope,
     local_node_id: &str,
 ) -> philotic_client::IpcRequest {
@@ -336,6 +339,17 @@ fn build_inbound_request(
         .get("target_kind")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+
+    // Signed native tasks are forwarded byte-for-byte; no transport extras or
+    // caller identity fields may replace authority. Receiver verifies all pins.
+    if target_kind == Some("native_memory") {
+        return IpcRequest::EmitTask {
+            target_node: target_node.unwrap_or_else(|| local_node_id.to_string()),
+            target_role: "native-memory-runner".into(),
+            target_guest_id: hinted_target_id,
+            task_json: envelope.content.clone(),
+        };
+    }
 
     let (target_role, target_guest_id) = resolve_target(target_kind, hinted_target_id);
 

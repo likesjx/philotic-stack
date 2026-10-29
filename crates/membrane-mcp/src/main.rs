@@ -28,6 +28,9 @@ use tracing::{error, warn};
 #[derive(Parser, Debug)]
 #[command(name = "membrane-mcp", about = "Philotic MCP membrane guest")]
 struct Args {
+    /// Opt-in local native-memory signing configuration. Never sent over IPC.
+    #[arg(long)]
+    native_memory_config: Option<std::path::PathBuf>,
     #[arg(short, long, env = "MCP_PORT", default_value_t = 9100)]
     port: u16,
 
@@ -606,6 +609,7 @@ async fn main() -> Result<()> {
     let declared_exposure = Arc::new(std::sync::RwLock::new(None));
 
     let state = Arc::new(MembraneState {
+        native_memory_config: args.native_memory_config.clone(),
         routing_table: table,
         endpoint_table,
         vault_cache: VaultHashCache::new(),

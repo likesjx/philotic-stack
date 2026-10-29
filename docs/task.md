@@ -1,5 +1,13 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Native memory capture vertical slice — 2026-10-29
+
+- Scope: authenticated membrane → signed fixed request → destination router/guest → native observation remember/recall. First intended client Percival/dot, then Claude; no callable dot connector or live capture is claimed. Preserve source content, stable IDs, owner/subject/authenticated writer/provenance. No enrichment, confirmed fact/goal edits, consolidation or unrelated-agent recovery.
+- Implemented in `crates/native-memory`, opt-in `NativeMemory` routing and local issuer configuration in membrane-mcp. Real Ed25519/SHA-256 and transactional SQLite replay/receipt state; no Muninn backend/auth hop or paid provider call. [Proposal/rollout effects](architecture/NATIVE_MEMORY_CAPTURE_PROPOSAL.md), [reproduction/limitations](../crates/native-memory/README.md).
+- Verification: native signatures, tampering, scope/provider denial, idempotent retries/restart replay, expiry/revocation/policy changes, rollback/cancellation/malformed inputs; real membrane dispatch/router composition and temporary binary IPC smoke. Affected crate regression and Clippy results reported with exact publication SHA. Full aiua/network/connector/production acceptance remains open.
+- Authority: user explicitly requested implementation/testing/publication and scoped draft PR. No merge, deployment, real keys/grants, private data, service restoration or network/security changes. Muninn recall/graph telemetry remain deliberately deferred under no-personal-memory/no-live-operation restrictions; repository/task evidence only, recheck before a memory-dependent decision.
+- Next: qualify actual disposable aiua composition, protected transport and supported dot connector; then obtain approval for exact activation artifacts, services, key/grant/storage effects. Migration/sharding and LifeGraph semantic enrichment remain full-target later work. Original checkout's Telegram edit untouched.
+
 ## Bounded project-guidance repair — 2026-10-24
 
 Publication phase: after local review at `6a8dfeadea82fe32268bf7284955b811cf4a5c1b`, the owner explicitly approved publishing this branch, a draft PR into develop, exact-revision CI/review, and merge only after those pass. Earlier local-only restrictions below describe the implementation phase; production, memory, graph, grants and unrelated-checkout restrictions remain in force. Current develop is integrated while preserving its concurrent task entries. `.github/workflows/guidance-contract.yml` adds a dedicated exact-head offline guidance gate; PR/merge evidence will be reported from GitHub rather than inferred from local checks.

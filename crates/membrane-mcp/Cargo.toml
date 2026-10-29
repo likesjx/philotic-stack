@@ -14,9 +14,14 @@ philotic-client = { path = "../philotic-client" }
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 perimeter-core = { path = "../perimeter-core" }
 membrane = { path = "../membrane" }
+native-memory = { path = "../native-memory" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.6", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = "2"

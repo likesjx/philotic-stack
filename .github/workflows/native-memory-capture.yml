@@ -1,0 +1,34 @@
+name: Native Memory Capture
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'crates/native-memory/**'
+      - 'crates/membrane/**'
+      - 'crates/membrane-mcp/**'
+      - 'crates/ansible-mesh-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/native-memory-capture.yml'
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.1'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check -p native-memory -p membrane -p membrane-mcp -p ansible-mesh-core
+      - run: cargo test --locked -p native-memory -p membrane -p membrane-mcp
+      - run: cargo test --locked -p ansible-mesh-core --lib
+      - run: cargo clippy --locked -p native-memory -p membrane -p membrane-mcp -p ansible-mesh-core --all-targets

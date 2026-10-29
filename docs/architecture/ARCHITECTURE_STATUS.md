@@ -322,6 +322,8 @@ These are accepted proposals not yet in implementation:
 
 ## Active Work Right Now
 
+- **Native capture (local tested, not deployed):** [NATIVE_MEMORY_CAPTURE_PROPOSAL](NATIVE_MEMORY_CAPTURE_PROPOSAL.md) adds an opt-in signed membrane → router → native runner path with private observation provenance, SQLite receipt/replay transactions and disposable two-hotel/binary tests. SQLite is interim capture storage, not LifeGraph/Memgraph qualification. Percival/dot and Claude callable integration, protected transport and explicit key/grant activation remain open; existing Muninn tools are unchanged.
+
 These are the most clearly active seams as of 2026-07-08:
 
 | Seam | Current truth | Next pressure |
