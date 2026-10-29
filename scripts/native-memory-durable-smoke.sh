@@ -7,7 +7,7 @@ set -euo pipefail
   exit 1
 }
 cd "$(dirname "$0")/.."
-readonly image='memgraph/memgraph@sha256:bd01a159023283b56b807943ed28225c8f662920b64317f26da7d9f0f5b19de4'
+readonly image='memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27'
 readonly fixture="native-memory-durable-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}-${RANDOM}"
 readonly volume="${fixture}-data"
 container_created=false
@@ -39,7 +39,7 @@ docker run -d --pull never --name "$fixture" \
   "$image" --log-level=WARNING --telemetry-enabled=false \
   --data-recovery-on-startup=true --storage-wal-enabled=true \
   --storage-wal-file-flush-every-n-tx=1 \
-  --storage-snapshot-interval-sec=3600 --storage-snapshot-on-exit=false >/dev/null
+  --storage-snapshot-interval-sec=300 --storage-snapshot-on-exit=true >/dev/null
 # Current flags: https://memgraph.com/docs/database-management/configuration
 ready() {
   for _ in {1..60}; do

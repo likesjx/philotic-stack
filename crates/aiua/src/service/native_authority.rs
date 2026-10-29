@@ -597,7 +597,10 @@ mod tests {
             let Reply::Permit { handle } = reply else {
                 panic!("admission denied")
             };
-            std::fs::write(dir.join("handle"), &handle).unwrap();
+            // Publish the whole frame atomically: existence alone must not let
+            // the runner read a just-created, still-empty fixture file.
+            std::fs::write(dir.join("handle.pending"), &handle).unwrap();
+            std::fs::rename(dir.join("handle.pending"), dir.join("handle")).unwrap();
             wait(&dir.join("committed")).await;
             let mut client = Client::connect(&socket).await.unwrap();
             assert!(matches!(
