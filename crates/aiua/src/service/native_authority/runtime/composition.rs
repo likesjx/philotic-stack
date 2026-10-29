@@ -290,7 +290,10 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
         "input_schema":{"type":"object"},"inbound_transform":{"kind":"field_map","action":format!("native-memory.{op}"),"target":{"kind":"native_memory","runner_id":runner,"target_node":hotel},"mappings":[]},
         "outbound_transform":{"kind":"pass_through"},"auth":{"scheme":"bearer_token","grants":[{"token_id":"fixture","vault_ref":"unused-in-oauth-mode","scopes":[]}]}})).collect();
     let endpoint=serde_json::from_value(json!({"endpoint_id":"native-fixture","owner_agent_id":"fixture-owner","port":mcp_port,"path":null,"exposure":"local","tools":tools,"default_auth":null,"allow_unauthenticated":false,
-        "preapproval_rules":[{"action_pattern":"native-memory.*","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null}],"updated_at":0})).unwrap();
+        "preapproval_rules":[
+            {"action_pattern":"native-memory.remember","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null},
+            {"action_pattern":"native-memory.recall","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null}
+        ],"updated_at":0})).unwrap();
     for guest in ["issuer", runner] {
         assert!(manager.ensure_guest_active(guest).await.unwrap());
     }
@@ -345,7 +348,7 @@ async fn same_hotel_oauth_http_capture_recall_and_coordinated_revocation() {
             remember.clone(),
         )
         .await;
-        assert!(denied.get("error").is_some(), "{denied}");
+        assert_eq!(denied["error"]["code"], -32001, "{denied}");
     }
     let saved = result(
         rpc(
