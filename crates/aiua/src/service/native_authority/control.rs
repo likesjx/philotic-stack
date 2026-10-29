@@ -18,7 +18,10 @@ impl NativeAuthority {
             let policy = policy.clone();
             tokio::spawn(async move {
                 let _slot = slot;
-                let _ = owner.control(stream, policy).await;
+                let outcome = owner.control(stream, policy).await;
+                #[cfg(test)]
+                eprintln!("synthetic native control completed: {}", outcome.is_ok());
+                let _ = outcome;
             });
         }
     }
@@ -44,6 +47,8 @@ impl NativeAuthority {
             Request::Admit {
                 token, envelope, ..
             } => {
+                #[cfg(test)]
+                eprintln!("synthetic native control: admit");
                 self.origin(&peer)?;
                 let verified = native_memory::VerifiedRequest::validate(
                     &envelope,
@@ -71,6 +76,8 @@ impl NativeAuthority {
                     Request::Release { handle, digest, .. } => (handle, digest, true),
                     _ => unreachable!(),
                 };
+                #[cfg(test)]
+                eprintln!("synthetic native control: reservation release={release}");
                 let lease = self
                     .reserve_kind(Uuid::parse_str(&handle)?, peer, digest, release)
                     .await?;
@@ -82,6 +89,8 @@ impl NativeAuthority {
                     loop {
                         match read::<Request>(&mut stream).await? {
                             Request::Validate { digest: requested } => {
+                                #[cfg(test)]
+                                eprintln!("synthetic native control: validate");
                                 ensure!(
                                     requested == digest && validations < 2,
                                     "invalid native validation"
@@ -91,6 +100,8 @@ impl NativeAuthority {
                                 write(&mut stream, &Reply::Ready).await?;
                             }
                             Request::Finish { committed } => {
+                                #[cfg(test)]
+                                eprintln!("synthetic native control: finish committed={committed}");
                                 ensure!(
                                     release || !committed || validations > 0,
                                     "precommit validation required"
