@@ -410,10 +410,13 @@ async fn composition(real: bool) {
                 .await
                 .is_ok()
                 && client
-                    .get(format!("{issuer}/oauth/introspect"))
+                    .get(format!(
+                        "{issuer}/{}",
+                        if real { "health" } else { "oauth/introspect" }
+                    ))
                     .send()
                     .await
-                    .is_ok()
+                    .is_ok_and(|r| !real || r.status().is_success())
             {
                 break;
             }
@@ -422,6 +425,7 @@ async fn composition(real: bool) {
     })
     .await
     .unwrap();
+    let denied_id = uuid::Uuid::new_v4().to_string();
     if real {
         let issued: Value = client
             .post(format!("{issuer}/test/issue"))
@@ -449,8 +453,8 @@ async fn composition(real: bool) {
             &url,
             readonly["token"].as_str().unwrap(),
             "native-memory.remember",
-            "readonly-denied",
-            json!({"operation":"remember"}),
+            &denied_id,
+            json!({"operation":"remember","id":denied_id,"subject":subject,"content":"Synthetic forbidden violet lantern","source":"synthetic://readonly","source_version":"1","lineage":"independent"}),
         )
         .await;
         assert_eq!(denied["error"]["code"], -32001);
@@ -518,6 +522,13 @@ async fn composition(real: bool) {
             .unwrap()
             .iter()
             .any(|o| o["id"] == event)
+    );
+    assert!(
+        !recalled["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == denied_id)
     );
     assert!(
         client
