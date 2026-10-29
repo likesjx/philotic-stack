@@ -367,22 +367,7 @@ impl Runtime {
         // an already configured protected guest, never new launch authority.
         // Only the private manifest supplies executable/args/environment.
         let generated_membrane = guest == self.authority.membrane
-            && config.as_object().is_some_and(|m| m.len() == 3)
-            && config.get("command").and_then(|v| v.as_str()) == Some("membrane-mcp")
-            && config.get("args") == Some(&serde_json::json!([]))
-            && config
-                .get("env")
-                .and_then(|v| v.as_object())
-                .is_some_and(|env| {
-                    env.len() == 4
-                        && env.get("MCP_PORT").and_then(|v| v.as_str())
-                            == argument(worker, "--port").ok()
-                        && env.get("PHILOTIC_HOTEL_SOCKET").and_then(|v| v.as_str())
-                            == argument(worker, "--ipc-socket").ok()
-                        && env.get("PHILOTIC_GUEST_ID").and_then(|v| v.as_str()) == Some(guest)
-                        && env.get("PHILOTIC_NODE_ID").and_then(|v| v.as_str())
-                            == Some(self.authority.hotel.as_str())
-                });
+            && generated_request(worker, guest, &self.authority.hotel, config);
         ensure!(
             worker.command.is_absolute()
                 && (generated_membrane
@@ -453,6 +438,29 @@ impl Runtime {
         })
     }
 }
+fn generated_request(
+    worker: &Worker,
+    guest: &str,
+    hotel: &str,
+    config: &serde_json::Value,
+) -> bool {
+    config.as_object().is_some_and(|m| m.len() == 3)
+        && config.get("command").and_then(|v| v.as_str()) == Some("membrane-mcp")
+        && config.get("args") == Some(&serde_json::json!([]))
+        && config
+            .get("env")
+            .and_then(|v| v.as_object())
+            .is_some_and(|env| {
+                env.len() == 4
+                    && argument(worker, "--port")
+                        .is_ok_and(|v| env.get("MCP_PORT").and_then(|v| v.as_str()) == Some(v))
+                    && argument(worker, "--ipc-socket").is_ok_and(|v| {
+                        env.get("PHILOTIC_HOTEL_SOCKET").and_then(|v| v.as_str()) == Some(v)
+                    })
+                    && env.get("PHILOTIC_GUEST_ID").and_then(|v| v.as_str()) == Some(guest)
+                    && env.get("PHILOTIC_NODE_ID").and_then(|v| v.as_str()) == Some(hotel)
+            })
+}
 fn argument<'a>(worker: &'a Worker, name: &str) -> Result<&'a str> {
     let positions: Vec<_> = worker
         .args
@@ -470,6 +478,63 @@ fn argument<'a>(worker: &'a Worker, name: &str) -> Result<&'a str> {
         .get(positions[0] + 1)
         .map(|s| s.as_str())
         .ok_or_else(|| anyhow!("missing protected argument value"))
+}
+
+#[cfg(test)]
+mod materialization_tests {
+    use super::*;
+    #[test]
+    fn generic_endpoint_record_cannot_supply_or_omit_protected_launch_values() {
+        let mut worker = Worker {
+            guest: "mcp-membrane-fixture".into(),
+            agent: "fixture".into(),
+            roles: BTreeSet::new(),
+            command: "/pinned/membrane".into(),
+            args: vec![
+                "--port".into(),
+                "19101".into(),
+                "--ipc-socket".into(),
+                "/tmp/private-hotel.sock".into(),
+            ],
+            sha256: "0".repeat(64),
+            environment: BTreeMap::new(),
+            artifacts: vec![],
+        };
+        let valid = serde_json::json!({"command":"membrane-mcp","args":[],"env":{"MCP_PORT":"19101","PHILOTIC_HOTEL_SOCKET":"/tmp/private-hotel.sock","PHILOTIC_GUEST_ID":worker.guest,"PHILOTIC_NODE_ID":"hotel"}});
+        assert!(generated_request(&worker, &worker.guest, "hotel", &valid));
+        for field in [
+            "MCP_PORT",
+            "PHILOTIC_HOTEL_SOCKET",
+            "PHILOTIC_GUEST_ID",
+            "PHILOTIC_NODE_ID",
+        ] {
+            for replacement in [
+                serde_json::Value::Null,
+                serde_json::json!(123),
+                serde_json::json!("other"),
+            ] {
+                let mut changed = valid.clone();
+                changed["env"][field] = replacement;
+                assert!(!generated_request(
+                    &worker,
+                    &worker.guest,
+                    "hotel",
+                    &changed
+                ));
+            }
+        }
+        let mut missing = valid.clone();
+        missing["env"].as_object_mut().unwrap().remove("MCP_PORT");
+        missing["env"]["unrelated"] = serde_json::json!("19101");
+        worker.args.drain(..2);
+        assert!(!generated_request(
+            &worker,
+            &worker.guest,
+            "hotel",
+            &missing
+        ));
+        assert!(!generated_request(&worker, &worker.guest, "hotel", &valid));
+    }
 }
 fn validate_wiring(c: &Config) -> Result<()> {
     ensure!(
@@ -527,7 +592,12 @@ fn validate_wiring(c: &Config) -> Result<()> {
         .ok_or_else(|| anyhow!("membrane missing"))?;
     ensure!(
         argument(membrane, "--node-id")? == c.hotel
-            && argument(membrane, "--guest-id")? == c.membrane,
+            && argument(membrane, "--guest-id")? == c.membrane
+            && argument(membrane, "--port")?
+                .parse::<u16>()
+                .is_ok_and(|port| port != 0)
+            && Path::new(argument(membrane, "--ipc-socket")?).is_absolute()
+            && argument(membrane, "--ipc-socket")? == argument(runner, "--socket")?,
         "membrane identity mismatch"
     );
     let ingress = native_memory::IngressConfig::load(Path::new(argument(
