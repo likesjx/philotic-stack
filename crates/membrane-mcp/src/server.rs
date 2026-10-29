@@ -227,6 +227,10 @@ pub(crate) fn is_trusted_loopback(addr: &SocketAddr, headers: &HeaderMap) -> boo
             .any(|h| headers.contains_key(*h))
 }
 
+/// Set only by the authenticated proxy transport, never by a caller header.
+#[derive(Clone)]
+pub(crate) struct ProxyTransport;
+
 /// Run the listener-level ingress fence for a request. Returns `None` when the
 /// request may proceed, or a ready-to-send denial response.
 fn ingress_fence_gate(
@@ -256,8 +260,9 @@ async fn handle_health(
     State(state): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    proxy: Option<axum::Extension<ProxyTransport>>,
 ) -> axum::response::Response {
-    let is_loopback = is_trusted_loopback(&addr, &headers);
+    let is_loopback = proxy.is_none() && is_trusted_loopback(&addr, &headers);
     if !is_loopback && let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
         return denied;
     }
@@ -274,9 +279,13 @@ async fn handle_mcp_sse(
     State(state): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    proxy: Option<axum::Extension<ProxyTransport>>,
 ) -> axum::response::Response {
-    if let Some(denied) = ingress_fence_gate(&state, &headers, is_trusted_loopback(&addr, &headers))
-    {
+    if let Some(denied) = ingress_fence_gate(
+        &state,
+        &headers,
+        proxy.is_none() && is_trusted_loopback(&addr, &headers),
+    ) {
         return denied;
     }
     let body = ": keepalive\n\n";
@@ -296,9 +305,10 @@ async fn handle_mcp(
     State(state): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    proxy: Option<axum::Extension<ProxyTransport>>,
     axum::Json(req): axum::Json<JsonRpcRequest>,
 ) -> axum::response::Response {
-    let is_loopback = is_trusted_loopback(&addr, &headers);
+    let is_loopback = proxy.is_none() && is_trusted_loopback(&addr, &headers);
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
     dispatch_rpc(&state, req, auth_header, is_loopback).await
 }

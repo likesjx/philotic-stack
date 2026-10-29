@@ -121,7 +121,8 @@ async fn composition(real: bool) {
     let subject = "00000000-0000-4000-8000-000000000001";
     let resource = "https://native.example/mcp";
     let issuer_port = port();
-    let mcp_port = port();
+    let bridge = std::env::var("PHILOTIC_MCP_TLS_BIND").ok();
+    let mcp_port = if bridge.is_some() { 19101 } else { port() };
     let issuer = format!("https://127.0.0.1:{issuer_port}");
     let mut token = "a".repeat(43);
     let secret = "synthetic-introspection-secret-not-a-real-credential";
@@ -158,13 +159,20 @@ async fn composition(real: bool) {
     for path in [&key, &cert] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let client = reqwest::Client::builder()
+    let mut client = reqwest::Client::builder()
         .add_root_certificate(
             reqwest::Certificate::from_pem(&std::fs::read(&cert).unwrap()).unwrap(),
         )
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
+        .timeout(Duration::from_secs(15));
+    if bridge.is_some() {
+        client = client.add_root_certificate(
+            reqwest::Certificate::from_pem(
+                &std::fs::read("/fixture/bridge/public/ca.pem").unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    let client = client.build().unwrap();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -254,7 +262,7 @@ async fn composition(real: bool) {
     let (mcp_bin, mcp_sha) = artifact(&binaries.join("membrane-mcp"), &root.join("membrane"));
     let (runner_bin, runner_sha) = artifact(&binaries.join("native-memory"), &root.join("runner"));
     let (node_bin, node_sha) = artifact(&node, &root.join("node"));
-    let workers = vec![
+    let mut workers = vec![
         json!({"guest":membrane,"agent":"fixture-membrane","roles":["membrane"],"command":mcp_bin,"sha256":mcp_sha,
           "args":["--node-id",hotel,"--guest-id",membrane,"--ipc-socket",socket,"--port",mcp_port.to_string(),"--native-memory-config",ingress],"environment":{}}),
         json!({"guest":runner,"agent":"fixture-runner","roles":["native-memory-runner"],"command":runner_bin,"sha256":runner_sha,
@@ -263,6 +271,14 @@ async fn composition(real: bool) {
           "args":issuer_args,"environment":issuer_environment,
           "artifacts":[{"path":bundle,"sha256":format!("{:x}",Sha256::digest(std::fs::read(&bundle).unwrap()))}]}),
     ];
+    if let Some(bind) = &bridge {
+        workers[0]["args"].as_array_mut().unwrap().extend([
+            json!("--tls-config"),
+            json!("/fixture/bridge/backend/tls.json"),
+            json!("--bind-address"),
+            json!(bind),
+        ]);
+    }
     let journal = root.join("journal");
     std::fs::write(&journal, b"clean\n").unwrap();
     let secret_file = root.join("secret");
@@ -390,7 +406,7 @@ async fn composition(real: bool) {
     let tools:Vec<Value>=["remember","recall"].into_iter().map(|op|json!({"name":format!("native-memory.{op}"),"description":"Synthetic capture",
         "input_schema":{"type":"object"},"inbound_transform":{"kind":"field_map","action":format!("native-memory.{op}"),"target":{"kind":"native_memory","runner_id":runner,"target_node":hotel},"mappings":[]},
         "outbound_transform":{"kind":"pass_through"},"auth":{"scheme":"bearer_token","grants":[{"token_id":"fixture","vault_ref":"unused-in-oauth-mode","scopes":[]}]}})).collect();
-    let endpoint=serde_json::from_value(json!({"endpoint_id":"native-fixture","owner_agent_id":"fixture-owner","port":mcp_port,"path":null,"exposure":"local","tools":tools,"default_auth":null,"allow_unauthenticated":false,
+    let endpoint=serde_json::from_value(json!({"endpoint_id":"native-fixture","owner_agent_id":"fixture-owner","port":mcp_port,"path":null,"exposure":if bridge.is_some(){"lan"}else{"local"},"tools":tools,"default_auth":null,"allow_unauthenticated":false,
         "preapproval_rules":[
             {"action_pattern":"native-memory.remember","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null},
             {"action_pattern":"native-memory.recall","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null}
@@ -410,14 +426,24 @@ async fn composition(real: bool) {
             ..
         }
     ));
-    let url = format!("http://127.0.0.1:{mcp_port}/mcp");
+    let url = if bridge.is_some() {
+        "https://native-package-proxy:8443/native-memory/mcp".to_string()
+    } else {
+        format!("http://127.0.0.1:{mcp_port}/mcp")
+    };
+    let health = if bridge.is_some() {
+        "https://native-package-proxy:8443/bridge-health".to_string()
+    } else {
+        format!("http://127.0.0.1:{mcp_port}/health")
+    };
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if client
-                .get(format!("http://127.0.0.1:{mcp_port}/health"))
+                .get(&health)
+                .bearer_auth("synthetic-readiness")
                 .send()
                 .await
-                .is_ok()
+                .is_ok_and(|r| r.status().is_success())
                 && client
                     .get(format!(
                         "{issuer}/{}",
@@ -434,6 +460,43 @@ async fn composition(real: bool) {
     })
     .await
     .unwrap();
+    if let Some(bind) = &bridge {
+        for (path, expected) in [
+            ("/bad-name", 500),
+            ("/bad-ca", 500),
+            ("/no-client", 502),
+            ("/wrong-client", 502),
+            ("/personal/mcp", 200),
+            ("/native-memory/other", 404),
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("https://native-package-proxy:8443{path}"))
+                    .bearer_auth("synthetic-readiness")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                expected,
+                "{path}"
+            );
+        }
+        assert!(
+            client
+                .get(format!("https://{bind}:19101/health"))
+                .send()
+                .await
+                .is_err(),
+            "direct untrusted TLS peer rejected"
+        );
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", 19101))
+                .await
+                .is_err(),
+            "explicit bridge bind must not also bind loopback"
+        );
+    }
     if let Some(process) = &mut unrelated {
         assert!(
             process.0.try_wait().unwrap().is_none(),
@@ -476,6 +539,13 @@ async fn composition(real: bool) {
     }
     let event = uuid::Uuid::new_v4().to_string();
     let remember = json!({"operation":"remember","id":event,"subject":subject,"content":"Synthetic violet lantern","source":"synthetic://oauth","source_version":"1","lineage":"independent"});
+    if bridge.is_some() {
+        let response = client.post(&url).json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"native-memory.remember","arguments":remember}})).send().await.unwrap();
+        if response.status().as_u16() != 401 {
+            let denied: Value = response.json().await.unwrap();
+            assert_eq!(denied["error"]["code"], -32001);
+        }
+    }
     for rejected in [
         "u".repeat(43),
         "s".repeat(43),

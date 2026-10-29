@@ -5,6 +5,7 @@ mod native_release;
 mod protocol;
 mod routing;
 mod server;
+mod tls;
 mod transform;
 
 use ansible_mesh_core::mcp_endpoint::McpEndpointConfig;
@@ -29,6 +30,12 @@ use tracing::{error, warn};
 #[derive(Parser, Debug)]
 #[command(name = "membrane-mcp", about = "Philotic MCP membrane guest")]
 struct Args {
+    /// Optional direct TLS/mTLS configuration, loaded before IPC.
+    #[arg(long)]
+    tls_config: Option<std::path::PathBuf>,
+    /// Narrow interface when the hotel perimeter permits nonlocal exposure.
+    #[arg(long)]
+    bind_address: Option<std::net::IpAddr>,
     /// Opt-in local native-memory signing configuration. Never sent over IPC.
     #[arg(long)]
     native_memory_config: Option<std::path::PathBuf>,
@@ -125,6 +132,9 @@ struct ListenerManager {
     port: u16,
     state: Arc<MembraneState>,
     current: Option<(SocketAddr, tokio::task::JoinHandle<()>)>,
+    transport: Option<tls::Transport>,
+    bind_address: Option<std::net::IpAddr>,
+    stop_transport: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ListenerManager {
@@ -133,6 +143,9 @@ impl ListenerManager {
             port,
             state,
             current: None,
+            transport: None,
+            bind_address: None,
+            stop_transport: None,
         }
     }
 
@@ -144,7 +157,7 @@ impl ListenerManager {
             Some(tier) if tier > ansible_mesh_core::ExposureTier::Local && tier <= ceiling
         );
         if wide {
-            SocketAddr::from(([0, 0, 0, 0], self.port))
+            SocketAddr::new(self.bind_address.unwrap_or([0, 0, 0, 0].into()), self.port)
         } else {
             SocketAddr::from(([127, 0, 0, 1], self.port))
         }
@@ -161,12 +174,15 @@ impl ListenerManager {
         }
         if let Some((old, handle)) = self.current.take() {
             info!(%old, new = %addr, "rebinding MCP listener for perimeter change");
-            handle.abort();
+            if let Some(stop) = self.stop_transport.take() {
+                let _ = stop.send(());
+            } else {
+                handle.abort();
+            }
             let _ = handle.await;
         }
 
-        let router = server::build_router(self.state.clone())
-            .into_make_service_with_connect_info::<SocketAddr>();
+        let router = server::build_router(self.state.clone());
 
         // The previous listener's fd releases on task drop; retry briefly in
         // case the old socket has not been reaped yet.
@@ -188,10 +204,22 @@ impl ListenerManager {
             return;
         };
 
-        info!(%addr, "MCP membrane HTTP server listening");
+        info!(%addr, tls = self.transport.is_some(), "MCP membrane server listening");
+        let transport = self.transport.clone();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        self.stop_transport = transport.as_ref().map(|_| stop_tx);
         let handle = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
-                error!(err = %e, "MCP HTTP server error");
+            let result = match transport {
+                Some(t) => t.serve(listener, router, stop_rx).await,
+                None => axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .map_err(Into::into),
+            };
+            if let Err(e) = result {
+                error!(err = %e, "MCP server error");
             }
         });
         self.current = Some((addr, handle));
@@ -592,6 +620,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let transport = args
+        .tls_config
+        .as_deref()
+        .map(tls::Transport::load)
+        .transpose()?;
+    tls::validate_bind(
+        args.bind_address,
+        transport.is_some(),
+        args.ipc_socket.is_some(),
+    )?;
+    anyhow::ensure!(
+        transport.is_none() || args.bind_address.is_some(),
+        "TLS requires an explicit narrow bind address"
+    );
     info!(port = args.port, "membrane-mcp starting");
 
     let table = new_shared_table();
@@ -652,7 +694,9 @@ async fn main() -> Result<()> {
         declared_exposure,
     });
 
-    let guest = McpMembrane::new(args.port, &args.guest_id, state);
+    let mut guest = McpMembrane::new(args.port, &args.guest_id, state);
+    guest.listener.transport = transport.clone();
+    guest.listener.bind_address = args.bind_address;
 
     if let Some(socket) = &args.ipc_socket {
         membrane::MembraneRuntime::new(socket, &args.guest_id, &args.node_id)
@@ -664,12 +708,26 @@ async fn main() -> Result<()> {
         // No dispatch is possible in this mode, and there is no hotel to widen
         // the perimeter for us, so the listener is loopback-only.
         info!("running in static-only mode (no IPC socket)");
-        let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-        let router =
-            build_router(guest.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let addr = SocketAddr::new(
+            args.bind_address.unwrap_or([127, 0, 0, 1].into()),
+            args.port,
+        );
+        let router = build_router(guest.state.clone());
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!(%addr, "MCP membrane listening");
-        axum::serve(listener, router).await?;
+        match transport {
+            Some(t) => {
+                let (_stop, rx) = tokio::sync::oneshot::channel();
+                t.serve(listener, router, rx).await?;
+            }
+            None => {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await?
+            }
+        }
         Ok(())
     }
 }

@@ -894,6 +894,20 @@ async fn bind_addr_derives_from_declared_exposure_and_ceiling() {
     }
 }
 
+#[tokio::test]
+async fn explicit_bridge_binding_still_obeys_perimeter_narrowing() {
+    let h = harness(false, ExposureTier::Lan, HashMap::new());
+    *h.state.declared_exposure.write().unwrap() = Some(ExposureTier::Lan);
+    let mut manager = ListenerManager::new(19101, h.state.clone());
+    manager.bind_address = Some("172.18.0.1".parse().unwrap());
+    assert_eq!(
+        manager.effective_addr(),
+        "172.18.0.1:19101".parse().unwrap()
+    );
+    *h.state.ingress_tier.write().unwrap() = ExposureTier::Local;
+    assert_eq!(manager.effective_addr(), "127.0.0.1:19101".parse().unwrap());
+}
+
 // ── deliver(): streaming accumulation and error outcomes ──────────────────────
 
 #[tokio::test]
