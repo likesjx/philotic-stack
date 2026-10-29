@@ -908,6 +908,27 @@ async fn explicit_bridge_binding_still_obeys_perimeter_narrowing() {
     assert_eq!(manager.effective_addr(), "127.0.0.1:19101".parse().unwrap());
 }
 
+#[tokio::test]
+async fn authenticated_proxy_cannot_inherit_loopback_trust_without_headers() {
+    use hyper::service::Service;
+    let h = harness(false, ExposureTier::Mesh, HashMap::new());
+    let router = server::build_router(h.state.clone()).layer(axum::Extension(
+        axum::extract::ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()),
+    ));
+    let direct = hyper_util::service::TowerToHyperService::new(router.clone());
+    let request = || {
+        axum::http::Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(direct.call(request()).await.unwrap().status(), 200);
+    let proxy = hyper_util::service::TowerToHyperService::new(
+        router.layer(axum::Extension(server::ProxyTransport)),
+    );
+    assert_eq!(proxy.call(request()).await.unwrap().status(), 401);
+}
+
 // ── deliver(): streaming accumulation and error outcomes ──────────────────────
 
 #[tokio::test]
