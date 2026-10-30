@@ -11,7 +11,7 @@ const resource = 'https://mcp.example.test/life/mcp', issuerUrl = 'https://ident
 const policies = ['dot', 'claude'].map(clientId => ({ clientId, subjects: ['synthetic-operator'], namespace: `synthetic_${clientId}`, scopes: ['life:recall'] }));
 const actor = clientId => ({ active: true, audience: resource, clientId, subject: 'synthetic-operator', scope: 'life:recall', agentId: `agent-${clientId}`, roles: ['reader'], grantVersion: '1' });
 const policy = () => ({ owner: 'operator', creator: 'agent-dot', creator_read_grant: true, read_roles: ['reader'], private: false, external_operations: ['inference'], sources: [] });
-async function fixture(t) {
+async function fixture(t, acceptanceHandoff) {
   const dir = await mkdtemp(join(tmpdir(), 'synthetic-lifegateway-')), db = new DatabaseSync(join(dir, 'acl.sqlite'));
   db.exec('CREATE TABLE privacy_revision(singleton INTEGER PRIMARY KEY, revision INTEGER); INSERT INTO privacy_revision VALUES(1,1); CREATE TABLE privacy_policy(resource TEXT PRIMARY KEY, policy_json TEXT)');
   for (const c of ['dot', 'claude']) db.prepare('INSERT INTO privacy_policy VALUES(?,?)').run(c, JSON.stringify(policy()));
@@ -19,14 +19,14 @@ async function fixture(t) {
   const issuer = { issuer: issuerUrl, ready: async () => {}, inspect: async c => ({ active: !revoked.has(c), iss: issuerUrl,
     aud: resource, sub: 'synthetic-operator', client_id: c, scope: 'life:recall', grant_version: '1',
     iat: Math.floor(Date.now() / 1000) - 1, exp: Math.floor(Date.now() / 1000) + 600, ...claimsChange }) };
-  const identityAuthority = { resolve: async () => ({ agentId: 'agent-dot', roles: ['reader'] }) };
+  const identityAuthority = { verifyResponse: () => !revoked.has('dot'), resolve: async () => ({ agentId: 'agent-dot', roles: ['reader'] }) };
   identityAuthority.resolve = async c => ({ agentId: `agent-${c.clientId}`, roles: ['reader'] });
   const storage = createLifeGraphStorageAuthority({ policyDatabase: join(dir, 'acl.sqlite'),
     graphReader: { readSnapshot: async c => { graphCalls.push(c); return { namespace: c.namespace, revision: graphRevision,
       nodes: [{ id: c.clientId, namespace: c.namespace, kind: 'Goal', summary: `synthetic ${c.clientId}` }], edges: [] }; } },
     releaseBarrier: { admit: async (a, check) => { beforeRelease(); return !revoked.has(a.actor.clientId) && check({ graphRevision, actor: actor(a.actor.clientId) }); } } });
   const config = { resource, profile: 'synthetic-read-only-v1', allowedClients: ['dot', 'claude'], allowedSubjects: ['synthetic-operator'], clientPolicies: policies };
-  const server = await createLifeGraphGateway({ enabled: true, config, issuer, identityAuthority, storageAuthorityFactory: async () => storage });
+  const server = await createLifeGraphGateway({ enabled: true, config, issuer, identityAuthority, storageAuthorityFactory: async () => storage, acceptanceHandoff });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => { await new Promise(resolve => server.close(resolve)); db.close(); await rm(dir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -70,4 +70,11 @@ test('separate LifeGraph profile rejects inherited memory policy configuration',
   await assert.rejects(createPersonalMcp({ resource, issuer: {}, allowedSubjects: new Set(['synthetic-operator']), allowedClients: new Set(['dot']),
     enabledTools: ['life.recall', 'muninn_recall'], clientPolicies: [{ clientId: 'dot', scopes: ['memory:recall'] }],
     lifeGraph: { enabled: true } }), /separate LifeGraph authority/);
+});
+
+test('acceptance resume revalidates identity and storage before emitting any result', async t => {
+  let f;
+  f = await fixture(t, async () => { f.revoked.add('dot'); });
+  await assert.rejects(f.rpc('dot', 'tools/call', { name: 'life.recall', arguments: { query_text: 'synthetic' } }));
+  f.revoked.clear();
 });

@@ -1,12 +1,12 @@
 // Explicit opt-in composition for the separately scoped LifeGraph resource.
 // Does not bind a port, initialize an issuer/broker or provision a credential.
 import { createPersonalMcp } from './gateway.mjs';
-export async function createLifeGraphGateway({ enabled = false, config, issuer, identityAuthority, storageAuthorityFactory }) {
+export async function createLifeGraphGateway({ enabled = false, config, issuer, identityAuthority, storageAuthorityFactory, acceptanceHandoff }) {
   if (enabled === false) return null;
   if (enabled !== true || !config || typeof storageAuthorityFactory !== 'function') throw new Error('LifeGraph admission unavailable');
   const storageAuthority = await storageAuthorityFactory();
   try {
-    const server = await createPersonalMcp({ resource: config.resource, issuer,
+    const server = await createPersonalMcp({ resource: config.resource, issuer, acceptanceHandoff,
       allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients),
       enabledTools: ['life.recall'], requestDeadlineMs: config.requestDeadlineMs,
       lifeGraph: { enabled: true, profile: config.profile, clientPolicies: config.clientPolicies, identityAuthority, storageAuthority } });
