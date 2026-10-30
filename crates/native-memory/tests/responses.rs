@@ -61,6 +61,11 @@ fn signed_result_binds_entire_request_and_result() {
     let signer = ResponseSigner::new("result-key".into(), [8; 32]);
     let reply = signer.sign(&request, result.clone(), 101).unwrap();
     let expectation = ResponseExpectation::new(request.clone(), &verifiers).unwrap();
+    // A request-time sample is stale once the reply is signed in the next second.
+    assert!(matches!(
+        expectation.verify(&reply, &verifiers, 100),
+        Err(Error::Expired)
+    ));
     assert_eq!(expectation.verify(&reply, &verifiers, 101).unwrap(), result);
     let mut tampered = reply.clone();
     tampered.result.receipt.event = "another".into();

@@ -15,6 +15,9 @@ on:
       - 'scripts/release-manifest.py'
       - 'scripts/release-packages.sh'
       - '.github/workflows/native-memory-capture.yml'
+      - 'docs/architecture/outbound-egress-inventory.json'
+      - 'scripts/check-outbound-egress-inventory.py'
+      - 'scripts/tests/test_outbound_egress_inventory.py'
 permissions:
   contents: read
 jobs:
@@ -28,6 +31,10 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: Enforce outbound egress classifications and negative cases
+        run: |
+          python3 scripts/check-outbound-egress-inventory.py
+          python3 -B -m unittest discover -s scripts/tests -p 'test_outbound_egress_inventory.py' -v
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.94.1'
@@ -62,6 +69,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.94.1'
@@ -107,6 +117,35 @@ jobs:
           cp stage/manifest.json stage/provenance.json dist/
           (cd dist && sha256sum *.tar.gz manifest.json provenance.json > SHA256SUMS)
           cat dist/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+      - name: Exercise unpacked release hotel and runner through test-built HTTP MCP
+        run: |
+          PHILOTIC_TEST_BIN_DIR="$PWD/unpacked/bin" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture
+          python3 scripts/release-manifest.py verify --dir unpacked
+      - name: Exercise unpacked release guests with test-built hotel authority and synthetic issuer
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f native-release-memgraph >/dev/null 2>&1 || true' EXIT
+          docker run -d --name native-release-memgraph --publish 127.0.0.1:17687:7687 \
+            --cap-drop ALL --security-opt no-new-privileges --memory 2g --cpus 2 --pids-limit 256 \
+            --log-opt max-size=10m --log-opt max-file=3 \
+            memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27 \
+            --storage-wal-enabled=true --storage-wal-file-flush-every-n-tx=1 \
+            --storage-snapshot-interval-sec=300 --storage-snapshot-on-exit=true --telemetry-enabled=false
+          ready=false
+          for attempt in {1..60}; do
+            if docker exec -i native-release-memgraph mgconsole --host 127.0.0.1 --port 7687 <<< 'RETURN 1;' >/dev/null 2>&1; then ready=true; break; fi
+            sleep 1
+          done
+          "$ready"
+          docker exec -i native-release-memgraph mgconsole --host 127.0.0.1 --port 7687 <<'CYPHER'
+          CREATE CONSTRAINT ON (n:NativeMemoryObservation) ASSERT n.key IS UNIQUE;
+          CREATE CONSTRAINT ON (n:NativeMemoryReceipt) ASSERT n.key IS UNIQUE;
+          CREATE CONSTRAINT ON (n:NativeMemoryNonce) ASSERT n.key IS UNIQUE;
+          CYPHER
+          PHILOTIC_NATIVE_OAUTH_COMPOSITION=1 PHILOTIC_TEST_BIN_DIR="$PWD/unpacked/bin" \
+            NODE_TEST_EXECUTABLE="$(command -v node)" cargo test --locked -p aiua \
+            same_hotel_oauth_http_capture_recall_and_coordinated_revocation -- --ignored --nocapture
+          python3 scripts/release-manifest.py verify --dir unpacked
       - uses: actions/upload-artifact@v4
         with:
           name: native-memory-linux-x86_64-${{ github.event.pull_request.head.sha }}
