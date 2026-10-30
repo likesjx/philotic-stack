@@ -4,7 +4,7 @@
 import { readFile, open } from 'node:fs/promises';
 import { vaultCredential, brokerCredential } from './vault.mjs';
 import { pathToFileURL } from 'node:url';
-import { createPersonalMcp, issuerAdapter, frontdoorAdapter, createDiscoveryBootstrap, selectedTools } from './gateway.mjs';
+import { createPersonalMcp, issuerAdapter, frontdoorAdapter, createDiscoveryBootstrap, selectedTools, createAcceptanceHandoff } from './gateway.mjs';
 
 export async function start(config, env = process.env, { resolveLifeGraphBinding } = {}) {
   const secret = name => {
@@ -14,6 +14,8 @@ export async function start(config, env = process.env, { resolveLifeGraphBinding
   if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) throw new Error('Explicit unprivileged port required');
   const enabledTools = selectedTools(config.enabledTools);
   if (config.mode !== undefined && !['active', 'discovery-only'].includes(config.mode)) throw new Error('Unknown mode');
+  const acceptanceHandoff = await createAcceptanceHandoff(config.acceptanceHandoff, env);
+  if (acceptanceHandoff && !config.lifeGraph) throw Error('Acceptance requires LifeGraph');
   if (config.mode === 'discovery-only') {
     const server = createDiscoveryBootstrap({ resource: config.resource, issuer: config.issuer.issuer, enabledTools });
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
@@ -29,7 +31,7 @@ export async function start(config, env = process.env, { resolveLifeGraphBinding
     const issuer = issuerAdapter({ ...config.issuer, credential: brokerCredential({ socketPath: config.issuer.credentialBrokerSocketPath, kind: 'introspection' }) });
     const server = await createApprovedLifeGraphGateway({ config: { ...config.lifeGraph,
       resource: config.resource, allowedSubjects: config.allowedSubjects, allowedClients: config.allowedClients }, issuer,
-      resolveBinding: resolveLifeGraphBinding });
+      resolveBinding: resolveLifeGraphBinding, acceptanceHandoff });
     try {
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
       return server;

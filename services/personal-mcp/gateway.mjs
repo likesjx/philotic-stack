@@ -1,6 +1,80 @@
 import { createServer } from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { connect } from 'node:net';
+import { lstat, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { createLifeGraphAdapter } from './lifegraph.mjs';
+
+// Explicit acceptance instrumentation. Never enabled by a request or by the
+// production compiler. The endpoint receives correlation only, never a result,
+// token or credential. Existing response finish/close remains the lease owner.
+export async function createAcceptanceHandoff(config, env = {}) {
+  if (config === undefined) {
+    if (env.PHILOTIC_ACCEPTANCE_HANDOFF !== undefined) throw Error('Acceptance configuration missing');
+    return undefined;
+  }
+  if (env.PHILOTIC_ACCEPTANCE_HANDOFF !== 'response-boundary-v1' || !config ||
+      Object.keys(config).sort().join(',') !== 'mode,socket' || config.mode !== 'response-boundary-v1' ||
+      typeof config.socket !== 'string' || !isAbsolute(config.socket) || config.socket.length > 100 ||
+      typeof process.getuid !== 'function') throw Error('Explicit acceptance mode required');
+  const path = config.socket, parent = dirname(path), uid = process.getuid();
+  if (await realpath(parent) !== parent || await realpath(path) !== path) throw Error('Canonical acceptance path required');
+  const directory = await lstat(parent), socket = await lstat(path);
+  if (!directory.isDirectory() || directory.uid !== uid || (directory.mode & 0o777) !== 0o700 ||
+      !socket.isSocket() || socket.uid !== uid || (socket.mode & 0o777) !== 0o600) throw Error('Private same-owner acceptance socket required');
+  return async ({ signal, response }) => {
+    const deadline = performance.now() + 1000;
+    try {
+      signal.throwIfAborted();
+      const current = await lstat(path), dir = await lstat(parent);
+      if (current.dev !== socket.dev || current.ino !== socket.ino || current.uid !== uid ||
+          (current.mode & 0o777) !== 0o600 || !current.isSocket() || dir.dev !== directory.dev ||
+          dir.ino !== directory.ino || dir.uid !== uid || (dir.mode & 0o777) !== 0o700 ||
+          response.destroyed || response.writableEnded || performance.now() >= deadline) throw Error('Acceptance endpoint changed');
+      const nonce = randomBytes(32).toString('hex');
+      await new Promise((resolve, reject) => {
+        const peer = connect(path); let bytes = Buffer.alloc(0), settled = false;
+        const finish = error => {
+          if (settled) return; settled = true; clearTimeout(timer);
+          signal.removeEventListener('abort', abort); response.removeListener('close', abort);
+          peer.destroy(); error ? reject(error) : resolve();
+        };
+        const abort = () => finish(Error('Acceptance cancelled'));
+        const timer = setTimeout(() => finish(Error('Acceptance timeout')), Math.max(1, deadline - performance.now()));
+        signal.addEventListener('abort', abort, { once: true }); response.once('close', abort);
+        peer.once('error', error => finish(error));
+        peer.once('connect', () => { if (signal.aborted) return abort(); peer.write(JSON.stringify({ nonce }) + '\n'); });
+        peer.on('data', chunk => { bytes = Buffer.concat([bytes, chunk]); if (bytes.length > 256) finish(Error('Acceptance frame oversized')); });
+        // End-of-stream is part of framing: duplicate/trailing frames cannot
+        // race an already accepted resume.
+        peer.once('end', () => {
+          try {
+            if (signal.aborted || response.destroyed || response.writableEnded || performance.now() >= deadline) throw Error('Acceptance expired');
+            const value = JSON.parse(bytes.toString('utf8'));
+            if (Object.keys(value).sort().join(',') !== 'nonce,resume' || value.nonce !== nonce || value.resume !== true) throw Error('Acceptance resume mismatch');
+            finish();
+          } catch (error) { finish(error); }
+        });
+        peer.once('close', () => { if (!settled) finish(Error('Acceptance disconnected')); });
+        if (signal.aborted) abort();
+      });
+      const after = await lstat(path), afterDir = await lstat(parent);
+      if (await realpath(path) !== path || await realpath(parent) !== parent ||
+          after.dev !== socket.dev || after.ino !== socket.ino || after.uid !== uid || (after.mode & 0o777) !== 0o600 ||
+          afterDir.dev !== directory.dev || afterDir.ino !== directory.ino || afterDir.uid !== uid || (afterDir.mode & 0o777) !== 0o700 ||
+          signal.aborted || response.destroyed || response.writableEnded || performance.now() >= deadline) throw Error('Acceptance expired or replaced');
+      response.once('finish', () => {
+        // Observation only: capture the boundary synchronously. Delivery time is
+        // not the finish time, and this notification never owns/releases a lease.
+        const finished_ns = process.hrtime.bigint().toString();
+        const observer = connect(path); observer.on('error', () => observer.destroy());
+        observer.setTimeout(500, () => observer.destroy());
+        observer.once('connect', () => observer.end(JSON.stringify({ nonce, phase: 'finish', finished_ns }) + '\n'));
+      });
+    } catch (error) { response.destroy(); throw error; }
+  };
+}
 
 export const SCOPES = Object.freeze({ muninn_recall: 'memory:recall', 'life.recall': 'life:recall' });
 export function selectedTools(value = ['muninn_recall']) {
@@ -170,7 +244,7 @@ export function frontdoorAdapter({ endpoints, enabledTools, fetchImpl = fetch })
 }
 
 export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients, clientPolicies,
-  lifeGraph, clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools, requestDeadlineMs = 45000 }) {
+  lifeGraph, acceptanceHandoff, clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools, requestDeadlineMs = 45000 }) {
   const tools = selectedTools(enabledTools);
   const canonical = httpsUrl(resource);
   if (!Number.isInteger(requestDeadlineMs) || requestDeadlineMs < 1 || requestDeadlineMs > 45000) throw new Error('Bounded request deadline required');
@@ -182,6 +256,7 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
     typeof value !== 'string' || !value.trim() || value.length > 2048))) throw new Error('Bounded string allowlists required');
   if (!Number.isInteger(maxLifetimeSeconds) || maxLifetimeSeconds < 1 || maxLifetimeSeconds > 900) throw new Error('Bounded lifetime required');
   const lifeOnly = lifeGraph?.enabled === true;
+  if (acceptanceHandoff !== undefined && (!lifeOnly || typeof acceptanceHandoff !== 'function')) throw Error('Acceptance requires LifeGraph');
   if (lifeGraph !== undefined && (!lifeOnly || tools.length !== 1 || tools[0] !== 'life.recall' || clientPolicies !== undefined ||
       typeof lifeGraph.identityAuthority?.resolve !== 'function' || typeof lifeGraph.storageAuthority?.snapshot !== 'function' ||
       typeof lifeGraph.storageAuthority?.authorizeRelease !== 'function')) throw new Error('Explicit separate LifeGraph authority required');
@@ -340,6 +415,16 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
           // do not add another awaited authority call after its release boundary.
           if (lifeAdapter && typeof lifeGraph.storageAuthority.verifyResponse === 'function' &&
               lifeGraph.storageAuthority.verifyResponse(req, result) !== true) deny(503, 'upstream_unavailable');
+          if (lifeAdapter && acceptanceHandoff) {
+            try {
+              await acceptanceHandoff({ signal, response: res });
+              // No network lookup while holding the owner fence. Revalidate the
+              // exact request-bound authority/expiry/lease/digest synchronously.
+              if (signal.aborted || res.destroyed || res.writableEnded ||
+                  lifeGraph.storageAuthority.verifyResponse(req, result) !== true ||
+                  lifeGraph.identityAuthority.verifyResponse(req) !== true) throw Error('Acceptance permit expired');
+            } catch (error) { res.destroy(); throw error; }
+          }
           if (!lifeAdapter) {
             const fresh = await authorize(req, signal);
             if (!fresh.scopes.has(SCOPES[name])) deny(403, 'insufficient_scope');
