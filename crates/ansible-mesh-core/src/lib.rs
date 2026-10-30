@@ -6,6 +6,8 @@ pub mod adapter;
 pub mod agent;
 pub mod agent_graph_storage;
 pub mod attention_steward;
+#[cfg(unix)]
+pub mod authority_fence;
 pub mod authz;
 pub mod autonomy;
 pub mod beacon;
@@ -43,6 +45,8 @@ pub mod privacy;
 pub mod privacy_local;
 pub mod privacy_storage;
 pub mod procedure;
+#[cfg(unix)]
+pub mod process_artifact;
 pub mod provenance;
 pub mod provider_keys;
 pub mod registry;

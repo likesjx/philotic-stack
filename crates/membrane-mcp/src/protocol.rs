@@ -18,6 +18,13 @@ pub struct JsonRpcRequest {
 
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
+    #[serde(skip)]
+    pub native_release: Option<(
+        native_memory::authority_control::Client,
+        String,
+        [u8; 32],
+        std::time::Instant,
+    )>,
     pub jsonrpc: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -29,6 +36,7 @@ pub struct JsonRpcResponse {
 impl JsonRpcResponse {
     pub fn ok(id: Value, result: Value) -> Self {
         Self {
+            native_release: None,
             jsonrpc: "2.0",
             result: Some(result),
             error: None,
@@ -38,6 +46,7 @@ impl JsonRpcResponse {
 
     pub fn err(id: Value, code: i32, message: impl Into<String>) -> Self {
         Self {
+            native_release: None,
             jsonrpc: "2.0",
             result: None,
             error: Some(JsonRpcError {

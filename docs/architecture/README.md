@@ -125,6 +125,8 @@ Recommended disposition vocabulary:
 
 ## Current Gaps Worth Cleaning Later
 
+- [Native memory capture](NATIVE_MEMORY_CAPTURE_PROPOSAL.md): accepted bounded source-observation capture slice; local signatures/storage/router tests precede actual hotel and dot/Claude connector qualification.
+
 - [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) still carries some older wording around mesh/data-plane details and should be tightened against the current execution-transport reality.
 - some crate READMEs still carry older `Ansible` naming, port-first launch examples, or stale IPC wording. Treat them as convenience docs unless they match current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md).
 - [docs/PHILOTIC-ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/PHILOTIC-ARCHITECTURE.md) is historical and should not be treated as current architecture truth.

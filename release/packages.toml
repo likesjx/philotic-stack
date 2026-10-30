@@ -52,6 +52,13 @@ bins = ["membrane-mcp"]
 required = ["membrane-mcp"]
 
 [[package]]
+name = "native-memory"
+linux = true
+darwin = false
+bins = ["native-memory"]
+required = ["native-memory"]
+
+[[package]]
 name = "membrane-mcp-client"
 linux = true
 darwin = true

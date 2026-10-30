@@ -18,6 +18,12 @@ pub trait Materializer: Send + Sync {
     /// Request the Materializer to gracefully or forcefully retire the identity
     async fn reclaim_guest(&mut self, guest_id: &str) -> Result<()>;
 
+    /// Optional legacy orphan retirement. A persisted handle is not ownership;
+    /// protected materializers must refuse this path for enrolled identities.
+    async fn reclaim_untracked(&mut self, _guest_id: &str, _active_id: &str) -> Result<()> {
+        anyhow::bail!("untracked retirement unsupported")
+    }
+
     /// Check if the materialized Guest identity is currently running and healthy
     async fn check_status(&mut self, guest_id: &str, active_id: &str) -> Result<bool>;
 }

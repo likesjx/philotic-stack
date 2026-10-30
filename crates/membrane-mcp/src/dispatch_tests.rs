@@ -5,6 +5,150 @@
 use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use crate::protocol::JsonRpcRequest;
 use crate::routing::{new_shared_endpoint_table, new_shared_table};
+use crate::server;
+#[cfg(unix)]
+#[path = "native_composition.rs"]
+mod native_composition;
+
+#[tokio::test]
+async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_once() {
+    use native_memory::response::{ResponseExpectation, ResponseSigner, ResponseVerifier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issuer.json");
+    let verifiers = vec![ResponseVerifier {
+        destination: "dest".into(),
+        runner: "memory".into(),
+        key_id: "result-key".into(),
+        public_key: ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+            .verifying_key()
+            .to_bytes(),
+    }];
+    let grant = native_memory::Grant {
+        issuer: "ingress".into(),
+        reply_node: "ingress".into(),
+        reply_guest: "mcp".into(),
+        principal: "alice".into(),
+        owner: "alice".into(),
+        namespace: "notes".into(),
+        destination: "dest".into(),
+        runner: "memory".into(),
+        operations: vec!["recall".into()],
+        revision: 1,
+        expires_at: u64::MAX,
+        revoked: false,
+    };
+    let grants = std::collections::BTreeMap::from([("grant".into(), grant)]);
+    let mut config = json!({"issuer":"ingress","key_id":"key","signing_seed":vec![7;32],"grants":grants,"response_verifiers":verifiers});
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let envelope = native_memory::Ingress::new(
+        "ingress".into(),
+        "key".into(),
+        ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+        grants,
+    )
+    .issue(
+        "grant",
+        native_memory::Command::Recall {
+            query: "synthetic".into(),
+            limit: 1,
+        },
+        "event".into(),
+        "turn".into(),
+        now,
+    )
+    .unwrap();
+    let result = native_memory::Response {
+        receipt: native_memory::Receipt {
+            event: "event".into(),
+            operation: "recall".into(),
+            status: "committed".into(),
+            committed_at: now,
+        },
+        observations: vec![],
+    };
+    let signed = ResponseSigner::new("result-key".into(), [8; 32])
+        .sign(&envelope, result, now)
+        .unwrap();
+    let mut h = harness(false, ExposureTier::Local, HashMap::new());
+    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(path.clone());
+    let (tx, mut rx) = oneshot::channel();
+    h.state.pending_responses.lock().await.insert(
+        "turn".into(),
+        server::PendingResponse {
+            sender: tx,
+            native: Some(ResponseExpectation::new(envelope, &verifiers).unwrap()),
+        },
+    );
+    let mut guest = McpMembrane::new(9100, "mcp", h.state.clone());
+    for reply in [
+        OutboundReply::StreamingToken {
+            session_id: "s".into(),
+            turn_id: "turn".into(),
+            token: "forged".into(),
+        },
+        OutboundReply::Text {
+            session_id: "s".into(),
+            turn_id: "turn".into(),
+            content: "forged".into(),
+            reply_to: None,
+        },
+        OutboundReply::Error {
+            session_id: "s".into(),
+            turn_id: "turn".into(),
+            message: "forged".into(),
+        },
+    ] {
+        guest.deliver(reply).await.unwrap();
+    }
+    let message = |payload: Value| philotic_client::IpcResponse::InboundTask {
+        source_node: "untrusted".into(),
+        task_id: uuid::Uuid::new_v4(),
+        task_json: payload.to_string(),
+    };
+    guest
+        .handle_push(&message(
+            json!({"action":"datasource_response","turn_id":"turn","result":"forged"}),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(h.state.streaming_buffers.lock().await.is_empty());
+    let mut forged = signed.clone();
+    forged.result.receipt.status = "forged".into();
+    assert!(
+        !guest
+            .handle_push(&message(
+                json!({"action":"native_memory_response","turn_id":"turn","signed_response":forged})
+            ))
+            .await
+            .unwrap()
+    );
+    assert_eq!(h.state.pending_responses.lock().await.len(), 1);
+    let valid = message(
+        json!({"action":"native_memory_response","turn_id":"turn","signed_response":signed}),
+    );
+    config["grants"]["grant"]["revoked"] = true.into();
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(!guest.handle_push(&valid).await.unwrap());
+    assert_eq!(h.state.pending_responses.lock().await.len(), 1);
+    config["grants"]["grant"]["revoked"] = false.into();
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(guest.handle_push(&valid).await.unwrap());
+    assert!(matches!(rx.await.unwrap(), DispatchOutcome::Ok(_)));
+    assert!(!guest.handle_push(&valid).await.unwrap());
+}
 use crate::server::{DispatchOutcome, MembraneState, SharedState, dispatch_rpc};
 use crate::{ListenerManager, McpMembrane};
 use ansible_mesh_core::ExposureTier;
@@ -41,9 +185,172 @@ struct Harness {
     inbound_rx: Option<mpsc::Receiver<InboundEnvelope>>,
 }
 
+#[tokio::test]
+async fn native_memory_authenticated_membrane_router_two_hotel_roundtrip() {
+    use native_memory::{Grant, Policy, Runner, TrustedIssuer};
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().unwrap();
+    let bearer = "SYNTHETIC-EXTERNAL-BEARER-CANARY";
+    let mut vault = HashMap::new();
+    // Use an opaque token ID unrelated to the actual reusable credential.
+    vault.insert(
+        "fixture-hash".into(),
+        *blake3::hash(bearer.as_bytes()).as_bytes(),
+    );
+    let auth = McpAuthScheme::BearerToken {
+        grants: vec![McpTokenGrant {
+            token_id: "caller-1".into(),
+            vault_ref: "fixture-hash".into(),
+            scopes: vec![],
+            expires_at: None,
+            allotment: None,
+        }],
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let grant = Grant {
+        issuer: "test-node".into(),
+        reply_node: "test-node".into(),
+        reply_guest: "mcp-membrane-test".into(),
+        principal: "alice".into(),
+        owner: "alice".into(),
+        namespace: "notes".into(),
+        destination: "memory-hotel".into(),
+        runner: "memory-1".into(),
+        operations: vec!["remember".into(), "recall".into()],
+        revision: 1,
+        expires_at: u64::MAX,
+        revoked: false,
+    };
+    let grants = BTreeMap::from([("caller-1".into(), grant)]);
+    let config = dir.path().join("synthetic-issuer.json");
+    std::fs::write(&config,serde_json::to_vec(&json!({"issuer":"test-node","key_id":"test-key","signing_seed":vec![7;32],"grants":grants,"response_verifiers":[{"destination":"memory-hotel","runner":"memory-1","key_id":"result-key","public_key":ed25519_dalek::SigningKey::from_bytes(&[8;32]).verifying_key().to_bytes()}]})).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let policy = Policy {
+        issuers: BTreeMap::from([(
+            "test-node".into(),
+            TrustedIssuer {
+                key_id: "test-key".into(),
+                public_key: key.verifying_key().to_bytes(),
+            },
+        )]),
+        grants,
+    };
+    let mut h = harness(false, ExposureTier::Local, vault);
+    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(config);
+    let tools = ["remember", "recall"]
+        .into_iter()
+        .map(|op| McpToolSpec {
+            name: format!("native-memory.{op}"),
+            description: "synthetic native memory".into(),
+            input_schema: json!({"type":"object"}),
+            inbound_transform: McpInboundTransform::FieldMap {
+                action: format!("native-memory.{op}"),
+                target: McpRouteTarget::NativeMemory {
+                    runner_id: "memory-1".into(),
+                    target_node: "memory-hotel".into(),
+                },
+                mappings: vec![],
+            },
+            outbound_transform: McpOutboundTransform::PassThrough,
+            auth: Some(auth.clone()),
+            handler: None,
+        })
+        .collect();
+    h.set_endpoint(endpoint_with(tools, None)).await;
+    let path = dir.path().join("memory.db");
+    let runner = std::sync::Mutex::new(
+        Runner::open(&path, "memory-hotel".into(), "memory-1".into()).unwrap(),
+    );
+    h.spawn_stub(move |env| {
+        // Actual membrane -> hotel EmitTask composition; destination hotel mocked.
+        let request = membrane::runtime::build_inbound_request(env, "test-node");
+        let philotic_client::IpcRequest::EmitTask {
+            target_node,
+            target_role,
+            target_guest_id,
+            task_json,
+        } = request
+        else {
+            panic!("must route")
+        };
+        assert_eq!(target_node, "memory-hotel");
+        assert_eq!(target_role, native_memory::ROLE);
+        assert_eq!(target_guest_id.as_deref(), Some("memory-1"));
+        assert!(!task_json.contains(bearer));
+        assert!(
+            !serde_json::to_string(&env.raw_transport)
+                .unwrap()
+                .contains(bearer)
+        );
+        assert!(!task_json.contains("signing_seed"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let routed: native_memory::RoutedRequest = serde_json::from_str(&task_json).unwrap();
+        match runner.lock().unwrap().execute(
+            &routed.signed_request,
+            &policy,
+            now,
+            &std::sync::atomic::AtomicBool::new(false),
+        ) {
+            Ok(response) => {
+                let envelope = routed.signed_request;
+                let signed =
+                    native_memory::response::ResponseSigner::new("result-key".into(), [8; 32])
+                        .sign(&envelope, response, now)
+                        .unwrap();
+                DispatchOutcome::Ok(serde_json::to_string(&signed).unwrap())
+            }
+            Err(e) => DispatchOutcome::Err(e.to_string()),
+        }
+    });
+    let command = json!({"operation":"remember","id":"note-1","subject":"practice","content":"harmless blue notebook","source":"synthetic://dot","source_version":"1","lineage":"source-1"});
+    let args = json!({"event":"remember-1","command":command});
+    let (_, denied) = call(
+        &h.state,
+        rpc(
+            "tools/call",
+            json!({"name":"native-memory.remember","arguments":args}),
+        ),
+        Some("Bearer wrong"),
+        true,
+    )
+    .await;
+    assert!(denied.get("error").is_some());
+    let (_, remember) = call(
+        &h.state,
+        rpc(
+            "tools/call",
+            json!({"name":"native-memory.remember","arguments":args}),
+        ),
+        Some(&format!("Bearer {bearer}")),
+        true,
+    )
+    .await;
+    assert!(
+        remember["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("committed")
+    );
+    let(_,recall)=call(&h.state,rpc("tools/call",json!({"name":"native-memory.recall","arguments":{"event":"recall-1","command":{"operation":"recall","query":"notebook","limit":5}}})),Some(&format!("Bearer {bearer}")),true).await;
+    let text = recall["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("harmless blue notebook"));
+    assert!(text.contains("authenticated_writer"));
+    let db = std::fs::read(path).unwrap();
+    assert!(!db.windows(bearer.len()).any(|w| w == bearer.as_bytes()));
+}
+
 fn harness(static_mode: bool, tier: ExposureTier, vault: HashMap<String, [u8; 32]>) -> Harness {
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let state = Arc::new(MembraneState {
+        native_memory_config: None,
+        native_pending: Default::default(),
         routing_table: new_shared_table(),
         endpoint_table: new_shared_endpoint_table(),
         vault_cache: VaultHashCache::new(),
@@ -75,9 +382,28 @@ impl Harness {
         let state = self.state.clone();
         tokio::spawn(async move {
             while let Some(env) = rx.recv().await {
-                let tx = { state.pending_responses.lock().await.remove(&env.turn_id) };
-                if let Some(tx) = tx {
-                    let _ = tx.send(outcome(&env));
+                let result = outcome(&env);
+                if state
+                    .pending_responses
+                    .lock()
+                    .await
+                    .get(&env.turn_id)
+                    .is_some_and(|p| p.native.is_some())
+                {
+                    if let DispatchOutcome::Ok(value) = result {
+                        let reply = serde_json::from_str(&value).unwrap();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        assert!(
+                            server::resolve_native_response(&state, &env.turn_id, &reply, now)
+                                .await
+                        );
+                    }
+                } else if let Some(tx) = server::take_unsigned_response(&state, &env.turn_id).await
+                {
+                    let _ = tx.send(result);
                 }
             }
         });
@@ -568,6 +894,41 @@ async fn bind_addr_derives_from_declared_exposure_and_ceiling() {
     }
 }
 
+#[tokio::test]
+async fn explicit_bridge_binding_still_obeys_perimeter_narrowing() {
+    let h = harness(false, ExposureTier::Lan, HashMap::new());
+    *h.state.declared_exposure.write().unwrap() = Some(ExposureTier::Lan);
+    let mut manager = ListenerManager::new(19101, h.state.clone());
+    manager.bind_address = Some("172.18.0.1".parse().unwrap());
+    assert_eq!(
+        manager.effective_addr(),
+        "172.18.0.1:19101".parse().unwrap()
+    );
+    *h.state.ingress_tier.write().unwrap() = ExposureTier::Local;
+    assert_eq!(manager.effective_addr(), "127.0.0.1:19101".parse().unwrap());
+}
+
+#[tokio::test]
+async fn authenticated_proxy_cannot_inherit_loopback_trust_without_headers() {
+    use hyper::service::Service;
+    let h = harness(false, ExposureTier::Mesh, HashMap::new());
+    let router = server::build_router(h.state.clone()).layer(axum::Extension(
+        axum::extract::ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()),
+    ));
+    let direct = hyper_util::service::TowerToHyperService::new(router.clone());
+    let request = || {
+        axum::http::Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(direct.call(request()).await.unwrap().status(), 200);
+    let proxy = hyper_util::service::TowerToHyperService::new(
+        router.layer(axum::Extension(server::ProxyTransport)),
+    );
+    assert_eq!(proxy.call(request()).await.unwrap().status(), 401);
+}
+
 // ── deliver(): streaming accumulation and error outcomes ──────────────────────
 
 #[tokio::test]
@@ -580,7 +941,7 @@ async fn deliver_accumulates_streaming_tokens_into_empty_final_reply() {
         .pending_responses
         .lock()
         .await
-        .insert("turn-1".into(), tx);
+        .insert("turn-1".into(), tx.into());
 
     for token in ["hel", "lo"] {
         guest
@@ -619,7 +980,7 @@ async fn deliver_error_reply_yields_err_outcome() {
         .pending_responses
         .lock()
         .await
-        .insert("turn-2".into(), tx);
+        .insert("turn-2".into(), tx.into());
 
     guest
         .deliver(OutboundReply::Error {

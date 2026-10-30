@@ -15,6 +15,7 @@ members = [
     "crates/philotic-edge-protocol",
     "crates/ansible-mesh-core",
     "crates/memory-core",
+    "crates/native-memory",
     "crates/philotic-web",
     "crates/philotic-sandbox",
     "crates/mlx-runner",
