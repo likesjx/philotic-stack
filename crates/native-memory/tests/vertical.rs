@@ -478,7 +478,15 @@ fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
             public_key: SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes(),
         }];
         let expectation = response::ResponseExpectation::new(envelope.clone(), &verifiers).unwrap();
-        let result = expectation.verify(&signed, &verifiers, now).unwrap();
+        // The child may sign in the next second. Verify at receipt time, not
+        // the timestamp captured before sending the request; retain real expiry.
+        let received_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = expectation
+            .verify(&signed, &verifiers, received_at)
+            .unwrap();
         assert_eq!(result.receipt.status, "committed");
         if event == "recall" {
             assert_eq!(result.observations.len(), 1);
