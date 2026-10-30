@@ -3,6 +3,20 @@
   "scanner": "scripts/check-outbound-egress-inventory.py",
   "direct_callers": [
     {
+      "path": "crates/aiua/src/service/native_authority/runtime.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "named-exception",
+      "authority": "operator-owned native authority issuer binding and private local introspection credential",
+      "note": "Production hotel control-plane introspection at the configured HTTPS issuer's /oauth/introspect endpoint; redirects disabled, two-second timeout and 16 KiB response limit. Not test-only or a caller-selected general HTTP proxy. The introspection credential remains hotel-local and is used only with the configured issuer."
+    },
+    {
+      "path": "crates/aiua/src/service/native_authority/runtime/composition.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "explicit isolated Linux CI native-authority composition",
+      "note": "The parent includes this module only under #[cfg(all(test, target_os = \"linux\"))]. Synthetic issuer/guest/bridge HTTP calls qualify disposable fixtures; this module makes no production calls. Keep this exact path classified rather than excluding test-looking source files from the scanner."
+    },
+    {
       "path": "crates/aiua/src/cortex_viewer.rs",
       "traffic_classes": ["local-resource"],
       "disposition": "named-exception",
