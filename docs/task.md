@@ -220,7 +220,8 @@ develop. Spec: [graphical workspace](architecture/APPLE_MEMORY_WORKSPACE_PROPOSA
 - [x] Add explicit title-only OpenLoop export to a chosen Reminders list, including linked completed-item deduplication; never mutate graph status.
 - [x] Install and launch the signed graphical workspace on the new iPhone (October 2); interactive graph and real EventKit export/repeat-export acceptance remain pending.
 - [x] Implement audited device-authorized confirm/close/reopen with original-snapshot/revision guards and retry receipts; Mac/iOS builds, client/runner/authority tests and disposable Memgraph persistence/race checks pass (October 3).
-- [ ] Merge/deploy the action endpoint and runner, install the updated app, and prove live save/read-back/audit plus phone UI acceptance; these new actions are not yet on the phone.
+- [x] Preserve the October 3 rollout record from `a9cc1129`: PR #612 merged to develop `04856a44`; Linux build `37140980630`, gateway/runner paths and hashes, enrolled-device actions/replay/stale-write rejection/read-back/audit persistence and synthetic cleanup were recorded as passing. Reconciled October 19 without a new deployment or live test.
+- [ ] Recheck phone availability and install the signed action build; the October 3 signature check passed but installation was blocked then. Phone UI and real Reminders export acceptance remain pending.
 - [ ] Implement reviewed two-way Reminders reconciliation with a durable multi-device binding ledger; extend lifecycle revision discipline across existing writers.
 - [ ] Add authorized Cortex association/search endpoints and focused semantic-neighborhood exploration.
 
