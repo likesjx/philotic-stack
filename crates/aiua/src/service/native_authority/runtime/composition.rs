@@ -41,6 +41,43 @@ fn json_file(path: &Path, value: Value) {
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
+fn live_guest_snapshot(db: &Path, hotel: &str, guests: [&str; 3]) -> [(String, String, String); 3] {
+    let storage = SqliteGraphStorage::open(db).unwrap();
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    guests.map(|guest| {
+        let record = graph.get_guest(hotel, guest).unwrap().unwrap();
+        assert!(record.is_active);
+        let pid = record.active_pid.expect("live guest PID");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let start = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .to_owned();
+        (pid, start, record.config_json)
+    })
+}
+
+async fn denied_renewal_phase(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    subject: &str,
+    code: i64,
+    message: &str,
+) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let value = rpc(client,url,token,"native-memory.remember",&id,
+        json!({"operation":"remember","id":id,"subject":subject,"content":"Synthetic denied violet lantern",
+        "source":"synthetic://renewal-denied","source_version":"1","lineage":"independent"})).await;
+    assert_eq!(value["error"]["code"], code, "{value}");
+    assert_eq!(value["error"]["message"], message, "{value}");
+    id
+}
+
 fn port() -> u16 {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -99,7 +136,22 @@ async fn packaged_hotel_real_issuer_native_capture_and_revocation() {
     composition(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit CI: exact packaged runtime and website, disposable databases"]
+async fn packaged_hotel_real_issuer_expired_preapproval_renewal() {
+    assert_eq!(
+        std::env::var("PHILOTIC_TEST_PREAPPROVAL_RENEWAL").as_deref(),
+        Ok("1")
+    );
+    composition(true).await;
+}
+
 async fn composition(real: bool) {
+    let renewal = std::env::var("PHILOTIC_TEST_PREAPPROVAL_RENEWAL").as_deref() == Ok("1");
+    assert!(
+        !renewal || real,
+        "renewal qualification requires packaged real issuer"
+    );
     assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
     assert_eq!(
         std::env::var("PHILOTIC_NATIVE_OAUTH_COMPOSITION").as_deref(),
@@ -180,7 +232,7 @@ async fn composition(real: bool) {
     let request_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
     let response_key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
     let grants = json!({"fixture":{"issuer":hotel,"reply_node":hotel,"reply_guest":membrane,"principal":subject,"owner":subject,
-        "namespace":"native-oauth-synthetic","destination":hotel,"runner":runner,"operations":["remember","recall"],"revision":1,"expires_at":now+600,"revoked":false}});
+        "namespace":"native-oauth-synthetic","destination":hotel,"runner":runner,"operations":["remember","recall"],"revision":1,"expires_at":if renewal { now-1 } else { now+600 },"revoked":false}});
     let policy = root.join("policy.json");
     let ingress = root.join("ingress.json");
     let signer = root.join("signer.json");
@@ -406,11 +458,18 @@ async fn composition(real: bool) {
     let tools:Vec<Value>=["remember","recall"].into_iter().map(|op|json!({"name":format!("native-memory.{op}"),"description":"Synthetic capture",
         "input_schema":{"type":"object"},"inbound_transform":{"kind":"field_map","action":format!("native-memory.{op}"),"target":{"kind":"native_memory","runner_id":runner,"target_node":hotel},"mappings":[]},
         "outbound_transform":{"kind":"pass_through"},"auth":{"scheme":"bearer_token","grants":[{"token_id":"fixture","vault_ref":"unused-in-oauth-mode","scopes":[]}]}})).collect();
-    let endpoint=serde_json::from_value(json!({"endpoint_id":"native-fixture","owner_agent_id":"fixture-owner","port":mcp_port,"path":null,"exposure":if bridge.is_some(){"lan"}else{"local"},"tools":tools,"default_auth":null,"allow_unauthenticated":false,
+    let mut endpoint_value = json!({"endpoint_id":"native-fixture","owner_agent_id":"fixture-owner","port":mcp_port,"path":null,"exposure":if bridge.is_some(){"lan"}else{"local"},"tools":tools,"default_auth":null,"allow_unauthenticated":false,
         "preapproval_rules":[
             {"action_pattern":"native-memory.remember","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null},
             {"action_pattern":"native-memory.recall","target":null,"approved_by_turn":"synthetic","approved_at":0,"expires_at":null}
-        ],"updated_at":0})).unwrap();
+        ],"updated_at":0});
+    if renewal {
+        for rule in endpoint_value["preapproval_rules"].as_array_mut().unwrap() {
+            rule["target"] = json!({"kind":"native_memory","runner_id":runner,"target_node":hotel});
+            rule["expires_at"] = json!(now - 1);
+        }
+    }
+    let endpoint = serde_json::from_value(endpoint_value).unwrap();
     if let Some(manager) = &manager {
         for guest in ["issuer", runner] {
             assert!(manager.ensure_guest_active(guest).await.unwrap());
@@ -539,6 +598,113 @@ async fn composition(real: bool) {
     }
     let event = uuid::Uuid::new_v4().to_string();
     let remember = json!({"operation":"remember","id":event,"subject":subject,"content":"Synthetic violet lantern","source":"synthetic://oauth","source_version":"1","lineage":"independent"});
+    let mut renewal_denied_ids = Vec::new();
+    let mut renewal_before = None;
+    if renewal {
+        let snapshot = || live_guest_snapshot(&db_path, hotel, [membrane, runner, "issuer"]);
+        let before = snapshot();
+        renewal_denied_ids.push(
+            denied_renewal_phase(
+                &client,
+                &url,
+                &token,
+                subject,
+                -32602,
+                "native memory requires explicit bearer auth and preapproval",
+            )
+            .await,
+        );
+        let IpcResponse::Standard {
+            ok: true,
+            data: Some(status),
+            ..
+        } = probe
+            .send_request(IpcRequest::GetMcpEndpointStatus {
+                endpoint_id: "native-fixture".into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("packaged endpoint status unavailable")
+        };
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let old_digest = status["config_sha256"].as_str().unwrap().to_owned();
+        let update = |digest: String| IpcRequest::ExtendNativeMcpPreapprovals {
+            endpoint_id: "native-fixture".into(),
+            expected_config_sha256: digest,
+            expires_at: expiry,
+            approval_reference: "synthetic exact-package renewal".into(),
+        };
+        let IpcResponse::Standard {
+            ok: true,
+            data: Some(updated),
+            ..
+        } = probe
+            .send_request(update(old_digest.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("packaged maintenance failed")
+        };
+        assert_eq!(updated["persisted"], true);
+        assert_eq!(updated["push_enqueued"], true);
+        assert_eq!(updated["lifecycle_changed"], false);
+        assert_eq!(updated["effective_state_verified"], false);
+        assert!(matches!(
+            probe.send_request(update(old_digest)).await.unwrap(),
+            IpcResponse::Standard { ok: false, .. }
+        ));
+        // Reconciliation repeats only the push, without touching lifecycle state.
+        for _ in 0..3 {
+            assert!(matches!(
+                probe
+                    .send_request(update(updated["config_sha256"].as_str().unwrap().into()))
+                    .await
+                    .unwrap(),
+                IpcResponse::Standard { ok: true, .. }
+            ));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                snapshot(),
+                before,
+                "supervision must preserve every running generation"
+            );
+        }
+        renewal_denied_ids
+            .push(denied_renewal_phase(&client, &url, &token, subject, -32000, "Denied").await);
+        let renew_file = |path: &Path| {
+            let mut value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            value["grants"]["fixture"]["revision"] = json!(2);
+            value["grants"]["fixture"]["expires_at"] = json!(expiry);
+            let temporary = path.with_extension("renewal");
+            json_file(&temporary, value);
+            std::fs::rename(temporary, path).unwrap();
+        };
+        renew_file(&ingress);
+        // A valid new ingress grant cannot override the still-expired receiver policy.
+        renewal_denied_ids.push(
+            denied_renewal_phase(
+                &client,
+                &url,
+                &token,
+                subject,
+                -32001,
+                "native OAuth denied",
+            )
+            .await,
+        );
+        renew_file(&policy);
+        assert_eq!(snapshot(), before);
+        renewal_before = Some(before);
+        println!(
+            "qualification: expired grants denied; approval-only renewal denied; new ingress/stale receiver denied; PID/starttime/config unchanged across supervision"
+        );
+    }
+
     if bridge.is_some() {
         let response = client.post(&url).json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"native-memory.remember","arguments":remember}})).send().await.unwrap();
         if response.status().as_u16() != 401 {
@@ -615,6 +781,16 @@ async fn composition(real: bool) {
             .iter()
             .any(|o| o["id"] == denied_id)
     );
+    for denied in &renewal_denied_ids {
+        assert!(
+            !recalled["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["id"] == *denied),
+            "denied renewal phase must not commit an observation"
+        );
+    }
     assert!(
         client
             .post(format!("{issuer}/test/revoke"))
@@ -637,6 +813,16 @@ async fn composition(real: bool) {
         .await["error"]["code"],
         -32001
     );
+    if let Some(before) = renewal_before {
+        assert_eq!(
+            live_guest_snapshot(&db_path, hotel, [membrane, runner, "issuer"]),
+            before,
+            "capture/recall/revocation must preserve supervised guest generations"
+        );
+        println!(
+            "qualification: synchronized renewal captured/recalled; all denied IDs absent; revocation denied; final guest generations unchanged"
+        );
+    }
     if let Some(materializer) = materializer {
         for guest in [membrane, runner, "issuer"] {
             materializer

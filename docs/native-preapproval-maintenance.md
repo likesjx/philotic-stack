@@ -103,3 +103,28 @@ No personal memory reads, production registrations, grant writes, installation,
 service changes or new credentials were part of this implementation. Memory
 bootstrap and telemetry are deferred under the explicit task restrictions; the
 operator/parent owns rechecking before a memory-dependent decision.
+
+## Exact-package renewal qualification
+
+`native-preapproval-real-issuer.yml` fixes runtime source `1b48281d` (artifact
+13195140377, alpha.26) and website source `0fe29c77` (artifact 13182062405).
+It verifies ZIP/archive hashes, runtime manifest/provenance, website image config,
+source/platform and authority bundle equality. It rebuilds only the test driver
+and synthetic adapter; the selected runtime and website are not rebuilt or
+published. The driver revision is recorded separately from runtime source.
+
+The new test starts with expired receiver/ingress grants and finite expired
+endpoint approvals. It requires specific denial responses before renewal, after
+approval-only renewal, and with renewed ingress but stale receiver authority.
+Distinct denied observation IDs must remain absent after synchronized capture and
+recall. Duplicate maintenance pushes and a stale CAS are exercised while the real
+hotel supervisor runs. PID, Linux process starttime and launch configuration must
+remain unchanged across supervision, capture, recall and revocation.
+
+This uses disposable authenticated Mongo, Memgraph and Traefik on an internal
+network with no host ports. Synthetic identities and fixture-controlled consent
+exercise real website token/introspection handlers, not a real user's login.
+The website image has a test startup wrapper and CI UID override; exact application
+bytes do not establish production launch-identity or systemd sandbox parity.
+Qualification is pending until the exact-head workflow succeeds. No production
+registration, grant update or restart is part of this workflow.
