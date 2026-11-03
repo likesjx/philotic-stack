@@ -666,8 +666,9 @@ async fn composition(real: bool) {
                 "supervision must preserve every running generation"
             );
         }
+        // membrane-mcp protocol::error_code::DISPATCH_ERROR is -32004.
         renewal_denied_ids
-            .push(denied_renewal_phase(&client, &url, &token, subject, -32000, "Denied").await);
+            .push(denied_renewal_phase(&client, &url, &token, subject, -32004, "Denied").await);
         let renew_file = |path: &Path| {
             let mut value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             value["grants"]["fixture"]["revision"] = json!(2);
