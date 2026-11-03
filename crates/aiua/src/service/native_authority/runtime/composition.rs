@@ -563,6 +563,7 @@ async fn composition(real: bool) {
         );
     }
     let denied_id = uuid::Uuid::new_v4().to_string();
+    let mut readonly_token = None;
     if real {
         let issued: Value = client
             .post(format!("{issuer}/test/issue"))
@@ -585,16 +586,7 @@ async fn composition(real: bool) {
             .json()
             .await
             .unwrap();
-        let denied = rpc(
-            &client,
-            &url,
-            readonly["token"].as_str().unwrap(),
-            "native-memory.remember",
-            &denied_id,
-            json!({"operation":"remember","id":denied_id,"subject":subject,"content":"Synthetic forbidden violet lantern","source":"synthetic://readonly","source_version":"1","lineage":"independent"}),
-        )
-        .await;
-        assert_eq!(denied["error"]["code"], -32001);
+        readonly_token = Some(readonly["token"].as_str().unwrap().to_owned());
     }
     let event = uuid::Uuid::new_v4().to_string();
     let remember = json!({"operation":"remember","id":event,"subject":subject,"content":"Synthetic violet lantern","source":"synthetic://oauth","source_version":"1","lineage":"independent"});
@@ -705,6 +697,19 @@ async fn composition(real: bool) {
         );
     }
 
+    // Scope denial is tested only after endpoint/grant expiry gates have cleared.
+    if let Some(readonly_token) = readonly_token {
+        let denied = rpc(
+            &client,
+            &url,
+            readonly_token.as_str(),
+            "native-memory.remember",
+            &denied_id,
+            json!({"operation":"remember","id":denied_id,"subject":subject,"content":"Synthetic forbidden violet lantern","source":"synthetic://readonly","source_version":"1","lineage":"independent"}),
+        )
+        .await;
+        assert_eq!(denied["error"]["code"], -32001);
+    }
     if bridge.is_some() {
         let response = client.post(&url).json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"native-memory.remember","arguments":remember}})).send().await.unwrap();
         if response.status().as_u16() != 401 {

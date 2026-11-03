@@ -106,7 +106,8 @@ operator/parent owns rechecking before a memory-dependent decision.
 
 ## Exact-package renewal qualification
 
-`native-preapproval-real-issuer.yml` fixes runtime source `1b48281d` (artifact
+The issuer-owned `native-preapproval-real-issuer.yml` in jaredlikes-com PR58 fixes
+runtime source `1b48281d` (artifact
 13195140377, alpha.26) and website source `0fe29c77` (artifact 13182062405).
 It verifies ZIP/archive hashes, runtime manifest/provenance, website image config,
 source/platform and authority bundle equality. It rebuilds only the test driver
@@ -128,3 +129,8 @@ The website image has a test startup wrapper and CI UID override; exact applicat
 bytes do not establish production launch-identity or systemd sandbox parity.
 Qualification is pending until the exact-head workflow succeeds. No production
 registration, grant update or restart is part of this workflow.
+
+The initial Philotic-owned workflow could not read the private issuer repository.
+It was removed after the separately approved issuer-owned workflow was published,
+so subsequent test-driver updates do not retry that unavailable access. This is
+not a waived gate: require exact issuer-owned composition evidence before rollout.
