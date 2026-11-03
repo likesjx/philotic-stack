@@ -7323,6 +7323,7 @@ impl AgentRuntime {
                     .unwrap_or(false);
 
                 let config = ansible_mesh_core::mcp_endpoint::McpEndpointConfig {
+                    approval_incarnation: None,
                     endpoint_id: endpoint_id.clone(),
                     owner_agent_id: self.agent_id.clone(),
                     port,

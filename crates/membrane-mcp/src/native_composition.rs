@@ -460,6 +460,7 @@ async fn real_hotels_native_runner_authenticated_mcp_composition() {
             "smoke provision must persist config without spawning guests: {result:?}"
         );
     }
+    let mut incarnations = std::collections::BTreeSet::new();
     for endpoint in [&legacy, &config] {
         let stored = source_probe
             .send_request(IpcRequest::GetMcpEndpointStatus {
@@ -475,9 +476,22 @@ async fn real_hotels_native_runner_authenticated_mcp_composition() {
         else {
             panic!("expected persisted endpoint config: {stored:?}")
         };
+        let persisted =
+            serde_json::from_value::<McpEndpointConfig>(data["config"].clone()).unwrap();
+        let incarnation = persisted
+            .approval_incarnation
+            .as_deref()
+            .expect("hotel-minted endpoint incarnation");
+        assert!(uuid::Uuid::parse_str(incarnation).is_ok());
+        assert!(
+            incarnations.insert(incarnation.to_owned()),
+            "each endpoint has a distinct incarnation"
+        );
+        let mut expected = endpoint.clone();
+        expected.approval_incarnation = persisted.approval_incarnation.clone();
         assert_eq!(
-            serde_json::from_value::<McpEndpointConfig>(data["config"].clone()).unwrap(),
-            *endpoint
+            persisted, expected,
+            "all caller-declared endpoint fields remain unchanged"
         );
     }
     let runtime = membrane::MembraneRuntime::new(a.to_str().unwrap(), GUEST, SOURCE)

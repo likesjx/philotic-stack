@@ -19,6 +19,12 @@ Reuse membrane bearer checking and `EmitTask`, add an explicit `NativeMemory` ta
 
 ## Disposition / Current Slice
 
+November 3 maintenance follow-up: [native endpoint approval maintenance](../native-preapproval-maintenance.md)
+adds a narrowly scoped atomic update without guest lifecycle mutation. This draft
+does not install the new runtime or extend any production grant. Earlier rollout
+statements below describe their historical slice; current operational receipts
+remain separate from source qualification and live client acceptance.
+
 Accepted for this bounded capture slice. Implementation includes real signature verification, private remember/recall, SQLite receipts/replay protection, opt-in membrane and native runner entrypoints, two-hotel simulation and real-binary IPC smoke. Not deployed, integrated with actual aiua hotels, connected to dot, or qualified for production. Source baseline `adfe7497`; original unrelated Telegram work is untouched. Prototype commit `b40694e9` was not present in available repository objects; existing protected-authority and execution-transport source was inspected rather than claiming reuse of an unavailable revision.
 
 ## Scope register preserved

@@ -7391,7 +7391,7 @@ impl IpcServer {
             }
 
             // ── MCP endpoint provisioning ──────────────────────────────────
-            IpcRequest::ProvisionMcpEndpoint { config } => {
+            IpcRequest::ProvisionMcpEndpoint { mut config } => {
                 let endpoint_id = config.endpoint_id.clone();
                 let port = config.port;
 
@@ -7506,6 +7506,10 @@ impl IpcServer {
                     }
                 }
 
+                // Full provisioning always establishes a new incarnation,
+                // including identical revoke/recreate cycles. Never trust a
+                // caller-provided value. Maintenance preserves this value.
+                config.approval_incarnation = Some(Uuid::new_v4().to_string());
                 // Persist the endpoint config in the context graph.
                 let config_key = format!("__mcp_endpoint__:{endpoint_id}");
                 let preapproval_key = format!("__mcp_preapproval__:{endpoint_id}");
@@ -7792,10 +7796,74 @@ impl IpcServer {
                     Some(serde_json::json!({
                         "endpoint_id": endpoint_id,
                         "config": config,
+                        "config_sha256": config.as_ref().and_then(|v| ansible_mesh_core::domain::mcp_maintenance::endpoint_digest(v).ok()),
                         "hotel_ceiling": ceiling,
                         "active": config.is_some(),
                     })),
                 )
+            }
+
+            IpcRequest::ExtendNativeMcpPreapprovals {
+                endpoint_id,
+                expected_config_sha256,
+                expires_at,
+                approval_reference,
+            } => {
+                // The surrounding Unix transport requires the hotel's OS UID.
+                // This is a local administrative operation, not agent delegation
+                // or an MCP tool. Registration alone is not a remote credential.
+                let owner = graph
+                    .get_config_value(&format!("__mcp_endpoint__:{endpoint_id}"))
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                    .and_then(|v| v["owner_agent_id"].as_str().map(str::to_owned));
+                if !current_identity.as_ref().is_some_and(|i| {
+                    i.role == "operator" && owner.as_deref() == Some(i.guest_id.as_str())
+                }) {
+                    return IpcResponse::error(
+                        "native_preapproval",
+                        "FORBIDDEN",
+                        "registered local endpoint owner operator required",
+                    );
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                match graph.extend_native_preapprovals(
+                    &endpoint_id,
+                    &current_identity.as_ref().unwrap().guest_id,
+                    &expected_config_sha256,
+                    expires_at,
+                    &approval_reference,
+                    now,
+                ) {
+                    Err(_) => IpcResponse::error(
+                        "native_preapproval",
+                        "PRECONDITION_FAILED",
+                        "native approval update refused; inspect endpoint digest and approval index",
+                    ),
+                    Ok((digest, config)) => {
+                        let queued = Self::push_to_mcp_endpoint_guest(
+                            inboxes,
+                            local_node_id,
+                            &format!("mcp-membrane-{endpoint_id}"),
+                            serde_json::json!({
+                                "action":"update_native_preapprovals", "config":config
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                        IpcResponse::success(
+                            "native_preapproval",
+                            Some(serde_json::json!({
+                                "persisted":true,"config_sha256":digest,"push_enqueued":queued,
+                                "effective_state_verified":false,"lifecycle_changed":false
+                            })),
+                        )
+                    }
+                }
             }
 
             IpcRequest::ProvisionMcpTokenGrant {

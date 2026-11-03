@@ -46,6 +46,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 mod kinds;
+pub mod mcp_maintenance;
 pub use kinds::*;
 // ── GraphDomain ───────────────────────────────────────────────────────────────
 

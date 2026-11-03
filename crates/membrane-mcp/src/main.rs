@@ -533,6 +533,26 @@ impl MembraneGuest for McpMembrane {
                 info!(agent_id, "agent routes revoked from hotel push");
                 Ok(true)
             }
+            "update_native_preapprovals" => {
+                let config = payload
+                    .get("config")
+                    .and_then(|v| serde_json::from_value::<McpEndpointConfig>(v.clone()).ok());
+                let accepted = match config {
+                    Some(config) => self
+                        .state
+                        .endpoint_table
+                        .write()
+                        .await
+                        .extend_native_preapprovals(config),
+                    _ => false,
+                };
+                // No listener reconciliation, process replacement or policy
+                // expansion. A dropped/refused push leaves shorter-lived access.
+                if !accepted {
+                    warn!("native preapproval maintenance push refused");
+                }
+                Ok(accepted)
+            }
             "update_mcp_config" => {
                 let config: McpEndpointConfig = match payload
                     .get("config")

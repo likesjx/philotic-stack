@@ -9,7 +9,7 @@ use crate::graph::{GraphEdge, GraphNode};
 use crate::storage::{CursorStorage, EventStorage, GraphAdapter};
 use anyhow::{Context, Result};
 use rusqlite::types::{Type, ValueRef};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -378,6 +378,48 @@ impl SqliteGraphAdapter {
 }
 
 impl GraphAdapter for SqliteGraphAdapter {
+    fn compare_exchange_nodes(&self, updates: &[(GraphNode, GraphNode)]) -> Result<bool> {
+        let mut keys = std::collections::BTreeSet::new();
+        anyhow::ensure!(!updates.is_empty(), "empty compare-exchange");
+        for (old, new) in updates {
+            anyhow::ensure!(
+                old.node_key == new.node_key && keys.insert(&old.node_key),
+                "invalid compare-exchange keys"
+            );
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (old, _) in updates {
+            let found = tx
+                .query_row(
+                    "SELECT kind,label,data_json FROM graph_nodes WHERE node_key=?1",
+                    [&old.node_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((kind, label, data)) = found else {
+                return Ok(false);
+            };
+            if kind != old.kind
+                || label != old.label
+                || serde_json::from_str::<serde_json::Value>(&data)? != old.data
+            {
+                return Ok(false);
+            }
+        }
+        for (_, new) in updates {
+            tx.execute("UPDATE graph_nodes SET kind=?1,label=?2,data_json=?3,updated_at=CURRENT_TIMESTAMP WHERE node_key=?4",
+                params![new.kind,new.label,serde_json::to_string(&new.data)?,new.node_key])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
     fn upsert_node(&self, node: &GraphNode) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

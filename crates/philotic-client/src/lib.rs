@@ -1920,6 +1920,14 @@ pub enum IpcRequest {
     GetMcpEndpointStatus {
         endpoint_id: String,
     },
+    /// Local operator-only finite native approval extension. Compare-and-swap
+    /// complete endpoint identity; never provisions or restarts a guest.
+    ExtendNativeMcpPreapprovals {
+        endpoint_id: String,
+        expected_config_sha256: String,
+        expires_at: u64,
+        approval_reference: String,
+    },
     /// Mint (or rotate) a bearer-token grant for an MCP endpoint.
     ///
     /// The hotel generates the token, stores `BLAKE3(token)` in the vault under

@@ -142,6 +142,62 @@ pub struct McpEndpointTable {
 }
 
 impl McpEndpointTable {
+    /// A late or reordered maintenance push cannot overwrite a newer config.
+    /// Refusal keeps the old finite approval; persistence is not an apply ACK.
+    pub fn extend_native_preapprovals(&mut self, next: McpEndpointConfig) -> bool {
+        let Some(current) = self.config.as_ref() else {
+            return false;
+        };
+        if current == &next {
+            return true;
+        }
+        if next.updated_at <= current.updated_at
+            || current.preapproval_rules.len() != 2
+            || next.preapproval_rules.len() != 2
+        {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut unchanged = next.clone();
+        for (old, new) in current
+            .preapproval_rules
+            .iter()
+            .zip(&next.preapproval_rules)
+        {
+            if !matches!(
+                old.action_pattern.as_str(),
+                "native-memory.remember" | "native-memory.recall"
+            ) || !matches!(
+                &old.target,
+                Some(ansible_mesh_core::mcp_route::McpRouteTarget::NativeMemory { .. })
+            ) || !matches!((old.expires_at,new.expires_at),(Some(a),Some(b)) if b>a && b>now && b<=now.saturating_add(86400))
+            {
+                return false;
+            }
+        }
+        unchanged.preapproval_rules = current.preapproval_rules.clone();
+        unchanged.updated_at = current.updated_at;
+        if &unchanged != current {
+            return false;
+        }
+        for (old, new) in current
+            .preapproval_rules
+            .iter()
+            .zip(&next.preapproval_rules)
+        {
+            if old.action_pattern != new.action_pattern
+                || old.target != new.target
+                || new.approved_by_turn.trim().is_empty()
+            {
+                return false;
+            }
+        }
+        self.config = Some(next);
+        true
+    }
     pub fn update(&mut self, config: McpEndpointConfig) {
         info!(
             endpoint_id = %config.endpoint_id,
@@ -198,4 +254,67 @@ pub type SharedEndpointTable = Arc<RwLock<McpEndpointTable>>;
 
 pub fn new_shared_endpoint_table() -> SharedEndpointTable {
     Arc::new(RwLock::new(McpEndpointTable::default()))
+}
+
+#[cfg(test)]
+mod native_maintenance_tests {
+    use super::*;
+    fn config() -> McpEndpointConfig {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        serde_json::from_value(serde_json::json!({"endpoint_id":"pilot","owner_agent_id":"owner","port":19101,"tools":[],"updated_at":now,
+            "preapproval_rules":[
+                {"action_pattern":"native-memory.remember","target":{"kind":"native_memory","runner_id":"runner","target_node":"hotel"},"approved_by_turn":"old","approved_at":now,"expires_at":now+10},
+                {"action_pattern":"native-memory.recall","target":{"kind":"native_memory","runner_id":"runner","target_node":"hotel"},"approved_by_turn":"old","approved_at":now,"expires_at":now+10}]})).unwrap()
+    }
+    fn extend(mut c: McpEndpointConfig, seconds: u64) -> McpEndpointConfig {
+        c.updated_at += seconds;
+        for rule in &mut c.preapproval_rules {
+            rule.expires_at = Some(rule.expires_at.unwrap() + seconds);
+            rule.approved_by_turn = "renewal".into();
+        }
+        c
+    }
+    #[test]
+    fn native_maintenance_push_reorders_duplicates_and_revocation_fail_closed() {
+        let old = config();
+        let next = extend(old.clone(), 100);
+        let latest = extend(next.clone(), 100);
+        let mut table = McpEndpointTable::default();
+        table.update(old);
+        assert!(table.extend_native_preapprovals(latest.clone()));
+        assert!(!table.extend_native_preapprovals(next));
+        assert!(table.extend_native_preapprovals(latest.clone()));
+        assert_eq!(table.config(), Some(&latest));
+        table.revoke();
+        assert!(!table.extend_native_preapprovals(latest.clone()));
+        // Full provisioning mints a new incarnation even for an otherwise
+        // identical baseline. A delayed old approval cannot cross it.
+        let mut recreated = config();
+        recreated.approval_incarnation = Some("new-hotel-incarnation".into());
+        table.update(recreated.clone());
+        assert!(!table.extend_native_preapprovals(latest));
+        assert_eq!(table.config(), Some(&recreated));
+    }
+    #[test]
+    fn native_maintenance_push_cannot_change_scopes_routes_auth_or_listener() {
+        for case in 0..6 {
+            let old = config();
+            let mut next = extend(old.clone(), 100);
+            match case {
+                0 => next.port += 1,
+                1 => next.allow_unauthenticated = true,
+                2 => next.owner_agent_id = "other".into(),
+                3 => next.preapproval_rules[0].action_pattern = "*".into(),
+                4 => next.preapproval_rules[0].target = None,
+                _ => next.preapproval_rules[0].expires_at = None,
+            }
+            let mut table = McpEndpointTable::default();
+            table.update(old.clone());
+            assert!(!table.extend_native_preapprovals(next));
+            assert_eq!(table.config(), Some(&old));
+        }
+    }
 }

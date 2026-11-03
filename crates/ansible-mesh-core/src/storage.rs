@@ -294,6 +294,12 @@ pub struct VaultRegistryEntry {
 /// Backends can model nodes/edges however they want, but consumers should see
 /// a graph-shaped API instead of leaking table-oriented assumptions upward.
 pub trait GraphAdapter: Send + Sync {
+    /// Atomically replace existing nodes only if every complete expected node
+    /// still matches. Unsupported backends must refuse, never emulate this
+    /// security-sensitive operation with a read/write loop.
+    fn compare_exchange_nodes(&self, _updates: &[(GraphNode, GraphNode)]) -> Result<bool> {
+        anyhow::bail!("atomic node compare-exchange unsupported")
+    }
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn get_node(&self, node_key: &str) -> Result<Option<GraphNode>>;
     fn delete_node(&self, node_key: &str) -> Result<()>;

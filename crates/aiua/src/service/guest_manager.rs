@@ -1524,6 +1524,89 @@ mod tests {
         status_by_pid: HashMap<String, bool>,
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_preapproval_maintenance_preserves_actual_child_during_supervision() {
+        use ansible_mesh_core::domain::mcp_maintenance::endpoint_digest;
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+        let graph = Arc::new(GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        )));
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "hotel".into(),
+                guest_id: "mcp-membrane-pilot".into(),
+                role: "mcp-membrane".into(),
+                config_json: serde_json::json!({"command":"/bin/sleep","args":["60"]}).to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .unwrap();
+        let value = serde_json::json!({"endpoint_id":"pilot","owner_agent_id":"owner","port":19101,"tools":[],"updated_at":10,
+            "preapproval_rules":[
+                {"action_pattern":"native-memory.remember","target":{"kind":"native_memory","runner_id":"runner","target_node":"hotel"},"approved_by_turn":"old","approved_at":10,"expires_at":100},
+                {"action_pattern":"native-memory.recall","target":{"kind":"native_memory","runner_id":"runner","target_node":"hotel"},"approved_by_turn":"old","approved_at":10,"expires_at":100}]});
+        graph
+            .set_config_value("__mcp_endpoint__:pilot", &value.to_string())
+            .unwrap();
+        graph
+            .set_config_value(
+                "__mcp_preapproval__:pilot",
+                &value["preapproval_rules"].to_string(),
+            )
+            .unwrap();
+        let manager = Arc::new(GuestManager::new(
+            "hotel",
+            graph.clone(),
+            Box::new(LocalProcessMaterializer::new(":memory:")),
+        ));
+        assert!(
+            manager
+                .ensure_guest_active("mcp-membrane-pilot")
+                .await
+                .unwrap()
+        );
+        let before = graph.list_guests("hotel", false).unwrap().remove(0);
+        let worker = manager.clone();
+        let supervisor = tokio::spawn(async move {
+            for _ in 0..100 {
+                worker.reconcile_all().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut digest = endpoint_digest(&value).unwrap();
+        for n in 0..100 {
+            digest = graph
+                .extend_native_preapprovals(
+                    "pilot",
+                    "owner",
+                    &digest,
+                    200 + n,
+                    "synthetic approval",
+                    20,
+                )
+                .unwrap()
+                .0;
+            tokio::task::yield_now().await;
+        }
+        supervisor.await.unwrap();
+        let after = graph.list_guests("hotel", false).unwrap().remove(0);
+        assert_eq!(before.active_pid, after.active_pid);
+        assert_eq!(before.config_json, after.config_json);
+        assert!(after.is_active);
+        let mut materializer = manager.materializer.lock().await;
+        assert!(
+            materializer
+                .check_status("mcp-membrane-pilot", after.active_pid.as_deref().unwrap())
+                .await
+                .unwrap()
+        );
+        materializer
+            .reclaim_guest("mcp-membrane-pilot")
+            .await
+            .unwrap();
+    }
+
     impl MockMaterializer {
         fn new(status_by_pid: HashMap<String, bool>) -> Self {
             Self {

@@ -25,6 +25,153 @@ fn register_skill_test_graph() -> GraphDomain {
 }
 
 #[tokio::test]
+async fn native_preapproval_ipc_owner_drift_and_reconciliation() {
+    use ansible_mesh_core::domain::mcp_maintenance::endpoint_digest;
+    let socket = test_socket_path();
+    let graph = Arc::new(register_skill_test_graph());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let value = serde_json::json!({"endpoint_id":"pilot","owner_agent_id":"owner","port":19101,"tools":[],"updated_at":now,
+        "preapproval_rules":[
+            {"action_pattern":"native-memory.remember","target":{"kind":"native_memory","runner_id":"runner","target_node":"hotel"},"approved_by_turn":"old","approved_at":now,"expires_at":now+10},
+            {"action_pattern":"native-memory.recall","target":{"kind":"native_memory","runner_id":"runner","target_node":"hotel"},"approved_by_turn":"old","approved_at":now,"expires_at":now+10}]});
+    graph
+        .set_config_value("__mcp_endpoint__:pilot", &value.to_string())
+        .unwrap();
+    graph
+        .set_config_value(
+            "__mcp_preapproval__:pilot",
+            &value["preapproval_rules"].to_string(),
+        )
+        .unwrap();
+    let (tx, _rx) = test_dispatcher_channel();
+    let server = IpcServer::new(socket.clone(), "hotel", tx, graph.clone());
+    let task = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    for _ in 0..100 {
+        if Path::new(&socket).exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let request = |digest: String| IpcRequest::ExtendNativeMcpPreapprovals {
+        endpoint_id: "pilot".into(),
+        expected_config_sha256: digest,
+        expires_at: now + 100,
+        approval_reference: "synthetic approval".into(),
+    };
+    for (guest, role) in [("intruder", "operator"), ("owner", "agent")] {
+        let mut client = PhiloticClient::connect_at(
+            &socket,
+            GuestIdentity {
+                guest_id: guest.into(),
+                role: role.into(),
+                supported_tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(client.send_request(request(endpoint_digest(&value).unwrap())).await.unwrap(),IpcResponse::Standard{ok:false,code,..} if code=="FORBIDDEN")
+        );
+    }
+    let mut owner = PhiloticClient::connect_at(
+        &socket,
+        GuestIdentity {
+            guest_id: "owner".into(),
+            role: "operator".into(),
+            supported_tools: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let response = owner
+        .send_request(request(endpoint_digest(&value).unwrap()))
+        .await
+        .unwrap();
+    let IpcResponse::Standard {
+        ok: true,
+        data: Some(data),
+        ..
+    } = response
+    else {
+        panic!("expected persisted update");
+    };
+    assert_eq!(data["lifecycle_changed"], false);
+    assert_eq!(data["push_enqueued"], false);
+    assert_eq!(data["effective_state_verified"], false);
+    assert!(matches!(
+        owner
+            .send_request(request(endpoint_digest(&value).unwrap()))
+            .await
+            .unwrap(),
+        IpcResponse::Standard { ok: false, .. }
+    ));
+    let current = graph
+        .get_config_value("__mcp_endpoint__:pilot")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        owner
+            .send_request(request(data["config_sha256"].as_str().unwrap().into()))
+            .await
+            .unwrap(),
+        IpcResponse::Standard { ok: true, .. }
+    ));
+    assert_eq!(
+        graph
+            .get_config_value("__mcp_endpoint__:pilot")
+            .unwrap()
+            .unwrap(),
+        current
+    );
+    let mut reprovision: ansible_mesh_core::mcp_endpoint::McpEndpointConfig =
+        serde_json::from_value(value).unwrap();
+    reprovision.approval_incarnation = Some("caller-chosen-must-not-survive".into());
+    owner
+        .send_request(IpcRequest::ProvisionMcpEndpoint {
+            config: reprovision.clone(),
+        })
+        .await
+        .unwrap();
+    let first: serde_json::Value = serde_json::from_str(
+        &graph
+            .get_config_value("__mcp_endpoint__:pilot")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(first["approval_incarnation"].as_str().is_some());
+    assert_ne!(
+        first["approval_incarnation"],
+        "caller-chosen-must-not-survive"
+    );
+    owner
+        .send_request(IpcRequest::ProvisionMcpEndpoint {
+            config: reprovision,
+        })
+        .await
+        .unwrap();
+    let second: serde_json::Value = serde_json::from_str(
+        &graph
+            .get_config_value("__mcp_endpoint__:pilot")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        first["approval_incarnation"],
+        second["approval_incarnation"]
+    );
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_file(socket);
+}
+
+#[tokio::test]
 async fn memory_refresh_hotel_correlates_probe_and_refuses_legacy_wire() {
     let socket_path = test_socket_path();
     let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
