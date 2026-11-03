@@ -3,7 +3,7 @@ title: Apple Memory Workspace and Open-loop Actions
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-10-03
+last_updated: 2026-10-19
 tags: [apple, graphical-ux, lifegraph, cortex, reminders]
 related_docs:
 - ARCHITECTURE_STATUS.md
@@ -41,8 +41,12 @@ and act on open loops without treating a list of database rows as the product.
 Accepted for current slice. Initial graphical navigation and linked export are
 implemented on `codex/apple-memory-workspace`, followed by audited lifecycle
 actions. The graphical build was installed and launched on the new iPhone on
-October 2; physical UI acceptance, real EventKit writes and the new lifecycle
-actions' deployment remain unverified. The complete requested workflow is
+October 2. The October 3 rollout record in `a9cc1129` reports PR #612 merged to
+develop `04856a44` and the lifecycle gateway and runner deployed with watched-live
+API/audit proof. At that verification, the signed phone build was ready but
+installation was blocked by device availability. This historical record was
+reconciled on October 19 without repeating live validation; physical UI acceptance
+and real EventKit writes remain unverified. The complete requested workflow is
 **not** implemented by these slices.
 
 ## Current Slice
@@ -96,9 +100,9 @@ Apple-owned; an export receipt is not proof that another device received it.
 
 ## Next Implementation Work
 
-- Merge/deploy both action boundaries, install the updated app, and verify
-  live enrolled-device save/read-back plus persisted audit on a disposable
-  loop. Verify native UI confirm/close/reopen and stale-screen rejection.
+- Recheck device availability, install the signed app, and verify native UI
+  confirm/close/reopen and stale-screen rejection. The October 3 server API/audit
+  record is not a substitute for current runtime or physical UI acceptance.
 - Extend lifecycle revision discipline to other writers before claiming a
   graph-wide revision guarantee; keep generic text editing narrow.
 - Add reviewable reconciliation: reminder completed / loop still open,
@@ -125,6 +129,19 @@ against disposable Memgraph 3.5.0 proves actual audit persistence, protected
 property preservation, stale/ABA rejection, exact retry replay, concurrent
 retry deduplication, legacy alias clearing, wrong-label and duplicate-ID
 rejection. This is integration/test-green, not deployed or phone-action proof.
+Historical October 3 rollout record (`a9cc1129`, preserved during October 19
+worktree consolidation): all four PR gates and merge `04856a44` Linux build
+`37140980630` passed. The record reports updates to only
+`/opt/philotic/bin/life-graph-runner` and `/opt/philotic/bin/philotic-web`, retaining
+auth EnvironmentFiles and native callback containers with pre-rollout backups.
+It records restarted runner PID 2188181 and gateway PID 2188249, matching installed
+and running executable hashes, and both services active at that observation.
+The enrolled-device path passed confirm/close/reopen, exact receipt replay,
+stale HTTP 409, read-back and three persisted audits with unchanged protected
+provenance; synthetic records were removed and absence checked. This is the
+recorded **October 3 watched-live-green** result, not a fresh deployment or live
+test from this consolidation. The signed iOS build and strict signature check
+passed then, but phone installation was blocked and UI acceptance was not proven.
 Physical graph interaction, VoiceOver, permission revocation, real export,
 repeat export and completed-reminder reconciliation still require UI acceptance.
 
