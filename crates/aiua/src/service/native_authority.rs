@@ -37,6 +37,32 @@ struct Entry {
 type SnapshotSource =
     Arc<dyn Fn() -> Result<native_memory::grant_snapshot_candidate::LoadedSnapshot> + Send + Sync>;
 type CompletionReceipt = Arc<dyn Fn(Uuid, [u8; 32]) -> Result<bool> + Send + Sync>;
+/// Unwired authority: resolves only when the exact publisher and all
+/// effect-capable descendants are confirmed quiescent. Errors never release
+/// the fence; no runtime supplies this candidate yet.
+type PublisherQuiescence = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublisherStatus {
+    Unknown,
+    Pending,
+    Complete,
+    RecoveryRequired,
+}
+/// An aborted owner cannot leave a misleading volatile Pending status.
+struct PublisherStatusGuard(Arc<std::sync::Mutex<PublisherStatus>>);
+impl Drop for PublisherStatusGuard {
+    fn drop(&mut self) {
+        if let Ok(mut status) = self.0.lock() {
+            if *status == PublisherStatus::Pending {
+                *status = PublisherStatus::RecoveryRequired;
+            }
+        }
+    }
+}
 /// Unwired candidate reader for a root-owned group-readable completion
 /// receipt. Caller must supply the protected, pinned directory and group.
 #[allow(dead_code)]
@@ -62,6 +88,7 @@ pub(crate) struct PublisherPlan {
     new_digest: [u8; 32],
     deadline: u64,
     receipt: CompletionReceipt,
+    quiesce: PublisherQuiescence,
 }
 
 pub struct NativeAuthority {
@@ -76,6 +103,7 @@ pub struct NativeAuthority {
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     snapshot_source: Option<SnapshotSource>,
     publisher_plan: Option<PublisherPlan>,
+    publisher_status: Arc<std::sync::Mutex<PublisherStatus>>,
 }
 
 /// A reservation is deliberately not serializable. Its owner must retain it
@@ -135,6 +163,7 @@ impl NativeAuthority {
             }),
             snapshot_source: None,
             publisher_plan: None,
+            publisher_status: Arc::new(std::sync::Mutex::new(PublisherStatus::Unknown)),
         }))
     }
 
@@ -579,6 +608,7 @@ mod tests {
         collections::BTreeSet,
         os::unix::fs::{MetadataExt, PermissionsExt},
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        time::Duration,
     };
     struct Process(Arc<AtomicBool>);
     impl SupervisedProcess for Process {
@@ -1228,6 +1258,23 @@ mod tests {
         }
     }
 
+    async fn confirm_candidate(client: &mut tokio::net::UnixStream, id: Uuid) -> Result<()> {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        let nonce = match read::<Reply>(client).await? {
+            Reply::SnapshotChallenge { nonce } => nonce,
+            _ => return Err(anyhow!("candidate challenge missing")),
+        };
+        write(
+            client,
+            &Request::ConfirmSnapshot {
+                operation_id: id.to_string(),
+                nonce,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn synthetic_publisher_session_holds_fence_and_requires_completion_receipt() {
         use native_memory::authority_control::{Reply, Request, read, write};
@@ -1280,6 +1327,7 @@ mod tests {
                     old_digest: old,
                     new_digest: new,
                     deadline: 200,
+                    quiesce: Arc::new(|| Box::pin(async { Ok(()) })),
                     receipt: Arc::new(move |operation, digest| {
                         observed_receipt.store(true, Ordering::SeqCst);
                         Ok(operation == id && digest == new && check.load(Ordering::SeqCst))
@@ -1312,19 +1360,21 @@ mod tests {
                     )
                     .await
             });
+            let attempt_id = if mode == "wrong_operation" {
+                Uuid::new_v4()
+            } else {
+                id
+            };
             write(
                 &mut client,
                 &Request::BeginSnapshot {
                     guest: "publisher".into(),
-                    operation_id: if mode == "wrong_operation" {
-                        Uuid::new_v4().to_string()
-                    } else {
-                        id.to_string()
-                    },
+                    operation_id: attempt_id.to_string(),
                 },
             )
             .await
             .unwrap();
+            confirm_candidate(&mut client, attempt_id).await.unwrap();
             if mode == "wrong_operation" || mode == "replaced_generation" {
                 assert!(read::<Reply>(&mut client).await.is_err());
                 assert!(server.await.unwrap().is_err());
@@ -1357,25 +1407,16 @@ mod tests {
             )
             .await
             .unwrap();
-            if mode == "lost_ack" {
-                drop(client);
-                assert_eq!(
-                    server.await.unwrap().unwrap_err().to_string(),
-                    "Unavailable"
-                );
+            // Submission is one-way; disconnecting after the frame must not
+            // create a false failure after the hotel verifies quiescence.
+            drop(client);
+            let result = server.await.unwrap();
+            let succeeded = mode == "success" || mode == "replay" || mode == "lost_ack";
+            assert_eq!(result.is_ok(), succeeded);
+            if succeeded {
                 assert!(receipt_checked.load(Ordering::SeqCst));
                 assert_eq!(source().unwrap().digest(), new);
-                assert_eq!(
-                    std::fs::read(f.dir.join("uncertainty")).unwrap(),
-                    b"clean\n"
-                );
-                continue;
             }
-            let reply = read::<Reply>(&mut client).await;
-            let result = server.await.unwrap();
-            let succeeded = mode == "success" || mode == "replay";
-            assert_eq!(matches!(reply, Ok(Reply::Finished)), succeeded);
-            assert_eq!(result.is_ok(), succeeded);
             assert_eq!(
                 std::fs::read(f.dir.join("uncertainty")).unwrap(),
                 if succeeded { b"clean\n" } else { b"dirty\n" }
@@ -1402,6 +1443,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                confirm_candidate(&mut client, id).await.unwrap();
                 assert!(read::<Reply>(&mut client).await.is_err());
                 assert_eq!(
                     server.await.unwrap().unwrap_err().to_string(),
@@ -1409,9 +1451,891 @@ mod tests {
                 );
                 assert_eq!(
                     std::fs::read(f.dir.join("uncertainty")).unwrap(),
-                    b"clean\n"
+                    b"dirty\n"
                 );
             }
+        }
+    }
+
+    async fn query_publisher_status(
+        f: &Fixture,
+        guest: &str,
+        id: Uuid,
+    ) -> Result<native_memory::authority_control::Reply> {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        let (mut client, server) = tokio::net::UnixStream::pair()?;
+        let owner = f.authority.clone();
+        let policy = f.policy.clone();
+        let task = tokio::spawn(async move {
+            owner
+                .control(server, Arc::new(move || Ok(policy.clone())))
+                .await
+        });
+        write(
+            &mut client,
+            &Request::SnapshotStatus {
+                guest: guest.into(),
+                operation_id: id.to_string(),
+            },
+        )
+        .await?;
+        confirm_candidate(&mut client, id).await?;
+        let result = read::<Reply>(&mut client)
+            .await
+            .map_err(anyhow::Error::from);
+        let _ = task.await;
+        result
+    }
+
+    #[tokio::test]
+    async fn one_way_publisher_status_waits_for_quiescence_and_authenticates_consumer() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        let mut f = Fixture::new();
+        let current = install_synthetic_snapshot_source(&mut f);
+        let source = f.authority.snapshot_source.as_ref().unwrap().clone();
+        let old_snapshot = current.lock().unwrap().clone();
+        let old = source().unwrap().digest();
+        let mut next = old_snapshot.clone();
+        next.generation += 1;
+        next.grant.revision += 1;
+        next.grant.revoked = true;
+        *current.lock().unwrap() = next.clone();
+        let new = source().unwrap().digest();
+        *current.lock().unwrap() = old_snapshot;
+        let id = Uuid::new_v4();
+        let uid = unsafe { libc::geteuid() };
+        f.authority
+            .launches
+            .attach_new(
+                "publisher",
+                uid,
+                LaunchPrincipal {
+                    stable_agent_id: "publisher".into(),
+                    roles: BTreeSet::new(),
+                },
+                Arc::new(Process(f.alive.clone())),
+            )
+            .unwrap();
+        let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let gate = release.clone();
+        Arc::get_mut(&mut f.authority)
+            .unwrap()
+            .experimental_set_publisher_plan(PublisherPlan {
+                guest: "publisher".into(),
+                consumer,
+                operation_id: id,
+                old_digest: old,
+                new_digest: new,
+                deadline: 200,
+                receipt: Arc::new(move |operation, digest| Ok(operation == id && digest == new)),
+                quiesce: Arc::new(move || {
+                    let signal = signal.clone();
+                    let gate = gate.clone();
+                    Box::pin(async move {
+                        signal.notify_one();
+                        gate.notified().await;
+                        Ok(())
+                    })
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            query_publisher_status(&f, "membrane", id).await.unwrap(),
+            Reply::SnapshotUnknown
+        ));
+        assert!(query_publisher_status(&f, "runner", id).await.is_err());
+        assert!(
+            query_publisher_status(&f, "membrane", Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let authority = f.authority.clone();
+        let policy = f.policy.clone();
+        let task = tokio::spawn(async move {
+            authority
+                .test_control_with_publisher_uid(server, Arc::new(move || Ok(policy.clone())), uid)
+                .await
+        });
+        write(
+            &mut client,
+            &Request::BeginSnapshot {
+                guest: "publisher".into(),
+                operation_id: id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        confirm_candidate(&mut client, id).await.unwrap();
+        assert!(matches!(
+            read::<Reply>(&mut client).await.unwrap(),
+            Reply::Ready
+        ));
+        *current.lock().unwrap() = next;
+        write(
+            &mut client,
+            &Request::FinishSnapshot {
+                operation_id: id.to_string(),
+                digest: new,
+            },
+        )
+        .await
+        .unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert!(matches!(
+            query_publisher_status(&f, "membrane", id).await.unwrap(),
+            Reply::SnapshotPending
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), f.authority.fence())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(matches!(
+            query_publisher_status(&f, "membrane", id).await.unwrap(),
+            Reply::SnapshotComplete
+        ));
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"clean\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_way_clock_regression_after_finish_never_clears_fence() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        let mut f = Fixture::new();
+        let current = install_synthetic_snapshot_source(&mut f);
+        let source = f.authority.snapshot_source.as_ref().unwrap().clone();
+        let old = source().unwrap().digest();
+        let original = current.lock().unwrap().clone();
+        let mut next = original.clone();
+        next.generation += 1;
+        next.grant.revision += 1;
+        next.grant.revoked = true;
+        *current.lock().unwrap() = next.clone();
+        let new = source().unwrap().digest();
+        *current.lock().unwrap() = original;
+        let uid = unsafe { libc::geteuid() };
+        let id = Uuid::new_v4();
+        f.authority
+            .launches
+            .attach_new(
+                "publisher",
+                uid,
+                LaunchPrincipal {
+                    stable_agent_id: "publisher".into(),
+                    roles: BTreeSet::new(),
+                },
+                Arc::new(Process(f.alive.clone())),
+            )
+            .unwrap();
+        let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let gate = release.clone();
+        Arc::get_mut(&mut f.authority)
+            .unwrap()
+            .experimental_set_publisher_plan(PublisherPlan {
+                guest: "publisher".into(),
+                consumer,
+                operation_id: id,
+                old_digest: old,
+                new_digest: new,
+                deadline: 200,
+                receipt: Arc::new(|_, _| Ok(true)),
+                quiesce: Arc::new(move || {
+                    let signal = signal.clone();
+                    let gate = gate.clone();
+                    Box::pin(async move {
+                        signal.notify_one();
+                        gate.notified().await;
+                        Ok(())
+                    })
+                }),
+            })
+            .unwrap();
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let authority = f.authority.clone();
+        let policy = f.policy.clone();
+        let task = tokio::spawn(async move {
+            authority
+                .test_control_with_publisher_uid(server, Arc::new(move || Ok(policy.clone())), uid)
+                .await
+        });
+        write(
+            &mut client,
+            &Request::BeginSnapshot {
+                guest: "publisher".into(),
+                operation_id: id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        confirm_candidate(&mut client, id).await.unwrap();
+        assert!(matches!(
+            read::<Reply>(&mut client).await.unwrap(),
+            Reply::Ready
+        ));
+        *current.lock().unwrap() = next;
+        f.clock.store(103, Ordering::SeqCst);
+        write(
+            &mut client,
+            &Request::FinishSnapshot {
+                operation_id: id.to_string(),
+                digest: new,
+            },
+        )
+        .await
+        .unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        // This exceeds the earlier Ready time (101) but precedes Finish (103).
+        f.clock.store(102, Ordering::SeqCst);
+        release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(matches!(
+            query_publisher_status(&f, "membrane", id).await.unwrap(),
+            Reply::SnapshotRecoveryRequired
+        ));
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+    }
+
+    #[test]
+    #[ignore = "synthetic child invoked only by its owning test"]
+    fn candidate_one_way_publisher_child_helper() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        use std::io::Read as _;
+        let mut ready = [0u8; 1];
+        std::io::stdin().read_exact(&mut ready).unwrap();
+        let socket = std::env::var("NATIVE_TEST_SOCKET").unwrap();
+        let id = std::env::var("NATIVE_TEST_OPERATION").unwrap();
+        let digest: [u8; 32] =
+            serde_json::from_str(&std::env::var("NATIVE_TEST_DIGEST").unwrap()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+            write(
+                &mut stream,
+                &Request::BeginSnapshot {
+                    guest: "publisher".into(),
+                    operation_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let nonce = match read::<Reply>(&mut stream).await.unwrap() {
+                Reply::SnapshotChallenge { nonce } => nonce,
+                _ => panic!("challenge"),
+            };
+            write(
+                &mut stream,
+                &Request::ConfirmSnapshot {
+                    operation_id: id.clone(),
+                    nonce,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read::<Reply>(&mut stream).await.unwrap(),
+                Reply::Ready
+            ));
+            write(
+                &mut stream,
+                &Request::FinishSnapshot {
+                    operation_id: id,
+                    digest,
+                },
+            )
+            .await
+            .unwrap();
+            drop(stream);
+        });
+        // One-way submission is not success. This supervised child stays alive
+        // until the hotel lifecycle owner stops and reaps it.
+        loop {
+            std::thread::park();
+        }
+    }
+
+    struct SyntheticChildCleanup(Arc<std::sync::Mutex<std::process::Child>>);
+    impl Drop for SyntheticChildCleanup {
+        fn drop(&mut self) {
+            let mut child = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
+            for _ in 0..200 {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Err(_) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            eprintln!("synthetic child cleanup could not confirm reap");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "synthetic listener was denied locally; requires fresh authorization before execution"]
+    async fn one_way_real_child_stays_alive_until_owned_stop_and_status_completion() {
+        use std::io::Write as _;
+        let mut f = Fixture::new();
+        let current = install_synthetic_snapshot_source(&mut f);
+        let source = f.authority.snapshot_source.as_ref().unwrap().clone();
+        let old = source().unwrap().digest();
+        let old_snapshot = current.lock().unwrap().clone();
+        let mut next = old_snapshot.clone();
+        next.generation += 1;
+        next.grant.revision += 1;
+        next.grant.revoked = true;
+        *current.lock().unwrap() = next.clone();
+        let new = source().unwrap().digest();
+        *current.lock().unwrap() = old_snapshot;
+        let id = Uuid::new_v4();
+        let socket = f.dir.join("publisher.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::native_authority::tests::candidate_one_way_publisher_child_helper",
+                "--ignored",
+            ])
+            .env("NATIVE_TEST_SOCKET", &socket)
+            .env("NATIVE_TEST_OPERATION", id.to_string())
+            .env("NATIVE_TEST_DIGEST", serde_json::to_string(&new).unwrap())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let child = Arc::new(std::sync::Mutex::new(child));
+        let _cleanup = SyntheticChildCleanup(child.clone());
+        let mut input = child.lock().unwrap().stdin.take().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        f.authority
+            .launches
+            .attach_new(
+                "publisher",
+                uid,
+                LaunchPrincipal {
+                    stable_agent_id: "publisher".into(),
+                    roles: BTreeSet::new(),
+                },
+                child.clone(),
+            )
+            .unwrap();
+        let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+        let owner = child.clone();
+        let changed = current.clone();
+        Arc::get_mut(&mut f.authority)
+            .unwrap()
+            .experimental_set_publisher_plan(PublisherPlan {
+                guest: "publisher".into(),
+                consumer,
+                operation_id: id,
+                old_digest: old,
+                new_digest: new,
+                deadline: 200,
+                receipt: Arc::new(move |operation, digest| Ok(operation == id && digest == new)),
+                quiesce: Arc::new(move || {
+                    let owner = owner.clone();
+                    let changed = changed.clone();
+                    let next = next.clone();
+                    Box::pin(async move {
+                        // Synthetic in-memory snapshot substitutes for a protected write.
+                        *changed.lock().unwrap() = next;
+                        {
+                            let mut child =
+                                owner.lock().map_err(|_| anyhow!("child owner poisoned"))?;
+                            child.kill()?;
+                        }
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                        loop {
+                            if owner
+                                .lock()
+                                .map_err(|_| anyhow!("child owner poisoned"))?
+                                .try_wait()?
+                                .is_some()
+                            {
+                                return Ok(());
+                            }
+                            ensure!(
+                                tokio::time::Instant::now() < deadline,
+                                "synthetic child did not exit"
+                            );
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                }),
+            })
+            .unwrap();
+        input.write_all(b"s").unwrap();
+        drop(input);
+        let (server, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = f.authority.clone();
+        let policy = f.policy.clone();
+        let mut task = tokio::spawn(async move {
+            authority
+                .test_control_with_publisher_uid(server, Arc::new(move || Ok(policy.clone())), uid)
+                .await
+        });
+        match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                panic!("synthetic control timed out");
+            }
+        }
+        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(matches!(
+            query_publisher_status(&f, "membrane", id).await.unwrap(),
+            native_memory::authority_control::Reply::SnapshotComplete
+        ));
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"clean\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_way_unproven_quiescence_retains_fence_and_shutdown_poisons_journal() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        let mut f = Fixture::new();
+        let current = install_synthetic_snapshot_source(&mut f);
+        let source = f.authority.snapshot_source.as_ref().unwrap().clone();
+        let old_snapshot = current.lock().unwrap().clone();
+        let old = source().unwrap().digest();
+        let mut next = old_snapshot.clone();
+        next.generation += 1;
+        next.grant.revision += 1;
+        next.grant.revoked = true;
+        *current.lock().unwrap() = next.clone();
+        let new = source().unwrap().digest();
+        *current.lock().unwrap() = old_snapshot;
+        let id = Uuid::new_v4();
+        let uid = unsafe { libc::geteuid() };
+        f.authority
+            .launches
+            .attach_new(
+                "publisher",
+                uid,
+                LaunchPrincipal {
+                    stable_agent_id: "publisher".into(),
+                    roles: BTreeSet::new(),
+                },
+                Arc::new(Process(f.alive.clone())),
+            )
+            .unwrap();
+        let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+        Arc::get_mut(&mut f.authority)
+            .unwrap()
+            .experimental_set_publisher_plan(PublisherPlan {
+                guest: "publisher".into(),
+                consumer,
+                operation_id: id,
+                old_digest: old,
+                new_digest: new,
+                deadline: 200,
+                receipt: Arc::new(|_, _| Ok(true)),
+                quiesce: Arc::new(|| {
+                    Box::pin(async { Err(anyhow!("synthetic stop unavailable")) })
+                }),
+            })
+            .unwrap();
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let authority = f.authority.clone();
+        let policy = f.policy.clone();
+        let task = tokio::spawn(async move {
+            authority
+                .test_control_with_publisher_uid(server, Arc::new(move || Ok(policy.clone())), uid)
+                .await
+        });
+        write(
+            &mut client,
+            &Request::BeginSnapshot {
+                guest: "publisher".into(),
+                operation_id: id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        confirm_candidate(&mut client, id).await.unwrap();
+        assert!(matches!(
+            read::<Reply>(&mut client).await.unwrap(),
+            Reply::Ready
+        ));
+        *current.lock().unwrap() = next;
+        write(
+            &mut client,
+            &Request::FinishSnapshot {
+                operation_id: id.to_string(),
+                digest: new,
+            },
+        )
+        .await
+        .unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    query_publisher_status(&f, "membrane", id).await,
+                    Ok(Reply::SnapshotRecoveryRequired)
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), f.authority.fence())
+                .await
+                .is_err()
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            query_publisher_status(&f, "membrane", id).await.unwrap(),
+            Reply::SnapshotRecoveryRequired
+        ));
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+        assert!(f.authority.fence().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn candidate_challenge_rejects_prebuffer_and_cross_session_replay() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        let mut f = Fixture::new();
+        install_synthetic_snapshot_source(&mut f);
+        let uid = unsafe { libc::geteuid() };
+        let id = Uuid::new_v4();
+        f.authority
+            .launches
+            .attach_new(
+                "publisher",
+                uid,
+                LaunchPrincipal {
+                    stable_agent_id: "publisher".into(),
+                    roles: BTreeSet::new(),
+                },
+                Arc::new(Process(f.alive.clone())),
+            )
+            .unwrap();
+        let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+        Arc::get_mut(&mut f.authority)
+            .unwrap()
+            .experimental_set_publisher_plan(PublisherPlan {
+                guest: "publisher".into(),
+                consumer,
+                operation_id: id,
+                old_digest: [1; 32],
+                new_digest: [2; 32],
+                deadline: 200,
+                receipt: Arc::new(|_, _| Ok(true)),
+                quiesce: Arc::new(|| Box::pin(async { Ok(()) })),
+            })
+            .unwrap();
+        // A guessed response queued before the hotel generates the challenge
+        // must never enter the fence or trigger any authority action.
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        write(
+            &mut client,
+            &Request::BeginSnapshot {
+                guest: "publisher".into(),
+                operation_id: id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        write(
+            &mut client,
+            &Request::ConfirmSnapshot {
+                operation_id: id.to_string(),
+                nonce: [0; 16],
+            },
+        )
+        .await
+        .unwrap();
+        let authority = f.authority.clone();
+        let policy = f.policy.clone();
+        let task = tokio::spawn(async move {
+            authority
+                .test_control_with_publisher_uid(server, Arc::new(move || Ok(policy.clone())), uid)
+                .await
+        });
+        assert!(matches!(
+            read::<Reply>(&mut client).await.unwrap(),
+            Reply::SnapshotChallenge { .. }
+        ));
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"clean\n"
+        );
+        // A challenge from one connection cannot authenticate a second one.
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let authority = f.authority.clone();
+            let policy = f.policy.clone();
+            tasks.push(tokio::spawn(async move {
+                authority
+                    .test_control_with_publisher_uid(
+                        server,
+                        Arc::new(move || Ok(policy.clone())),
+                        uid,
+                    )
+                    .await
+            }));
+            write(
+                &mut client,
+                &Request::SnapshotStatus {
+                    guest: "membrane".into(),
+                    operation_id: id.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            clients.push(client);
+        }
+        let a = match read::<Reply>(&mut clients[0]).await.unwrap() {
+            Reply::SnapshotChallenge { nonce } => nonce,
+            _ => panic!("challenge"),
+        };
+        let b = match read::<Reply>(&mut clients[1]).await.unwrap() {
+            Reply::SnapshotChallenge { nonce } => nonce,
+            _ => panic!("challenge"),
+        };
+        assert_ne!(a, b);
+        write(
+            &mut clients[1],
+            &Request::ConfirmSnapshot {
+                operation_id: id.to_string(),
+                nonce: a,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(tasks.pop().unwrap().await.unwrap().is_err());
+        write(
+            &mut clients[0],
+            &Request::ConfirmSnapshot {
+                operation_id: id.to_string(),
+                nonce: b,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(tasks.pop().unwrap().await.unwrap().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"clean\n"
+        );
+    }
+
+    /// Linux only: the connected publisher remains alive while a forked
+    /// process writes through its inherited descriptor. No root needed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn candidate_control_rejects_delegated_confirmation_and_completion_fragments() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncWriteExt;
+        for mode in [
+            "confirm",
+            "confirm_partial",
+            "confirm_body",
+            "finish",
+            "finish_partial",
+            "finish_body",
+            "status",
+            "status_partial",
+            "status_body",
+        ] {
+            let mut f = Fixture::new();
+            let current = install_synthetic_snapshot_source(&mut f);
+            let source = f.authority.snapshot_source.as_ref().unwrap().clone();
+            let old = source().unwrap().digest();
+            let old_snapshot = current.lock().unwrap().clone();
+            let mut next = old_snapshot.clone();
+            next.generation += 1;
+            next.grant.revision += 1;
+            next.grant.revoked = true;
+            *current.lock().unwrap() = next;
+            let new = source().unwrap().digest();
+            *current.lock().unwrap() = old_snapshot;
+            let uid = unsafe { libc::geteuid() };
+            let id = Uuid::new_v4();
+            f.authority
+                .launches
+                .attach_new(
+                    "publisher",
+                    uid,
+                    LaunchPrincipal {
+                        stable_agent_id: "publisher".into(),
+                        roles: BTreeSet::new(),
+                    },
+                    Arc::new(Process(f.alive.clone())),
+                )
+                .unwrap();
+            let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+            Arc::get_mut(&mut f.authority)
+                .unwrap()
+                .experimental_set_publisher_plan(PublisherPlan {
+                    guest: "publisher".into(),
+                    consumer,
+                    operation_id: id,
+                    old_digest: old,
+                    new_digest: new,
+                    deadline: 200,
+                    receipt: Arc::new(|_, _| Ok(true)),
+                    quiesce: Arc::new(|| Box::pin(async { Ok(()) })),
+                })
+                .unwrap();
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let authority = f.authority.clone();
+            let policy = f.policy.clone();
+            let task = tokio::spawn(async move {
+                authority
+                    .test_control_with_publisher_uid(
+                        server,
+                        Arc::new(move || Ok(policy.clone())),
+                        uid,
+                    )
+                    .await
+            });
+            let status = mode.starts_with("status");
+            if status {
+                write(
+                    &mut client,
+                    &Request::SnapshotStatus {
+                        guest: "membrane".into(),
+                        operation_id: id.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            } else {
+                write(
+                    &mut client,
+                    &Request::BeginSnapshot {
+                        guest: "publisher".into(),
+                        operation_id: id.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let nonce = match read::<Reply>(&mut client).await.unwrap() {
+                Reply::SnapshotChallenge { nonce } => nonce,
+                _ => panic!("missing challenge"),
+            };
+            let finish = mode.starts_with("finish");
+            let frame = if finish {
+                write(
+                    &mut client,
+                    &Request::ConfirmSnapshot {
+                        operation_id: id.to_string(),
+                        nonce,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    read::<Reply>(&mut client).await.unwrap(),
+                    Reply::Ready
+                ));
+                Request::FinishSnapshot {
+                    operation_id: id.to_string(),
+                    digest: new,
+                }
+            } else {
+                Request::ConfirmSnapshot {
+                    operation_id: id.to_string(),
+                    nonce,
+                }
+            };
+            let body = serde_json::to_vec(&frame).unwrap();
+            let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(&body);
+            let split = if mode.ends_with("partial") {
+                2
+            } else if mode.ends_with("body") {
+                4 + body.len() / 2
+            } else {
+                0
+            };
+            if split != 0 {
+                client.write_all(&wire[..split]).await.unwrap();
+            }
+            let fd = client.as_raw_fd();
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                let mut sent = split;
+                while sent < wire.len() {
+                    let n = unsafe {
+                        libc::send(
+                            fd,
+                            wire[sent..].as_ptr().cast(),
+                            wire.len() - sent,
+                            libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    if n <= 0 {
+                        unsafe { libc::_exit(1) }
+                    }
+                    sent += n as usize;
+                }
+                unsafe { libc::_exit(0) }
+            }
+            let mut status_code = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status_code, 0) }, child);
+            assert!(libc::WIFEXITED(status_code) && libc::WEXITSTATUS(status_code) == 0);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err(),
+                "{mode}"
+            );
+            assert_eq!(
+                std::fs::read(f.dir.join("uncertainty")).unwrap(),
+                if finish { b"dirty\n" } else { b"clean\n" },
+                "{mode}"
+            );
         }
     }
 
@@ -1446,6 +2370,7 @@ mod tests {
                 new_digest: [2; 32],
                 deadline: 200,
                 receipt: Arc::new(|_, _| Ok(true)),
+                quiesce: Arc::new(|| Box::pin(async { Ok(()) })),
             })
             .unwrap();
         let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
@@ -1513,6 +2438,7 @@ mod tests {
                 new_digest: [2; 32],
                 deadline: 200,
                 receipt: Arc::new(|_, _| Ok(true)),
+                quiesce: Arc::new(|| Box::pin(async { Ok(()) })),
             })
             .unwrap();
         let handle = f.admit().await;
@@ -1539,6 +2465,7 @@ mod tests {
         )
         .await
         .unwrap();
+        confirm_candidate(&mut client, id).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while calls.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;

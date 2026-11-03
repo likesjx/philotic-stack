@@ -6,6 +6,21 @@
 //! Kernel credentials are checked on every received fragment; root remains TCB.
 use crate::{Error, Result};
 
+/// A frame was handed to the local socket; this is not a commit or success.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PublicationSubmitted;
+
+/// Historical operation state, not a statement of current grant validity.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PublicationStatus {
+    Unknown,
+    Pending,
+    Complete,
+    RecoveryRequired,
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) struct PublisherClient {
     stream: std::os::unix::net::UnixStream,
@@ -107,17 +122,56 @@ impl PublisherClient {
         Err(Error::Uncertain)
     }
 
-    /// Experimental operation. The blocking install closure is NOT bounded by
-    /// this client and cannot prove the hotel still holds its fence. This API
-    /// must remain unwired until timeout kills and reaps the publisher before
-    /// the fence can be released. Any failure requires reconciliation.
+    /// A separate authenticated status consumer connects independently and
+    /// pins the hotel incarnation. Never retries or mutates a publication.
+    pub(crate) fn status(&mut self, guest: &str, id: uuid::Uuid) -> Result<PublicationStatus> {
+        use crate::authority_control::{Reply, Request};
+        if self.spent {
+            return Err(Error::Uncertain);
+        }
+        self.spent = true;
+        if self
+            .send(&Request::SnapshotStatus {
+                guest: guest.into(),
+                operation_id: id.to_string(),
+            })
+            .is_err()
+        {
+            return self.poison();
+        }
+        let nonce = match self.recv() {
+            Ok(Reply::SnapshotChallenge { nonce }) => nonce,
+            _ => return self.poison(),
+        };
+        if self
+            .send(&Request::ConfirmSnapshot {
+                operation_id: id.to_string(),
+                nonce,
+            })
+            .is_err()
+        {
+            return self.poison();
+        }
+        match self.recv() {
+            Ok(Reply::SnapshotUnknown) => Ok(PublicationStatus::Unknown),
+            Ok(Reply::SnapshotPending) => Ok(PublicationStatus::Pending),
+            Ok(Reply::SnapshotComplete) => Ok(PublicationStatus::Complete),
+            Ok(Reply::SnapshotRecoveryRequired) => Ok(PublicationStatus::RecoveryRequired),
+            _ => self.poison(),
+        }
+    }
+
+    /// Experimental one-way submission. Return only means the frame reached
+    /// the local socket, never that publication succeeded. The blocking install
+    /// closure is not bounded; this remains unwired until the hotel owns and
+    /// verifies the publisher's complete lifecycle and recovery.
     pub(crate) fn publish(
         &mut self,
         guest: &str,
         id: uuid::Uuid,
         expected: [u8; 32],
         install: impl FnOnce() -> Result<[u8; 32]>,
-    ) -> Result<()> {
+    ) -> Result<PublicationSubmitted> {
         use crate::authority_control::{Reply, Request};
         if self.spent {
             return Err(Error::Uncertain);
@@ -127,6 +181,19 @@ impl PublisherClient {
             .send(&Request::BeginSnapshot {
                 guest: guest.into(),
                 operation_id: id.to_string(),
+            })
+            .is_err()
+        {
+            return self.poison();
+        }
+        let nonce = match self.recv() {
+            Ok(Reply::SnapshotChallenge { nonce }) => nonce,
+            _ => return self.poison(),
+        };
+        if self
+            .send(&Request::ConfirmSnapshot {
+                operation_id: id.to_string(),
+                nonce,
             })
             .is_err()
             || !matches!(self.recv(), Ok(Reply::Ready))
@@ -143,11 +210,13 @@ impl PublisherClient {
                 digest: actual,
             })
             .is_err()
-            || !matches!(self.recv(), Ok(Reply::Finished))
         {
             return self.poison();
         }
-        Ok(())
+        self.stream
+            .shutdown(std::net::Shutdown::Both)
+            .map_err(|_| Error::Uncertain)?;
+        Ok(PublicationSubmitted)
     }
 }
 
@@ -308,11 +377,17 @@ mod tests {
             assert!(
                 matches!(receive_request(&mut server),Request::BeginSnapshot {operation_id,..} if operation_id==id.to_string())
             );
+            let nonce = [4; 16];
+            reply_fragmented(&mut server, &Reply::SnapshotChallenge { nonce });
+            assert!(
+                matches!(receive_request(&mut server),Request::ConfirmSnapshot { operation_id, nonce: got } if operation_id==id.to_string() && got==nonce)
+            );
             reply_fragmented(&mut server, &Reply::Ready);
             assert!(
                 matches!(receive_request(&mut server),Request::FinishSnapshot {operation_id,digest} if operation_id==id.to_string() && digest==expected)
             );
-            reply_fragmented(&mut server, &Reply::Finished);
+            let mut byte = [0u8; 1];
+            assert_eq!(server.read(&mut byte).unwrap(), 0);
         });
         assert!(
             publisher
@@ -325,6 +400,34 @@ mod tests {
             Err(Error::Uncertain)
         ));
     }
+    #[test]
+    fn linux_status_client_confirms_challenge_and_reports_historical_outcome() {
+        use crate::authority_control::{Reply, Request};
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = PublisherClient::new(client, pin_self()).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let worker = std::thread::spawn(move || {
+            assert!(
+                matches!(receive_request(&mut server), Request::SnapshotStatus { guest, operation_id } if guest == "membrane" && operation_id == id.to_string())
+            );
+            let nonce = [9; 16];
+            reply_fragmented(&mut server, &Reply::SnapshotChallenge { nonce });
+            assert!(
+                matches!(receive_request(&mut server), Request::ConfirmSnapshot { operation_id, nonce: got } if operation_id == id.to_string() && got == nonce)
+            );
+            reply_fragmented(&mut server, &Reply::SnapshotComplete);
+        });
+        assert_eq!(
+            client.status("membrane", id).unwrap(),
+            PublicationStatus::Complete
+        );
+        assert!(matches!(
+            client.status("membrane", id),
+            Err(Error::Uncertain)
+        ));
+        worker.join().unwrap();
+    }
+
     #[test]
     fn linux_stream_rejects_delegated_socket_sender_mid_frame() {
         use crate::authority_control::Reply;

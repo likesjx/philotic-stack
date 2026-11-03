@@ -16,6 +16,8 @@ pub struct Journal {
     device: u64,
     inode: u64,
     poisoned: bool,
+    #[cfg(test)]
+    fail_clean_after_write: bool,
 }
 impl Journal {
     pub fn open(path: &Path, uid: u32) -> Result<Self> {
@@ -50,6 +52,8 @@ impl Journal {
             device: after.dev(),
             inode: after.ino(),
             poisoned: false,
+            #[cfg(test)]
+            fail_clean_after_write: false,
         })
     }
     pub fn validate(&self) -> Result<()> {
@@ -72,6 +76,10 @@ impl Journal {
             self.file
                 .write_all(if clean { b"clean\n" } else { b"dirty\n" })?;
             self.file.set_len(6)?;
+            #[cfg(test)]
+            if clean && std::mem::take(&mut self.fail_clean_after_write) {
+                bail!("synthetic failure after clean bytes before sync");
+            }
             self.file.sync_all()?;
             Ok(())
         })();
@@ -158,6 +166,30 @@ mod tests {
         drop(journal); // Release the OS lock: rejection must be durable, not lock contention.
         assert_eq!(std::fs::read(&path).unwrap(), b"dirty\n");
         assert!(Journal::open(&path, uid).is_err());
+    }
+
+    /// Documents an existing recovery gap, not a simulated crash guarantee:
+    /// clean bytes visible before a sync error can be accepted on reopen.
+    #[tokio::test]
+    async fn uncertain_clean_write_can_be_visible_on_reopen() {
+        let (_dir, path, uid) = fixture();
+        let journal = Arc::new(Mutex::new(Journal::open(&path, uid).unwrap()));
+        let mut fence = Fence::new(journal.clone().lock_owned().await);
+        fence.mark(false).unwrap();
+        fence.fail_clean_after_write = true;
+        assert!(fence.finish().is_err());
+        assert!(
+            fence.is_poisoned(),
+            "write failure poisons the live journal"
+        );
+        drop(fence);
+        assert!(journal.lock().await.validate().is_err());
+        drop(journal);
+        assert_eq!(std::fs::read(&path).unwrap(), b"clean\n");
+        assert!(
+            Journal::open(&path, uid).is_ok(),
+            "documents the existing false-clean risk"
+        );
     }
 
     #[tokio::test]

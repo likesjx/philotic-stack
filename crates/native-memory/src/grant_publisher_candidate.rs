@@ -99,7 +99,7 @@ pub fn publish_root_owned(
 /// Any error requires reconciliation and must never trigger an automatic retry.
 #[cfg(all(target_os = "linux", test))]
 #[allow(clippy::too_many_arguments)]
-pub fn publish_through_hotel(
+pub(crate) fn publish_through_hotel(
     stream: std::os::unix::net::UnixStream,
     hotel: crate::protected_peer_candidate::ManagerPinnedProcess,
     ledger: &mut Ledger,
@@ -113,7 +113,7 @@ pub fn publish_through_hotel(
     clock: &dyn Fn() -> u64,
     max_expiry: u64,
     deadline: u64,
-) -> crate::Result<()> {
+) -> crate::Result<std::convert::Infallible> {
     use sha2::{Digest, Sha256};
     let expected: [u8; 32] = Sha256::digest(bytes).into();
     let mut client = crate::protected_stream_candidate::PublisherClient::new(stream, hotel)?;
@@ -132,7 +132,13 @@ pub fn publish_through_hotel(
             return Err(crate::Error::Uncertain);
         }
         Ok(expected)
-    })
+    })?;
+    // Do not exit before the hotel verifies this exact incarnation. The
+    // qualified lifecycle manager must terminate and confirm quiescence;
+    // callers obtain completion from a separate authenticated status path.
+    loop {
+        std::thread::park();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

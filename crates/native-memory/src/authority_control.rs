@@ -26,6 +26,17 @@ pub enum Request {
         operation_id: String,
         digest: [u8; 32],
     },
+    /// Historical result of one publication, only for an authenticated
+    /// hotel-supervised status consumer. No token or mutation is carried.
+    SnapshotStatus {
+        guest: String,
+        operation_id: String,
+    },
+    /// Echoes the hotel's fresh challenge before any candidate operation.
+    ConfirmSnapshot {
+        operation_id: String,
+        nonce: [u8; 16],
+    },
     Admit {
         guest: String,
         token: String,
@@ -56,10 +67,23 @@ pub enum Request {
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     SnapshotReady,
-    Permit { handle: String },
+    SnapshotChallenge {
+        nonce: [u8; 16],
+    },
+    SnapshotPending,
+    /// Historical completion of this operation only; not current grant
+    /// validity or current journal cleanliness. Volatile across restart.
+    SnapshotComplete,
+    SnapshotRecoveryRequired,
+    SnapshotUnknown,
+    Permit {
+        handle: String,
+    },
     Ready,
     Finished,
-    Cancelled { committed: bool },
+    Cancelled {
+        committed: bool,
+    },
     Denied,
 }
 pub async fn write<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {

@@ -4,6 +4,193 @@ use native_memory::authority_control::{Reply, Request, read, write};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
+// Candidate-only credential-aware read after a fresh challenge. Legacy control
+// framing remains unchanged. Missing or delegated credentials fail closed.
+#[cfg(target_os = "linux")]
+fn enable_candidate_credentials(stream: &UnixStream) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        )
+    };
+    ensure!(rc == 0, "candidate peer credentials unavailable");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_fragment(
+    fd: std::os::fd::RawFd,
+    bytes: &mut [u8],
+    uid: u32,
+    pid: u32,
+) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind};
+    let mut control = [0usize; 64];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&control);
+    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(Error::last_os_error());
+    }
+    if n == 0 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "candidate stream closed",
+        ));
+    }
+    if msg.msg_controllen > std::mem::size_of_val(&control) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "candidate ancillary overflow",
+        ));
+    }
+    let mut credential = None;
+    let mut unexpected = false;
+    unsafe {
+        let begin = msg.msg_control as usize;
+        let end = begin
+            .checked_add(msg.msg_controllen)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "candidate ancillary overflow"))?;
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            let at = c as usize;
+            if at < begin
+                || at
+                    .checked_add(std::mem::size_of::<libc::cmsghdr>())
+                    .is_none_or(|v| v > end)
+            {
+                unexpected = true;
+                break;
+            }
+            let h = &*c;
+            if h.cmsg_len < libc::CMSG_LEN(0) as usize
+                || at.checked_add(h.cmsg_len).is_none_or(|v| v > end)
+            {
+                unexpected = true;
+                break;
+            }
+            if h.cmsg_level == libc::SOL_SOCKET
+                && h.cmsg_type == libc::SCM_CREDENTIALS
+                && h.cmsg_len == libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as u32) as usize
+                && credential.is_none()
+            {
+                credential = Some(std::ptr::read_unaligned(
+                    libc::CMSG_DATA(c).cast::<libc::ucred>(),
+                ));
+            } else {
+                unexpected = true;
+                if h.cmsg_level == libc::SOL_SOCKET && h.cmsg_type == libc::SCM_RIGHTS {
+                    let count = (h.cmsg_len - libc::CMSG_LEN(0) as usize)
+                        / std::mem::size_of::<libc::c_int>();
+                    let ptr = libc::CMSG_DATA(c).cast::<libc::c_int>();
+                    for i in 0..count {
+                        libc::close(std::ptr::read_unaligned(ptr.add(i)));
+                    }
+                }
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    if unexpected || msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "unexpected candidate ancillary data",
+        ));
+    }
+    let credential = credential
+        .ok_or_else(|| Error::new(ErrorKind::PermissionDenied, "candidate credentials missing"))?;
+    if credential.uid != uid || u32::try_from(credential.pid).ok() != Some(pid) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "candidate sender changed",
+        ));
+    }
+    Ok(n as usize)
+}
+
+#[cfg(target_os = "linux")]
+async fn read_candidate<T: serde::de::DeserializeOwned>(
+    stream: &UnixStream,
+    peer: &VerifiedLocalSession,
+) -> Result<T> {
+    let cred = stream.peer_cred()?;
+    let pid = u32::try_from(
+        cred.pid()
+            .ok_or_else(|| anyhow!("candidate PID unavailable"))?,
+    )?;
+    let uid = cred.uid();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    async fn exact(
+        stream: &UnixStream,
+        peer: &VerifiedLocalSession,
+        out: &mut [u8],
+        uid: u32,
+        pid: u32,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut offset = 0;
+        while offset < out.len() {
+            let count = tokio::time::timeout_at(
+                deadline,
+                stream.async_io(tokio::io::Interest::READABLE, || {
+                    candidate_fragment(stream.as_raw_fd(), &mut out[offset..], uid, pid)
+                }),
+            )
+            .await??;
+            peer.principal()?;
+            offset += count;
+        }
+        Ok(())
+    }
+    let mut header = [0u8; 4];
+    exact(stream, peer, &mut header, uid, pid, deadline).await?;
+    let size = u32::from_be_bytes(header) as usize;
+    ensure!(size > 0 && size <= 131_072, "invalid candidate frame size");
+    let mut bytes = vec![0; size];
+    exact(stream, peer, &mut bytes, uid, pid, deadline).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+// Synthetic tests on other hosts exercise control flow only, never Linux peer
+// authentication. Non-Linux production does not enable candidate publication.
+#[cfg(all(not(target_os = "linux"), test))]
+fn enable_candidate_credentials(_: &UnixStream) -> Result<()> {
+    Ok(())
+}
+#[cfg(all(not(target_os = "linux"), test))]
+async fn read_candidate<T: serde::de::DeserializeOwned>(
+    stream: &mut UnixStream,
+    peer: &VerifiedLocalSession,
+) -> Result<T> {
+    peer.principal()?;
+    Ok(read(stream).await?)
+}
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn enable_candidate_credentials(_: &UnixStream) -> Result<()> {
+    Err(anyhow!("candidate credentials unsupported"))
+}
+#[cfg(all(not(target_os = "linux"), not(test)))]
+async fn read_candidate<T: serde::de::DeserializeOwned>(
+    _: &mut UnixStream,
+    _: &VerifiedLocalSession,
+) -> Result<T> {
+    Err(anyhow!("candidate credentials unsupported"))
+}
+
 impl NativeAuthority {
     pub async fn serve_control(
         self: Arc<Self>,
@@ -56,7 +243,8 @@ impl NativeAuthority {
             | Request::Release { guest, .. }
             | Request::Cancel { guest, .. }
             | Request::SnapshotReady { guest, .. }
-            | Request::BeginSnapshot { guest, .. } => guest,
+            | Request::BeginSnapshot { guest, .. }
+            | Request::SnapshotStatus { guest, .. } => guest,
             _ => return Err(anyhow!("invalid native control start")),
         };
         if matches!(&first, Request::BeginSnapshot { .. }) {
@@ -75,6 +263,22 @@ impl NativeAuthority {
             );
         }
         let peer = self.launches.authenticate(&self.hotel, &stream, guest)?;
+        if let Request::BeginSnapshot { operation_id, .. }
+        | Request::SnapshotStatus { operation_id, .. } = &first
+        {
+            // The first frame is only a request to challenge; no fence or
+            // authority effect occurs until the actual sender confirms.
+            let id = Uuid::parse_str(operation_id)?;
+            enable_candidate_credentials(&stream)?;
+            let nonce = *Uuid::new_v4().as_bytes();
+            write(&mut stream, &Reply::SnapshotChallenge { nonce }).await?;
+            let confirm: Request = read_candidate(&mut stream, &peer).await?;
+            ensure!(
+                matches!(confirm, Request::ConfirmSnapshot { operation_id, nonce: got }
+                if Uuid::parse_str(&operation_id).ok() == Some(id) && got == nonce),
+                "candidate confirmation denied"
+            );
+        }
         match first {
             Request::BeginSnapshot { operation_id, .. } => {
                 let plan = self
@@ -105,7 +309,8 @@ impl NativeAuthority {
                 if before.digest() == plan.new_digest
                     && (plan.receipt)(plan.operation_id, plan.new_digest)?
                 {
-                    fence.finish()?;
+                    // A receipt alone does not prove this or any older
+                    // publisher is quiescent; require explicit recovery.
                     return Err(anyhow!("publisher operation already completed"));
                 }
                 ensure!(
@@ -113,24 +318,115 @@ impl NativeAuthority {
                     "publisher starting snapshot mismatch"
                 );
                 let previous = before.snapshot().generation;
-                tokio::time::timeout(Duration::from_secs(5),async {
-                    peer.principal()?;ensure!(peer.consumer()==plan.consumer,"publisher generation changed");
-                    let ready_time=(self.clock)();
-                    if ready_time<after_wait || ready_time>=plan.deadline {fence.finish()?;return Err(anyhow!("publisher deadline elapsed before permission"));}
-                    write(&mut stream,&Reply::Ready).await?;
-                    let finish:Request=read(&mut stream).await?;
-                    ensure!(matches!(finish,Request::FinishSnapshot {ref operation_id,digest} if Uuid::parse_str(operation_id).ok()==Some(plan.operation_id) && digest==plan.new_digest),"invalid publisher completion");
-                    let finish_time=(self.clock)();ensure!(finish_time>=ready_time && finish_time<plan.deadline,"publisher deadline elapsed");
-                    peer.principal()?;let after=source()?;self.verify_snapshot_binding(&after)?;
-                    ensure!(after.digest()==plan.new_digest && after.snapshot().generation==previous.checked_add(1).ok_or_else(||anyhow!("generation overflow"))?,"publisher resulting snapshot mismatch");
-                    ensure!((plan.receipt)(plan.operation_id,plan.new_digest)?,"publisher completion receipt missing");
-                    peer.principal()?;ensure!(peer.consumer()==plan.consumer,"publisher generation changed");
-                    let final_time=(self.clock)();ensure!(final_time>=finish_time && final_time<plan.deadline,"publisher deadline elapsed");
-                    // Completion is durable before the final ACK. Losing the
-                    // ACK after this point does not dirty the journal or retry.
-                    fence.finish()?;write(&mut stream,&Reply::Finished).await?;
-                    Ok::<(),anyhow::Error>(())
-                }).await??;
+                // Status is volatile and deliberately conservative after restart.
+                *self
+                    .publisher_status
+                    .lock()
+                    .map_err(|_| anyhow!("publisher status unavailable"))? =
+                    PublisherStatus::Pending;
+                let _status_guard = PublisherStatusGuard(self.publisher_status.clone());
+                let request_result = async {
+                    peer.principal()?;
+                    ensure!(peer.consumer() == plan.consumer, "publisher generation changed");
+                    let ready_time = (self.clock)();
+                    ensure!(ready_time >= after_wait && ready_time < plan.deadline, "publisher deadline elapsed");
+                    write(&mut stream, &Reply::Ready).await?;
+                    let finish: Request = read_candidate(&mut stream, &peer).await?;
+                    ensure!(matches!(finish, Request::FinishSnapshot { ref operation_id, digest }
+                        if Uuid::parse_str(operation_id).ok() == Some(plan.operation_id) && digest == plan.new_digest),
+                        "invalid publisher completion");
+                    peer.principal()?;
+                    ensure!(peer.consumer() == plan.consumer, "publisher generation changed");
+                    let finish_time = (self.clock)();
+                    ensure!(finish_time >= ready_time && finish_time < plan.deadline, "publisher deadline elapsed");
+                    Ok::<u64, anyhow::Error>(finish_time)
+                }.await;
+                // The publisher closes its stream after submission and stays
+                // alive until the trusted lifecycle owner stops it.
+                // Retain the actual fence until the trusted lifecycle owner has
+                // confirmed quiescence. Missing proof holds indefinitely; task
+                // cancellation/shutdown leaves the durable journal dirty.
+                if (plan.quiesce)().await.is_err() {
+                    *self
+                        .publisher_status
+                        .lock()
+                        .map_err(|_| anyhow!("publisher status unavailable"))? =
+                        PublisherStatus::RecoveryRequired;
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+                let finish_time = match request_result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        *self
+                            .publisher_status
+                            .lock()
+                            .map_err(|_| anyhow!("publisher status unavailable"))? =
+                            PublisherStatus::RecoveryRequired;
+                        return Err(error);
+                    }
+                };
+                let verified = (|| -> Result<()> {
+                    let after = source()?;
+                    self.verify_snapshot_binding(&after)?;
+                    ensure!(
+                        after.digest() == plan.new_digest
+                            && after.snapshot().generation
+                                == previous
+                                    .checked_add(1)
+                                    .ok_or_else(|| anyhow!("generation overflow"))?,
+                        "publisher resulting snapshot mismatch"
+                    );
+                    ensure!(
+                        (plan.receipt)(plan.operation_id, plan.new_digest)?,
+                        "publisher completion receipt missing"
+                    );
+                    let final_time = (self.clock)();
+                    ensure!(
+                        final_time >= finish_time && final_time < plan.deadline,
+                        "publisher deadline elapsed"
+                    );
+                    Ok(())
+                })();
+                if let Err(error) = verified {
+                    *self
+                        .publisher_status
+                        .lock()
+                        .map_err(|_| anyhow!("publisher status unavailable"))? =
+                        PublisherStatus::RecoveryRequired;
+                    return Err(error);
+                }
+                fence.finish()?;
+                *self
+                    .publisher_status
+                    .lock()
+                    .map_err(|_| anyhow!("publisher status unavailable"))? =
+                    PublisherStatus::Complete;
+                // One-way completion: do not wait for an ACK from an exited
+                // publisher. A separate authenticated consumer queries status.
+            }
+            Request::SnapshotStatus { operation_id, .. } => {
+                self.origin(&peer)?;
+                let plan = self
+                    .publisher_plan
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("publisher disabled"))?;
+                ensure!(
+                    Uuid::parse_str(&operation_id)? == plan.operation_id,
+                    "unknown publisher operation"
+                );
+                peer.principal()?;
+                let status = *self
+                    .publisher_status
+                    .lock()
+                    .map_err(|_| anyhow!("publisher status unavailable"))?;
+                let reply = match status {
+                    PublisherStatus::Unknown => Reply::SnapshotUnknown,
+                    PublisherStatus::Pending => Reply::SnapshotPending,
+                    PublisherStatus::Complete => Reply::SnapshotComplete,
+                    PublisherStatus::RecoveryRequired => Reply::SnapshotRecoveryRequired,
+                };
+                write(&mut stream, &reply).await?;
             }
             Request::SnapshotReady { digest, .. } => {
                 let mut fence = self.fence().await?;
@@ -423,4 +719,77 @@ struct IssuerFrame {
     sequence: u64,
     operation: String,
     parameters: serde_json::Value,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod candidate_ancillary_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// Run in a single-threaded disposable Linux process: /proc FD counts are
+    /// process-wide and unrelated concurrent tests would make them unreliable.
+    #[test]
+    #[ignore = "requires isolated Linux test process"]
+    fn candidate_truncated_rights_are_closed_before_rejection() {
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        let (sender, receiver) = StdUnixStream::pair().unwrap();
+        let one: libc::c_int = 1;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    receiver.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fds = vec![file.as_raw_fd(); 200];
+        let bytes = fds.len() * std::mem::size_of::<libc::c_int>();
+        let space = unsafe { libc::CMSG_SPACE(bytes as u32) } as usize;
+        let mut control = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
+        let mut payload = [7u8];
+        let mut iov = libc::iovec {
+            iov_base: payload.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space;
+        unsafe {
+            let h = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!h.is_null());
+            (*h).cmsg_level = libc::SOL_SOCKET;
+            (*h).cmsg_type = libc::SCM_RIGHTS;
+            (*h).cmsg_len = libc::CMSG_LEN(bytes as u32) as usize;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr(),
+                libc::CMSG_DATA(h).cast::<libc::c_int>(),
+                fds.len(),
+            );
+            assert_eq!(libc::sendmsg(sender.as_raw_fd(), &msg, 0), 1);
+        }
+        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = count();
+        let mut received = [0u8; 1];
+        assert!(
+            candidate_fragment(
+                receiver.as_raw_fd(),
+                &mut received,
+                unsafe { libc::geteuid() },
+                std::process::id()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            count(),
+            before,
+            "received descriptors leaked on ancillary truncation"
+        );
+    }
 }
