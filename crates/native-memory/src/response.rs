@@ -54,6 +54,18 @@ impl ResponseSigner {
             signing_seed,
         }
     }
+    /// Candidate snapshot mode must bind the local signing key to the pinned
+    /// verifier before emitting a response; the seed is never returned.
+    #[cfg(unix)]
+    pub fn verify_snapshot(
+        &self,
+        snapshot: &crate::grant_snapshot_candidate::LoadedSnapshot,
+    ) -> Result<()> {
+        if self.key_id != snapshot.snapshot().response_verifier.key_id {
+            return Err(Error::Denied);
+        }
+        snapshot.verify_response_seed(&self.signing_seed)
+    }
     /// Call only after verified execution/commit. Never sign an unverified error route.
     pub fn sign(&self, envelope: &Envelope, result: Response, now: u64) -> Result<SignedResponse> {
         if now < envelope.claims.issued_at || now >= envelope.claims.expires_at {

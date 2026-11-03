@@ -12,8 +12,22 @@ use std::{
 
 #[cfg(unix)]
 pub mod authority_control;
+#[cfg(unix)]
+pub mod grant_ledger_candidate;
+#[cfg(unix)]
+pub mod grant_publisher_candidate;
+#[cfg(unix)]
+pub mod grant_snapshot_candidate;
 pub mod memgraph;
 pub mod oauth;
+#[cfg(unix)]
+pub mod protected_peer_candidate;
+#[cfg(unix)]
+pub mod protected_stream_candidate;
+#[cfg(unix)]
+pub mod protected_transfer_candidate;
+#[cfg(unix)]
+pub mod recovery_candidate;
 pub mod response;
 
 pub const ROLE: &str = "native-memory-runner";

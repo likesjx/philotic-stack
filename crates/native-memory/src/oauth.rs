@@ -92,7 +92,7 @@ pub struct Authority {
     expires_at: u64,
 }
 
-fn version(value: &str) -> bool {
+pub(crate) fn version(value: &str) -> bool {
     let parts: Vec<_> = value.split(':').collect();
     parts.len() == 2
         && parts.iter().all(|p| {

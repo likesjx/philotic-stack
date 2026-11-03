@@ -57,6 +57,55 @@ jobs:
         run: cargo build --locked -p aiua -p native-memory
       - name: Real hotels and signed native runner through HTTP MCP
         run: PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p membrane-mcp real_hotels_native_runner_authenticated_mcp_composition -- --ignored --nocapture
+  publisher-identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.1'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the isolated test executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p native-memory --lib --no-run --message-format=json > "$RUNNER_TEMP/native-publisher-build.jsonl"
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          matches = []
+          for line in Path(os.environ['RUNNER_TEMP'], 'native-publisher-build.jsonl').read_text().splitlines():
+              item = json.loads(line)
+              if (item.get('reason') == 'compiler-artifact' and
+                  item.get('target', {}).get('name') == 'native_memory' and
+                  item.get('profile', {}).get('test') and item.get('executable')):
+                  matches.append(Path(item['executable']).resolve())
+          target = (Path(os.environ['GITHUB_WORKSPACE']) / 'target').resolve()
+          assert len(matches) == 1 and matches[0].is_relative_to(target) and os.access(matches[0], os.X_OK), matches
+          Path(os.environ['RUNNER_TEMP'], 'native-publisher-test-path').write_text(str(matches[0]))
+          PYCODE
+      - name: Linux packet and stream identity tests
+        run: cargo test --locked -p native-memory --lib protected_ -- --test-threads=1
+      - name: Isolated descriptor and truncation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_bin="$(cat "$RUNNER_TEMP/native-publisher-test-path")"
+          test_name="protected_transfer_candidate::tests::linux_isolated_rejects_rights_and_truncation_without_fd_leaks"
+          "$test_bin" --list --ignored | grep -Fx "$test_name: test"
+          "$test_bin" --exact "$test_name" --ignored --test-threads=1
+      - name: Disposable root and dropped-UID test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_bin="$(cat "$RUNNER_TEMP/native-publisher-test-path")"
+          test_name="protected_transfer_candidate::tests::real_linux_root_receiver_rejects_dropped_uid_child"
+          "$test_bin" --list --ignored | grep -Fx "$test_name: test"
+          sudo -n "$test_bin" --exact "$test_name" --ignored --test-threads=1
   package-linux:
     needs: capture
     runs-on: ubuntu-24.04

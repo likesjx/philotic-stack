@@ -10,6 +10,22 @@ use tokio::{
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    /// Opt-in snapshot mode requires an independently authenticated hotel to
+    /// confirm the exact active digest; legacy hotels reject this frame.
+    SnapshotReady {
+        guest: String,
+        digest: [u8; 32],
+    },
+    /// Candidate root publisher lifecycle; all operation limits are supplied by
+    /// trusted hotel configuration, never by this caller.
+    BeginSnapshot {
+        guest: String,
+        operation_id: String,
+    },
+    FinishSnapshot {
+        operation_id: String,
+        digest: [u8; 32],
+    },
     Admit {
         guest: String,
         token: String,
@@ -39,6 +55,7 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
+    SnapshotReady,
     Permit { handle: String },
     Ready,
     Finished,
