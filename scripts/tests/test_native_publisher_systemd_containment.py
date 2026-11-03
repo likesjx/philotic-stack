@@ -51,7 +51,12 @@ class SystemdContainment(unittest.TestCase):
         self.assertIn('LoadState=not-found', absent.stdout.splitlines())
         directory = tempfile.mkdtemp(prefix='philotic-containment-')
         cg_events = pathlib.Path('/sys/fs/cgroup/system.slice') / unit / 'cgroup.events'
+        # The restricted root service has no DAC override; do not depend on
+        # traversing the runner's private home directory.
+        fixture_script = pathlib.Path(directory) / 'fixture.py'
         try:
+            shutil.copyfile(pathlib.Path(__file__).resolve(), fixture_script)
+            os.chmod(fixture_script, 0o600)
             start = cmd('/usr/bin/systemd-run', '--system', '--unit=' + unit,
             '--slice=system.slice', '--property=Type=exec', '--property=User=root',
             '--property=KillMode=control-group', '--property=TimeoutStopSec=2s',
@@ -59,12 +64,16 @@ class SystemdContainment(unittest.TestCase):
             '--property=CapabilityBoundingSet=', '--property=ProtectControlGroups=yes',
             '--property=ProtectSystem=strict', '--property=ReadWritePaths=' + directory,
             '--property=PrivateNetwork=yes', '--property=UMask=0077',
-            '/usr/bin/python3', str(pathlib.Path(__file__).resolve()), '--service', directory)
+            '/usr/bin/python3', str(fixture_script), '--service', directory)
             self.assertEqual(start.returncode, 0, start.stderr)
             root = pathlib.Path(directory)
             limit = time.monotonic() + 12
             while not all((root / name).is_file() for name in ('leader', 'descendant', 'effect')):
-                self.assertLess(time.monotonic(), limit, 'service did not start')
+                if time.monotonic() >= limit or cmd('/usr/bin/systemctl', 'is-failed', unit).returncode == 0:
+                    state = cmd('/usr/bin/systemctl', 'show', unit, '--property=ActiveState',
+                                '--property=Result', '--property=ExecMainStatus')
+                    journal = cmd('/usr/bin/journalctl', '-u', unit, '-n', '15', '--no-pager')
+                    self.fail('synthetic service did not start: ' + state.stdout + journal.stdout)
                 time.sleep(0.05)
             main = int((root / 'leader').read_text())
             desc = int((root / 'descendant').read_text())
