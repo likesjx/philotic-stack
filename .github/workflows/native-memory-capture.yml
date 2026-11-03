@@ -106,6 +106,11 @@ jobs:
           test_name="protected_transfer_candidate::tests::real_linux_root_receiver_rejects_dropped_uid_child"
           "$test_bin" --list --ignored | grep -Fx "$test_name: test"
           sudo -n "$test_bin" --exact "$test_name" --ignored --test-threads=1
+      - name: Disposable root service descendant containment experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n env PHILOTIC_DISPOSABLE_SYSTEMD_TEST=1 /usr/bin/python3 scripts/tests/test_native_publisher_systemd_containment.py -v
   package-linux:
     needs: capture
     runs-on: ubuntu-24.04
