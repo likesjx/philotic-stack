@@ -1,5 +1,11 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Native endpoint preapproval maintenance — 2026-11-03
+
+- Focused draft: hotel-owned atomic expiry update preserves guest/PID/generation/listener state; full provisioning now mints an incarnation to fence delayed maintenance across recreation. [Protocol, tests, limits and rollout](native-preapproval-maintenance.md).
+- Qualification: local storage, IPC, actual-child/concurrent-supervisor and membrane negative cases; exact-head Linux qualification remains reported in PR checks. No production installation or grant extension in this work.
+- Next: independently reviewed exact package, separate runtime replacement approval and live effective-state verification. OAuth connection evidence is separate from memory round-trip acceptance; no personal data was read. Muninn/graph bootstrap and harness telemetry deferred under task restrictions.
+
 ## Native memory capture vertical slice — 2026-10-29
 
 - Scope: authenticated membrane → signed fixed request → destination router/guest → native observation remember/recall. First intended client Percival/dot, then Claude; no callable dot connector or live capture is claimed. Preserve source content, stable IDs, owner/subject/authenticated writer/provenance. No enrichment, confirmed fact/goal edits, consolidation or unrelated-agent recovery.

@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 /// LWW-merged on `updated_at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpEndpointConfig {
+    /// Hotel-minted on full provisioning, never caller authority. Distinguishes
+    /// recreation from an identical older configuration for delayed maintenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_incarnation: Option<String>,
     /// Stable ID for this endpoint (e.g. `"bjork-mcp-01"`).
     pub endpoint_id: String,
     /// Agent that owns and may update this endpoint.
@@ -330,6 +334,7 @@ mod tests {
     #[test]
     fn full_endpoint_config() {
         round_trip(&McpEndpointConfig {
+            approval_incarnation: None,
             endpoint_id: "bjork-mcp-01".into(),
             owner_agent_id: "agent-bjork-01".into(),
             port: 8910,

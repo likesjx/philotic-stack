@@ -49,6 +49,7 @@ jobs:
       - run: cargo test --locked -p aiua native_authority
       - run: cargo test --locked -p aiua manager_never_signals_stored_pid
       - run: cargo test --locked -p aiua concrete_child_retirement_and_replacement
+      - run: cargo test --locked -p aiua native_preapproval
       - run: NODE_TEST_EXECUTABLE="$(command -v node)" cargo test --locked -p aiua sealed_node_bundle_survives_source_replacement_and_cannot_be_written -- --ignored --nocapture
       - run: cargo check --locked -p data-memorygraphrag --all-targets
       - run: cargo clippy --locked -p native-memory -p membrane -p membrane-mcp -p ansible-mesh-core --all-targets

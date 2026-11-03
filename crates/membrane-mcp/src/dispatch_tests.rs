@@ -470,6 +470,7 @@ fn endpoint_with(
     default_auth: Option<McpAuthScheme>,
 ) -> McpEndpointConfig {
     McpEndpointConfig {
+        approval_incarnation: None,
         endpoint_id: "test-ep".into(),
         owner_agent_id: "agent-test".into(),
         port: 9100,
