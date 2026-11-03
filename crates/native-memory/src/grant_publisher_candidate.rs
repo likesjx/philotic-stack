@@ -71,13 +71,12 @@ pub fn publish_root_owned(
     path: &Path,
     group: u32,
     binding: &ExpectedBinding<'_>,
-    id: &str,
-    expected: &str,
-    bytes: &[u8],
+    operation: (&str, &str, &[u8]),
     clock: &dyn Fn() -> u64,
-    max_expiry: u64,
-    deadline: u64,
+    window: (u64, u64),
 ) -> Result<String> {
+    let (id, expected, bytes) = operation;
+    let (max_expiry, deadline) = window;
     publish_for_owner(
         ledger,
         path,
@@ -124,12 +123,9 @@ pub fn publish_through_hotel(
             path,
             group,
             binding,
-            &id.to_string(),
-            expected_old,
-            bytes,
+            (&id.to_string(), expected_old, bytes),
             clock,
-            max_expiry,
-            deadline,
+            (max_expiry, deadline),
         )
         .map_err(|_| crate::Error::Uncertain)?;
         if actual != hex(expected) {
@@ -213,8 +209,7 @@ fn publish_for_owner(
         bytes,
         binding,
         &observed_clock,
-        max_expiry,
-        deadline,
+        (max_expiry, deadline),
     ) {
         Ok(value) => value,
         Err(LedgerError::Invalid | LedgerError::Denied | LedgerError::Conflict) => {

@@ -233,9 +233,9 @@ impl Ledger {
         bytes: &[u8],
         binding: &crate::grant_snapshot_candidate::ExpectedBinding<'_>,
         clock: &dyn Fn() -> u64,
-        max_expiry: u64,
-        deadline: u64,
+        window: (u64, u64),
     ) -> Result<String> {
+        let (max_expiry, deadline) = window;
         use sha2::{Digest, Sha256};
         if self.uncertain {
             return Err(LedgerError::Uncertain);
@@ -807,8 +807,7 @@ pub(crate) mod tests {
                 &serde_json::to_vec(&next).unwrap(),
                 &invalid_binding,
                 &|| 101,
-                1200,
-                1000
+                (1200, 1000)
             ),
             Err(LedgerError::Denied)
         );
@@ -826,8 +825,7 @@ pub(crate) mod tests {
                     &serde_json::to_vec(&next).unwrap(),
                     &binding,
                     &clock,
-                    1200,
-                    deadline
+                    (1200, deadline)
                 ),
                 Err(LedgerError::Uncertain)
             );
@@ -842,14 +840,13 @@ pub(crate) mod tests {
                 &serde_json::to_vec(&widened).unwrap(),
                 &binding,
                 &|| 101,
-                1200,
-                1000
+                (1200, 1000)
             ),
             Err(LedgerError::Denied)
         );
         let bytes = serde_json::to_vec(&next).unwrap();
         let new = ledger
-            .publish_snapshot(&id, &old, &bytes, &binding, &|| 101, 1200, 1000)
+            .publish_snapshot(&id, &old, &bytes, &binding, &|| 101, (1200, 1000))
             .unwrap();
         assert_eq!(
             ledger.status(&id).unwrap(),
@@ -932,8 +929,7 @@ pub(crate) mod tests {
                 &serde_json::to_vec(&next).unwrap(),
                 &binding,
                 &|| 101,
-                1200,
-                1000
+                (1200, 1000)
             ),
             Err(LedgerError::Conflict)
         );
@@ -949,8 +945,7 @@ pub(crate) mod tests {
                 &serde_json::to_vec(&revoked).unwrap(),
                 &binding,
                 &|| 101,
-                1200,
-                1000,
+                (1200, 1000),
             )
             .unwrap();
         ledger
@@ -977,8 +972,7 @@ pub(crate) mod tests {
                 &serde_json::to_vec(&revoked).unwrap(),
                 &binding,
                 &|| 101,
-                1200,
-                1000
+                (1200, 1000)
             ),
             Err(LedgerError::Denied)
         );

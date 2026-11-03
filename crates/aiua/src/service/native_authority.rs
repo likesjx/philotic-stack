@@ -477,8 +477,7 @@ impl NativeAuthority {
             bytes,
             binding,
             self.clock.as_ref(),
-            max_expiry,
-            deadline,
+            (max_expiry, deadline),
         ) {
             Ok(digest) => {
                 fence.finish()?;
