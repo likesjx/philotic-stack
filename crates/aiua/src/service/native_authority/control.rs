@@ -726,6 +726,23 @@ mod candidate_ancillary_tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
+    #[test]
+    fn candidate_fragment_without_kernel_credentials_is_denied() {
+        use std::io::Write as _;
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Deliberately do not enable SO_PASSCRED on the receiving socket.
+        sender.write_all(&[7]).unwrap();
+        let mut out = [0u8; 1];
+        let error = candidate_fragment(
+            receiver.as_raw_fd(),
+            &mut out,
+            unsafe { libc::geteuid() },
+            std::process::id(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
     /// Run in a single-threaded disposable Linux process: /proc FD counts are
     /// process-wide and unrelated concurrent tests would make them unreliable.
     #[test]

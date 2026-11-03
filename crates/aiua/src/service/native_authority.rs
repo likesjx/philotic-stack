@@ -2164,6 +2164,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn candidate_status_confirmation_rejects_wrong_operation_and_retired_consumer() {
+        use native_memory::authority_control::{Reply, Request, read, write};
+        for mode in ["wrong_operation", "retired"] {
+            let mut f = Fixture::new();
+            install_synthetic_snapshot_source(&mut f);
+            let uid = unsafe { libc::geteuid() };
+            let id = Uuid::new_v4();
+            f.authority
+                .launches
+                .attach_new(
+                    "publisher",
+                    uid,
+                    LaunchPrincipal {
+                        stable_agent_id: "publisher".into(),
+                        roles: BTreeSet::new(),
+                    },
+                    Arc::new(Process(f.alive.clone())),
+                )
+                .unwrap();
+            let consumer = f.authority.launches.target("hotel", "publisher").unwrap();
+            Arc::get_mut(&mut f.authority)
+                .unwrap()
+                .experimental_set_publisher_plan(PublisherPlan {
+                    guest: "publisher".into(),
+                    consumer,
+                    operation_id: id,
+                    old_digest: [1; 32],
+                    new_digest: [2; 32],
+                    deadline: 200,
+                    receipt: Arc::new(|_, _| Ok(true)),
+                    quiesce: Arc::new(|| Box::pin(async { Ok(()) })),
+                })
+                .unwrap();
+            let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+            let authority = f.authority.clone();
+            let policy = f.policy.clone();
+            let task = tokio::spawn(async move {
+                authority
+                    .control(server, Arc::new(move || Ok(policy.clone())))
+                    .await
+            });
+            write(
+                &mut client,
+                &Request::SnapshotStatus {
+                    guest: "membrane".into(),
+                    operation_id: id.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            let nonce = match read::<Reply>(&mut client).await.unwrap() {
+                Reply::SnapshotChallenge { nonce } => nonce,
+                _ => panic!("challenge"),
+            };
+            if mode == "retired" {
+                f.authority
+                    .launches
+                    .attach(
+                        "membrane",
+                        uid,
+                        LaunchPrincipal {
+                            stable_agent_id: "membrane".into(),
+                            roles: BTreeSet::new(),
+                        },
+                        Arc::new(Process(f.alive.clone())),
+                    )
+                    .unwrap();
+            }
+            let confirm_id = if mode == "wrong_operation" {
+                Uuid::new_v4()
+            } else {
+                id
+            };
+            let _ = write(
+                &mut client,
+                &Request::ConfirmSnapshot {
+                    operation_id: confirm_id.to_string(),
+                    nonce,
+                },
+            )
+            .await;
+            assert!(task.await.unwrap().is_err(), "{mode}");
+            assert_eq!(
+                std::fs::read(f.dir.join("uncertainty")).unwrap(),
+                b"clean\n",
+                "{mode}"
+            );
+        }
+    }
+
     /// Linux only: the connected publisher remains alive while a forked
     /// process writes through its inherited descriptor. No root needed.
     #[cfg(target_os = "linux")]
