@@ -36,6 +36,23 @@ def cmd(*args, timeout=10):
                           stderr=subprocess.PIPE, timeout=timeout, check=False)
 
 
+def cleanup_problems(rule_error, cleanup_errors, inactive, decoy_inactive, empty, decoy_empty):
+    """Return status labels only; never infer success from an unknown result."""
+    problems = []
+    if rule_error:
+        problems.append('rule-removal-error')
+    problems.extend(cleanup_errors)
+    if not inactive:
+        problems.append('target-not-confirmed-inactive')
+    if not decoy_inactive:
+        problems.append('decoy-not-confirmed-inactive')
+    if not empty:
+        problems.append('target-cgroup-not-confirmed-empty')
+    if not decoy_empty:
+        problems.append('decoy-cgroup-not-confirmed-empty')
+    return problems
+
+
 class SystemdContainment(unittest.TestCase):
     def test_disposable_unit_stop_contains_setsid_descendant(self):
         if os.environ.get('PHILOTIC_DISPOSABLE_SYSTEMD_TEST') != '1':
@@ -164,6 +181,7 @@ class SystemdContainment(unittest.TestCase):
         finally:
             # Reconcile the exact fresh unit even if start acknowledgement failed.
             # Preserve synthetic evidence if either service or cgroup is uncertain.
+            prior_failure = sys.exc_info()[1]
             try:
                 rule_error = None
                 try:
@@ -183,14 +201,15 @@ class SystemdContainment(unittest.TestCase):
                                       '--process $$ --detail unit "$1" --detail verb stop',
                                       'policy-check', unit, timeout=8)
                         if revoked.returncode != 1:
-                            raise RuntimeError('temporary policy revocation not confirmed')
+                            cleanup_errors.append('policy-revocation-check-exit-' + str(revoked.returncode))
                     except Exception as error:
-                        cleanup_errors.append(error)
+                        cleanup_errors.append('policy-revocation-check-' + type(error).__name__)
                 for name in (unit, decoy):
                     try:
                         cmd('/usr/bin/systemctl', '--no-ask-password', 'stop', name, timeout=12)
                     except Exception as error:
-                        cleanup_errors.append(error)
+                        label = 'target' if name == unit else 'decoy'
+                        cleanup_errors.append(label + '-stop-' + type(error).__name__)
                 state = cmd('/usr/bin/systemctl', 'show', unit, '--property=LoadState', '--property=ActiveState')
                 fields = dict(x.split('=', 1) for x in state.stdout.splitlines() if '=' in x)
                 inactive = fields.get('LoadState') == 'not-found' or (
@@ -201,10 +220,12 @@ class SystemdContainment(unittest.TestCase):
                     decoy_state.returncode == 0 and decoy_fields.get('ActiveState') in ('inactive', 'failed'))
                 empty = not cg_events.exists() or 'populated 0' in cg_events.read_text().splitlines()
                 decoy_empty = not decoy_events.exists() or 'populated 0' in decoy_events.read_text().splitlines()
-                if rule_error or cleanup_errors or not inactive or not decoy_inactive or not empty or not decoy_empty:
-                    raise RuntimeError('rule, unit, decoy, or cgroup state uncertain') from rule_error
+                problems = cleanup_problems(rule_error, cleanup_errors, inactive, decoy_inactive, empty, decoy_empty)
+                if problems:
+                    raise RuntimeError('cleanup uncertain: ' + ', '.join(problems))
             except Exception as error:
-                raise RuntimeError('synthetic evidence retained at ' + directory) from error
+                # Preserve both the original test failure and cleanup diagnosis.
+                raise RuntimeError('synthetic evidence retained at ' + directory + ': ' + str(error)) from (prior_failure or error)
             else:
                 shutil.rmtree(directory)
 
