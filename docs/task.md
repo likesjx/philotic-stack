@@ -1,8 +1,13 @@
 # Ansible Mesh Architecture Separation Task List
 
+## LifeGraph recall provenance — 2026-11-05
+
+- Local follow-on from develop `4c30a79f`: retain typed ranked evidence, source/passage and retrieval provenance; preserve authority and differing evidence during deduplication under existing complete-record budgets. [Contract](architecture/LIFE_GRAPH_RECALL_PROVENANCE.md).
+- Local qualification: 695 Philote, 44 memory-core, 228 graph-contract and 57 runner/provider tests, plus three protected actual-process acceptance tests passed. Independent review and publication coordinated separately. No memory migration, deletion, new gateway or deployment.
+
 ## Automatic recall outcome contract (2026-11-05)
 
-Implemented on `codex/automatic-recall-status`, based on merged develop `8fa2a79f`: bounded per-lane outcomes distinguish scoped no-match from incomplete recall without changing retrieval or candidate write authority. See [contract](architecture/AUTOMATIC_RECALL_STATUS.md). Local verification recorded in the contract; independent review and exact-head CI pending. No deployment.
+Implemented on `codex/automatic-recall-status`, based on merged develop `8fa2a79f`: bounded per-lane outcomes distinguish scoped no-match from incomplete recall without changing retrieval or candidate write authority. See [contract](architecture/AUTOMATIC_RECALL_STATUS.md). Integrated via [PR #691](https://github.com/likesjx/philotic-stack/pull/691) at develop `4c30a79f`; independent review and all eight exact-head checks passed. No deployment.
 
 ## Runner-owned native graph tools — 2026-11-05
 

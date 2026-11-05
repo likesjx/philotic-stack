@@ -10,6 +10,7 @@ tags:
 - recall
 - provenance
 related_docs:
+- LIFE_GRAPH_RECALL_PROVENANCE.md
 - ARCHITECTURE_STATUS.md
 - NATIVE_GRAPH_TOOLS_PROPOSAL.md
 task_refs:
@@ -73,8 +74,10 @@ logs/events. This is not a universal redaction boundary for the rest of the stac
 
 ## Disposition
 
-Implemented on the feature branch; independent review and remote exact-head CI
-remain pending. Local qualification is recorded below.
+Integrated into develop via [PR #691](https://github.com/likesjx/philotic-stack/pull/691),
+merge `4c30a79f`, after independent review and all eight exact-head CI checks passed.
+Original local qualification is recorded below; the additive provenance follow-on
+is described in [LifeGraph recall provenance](LIFE_GRAPH_RECALL_PROVENANCE.md).
 No production deployment or live-runtime qualification.
 
 ## Current slice

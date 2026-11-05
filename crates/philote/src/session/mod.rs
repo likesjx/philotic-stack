@@ -2019,8 +2019,9 @@ impl SessionState {
     ///
     /// Non-blocking by construction: only the cache is consulted — never the
     /// runner. Entries older than `max_age_secs` are skipped (stale), records are
-    /// deduplicated by node id (against both the cache lanes and any memories the
-    /// Muninn lane already recalled). Whole records fit the legacy `char_budget`
+    /// deduplicated by node id/content only when stored evidence, policy filters
+    /// and evidence paths agree. Different provenance remains separate, including
+    /// a Muninn continuity copy. Whole records fit the legacy `char_budget`
     /// setting using serialized UTF-8 bytes including metadata, escaping, array
     /// brackets and separators. Oversized records are omitted, never sliced or
     /// marked; cached originals remain unchanged. Returns complete records injected.
@@ -2030,7 +2031,7 @@ impl SessionState {
     /// so a strategy added later to the auto-recall lane's strategy list —
     /// e.g. `current_prompt_semantic` — isn't starved by two strategies'
     /// worth of records filling the budget first. Dedup precedence (first
-    /// strategy in cache order wins a shared node id) is decided before
+    /// strategy in cache order wins equivalent evidence) is decided before
     /// interleaving, so it is unaffected by the round-robin ordering.
     pub fn inject_cached_life_context(
         &mut self,
@@ -2063,21 +2064,21 @@ impl SessionState {
         } else {
             RecallOutcome::NoMatch
         };
-        let mut seen_ids: std::collections::HashSet<String> = turn
-            .recalled_memories
-            .iter()
-            .filter_map(|memory| memory.id.clone())
-            .collect();
-        // Cross-lane content dedup: the auto-capture lane forks one memory
-        // candidate into both Muninn and the LifeGraph, so the same fact can
-        // come back from both recall lanes under different ids (Muninn ULID
-        // vs life:* node id). Id dedup can't catch that; normalized content
-        // fingerprints can.
-        let mut seen_fingerprints: std::collections::HashSet<u64> = turn
-            .recalled_memories
-            .iter()
-            .filter_map(|memory| recalled_content_fingerprint(&memory.content))
-            .collect();
+        // Only collapse duplicate identity/content when the complete stored
+        // evidence agrees. Equal prose is not proof of equal authority/source.
+        // Legacy None/None records retain the established dedup behavior.
+        let mut seen_ids: std::collections::HashMap<&str, Vec<&RecalledMemoryRecord>> =
+            Default::default();
+        let mut seen_content: std::collections::HashMap<u64, Vec<&RecalledMemoryRecord>> =
+            Default::default();
+        for record in &turn.recalled_memories {
+            if let Some(id) = record.id.as_deref() {
+                seen_ids.entry(id).or_default().push(record);
+            }
+            if let Some(fingerprint) = recalled_content_fingerprint(&record.content) {
+                seen_content.entry(fingerprint).or_default().push(record);
+            }
+        }
 
         let mut lanes: Vec<std::collections::VecDeque<RecalledMemoryRecord>> = Vec::new();
         for entry in &self.life_recall_cache {
@@ -2086,15 +2087,25 @@ impl SessionState {
             }
             let mut lane = std::collections::VecDeque::new();
             for record in &entry.records {
-                if let Some(id) = record.id.as_deref() {
-                    if !seen_ids.insert(id.to_string()) {
-                        continue;
-                    }
+                let same_evidence =
+                    |other: &&RecalledMemoryRecord| record.same_life_graph_evidence(other);
+                let fingerprint = recalled_content_fingerprint(&record.content);
+                let duplicate = record
+                    .id
+                    .as_deref()
+                    .and_then(|id| seen_ids.get(id))
+                    .is_some_and(|records| records.iter().any(same_evidence))
+                    || fingerprint
+                        .and_then(|fp| seen_content.get(&fp))
+                        .is_some_and(|records| records.iter().any(same_evidence));
+                if duplicate {
+                    continue;
                 }
-                if let Some(fingerprint) = recalled_content_fingerprint(&record.content) {
-                    if !seen_fingerprints.insert(fingerprint) {
-                        continue;
-                    }
+                if let Some(id) = record.id.as_deref() {
+                    seen_ids.entry(id).or_default().push(record);
+                }
+                if let Some(fingerprint) = fingerprint {
+                    seen_content.entry(fingerprint).or_default().push(record);
                 }
                 lane.push_back(record.clone());
             }
@@ -4331,6 +4342,38 @@ impl SessionState {
             facts.push(when);
         }
         facts.push(origin.to_string());
+        if let Some(provenance) = &memory.life_graph_provenance {
+            let evidence = &provenance.ranked_packet.packet;
+            let authority =
+                serde_json::to_value(evidence.context_authority()).expect("authority serializes");
+            facts.push(format!(
+                "life authority: {}",
+                authority.as_str().expect("authority is an enum string")
+            ));
+            if evidence.validation_state != data_memorygraphrag::ValidationState::Confirmed {
+                facts.push("not confirmed LifeGraph truth".into());
+            }
+            if evidence.source_refs.iter().any(|source| {
+                matches!(
+                    source.source_kind,
+                    data_memorygraphrag::SourceKind::MuninnEngram
+                )
+            }) || evidence
+                .passage_refs
+                .iter()
+                .any(|passage| passage.muninn_engram_id.is_some())
+            {
+                facts.push(
+                    "Muninn refs are continuity handles, not confirmed LifeGraph truth".into(),
+                );
+            }
+            if !evidence.conflict_ids.is_empty() || !provenance.omitted_conflict_ids.is_empty() {
+                facts.push(
+                    "conflict references retained; do not infer resolution from recall".into(),
+                );
+            }
+        }
+
         // Stored frame facts only — inferred kinds/scopes/authority added
         // tokens without adding information.
         if let Some(kind) = frame.temporal_kind {
@@ -4363,6 +4406,18 @@ impl SessionState {
         if let Some(object) = metadata.as_object_mut() {
             object.remove("content");
             object.remove("concept");
+            // Claim text is already rendered above. All other stored evidence
+            // stays complete; never shorten source, scope or qualifications.
+            if let Some(evidence) = object
+                .get_mut("life_graph_provenance")
+                .and_then(|p| p.get_mut("ranked_packet"))
+                .and_then(|p| p.get_mut("packet"))
+                .and_then(Value::as_object_mut)
+                && evidence.get("claim_summary").and_then(Value::as_str)
+                    == Some(memory.content.as_str())
+            {
+                evidence.remove("claim_summary");
+            }
         }
         format!(
             "[{}] {} ({})\n   Stored metadata: {}",
