@@ -119,7 +119,28 @@ impl Fixture {
                 ..
             }
         ));
+        // Authorization cases control their own lease window. The global
+        // cfg(test) one-second TTL is for lease-handler expiry tests, not a
+        // deadline for these unrelated UDS round trips.
+        let now = unix_ts();
+        self.replace_membrane_lease(now, u64::MAX - now).await;
         client
+    }
+
+    async fn replace_membrane_lease(&self, now: u64, ttl: u64) -> philotic_client::LeaseEnvelope {
+        use crate::service::lease::{LeaseAcquireOutcome, NoopLeaseObserver};
+        let connection = self.inboxes.lock().await["mcp-membrane"][0].conn_id;
+        let mut leases = self.leases.lock().await;
+        let mut observer = NoopLeaseObserver;
+        let candidate = leases
+            .release("mcp-membrane-fixture", connection, &mut observer)
+            .expect("fixture membrane must already hold its lease");
+        let outcome = leases.acquire(connection, candidate, ttl, now, &mut observer);
+        let LeaseAcquireOutcome::Granted(lease) = outcome else {
+            panic!("fixture lease replacement was denied: {outcome:?}");
+        };
+        assert_eq!(lease.lease_expires_at, now + ttl);
+        lease
     }
 }
 fn advertisement() -> RunnerToolAdvertisement {
@@ -144,19 +165,33 @@ async fn advertise(client: &mut PhiloticClient, ad: RunnerToolAdvertisement) -> 
         IpcResponse::Standard { ok: true, .. }
     )
 }
+async fn descriptor_response(
+    client: &mut PhiloticClient,
+    endpoint: &str,
+    tool: &str,
+) -> IpcResponse {
+    client
+        .send_request(IpcRequest::GetRunnerTool {
+            endpoint_id: endpoint.into(),
+            tool_name: tool.into(),
+            caller_id: "fixture-caller".into(),
+        })
+        .await
+        .expect("fixture descriptor IPC request failed")
+}
 async fn visible(client: &mut PhiloticClient, endpoint: &str, tool: &str) -> bool {
     matches!(
-        client
-            .send_request(IpcRequest::GetRunnerTool {
-                endpoint_id: endpoint.into(),
-                tool_name: tool.into(),
-                caller_id: "fixture-caller".into(),
-            })
-            .await
-            .unwrap(),
+        descriptor_response(client, endpoint, tool).await,
         IpcResponse::Standard { ok: true, .. }
     )
 }
+fn assert_fixture_response(response: IpcResponse, expected_ok: bool, expected_message: &str) {
+    assert!(
+        matches!(&response, IpcResponse::Standard { ok, message, .. } if *ok == expected_ok && message.contains(expected_message)),
+        "expected ok={expected_ok} and message containing {expected_message:?}; got {response:?}"
+    );
+}
+
 fn invocation(caller: &str, arguments: serde_json::Value) -> IpcRequest {
     IpcRequest::InvokeRunnerTool {
         endpoint_id: "fixture".into(),
@@ -395,12 +430,25 @@ async fn native_runner_tools_assembly_uses_only_preselected_authorized_routes() 
 
 #[tokio::test]
 async fn native_runner_tools_expired_approval_and_expired_lease_fail_closed() {
-    use crate::service::lease::NoopLeaseObserver;
     let fixture = Fixture::new().await;
     let mut runner = fixture.runner().await;
     assert!(advertise(&mut runner, advertisement()).await);
     let mut membrane = fixture.membrane().await;
-    assert!(visible(&mut membrane, "fixture", "node-recall").await);
+    assert_eq!(
+        fixture
+            .leases
+            .lock()
+            .await
+            .inspect("mcp-membrane-fixture")
+            .unwrap()
+            .lease_expires_at,
+        u64::MAX
+    );
+    assert_fixture_response(
+        descriptor_response(&mut membrane, "fixture", "node-recall").await,
+        true,
+        "Success",
+    );
     let original = fixture
         .graph
         .get_config_value("__mcp_endpoint__:fixture")
@@ -412,34 +460,43 @@ async fn native_runner_tools_expired_approval_and_expired_lease_fail_closed() {
         .graph
         .set_config_value("__mcp_endpoint__:fixture", &config.to_string())
         .unwrap();
-    assert!(!visible(&mut membrane, "fixture", "node-recall").await);
+    assert_fixture_response(
+        descriptor_response(&mut membrane, "fixture", "node-recall").await,
+        false,
+        "native runner requires finite target-bound preapproval",
+    );
     fixture
         .graph
         .set_config_value("__mcp_endpoint__:fixture", &original)
         .unwrap();
-    let connection = fixture.inboxes.lock().await["mcp-membrane"][0].conn_id;
-    {
-        let mut leases = fixture.leases.lock().await;
-        let mut observer = NoopLeaseObserver;
-        let candidate = leases
-            .release("mcp-membrane-fixture", connection, &mut observer)
-            .unwrap();
-        leases.acquire(connection, candidate, 0, unix_ts(), &mut observer);
-    }
-    assert!(
-        !visible(&mut membrane, "fixture", "node-recall").await,
-        "active status alone cannot extend an expired deadline"
+    // Restore a successful control before isolating the lease deadline case.
+    assert_fixture_response(
+        descriptor_response(&mut membrane, "fixture", "node-recall").await,
+        true,
+        "Success",
     );
-    assert!(matches!(
+    let expired = fixture.replace_membrane_lease(0, 0).await;
+    assert!(
+        expired.is_active(),
+        "status remains Active; the deadline must cause denial"
+    );
+    assert_eq!(expired.lease_expires_at, 0);
+    assert_fixture_response(
+        descriptor_response(&mut membrane, "fixture", "node-recall").await,
+        false,
+        "membrane lease expired",
+    );
+    assert_fixture_response(
         membrane
             .send_request(invocation(
                 "fixture-caller",
-                serde_json::json!({"id":"goal"})
+                serde_json::json!({"id":"goal"}),
             ))
             .await
             .unwrap(),
-        IpcResponse::Standard { ok: false, .. }
-    ));
+        false,
+        "membrane lease expired",
+    );
 }
 
 #[test]
