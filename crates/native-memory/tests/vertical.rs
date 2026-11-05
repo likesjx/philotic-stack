@@ -342,6 +342,84 @@ fn delayed_revocation_or_expiry_rolls_back_before_acknowledgement() {
 
 #[cfg(unix)]
 #[test]
+fn experimental_single_snapshot_revocation_denies_real_runner_before_commit() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let snapshot = dir.path().join("snapshot.json");
+    let (ingress, policy) = setup();
+    let envelope = issue(&ingress, "snapshot-event", "snapshot-nonce", command());
+    std::fs::write(&snapshot, serde_json::to_vec(&policy).unwrap()).unwrap();
+    std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut calls = 0;
+    let mut runner = open(&db);
+    let result = runner.execute_current(
+        &envelope,
+        || {
+            calls += 1;
+            if calls == 2 {
+                let mut revoked = policy.clone();
+                let grant = revoked.grants.get_mut("caller-1").unwrap();
+                grant.revision += 1;
+                grant.revoked = true;
+                let next = dir.path().join("snapshot.next");
+                std::fs::write(&next, serde_json::to_vec(&revoked).unwrap()).unwrap();
+                std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::rename(next, &snapshot).unwrap();
+            }
+            Ok((Policy::load(&snapshot)?, 101))
+        },
+        &AtomicBool::new(false),
+    );
+    assert_eq!(result, Err(Error::Denied));
+    assert_eq!(
+        calls, 2,
+        "revocation must be observed at the commit recheck"
+    );
+    drop(runner);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    for table in ["observations", "receipts", "nonces"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    drop(connection);
+    let mut restarted = open(&db);
+    assert_eq!(
+        restarted.execute_current(
+            &envelope,
+            || Ok((Policy::load(&snapshot)?, 101)),
+            &AtomicBool::new(false)
+        ),
+        Err(Error::Denied)
+    );
+    std::fs::write(&snapshot, b"{malformed").unwrap();
+    assert!(
+        restarted
+            .execute_current(
+                &envelope,
+                || Ok((Policy::load(&snapshot)?, 101)),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    std::fs::remove_file(&snapshot).unwrap();
+    assert!(
+        restarted
+            .execute_current(
+                &envelope,
+                || Ok((Policy::load(&snapshot)?, 101)),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    // This test does not establish privileged publisher custody, trusted path
+    // anchoring, crash recovery or hotel-fence integration.
+}
+
+#[cfg(unix)]
+#[test]
 fn native_runner_binary_uses_real_sdk_ipc_and_durable_receipt() {
     use philotic_client::{IpcRequest, IpcResponse};
     use std::io::{Read, Write};

@@ -95,6 +95,22 @@ impl ProtectedLocalGuest {
         }
         Ok(())
     }
+    /// Synthetic experiment only: the caller must already hold the matching
+    /// authority fence. This does not verify fence provenance and must never
+    /// become a production API without a non-forgeable permit and review.
+    #[cfg(test)]
+    pub(super) async fn experimental_stop_while_fenced(
+        &self,
+        _fence: &mut ansible_mesh_core::authority_fence::Fence,
+    ) -> Result<()> {
+        let mut child = self.child.lock().await;
+        if child.try_wait()?.is_none() {
+            child.kill().await?;
+        }
+        anyhow::ensure!(child.try_wait()?.is_some(), "child exit not confirmed");
+        self.registry.retire(&self.guest, self.generation)?;
+        Ok(())
+    }
     pub async fn exited(&self) -> Result<bool> {
         let exited = self.child.lock().await.try_wait()?.is_some();
         if exited {

@@ -196,6 +196,82 @@ async fn native_memgraph_capture_transaction_acceptance() {
             .unwrap_err(),
         Error::Denied
     );
+    // Candidate snapshot composition only: the source is a synthetic in-memory
+    // value, not a root-protected publisher or a running hotel. This exercises
+    // Memgraph's actual precommit policy recheck when the fixture is enabled.
+    {
+        use native_memory::grant_snapshot_candidate::{
+            ExpectedBinding, Snapshot, validate_snapshot_bytes,
+        };
+        let response_key = SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes();
+        let issuer_key = policy.issuers["ingress-hotel"].clone();
+        let binding = ExpectedBinding {
+            authority: "memory-hotel",
+            grant_id: "caller-1",
+            owner: "alice",
+            namespace: "notes",
+            destination: "memory-hotel",
+            runner: "memory-1",
+            ingress_issuer: "ingress-hotel",
+            reply_node: "ingress-hotel",
+            reply_guest: "membrane-1",
+            issuer_key_id: "test-key",
+            issuer_public_key: issuer_key.public_key,
+            response_key_id: "response-key",
+            response_public_key: response_key,
+            oauth_issuer: "https://issuer.example",
+            oauth_resource: "https://memory.example/native/mcp",
+            oauth_metadata_url: "https://memory.example/.well-known/oauth-protected-resource/native/mcp",
+            authority_socket: std::path::Path::new("/run/synthetic/authority.sock"),
+            oauth_client_id: "dot",
+            oauth_subject: "alice",
+            oauth_grant_version: "0:7",
+        };
+        let initial = Snapshot {
+            schema: 1,
+            authority_id: "memory-hotel".into(),
+            generation: 1,
+            grant_id: "caller-1".into(),
+            grant: policy.grants["caller-1"].clone(),
+            issuer_key,
+            response_verifier: native_memory::response::ResponseVerifier {
+                destination: "memory-hotel".into(),
+                runner: "memory-1".into(),
+                key_id: "response-key".into(),
+                public_key: response_key,
+            },
+            oauth_issuer: binding.oauth_issuer.into(),
+            oauth_resource: binding.oauth_resource.into(),
+            oauth_metadata_url: binding.oauth_metadata_url.into(),
+            authority_socket: binding.authority_socket.into(),
+            oauth_client_id: binding.oauth_client_id.into(),
+            oauth_subject: binding.oauth_subject.into(),
+            oauth_grant_version: binding.oauth_grant_version.into(),
+        };
+        let mut reads = 0;
+        let result = runner
+            .execute_current(
+                &rollback,
+                || {
+                    reads += 1;
+                    let mut snapshot = initial.clone();
+                    if reads == 2 {
+                        snapshot.generation += 1;
+                        snapshot.grant.revision += 1;
+                        snapshot.grant.revoked = true;
+                    }
+                    let bytes = serde_json::to_vec(&snapshot).map_err(|_| Error::Invalid)?;
+                    Ok((
+                        validate_snapshot_bytes(&bytes, &binding)?.receiver_policy(),
+                        100,
+                    ))
+                },
+                &cancel,
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), Error::Denied);
+        assert_eq!(reads, 2);
+    }
     // Verify all three writes rolled back together, and exact retries did not
     // duplicate observations. Counts include the one committed recall receipt.
     for (label, expected) in [

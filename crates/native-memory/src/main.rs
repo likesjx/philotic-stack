@@ -26,8 +26,20 @@ struct Args {
     )]
     memgraph_config: Option<PathBuf>,
     /// Local public-key pins and grants; reread for every task. Contains no secrets.
-    #[arg(long)]
-    policy: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "snapshot_policy",
+        conflicts_with = "snapshot_policy"
+    )]
+    policy: Option<PathBuf>,
+    /// Experimental protected snapshot mode. Requires a root-owned binding and
+    /// a hotel that explicitly confirms the same digest; no legacy fallback.
+    #[arg(long,requires_all=["snapshot_binding","snapshot_group","authority_socket"],conflicts_with="policy")]
+    snapshot_policy: Option<PathBuf>,
+    #[arg(long, requires = "snapshot_policy")]
+    snapshot_binding: Option<PathBuf>,
+    #[arg(long, requires = "snapshot_policy")]
+    snapshot_group: Option<u32>,
     /// Private local result-signing key; never routed or fetched from a vault.
     #[arg(long)]
     response_signing_config: PathBuf,
@@ -40,6 +52,31 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+fn candidate_snapshot(
+    args: &Args,
+) -> std::result::Result<
+    Option<native_memory::grant_snapshot_candidate::LoadedSnapshot>,
+    native_memory::Error,
+> {
+    let Some(path) = &args.snapshot_policy else {
+        return Ok(None);
+    };
+    let binding_path = args
+        .snapshot_binding
+        .as_ref()
+        .ok_or(native_memory::Error::Invalid)?;
+    let group = args.snapshot_group.ok_or(native_memory::Error::Invalid)?;
+    let binding = native_memory::grant_snapshot_candidate::load_root_binding(binding_path, group)?;
+    if binding.destination != args.node
+        || binding.runner != args.guest
+        || args.authority_socket.as_deref() != Some(binding.authority_socket.as_path())
+    {
+        return Err(native_memory::Error::Denied);
+    }
+    Ok(Some(
+        native_memory::grant_snapshot_candidate::load_root_owned(path, group, &binding.borrowed())?,
+    ))
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,11 +125,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let envelope = task.signed_request;
+        if args.snapshot_policy.is_some() {
+            use native_memory::authority_control::{Client, Reply, Request};
+            let Ok(Some(snapshot)) = candidate_snapshot(&args) else {
+                continue;
+            };
+            // Fail before any database reservation/write if the configured
+            // result signer does not match the protected snapshot pins. The
+            // signer and snapshot are reloaded again before response signing.
+            let Ok(signer) =
+                native_memory::response::ResponseSigner::load(&args.response_signing_config)
+            else {
+                continue;
+            };
+            if signer.verify_snapshot(&snapshot).is_err() {
+                continue;
+            }
+            let Some(path) = &args.authority_socket else {
+                continue;
+            };
+            let Ok(mut client) = Client::connect(path).await else {
+                continue;
+            };
+            if !matches!(
+                client
+                    .send(&Request::SnapshotReady {
+                        guest: args.guest.clone(),
+                        digest: snapshot.digest()
+                    })
+                    .await,
+                Ok(Reply::SnapshotReady)
+            ) {
+                continue;
+            }
+        }
         let current = || {
-            let policy: Policy = serde_json::from_slice(
-                &std::fs::read(&args.policy).map_err(|_| native_memory::Error::Unavailable)?,
-            )
-            .map_err(|_| native_memory::Error::Invalid)?;
+            let policy: Policy = if let Some(snapshot) = candidate_snapshot(&args)? {
+                snapshot.receiver_policy()
+            } else {
+                serde_json::from_slice(
+                    &std::fs::read(args.policy.as_ref().ok_or(native_memory::Error::Invalid)?)
+                        .map_err(|_| native_memory::Error::Unavailable)?,
+                )
+                .map_err(|_| native_memory::Error::Invalid)?
+            };
             Ok((policy, now()))
         };
         let cancelled = AtomicBool::new(false);
@@ -163,6 +239,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         else {
             continue;
         };
+        if args.snapshot_policy.is_some() {
+            let Ok(Some(snapshot)) = candidate_snapshot(&args) else {
+                continue;
+            };
+            if signer.verify_snapshot(&snapshot).is_err()
+                || native_memory::VerifiedRequest::validate(
+                    &envelope,
+                    &snapshot.receiver_policy(),
+                    &args.node,
+                    &args.guest,
+                    now(),
+                )
+                .is_err()
+            {
+                continue;
+            }
+        }
         let Ok(response) = signer.sign(&envelope, response, now()) else {
             continue;
         };
@@ -174,5 +267,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             task_json: payload.to_string(),
         })
         .await?;
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn base() -> Vec<&'static str> {
+        vec![
+            "native-memory",
+            "--socket",
+            "/tmp/hotel.sock",
+            "--node",
+            "hotel",
+            "--guest",
+            "runner",
+            "--memgraph-config",
+            "/tmp/db",
+            "--response-signing-config",
+            "/tmp/key",
+        ]
+    }
+    #[test]
+    fn snapshot_mode_requires_complete_configuration_and_hotel_guard() {
+        let mut legacy = base();
+        legacy.extend(["--policy", "/tmp/policy"]);
+        assert!(Args::try_parse_from(legacy).is_ok());
+        let mut incomplete = base();
+        incomplete.extend(["--snapshot-policy", "/tmp/snapshot"]);
+        assert!(Args::try_parse_from(incomplete).is_err());
+        let mut candidate = base();
+        candidate.extend([
+            "--snapshot-policy",
+            "/tmp/snapshot",
+            "--snapshot-binding",
+            "/tmp/binding",
+            "--snapshot-group",
+            "1",
+            "--authority-socket",
+            "/tmp/authority",
+        ]);
+        assert!(Args::try_parse_from(candidate.clone()).is_ok());
+        candidate.extend(["--policy", "/tmp/policy"]);
+        assert!(Args::try_parse_from(candidate).is_err());
     }
 }
