@@ -112,11 +112,15 @@ impl Drop for Fence {
 }
 
 impl Fence {
-    pub fn new(journal: OwnedMutexGuard<Journal>) -> Self {
-        Self {
+    /// Persist uncertainty before exposing a fence to any caller that could
+    /// perform an external effect. A caller cannot accidentally omit it.
+    pub fn begin(journal: OwnedMutexGuard<Journal>) -> Result<Self> {
+        let mut fence = Self {
             journal,
             complete: false,
-        }
+        };
+        fence.mark(false)?;
+        Ok(fence)
     }
     pub fn finish(&mut self) -> Result<()> {
         self.mark(true)?;
@@ -151,8 +155,7 @@ mod tests {
     async fn uncertain_completion_blocks_reopen_after_owner_is_gone() {
         let (_dir, path, uid) = fixture();
         let journal = Arc::new(Mutex::new(Journal::open(&path, uid).unwrap()));
-        let mut fence = Fence::new(journal.clone().lock_owned().await);
-        fence.mark(false).unwrap();
+        let fence = Fence::begin(journal.clone().lock_owned().await).unwrap();
         drop(fence);
         assert!(journal.lock().await.validate().is_err());
         drop(journal); // Release the OS lock: rejection must be durable, not lock contention.
@@ -165,12 +168,23 @@ mod tests {
         let (_dir, path, uid) = fixture();
         let journal = Arc::new(Mutex::new(Journal::open(&path, uid).unwrap()));
         assert!(Journal::open(&path, uid).is_err());
-        let mut fence = Fence::new(journal.clone().lock_owned().await);
-        fence.mark(false).unwrap();
+        let mut fence = Fence::begin(journal.clone().lock_owned().await).unwrap();
         fence.finish().unwrap();
         drop(fence);
         drop(journal);
         assert_eq!(std::fs::read(&path).unwrap(), b"clean\n");
         assert!(Journal::open(&path, uid).is_ok());
+    }
+
+    #[tokio::test]
+    async fn begin_refuses_replaced_journal_and_poisons_owner() {
+        let (_dir, path, uid) = fixture();
+        let journal = Arc::new(Mutex::new(Journal::open(&path, uid).unwrap()));
+        std::fs::rename(&path, path.with_extension("original")).unwrap();
+        std::fs::write(&path, b"clean\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(Fence::begin(journal.clone().lock_owned().await).is_err());
+        assert!(journal.lock().await.is_poisoned());
     }
 }
