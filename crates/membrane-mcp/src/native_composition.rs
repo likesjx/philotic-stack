@@ -343,13 +343,14 @@ async fn real_native_graph_runner_memgraph_mcp_composition() {
         )
         .with_inbound_rx(harness.inbound_rx.take().unwrap());
         let state = harness.state.clone();
-        Task(tokio::spawn(runtime.run(McpMembrane::new(
+        let task = Task(tokio::spawn(runtime.run(McpMembrane::new(
             port,
             "mcp-membrane-graph-fixture",
-            state,
-        ))))
+            state.clone(),
+        ))));
+        (task, state)
     };
-    let mut runtime = start_membrane();
+    let (mut runtime, _) = start_membrane();
     async fn wait_projection(port: u16, expected: usize) -> Value {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -409,6 +410,7 @@ async fn real_native_graph_runner_memgraph_mcp_composition() {
         .get("error")
         .is_some()
     );
+    assert!(http_rpc(port,"tools/call",json!({"name":"node-recall","arguments":{"id":"fixture-native-goal","api_key":"SYNTHETIC-ARGUMENT-KEY-CANARY"}})).await.get("error").is_some());
     let recalled = result(
         &http_rpc(
             port,
@@ -455,7 +457,8 @@ async fn real_native_graph_runner_memgraph_mcp_composition() {
     assert!(
         matches!(persisted,IpcResponse::Standard {ok:true,data:Some(data),..} if data["config"]["tools"][0]["name"]=="node-recall")
     );
-    runtime = start_membrane();
+    let (restarted_runtime, membrane_state) = start_membrane();
+    runtime = restarted_runtime;
     wait_projection(port, 0).await;
     runner = spawn_runner();
     wait_projection(port, 1).await;
@@ -471,11 +474,444 @@ async fn real_native_graph_runner_memgraph_mcp_composition() {
         .to_string()
         .contains("Synthetic graph recall canary")
     );
+    // Revocation must hold even if a membrane still has a stale cached config.
+    let revoked = probe
+        .send_request(IpcRequest::RevokeMcpTokenGrant {
+            endpoint_id: "graph-fixture".into(),
+            owner_agent_id: "fixture-graph-owner".into(),
+            token_id: "fixture-caller".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(revoked, IpcResponse::Standard { ok: true, .. }),
+        "{revoked:?}"
+    );
+    wait_projection(port, 0).await;
+    let denied = http_rpc(
+        port,
+        "tools/call",
+        json!({"name":"node-recall","arguments":{"id":"fixture-native-goal"}}),
+    )
+    .await;
+    assert!(
+        denied.get("error").is_some(),
+        "revoked grant invocation: {denied}"
+    );
+    membrane_state
+        .endpoint_table
+        .write()
+        .await
+        .update(config.clone());
+    assert_eq!(
+        http_rpc(port, "tools/list", json!({})).await["result"]["tools"],
+        json!([]),
+        "revoked grant must not reappear from stale membrane policy"
+    );
+    let denied = http_rpc(
+        port,
+        "tools/call",
+        json!({"name":"node-recall","arguments":{"id":"fixture-native-goal"}}),
+    )
+    .await;
+    assert!(
+        denied.get("error").is_some() || denied["result"]["isError"] == true,
+        "stale grant invocation: {denied}"
+    );
+    // A fresh explicit fixture provisioning isolates endpoint revocation from
+    // token revocation; confirm a successful read before removing the endpoint.
+    let provisioned = probe
+        .send_request(IpcRequest::ProvisionMcpEndpoint {
+            config: config.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        provisioned,
+        IpcResponse::McpEndpointProvisioned { .. }
+    ));
+    wait_projection(port, 1).await;
+    assert!(
+        result(
+            &http_rpc(
+                port,
+                "tools/call",
+                json!({"name":"node-recall","arguments":{"id":"fixture-native-goal"}})
+            )
+            .await
+        )
+        .to_string()
+        .contains("Synthetic graph recall canary")
+    );
+    let revoked = probe
+        .send_request(IpcRequest::RevokeMcpEndpoint {
+            endpoint_id: "graph-fixture".into(),
+            owner_agent_id: "fixture-graph-owner".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(revoked, IpcResponse::McpEndpointProvisioned { .. }),
+        "{revoked:?}"
+    );
+    wait_projection(port, 0).await;
+    assert!(
+        http_rpc(
+            port,
+            "tools/call",
+            json!({"name":"node-recall","arguments":{"id":"fixture-native-goal"}})
+        )
+        .await
+        .get("error")
+        .is_some()
+    );
+    membrane_state
+        .endpoint_table
+        .write()
+        .await
+        .update(config.clone());
+    assert_eq!(
+        http_rpc(port, "tools/list", json!({})).await["result"]["tools"],
+        json!([])
+    );
+    assert!(
+        http_rpc(
+            port,
+            "tools/call",
+            json!({"name":"node-recall","arguments":{"id":"fixture-native-goal"}})
+        )
+        .await
+        .get("error")
+        .is_some()
+    );
+    let persisted = probe
+        .send_request(IpcRequest::GetMcpEndpointStatus {
+            endpoint_id: "graph-fixture".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(persisted,IpcResponse::Standard {ok:true,data:Some(data),..} if data["config"].is_null()),
+        "revoked endpoint must not persist"
+    );
     // Delete only the row created by this fixture after its empty-store check.
     runner.stop();
     runtime.0.abort();
     hotel_process.stop();
+    let mut observed = String::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("logs")) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "log") {
+                observed.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+    }
+    for file in [root.join("process.log"), dir.path().join("runner.log")] {
+        observed.push_str(&std::fs::read_to_string(file).unwrap());
+    }
+    assert!(
+        observed.contains("native_graph_transaction"),
+        "actual hotel must emit native transaction metadata"
+    );
+    for field in [
+        "admission_duration_us",
+        "caller_ref",
+        "session_ref",
+        "turn_ref",
+        "life.view.node",
+    ] {
+        assert!(observed.contains(field), "missing metadata field {field}");
+    }
+    assert!(
+        observed.contains("\"policy_outcome\":\"allowed\"")
+            && observed.contains("\"policy_outcome\":\"denied\"")
+    );
+    for private in [
+        BEARER,
+        "SYNTHETIC-UNSCOPED",
+        "SYNTHETIC-ARGUMENT-KEY-CANARY",
+        "Authorization: Bearer",
+        "Synthetic graph recall canary",
+    ] {
+        assert!(
+            !observed.contains(private),
+            "credential/header/private graph payload leaked to fixture logs"
+        );
+    }
     graph.run(neo4rs::query("MATCH (n:Goal {id: 'fixture-native-goal', title: 'Synthetic graph recall canary'}) DELETE n")).await.unwrap();
+}
+
+/// Binary matrix for the pre-descriptor hotel/runner and this candidate. The
+/// current MCP runtime is qualified separately by the full HTTP composition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires pinned old/current hotel and LifeGraph binaries plus empty isolated Memgraph"]
+async fn real_native_graph_old_new_hotel_runner_binary_matrix() {
+    assert_eq!(
+        std::env::var("PHILOTIC_GRAPH_TOOL_MEMGRAPH_FIXTURE").as_deref(),
+        Ok("1")
+    );
+    let current =
+        PathBuf::from(std::env::var_os("PHILOTIC_TEST_BIN_DIR").expect("current pinned binaries"));
+    let old =
+        PathBuf::from(std::env::var_os("PHILOTIC_TEST_OLD_BIN_DIR").expect("old pinned binaries"));
+    assert!(current.is_absolute() && old.is_absolute() && current != old);
+    let graph = neo4rs::Graph::new("127.0.0.1:17687", "", "").unwrap();
+    let mut rows = graph
+        .execute(neo4rs::query("MATCH (n) RETURN count(n) AS count"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>("count")
+            .unwrap(),
+        0,
+        "matrix requires an empty disposable graph"
+    );
+    drop(rows);
+    graph
+        .run(neo4rs::query(
+            "CREATE (:Goal {id:'fixture-compat-goal',title:'Synthetic compatibility canary'})",
+        ))
+        .await
+        .unwrap();
+    for new_hotel in [false, true] {
+        for new_runner in [false, true] {
+            let dir = tempfile::Builder::new()
+                .prefix("graph-compat-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let _diagnostics = Diagnostics(dir.path().to_owned());
+            let socket = dir.path().join("hotel.sock");
+            let hotel_name = format!(
+                "fixture-compat-{}-{}",
+                u8::from(new_hotel),
+                u8::from(new_runner)
+            );
+            let node = format!("{hotel_name}-aiua-01");
+            let hotel_bin = if new_hotel { &current } else { &old };
+            let runner_bin = if new_runner { &current } else { &old };
+            let mut hotel_process =
+                hotel(hotel_bin, &dir.path().join("hotel"), &hotel_name, &socket);
+            let mut probe = connect(&socket, "fixture-compat-owner", "probe").await;
+            let feature = probe
+                .send_request(IpcRequest::GetConfig {
+                    key: "__runner_tool_protocol__".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(feature,IpcResponse::ConfigData {value_json:Some(ref value),..} if value=="1"),
+                new_hotel,
+                "feature negotiation"
+            );
+            let enrolled = probe
+                .send_request(IpcRequest::RegisterComponent {
+                    manifest: ansible_mesh_core::storage::ComponentManifest {
+                        guest_id: "life-fixture".into(),
+                        role: "life-graph-runner".into(),
+                        hotel: hotel_name.clone(),
+                        command: runner_bin
+                            .join("life-graph-runner")
+                            .to_str()
+                            .unwrap()
+                            .into(),
+                        args: vec![],
+                        env: HashMap::new(),
+                        component_config: json!({}),
+                        auto_start: true,
+                    },
+                })
+                .await
+                .unwrap();
+            assert!(matches!(enrolled, IpcResponse::ComponentRegistered { .. }));
+            let log = std::fs::File::create(dir.path().join("runner.log")).unwrap();
+            let mut runner = Process(
+                Command::new(runner_bin.join("life-graph-runner"))
+                    .env_clear()
+                    .current_dir(dir.path())
+                    .env("PHILOTIC_HOTEL_SOCKET", &socket)
+                    .env("PHILOTIC_NODE_ID", &node)
+                    .env("PHILOTIC_LIFE_GRAPH_RUNNER_ID", "life-fixture")
+                    .env("PHILOTIC_MEMGRAPH_URI", "127.0.0.1:17687")
+                    .env("PHILOTIC_HEARTBEAT_ENABLED", "0")
+                    .env("PHILOTIC_LIFE_HYGIENE_ENABLED", "0")
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap(),
+            );
+            // Retry a bounded read until the existing controller has completed
+            // startup. These are read-only fixture calls, with no model hop.
+            tokio::time::timeout(Duration::from_secs(15),async {
+                loop {
+                    assert!(runner.0.try_wait().unwrap().is_none(),"runner startup failed for {new_hotel}/{new_runner}");
+                    let sent=probe.send_request(IpcRequest::EmitTask {target_node:node.clone(),target_role:"life-graph-runner".into(),target_guest_id:Some("life-fixture".into()),
+                        task_json:json!({"tool_name":"life.view.node","arguments":{"id":"fixture-compat-goal","edge_limit":1},"session_id":"compat-legacy","turn_id":"compat-legacy","reply_to":node,"reply_role":"probe","reply_guest_id":"fixture-compat-owner"}).to_string()
+                    }).await.unwrap();
+                    if matches!(sent,IpcResponse::Standard {ok:true,..})
+                        && let Ok(Ok(IpcResponse::InboundTask {task_json,..}))=tokio::time::timeout(Duration::from_millis(250),probe.recv_task()).await
+                        && task_json.contains("Synthetic compatibility canary") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+            }).await.expect("legacy read must work in every mixed binary case");
+            let target = McpRouteTarget::RunnerTool {
+                runner_id: "life-fixture".into(),
+                tool_name: "life.view.node".into(),
+                version: 1,
+            };
+            let tool = McpToolSpec {
+                name: "node-recall".into(),
+                description: "placeholder".into(),
+                input_schema: json!({"type":"object"}),
+                inbound_transform: McpInboundTransform::FieldMap {
+                    action: "life.view.node".into(),
+                    target: target.clone(),
+                    mappings: vec![],
+                },
+                outbound_transform: McpOutboundTransform::PassThrough,
+                handler: None,
+                auth: Some(McpAuthScheme::BearerToken {
+                    grants: vec![McpTokenGrant {
+                        token_id: "fixture-caller".into(),
+                        vault_ref: "synthetic".into(),
+                        scopes: vec!["node-recall".into()],
+                        expires_at: None,
+                        allotment: None,
+                    }],
+                }),
+            };
+            let mut config = endpoint_with(vec![tool], None);
+            config.endpoint_id = "compat".into();
+            config.owner_agent_id = "fixture-compat-owner".into();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            config.preapproval_rules = vec![McpPreapprovalRule {
+                action_pattern: "life.view.node".into(),
+                target: Some(target),
+                approved_by_turn: "synthetic-compatibility".into(),
+                approved_at: now,
+                expires_at: Some(now + 60),
+            }];
+            if new_hotel {
+                assert!(matches!(
+                    probe
+                        .send_request(IpcRequest::ProvisionMcpEndpoint { config })
+                        .await
+                        .unwrap(),
+                    IpcResponse::McpEndpointProvisioned { .. }
+                ));
+                let mut membrane = connect(&socket, "mcp-membrane-compat", "mcp-membrane").await;
+                assert!(matches!(
+                    membrane
+                        .send_request(IpcRequest::AcquireMcpMembraneLease {
+                            lease_key: "mcp-membrane-compat".into(),
+                            port: 19001
+                        })
+                        .await
+                        .unwrap(),
+                    IpcResponse::McpMembraneLease {
+                        mcp_granted: true,
+                        ..
+                    }
+                ));
+                let definition = membrane
+                    .send_request(IpcRequest::GetRunnerTool {
+                        endpoint_id: "compat".into(),
+                        tool_name: "node-recall".into(),
+                        caller_id: "fixture-caller".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    matches!(definition, IpcResponse::Standard { ok: true, .. }),
+                    new_runner,
+                    "old runner must never acquire a native descriptor by fallback"
+                );
+                let invoked = membrane
+                    .send_request(IpcRequest::InvokeRunnerTool {
+                        endpoint_id: "compat".into(),
+                        tool_name: "node-recall".into(),
+                        version: 1,
+                        arguments: json!({"id":"fixture-compat-goal"}),
+                        caller_id: "fixture-caller".into(),
+                        session_id: "compat-native".into(),
+                        turn_id: "compat-native".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    matches!(invoked, IpcResponse::Standard { ok: true, .. }),
+                    new_runner
+                );
+                if new_runner {
+                    let reply = tokio::time::timeout(Duration::from_secs(5), membrane.recv_task())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        matches!(reply,IpcResponse::InboundTask {task_json,..} if task_json.contains("Synthetic compatibility canary") && task_json.contains("compat-native"))
+                    );
+                }
+            } else {
+                // Positive legacy provisioning control precedes the unknown
+                // native target, distinguishing refusal from broken framing.
+                let mut legacy = config.clone();
+                legacy.endpoint_id = "compat-legacy".into();
+                legacy.preapproval_rules.clear();
+                legacy.tools[0].inbound_transform = McpInboundTransform::FieldMap {
+                    action: "life.view.node".into(),
+                    target: McpRouteTarget::Datasource {
+                        datasource_id: "life-graph-runner".into(),
+                    },
+                    mappings: vec![],
+                };
+                assert!(matches!(
+                    probe
+                        .send_request(IpcRequest::ProvisionMcpEndpoint { config: legacy })
+                        .await
+                        .unwrap(),
+                    IpcResponse::McpEndpointProvisioned { .. }
+                ));
+                let native = probe
+                    .send_request_with_timeout(
+                        IpcRequest::ProvisionMcpEndpoint { config },
+                        Duration::from_secs(3),
+                    )
+                    .await;
+                assert!(
+                    !matches!(native, Ok(IpcResponse::McpEndpointProvisioned { .. })),
+                    "old hotel must refuse the unknown native target"
+                );
+                let mut observer = connect(&socket, "fixture-compat-observer", "probe").await;
+                let state = observer
+                    .send_request(IpcRequest::GetMcpEndpointStatus {
+                        endpoint_id: "compat".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(state,IpcResponse::Standard {ok:true,data:Some(data),..} if data["config"].is_null())
+                );
+            }
+            eprintln!(
+                "matrix hotel={} runner={}: legacy recall passed; native={}",
+                if new_hotel { "new" } else { "old" },
+                if new_runner { "new" } else { "old" },
+                new_hotel && new_runner
+            );
+            runner.stop();
+            hotel_process.stop();
+        }
+    }
+    graph.run(neo4rs::query("MATCH (n:Goal {id:'fixture-compat-goal',title:'Synthetic compatibility canary'}) DELETE n")).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

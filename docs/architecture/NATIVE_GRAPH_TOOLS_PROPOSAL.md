@@ -106,8 +106,8 @@ register no tools. A new runner first asks `GetConfig(__runner_tool_protocol__)`
 an older hotel returning no feature retains the legacy datasource path and is
 not sent the new advertisement. Older runners remain usable through their old
 routes but cannot appear on a native descriptor-bound endpoint. Unknown target
-variants fail closed on older hotels. Exact old-binary matrix qualification is
-still outstanding.
+variants fail closed on older hotels. The local old/new hotel/runner binary
+matrix is qualified below; old membrane binaries remain outside that matrix.
 
 This first increment is local-hotel and read-only. General structured schemas,
 semantic `life.recall`, cross-hotel descriptor propagation, writes, dynamic
@@ -161,7 +161,8 @@ identity, exact scope, stale version pins, disabled enrollment, lease loss,
 argument/return-route forgery rejection, expired approval/lease deadlines and
 preselected assembly projection.
 Their provider response is explicitly synthetic. A framed-UDS membrane test
-checks epoch renewal and lease-loss handling. Affected regression totals are
+checks epoch renewal and lease-loss handling. Initial checkpoint `248e3605`
+regression totals were
 4 hotel UDS tests, 24 existing MCP contract tests, 4 datasource tests,
 21 membrane tests, 43 MCP membrane tests (2 opt-in compositions ignored in the
 general run), 228 LifeGraph library tests and 57 LifeGraph provider tests.
@@ -180,7 +181,7 @@ published artifact is claimed. Whole-workspace baseline validation was not run
 under disk pressure; targeted regression and real-component checks are the
 evidence for this slice.
 
-Runtime fixture artifacts used in the successful smoke:
+Initial `248e3605` fixture artifacts (follow-up qualification is recorded below):
 
 - `target/debug/aiua` SHA-256 `35dc27f94fd0883f810b264c9c99bcfa54123f985f71895419f3b7df12805e71`.
 - `target/debug/life-graph-runner` SHA-256 `6c46d97a9efa74fedbca57c77dad20038214cbe8af5e348f66788247ae2f1f9b`.
@@ -215,3 +216,136 @@ Muninn readiness/recall and a read-only coordination dashboard check did run.
 The closeout preference write to local Muninn was refused because that listener
 is not the cluster Cortex; it is deferred. No redirect or retry to another node
 was attempted.
+
+## Review qualification and observable transactions
+
+The review follow-up extends the same real Memgraph/HTTP/UDS composition with
+typed `RevokeMcpTokenGrant` and `RevokeMcpEndpoint` operations. Each is followed
+by hidden discovery and denied invocation, including deliberately stale
+membrane endpoint snapshots. A successful read separates the two revocation
+cases. The test also verifies that the revoked endpoint is absent from durable
+hotel configuration.
+
+The stale-grant case first failed against `248e3605`: invocation checked the
+hotel's persisted caller grant, but descriptor lookup checked only endpoint
+authority. This follow-up binds `GetRunnerTool` to the membrane's verified opaque
+caller ID and rechecks exact scope and expiry against current hotel policy.
+Missing caller IDs from the unbound prototype deserialize to empty and are
+denied. No reusable bearer is sent to the hotel or runner. Current source tests
+verify empty/unknown caller refusal and the missing-field wire shape.
+
+`NativeToolObservation` emits an allowlisted `native_graph_transaction` log
+projection for descriptor discovery and invocation admission: phase, operation
+from a validated descriptor, policy outcome/code, admission duration, and stable
+BLAKE3-derived references for endpoint, exposed tool, caller, session and turn.
+It does not serialize the request, arguments, response, credentials, HTTP
+headers, vault values or graph content. Hash references correlate opaque IDs
+without copying arbitrary identity strings into this new telemetry. They are
+linkable metadata, not anonymization or a credential store.
+
+The full fixture asserts actual hotel transaction events contain timing and
+correlation fields and both allowed/denied outcomes, while synthetic bearer,
+argument-key, authorization-header and private graph-payload canaries are absent
+from hotel/process/runner logs. A separate pure metadata test verifies the exact
+field allowlist. Only synthetic payloads are inspected. Admission timing is not
+end-to-end provider latency; no model token accounting is invented for this
+deterministic graph read. The existing log writer/retention is reused, with no
+new database, capture listener, model call or observability authority.
+
+### Existing observability and memory hooks remain separate
+
+Source inspection found `RouterTraceStorage` in
+`ansible-mesh-core/src/router_trace.rs`: narrow provider/task/outcome/latency/token
+records owned exclusively by model-router, node-local and not mesh-synced. This
+slice does not write that training tap from the hotel. Existing hotel
+`EventEnvelope`/`TaskInvoke` records carry work messages via `EventPayload::Inline`;
+they are not a universal payload-redaction boundary. The new metadata events
+are not a replacement for the durable message ledger or full transaction
+completion tracing.
+
+`philote/src/memory_integration.rs` still runs Muninn auto-recall and the separate
+LifeGraph `life.recall` prefetch/cache/injection lane before prompt construction.
+No Philote source or data was migrated or deleted. Current source already has a
+`memory_degraded` prompt marker for some failed/degraded Muninn recalls, while
+`session/mod.rs` omits an empty recalled-memory section when no marker exists.
+LifeGraph prefetch failures/unusable packets can degrade to no injection. Native
+tool exposure neither replaces these hooks nor supplies a completed no-match
+status to reasoning.
+
+Follow-on contract, owned by the coordinating architecture workstream:
+
+- Extend existing recall/session/context projection with explicit outcomes for
+  matched, completed-no-authorized-match, skipped, unavailable and failed recall;
+  include source lane, freshness and permitted counts without exposing hidden
+  records. Render successful no-match to reasoning rather than inferring it
+  from absence or a log event.
+- Carry candidate/proposed memory state and provenance through existing
+  `RecalledMemoryRecord`/context packet paths. Preserve trust/source/confidence
+  and distinguish suggestions from confirmed LifeGraph truth; do not silently
+  promote, migrate or discard records.
+- Test the automatic hooks through actual prompt construction for empty success,
+  outage, stale cache and candidates, independently of native tool invocation.
+- Qualify capture privacy before enabling it: current auto-recall logs query and
+  concept text; opt-in model-router transcription fanout carries transcript and
+  audio/blob URLs to router-listener. These existing paths were inspected but
+  not changed, activated or claimed redacted. A common capture allowlist and
+  synthetic leakage tests across those paths remain necessary.
+
+### Local binary compatibility matrix
+
+`real_native_graph_old_new_hotel_runner_binary_matrix` uses separately pinned
+actual binaries and real Memgraph. Old means exact source
+`d4ecb35fc1064c8281b42cda61d7927ab0d0cc15`; current means this candidate. No
+installed runtime is used. All four cases passed locally:
+
+| Hotel | Runner | Existing legacy node recall | Native descriptor and invocation |
+|---|---|---|---|
+| old | old | passes | unsupported native provisioning refused |
+| old | current | passes, negotiated fallback | unsupported native provisioning refused |
+| current | old | passes | unavailable/denied, no fabricated descriptor |
+| current | current | passes | passes with pinned correlation |
+
+The old-hotel cases first accept a legacy endpoint as a framing/provisioning
+control, then refuse the unknown native target without persisting it. The
+current-hotel cases verify descriptor and invocation availability separately.
+Current MCP HTTP behavior is covered by the full composition. Old membrane
+binaries, a full three-component matrix, production issuer/frontdoor behavior
+and intended-client acceptance remain unqualified.
+
+Reproduction after the existing full fixture has returned its disposable graph
+to empty:
+
+```sh
+PHILOTIC_TEST_BIN_DIR=/absolute/pinned/current \
+PHILOTIC_TEST_OLD_BIN_DIR=/absolute/pinned/d4ecb35f \
+PHILOTIC_GRAPH_TOOL_MEMGRAPH_FIXTURE=1 \
+cargo test --locked -p membrane-mcp \
+  real_native_graph_old_new_hotel_runner_binary_matrix -- --ignored --nocapture
+```
+
+The existing CI workflow now checks out the exact PR head, pins current binaries,
+builds/pins the exact old baseline, and runs the matrix. This is checked-in
+wiring, not a remotely executed exact-head CI result; publication remains
+with the coordinating thread. The follow-up local regression set comprises
+5 hotel/metadata tests, 43 MCP tests and 57 SDK tests, plus the two explicitly
+enabled real-component compositions. Earlier unchanged-library regression
+results remain identified above rather than being presented as newly rerun.
+
+### Shared-target qualification boundary
+
+The Pro still has no discovered persistent shared-target/sccache configuration
+or worktree target symlink. Qualification reused the existing main target with
+command-local `CARGO_TARGET_DIR`; old/current binaries were pinned outside its
+mutable top-level filenames. No existing cache, worktree, power or security
+configuration was changed or removed, and the Air was not accessed.
+
+Switching the temporary old source snapshot and current worktree through that
+one target exposed a stale local crate: the current SDK was linked against an
+`ansible-mesh-core` artifact missing `runner_tool`. Cargo's process lock did not
+prevent this serial cross-source mismatch. Touching the owned current core entry
+source forced its rebuild without deleting caches; subsequent policy and real
+component tests passed. CI includes that bounded rebuild before matrix tests.
+This is not a general shared-cache fix. Until source/feature/toolchain/profile
+invalidation is qualified, serialize source switches and pin runtime artifacts;
+do not assume a common target or symlink alone makes concurrent qualification
+safe. No new persistent cache solution was introduced.

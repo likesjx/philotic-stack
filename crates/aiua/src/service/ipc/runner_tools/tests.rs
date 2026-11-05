@@ -149,7 +149,8 @@ async fn visible(client: &mut PhiloticClient, endpoint: &str, tool: &str) -> boo
         client
             .send_request(IpcRequest::GetRunnerTool {
                 endpoint_id: endpoint.into(),
-                tool_name: tool.into()
+                tool_name: tool.into(),
+                caller_id: "fixture-caller".into(),
             })
             .await
             .unwrap(),
@@ -194,6 +195,37 @@ async fn native_runner_tools_real_uds_registration_scope_replacement_and_return(
     );
     let mut membrane = fixture.membrane().await;
     assert!(visible(&mut membrane, "fixture", "node-recall").await);
+    for caller in ["", "wrong-caller"] {
+        assert!(matches!(
+            membrane
+                .send_request(IpcRequest::GetRunnerTool {
+                    endpoint_id: "fixture".into(),
+                    tool_name: "node-recall".into(),
+                    caller_id: caller.into()
+                })
+                .await
+                .unwrap(),
+            IpcResponse::Standard { ok: false, .. }
+        ));
+    }
+    let mut old_wire = serde_json::to_value(IpcRequest::GetRunnerTool {
+        endpoint_id: "fixture".into(),
+        tool_name: "node-recall".into(),
+        caller_id: "fixture-caller".into(),
+    })
+    .unwrap();
+    old_wire["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("caller_id");
+    let old_request = serde_json::from_value(old_wire).unwrap();
+    assert!(
+        matches!(
+            membrane.send_request(old_request).await.unwrap(),
+            IpcResponse::Standard { ok: false, .. }
+        ),
+        "unbound prototype descriptor request must fail closed"
+    );
     assert!(!visible(&mut membrane, "another-endpoint", "node-recall").await);
     assert!(!visible(&mut membrane, "fixture", "life.observe").await);
     let mut intruder = fixture.connect("intruder", "agent", vec![]).await;
@@ -408,4 +440,46 @@ async fn native_runner_tools_expired_approval_and_expired_lease_fail_closed() {
             .unwrap(),
         IpcResponse::Standard { ok: false, .. }
     ));
+}
+
+#[test]
+fn native_runner_tools_observation_has_only_allowlisted_metadata() {
+    let canary = "SYNTHETIC-SECRET-IDENTITY-CANARY";
+    let observation = NativeToolObservation {
+        phase: "invoke",
+        allowed: false,
+        endpoint: canary,
+        exposed_tool: canary,
+        caller: canary,
+        session: canary,
+        turn: canary,
+        operation: None,
+        elapsed: std::time::Duration::from_micros(17),
+    };
+    let metadata = observation.metadata();
+    let keys = metadata
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "event",
+            "phase",
+            "policy_outcome",
+            "policy_code",
+            "endpoint_ref",
+            "tool_ref",
+            "caller_ref",
+            "session_ref",
+            "turn_ref",
+            "operation",
+            "admission_duration_us"
+        ])
+    );
+    assert!(!metadata.to_string().contains(canary));
+    assert_eq!(metadata["policy_outcome"], "denied");
+    assert_eq!(metadata["admission_duration_us"], 17);
 }

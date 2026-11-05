@@ -966,6 +966,10 @@ pub enum IpcRequest {
     GetRunnerTool {
         endpoint_id: String,
         tool_name: String,
+        /// Verified bearer identity, never the reusable bearer itself. Missing
+        /// callers from an older prototype fail closed at the hotel.
+        #[serde(default)]
+        caller_id: String,
     },
     /// Deterministic local execution with hotel-owned authority and reply pins.
     InvokeRunnerTool {

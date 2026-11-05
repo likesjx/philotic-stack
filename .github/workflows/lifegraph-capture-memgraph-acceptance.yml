@@ -45,6 +45,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   CARGO_TERM_COLOR: always
+  PHILOTIC_BUILD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   RUST_BACKTRACE: '1'
   MEMGRAPH_IMAGE: memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27
 
@@ -56,6 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
@@ -123,6 +125,37 @@ jobs:
         env:
           PHILOTIC_GRAPH_TOOL_MEMGRAPH_FIXTURE: '1'
         run: PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p membrane-mcp real_native_graph_runner_memgraph_mcp_composition -- --ignored --nocapture
+
+      - name: Pin current hotel and LifeGraph binaries for compatibility tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-graph-current" "$RUNNER_TEMP/native-graph-old"
+          cp target/debug/aiua target/debug/life-graph-runner "$RUNNER_TEMP/native-graph-current/"
+          sha256sum "$RUNNER_TEMP/native-graph-current/aiua" "$RUNNER_TEMP/native-graph-current/life-graph-runner"
+
+      - name: Checkout exact pre-descriptor compatibility baseline
+        uses: actions/checkout@v4
+        with:
+          ref: d4ecb35fc1064c8281b42cda61d7927ab0d0cc15
+          path: .native-graph-compat-baseline
+          persist-credentials: false
+
+      - name: Build and pin old binaries using the shared target
+        working-directory: .native-graph-compat-baseline
+        env:
+          PHILOTIC_BUILD_SHA: d4ecb35fc1064c8281b42cda61d7927ab0d0cc15
+        run: |
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked -p aiua -p data-memorygraphrag --bin aiua --bin life-graph-runner
+          cp "$GITHUB_WORKSPACE/target/debug/aiua" "$GITHUB_WORKSPACE/target/debug/life-graph-runner" "$RUNNER_TEMP/native-graph-old/"
+          sha256sum "$RUNNER_TEMP/native-graph-old/aiua" "$RUNNER_TEMP/native-graph-old/life-graph-runner"
+
+      - name: Mixed old/new hotel and LifeGraph runner matrix
+        env:
+          PHILOTIC_GRAPH_TOOL_MEMGRAPH_FIXTURE: '1'
+        run: |
+          # Local crates from another source tree can share Cargo artifact names.
+          # Rebuild current local dependencies without deleting the shared cache.
+          touch crates/ansible-mesh-core/src/lib.rs
+          PHILOTIC_TEST_BIN_DIR="$RUNNER_TEMP/native-graph-current" PHILOTIC_TEST_OLD_BIN_DIR="$RUNNER_TEMP/native-graph-old" cargo test --locked -p membrane-mcp real_native_graph_old_new_hotel_runner_binary_matrix -- --ignored --nocapture
 
       - name: Build native two-hotel composition
         run: cargo build --locked -p aiua -p native-memory -p membrane-mcp

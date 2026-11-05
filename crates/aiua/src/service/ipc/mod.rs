@@ -3838,17 +3838,35 @@ impl IpcServer {
             IpcRequest::GetRunnerTool {
                 endpoint_id,
                 tool_name,
+                caller_id,
             } => {
-                match Self::resolve_runner_tool(
+                let started = std::time::Instant::now();
+                let resolved = Self::resolve_runner_tool(
                     graph,
                     inboxes,
                     mcp_membrane_leases,
                     current_identity.as_ref(),
                     &endpoint_id,
                     &tool_name,
+                    &caller_id,
                 )
-                .await
-                {
+                .await;
+                runner_tools::NativeToolObservation {
+                    phase: "discovery",
+                    allowed: resolved.is_ok(),
+                    endpoint: &endpoint_id,
+                    exposed_tool: &tool_name,
+                    caller: &caller_id,
+                    session: "",
+                    turn: "",
+                    operation: resolved
+                        .as_ref()
+                        .ok()
+                        .map(|(descriptor, _, _, _)| descriptor.name.as_str()),
+                    elapsed: started.elapsed(),
+                }
+                .emit();
+                match resolved {
                     Ok((descriptor, _, _, _)) => {
                         IpcResponse::success("runner_tool", Some(serde_json::json!(descriptor)))
                     }

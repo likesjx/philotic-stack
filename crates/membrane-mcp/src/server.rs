@@ -509,6 +509,7 @@ async fn runner_tool_descriptor(
     state: &SharedState,
     endpoint_id: &str,
     tool_name: &str,
+    caller_id: &str,
 ) -> Option<philotic_client::RunnerToolDescriptor> {
     use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
     let socket = state.runner_tool_socket.as_deref()?;
@@ -528,6 +529,7 @@ async fn runner_tool_descriptor(
             .send_request(IpcRequest::GetRunnerTool {
                 endpoint_id: endpoint_id.into(),
                 tool_name: tool_name.into(),
+                caller_id: caller_id.into(),
             })
             .await
             .ok()?
@@ -633,8 +635,28 @@ async fn handle_tools_list(
                 .find(|spec| spec.name == tool.name)
                 .unwrap();
             if is_runner_tool(spec) {
-                let Some(descriptor) =
-                    runner_tool_descriptor(state, &config.endpoint_id, &tool.name).await
+                let McpAuthScheme::BearerToken { grants } = config.effective_auth(spec) else {
+                    continue;
+                };
+                let Some(caller) = extract_bearer(auth_header).and_then(|bearer| {
+                    verify_bearer_token(
+                        &tool.name,
+                        bearer,
+                        &grants,
+                        &state.vault_cache,
+                        state.vault.as_ref(),
+                    )
+                    .ok()
+                }) else {
+                    continue;
+                };
+                let Some(descriptor) = runner_tool_descriptor(
+                    state,
+                    &config.endpoint_id,
+                    &tool.name,
+                    &caller.token_id,
+                )
+                .await
                 else {
                     continue;
                 };
@@ -859,7 +881,8 @@ async fn handle_tools_call(
                     "native runner requires preapproval",
                 );
             }
-            let Some(descriptor) = runner_tool_descriptor(state, &endpoint_id, tool_name).await
+            let Some(descriptor) =
+                runner_tool_descriptor(state, &endpoint_id, tool_name, &caller.token_id).await
             else {
                 return JsonRpcResponse::err(
                     id,

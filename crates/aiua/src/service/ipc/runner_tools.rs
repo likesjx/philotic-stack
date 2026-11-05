@@ -5,6 +5,35 @@ use ansible_mesh_core::mcp_endpoint::{McpEndpointConfig, McpInboundTransform};
 use ansible_mesh_core::mcp_route::{McpAuthScheme, McpRouteTarget};
 use philotic_client::{RunnerToolAdvertisement, RunnerToolDescriptor};
 
+/// Telemetry is a narrow projection, never a copy of an IPC envelope. Opaque
+/// refs correlate events without putting arbitrary identity strings in logs.
+pub(super) struct NativeToolObservation<'a> {
+    pub phase: &'static str,
+    pub allowed: bool,
+    pub endpoint: &'a str,
+    pub exposed_tool: &'a str,
+    pub caller: &'a str,
+    pub session: &'a str,
+    pub turn: &'a str,
+    pub operation: Option<&'a str>,
+    pub elapsed: std::time::Duration,
+}
+
+impl NativeToolObservation<'_> {
+    fn metadata(&self) -> serde_json::Value {
+        let reference = |value: &str| blake3::hash(value.as_bytes()).to_hex()[..32].to_owned();
+        serde_json::json!({"event":"native_graph_transaction","phase":self.phase,
+            "policy_outcome":if self.allowed {"allowed"}else{"denied"},
+            "policy_code":if self.allowed {"ADMITTED"}else{"DENIED"},
+            "endpoint_ref":reference(self.endpoint),"tool_ref":reference(self.exposed_tool),
+            "caller_ref":reference(self.caller),"session_ref":reference(self.session),"turn_ref":reference(self.turn),
+            "operation":self.operation,"admission_duration_us":self.elapsed.as_micros().min(u64::MAX as u128) as u64})
+    }
+    pub(super) fn emit(self) {
+        info!(native_graph_transaction = %self.metadata(), "Native graph policy transaction");
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -152,6 +181,7 @@ impl IpcServer {
         identity: Option<&GuestIdentity>,
         endpoint_id: &str,
         exposed_name: &str,
+        caller_id: &str,
     ) -> anyhow::Result<(
         RunnerToolDescriptor,
         RoleSubscriber,
@@ -210,13 +240,15 @@ impl IpcServer {
             .iter()
             .find(|spec| spec.name == exposed_name)
             .ok_or_else(|| anyhow::anyhow!("tool not granted to endpoint"))?;
-        anyhow::ensure!(
-            matches!(
-                config.effective_auth(spec),
-                McpAuthScheme::BearerToken { .. }
+        match config.effective_auth(spec) {
+            McpAuthScheme::BearerToken { grants } => anyhow::ensure!(
+                grants.iter().any(|grant| grant.token_id == caller_id
+                    && grant.expires_at.is_none_or(|expiry| unix_ts() <= expiry)
+                    && grant.scopes.iter().any(|scope| scope == exposed_name)),
+                "caller grant missing, expired, or outside tool scope"
             ),
-            "native runner requires bearer authentication"
-        );
+            McpAuthScheme::None => anyhow::bail!("native runner requires bearer authentication"),
+        }
         let McpInboundTransform::FieldMap {
             action,
             target:
@@ -292,6 +324,8 @@ impl IpcServer {
         session_id: &str,
         turn_id: &str,
     ) -> IpcResponse {
+        let started = std::time::Instant::now();
+        let mut operation = None;
         let dispatch = async {
             let (descriptor, runner, config, membrane) = Self::resolve_runner_tool(
                 graph,
@@ -300,8 +334,10 @@ impl IpcServer {
                 identity,
                 endpoint_id,
                 exposed_name,
+                caller_id,
             )
             .await?;
+            operation = Some(descriptor.name.clone());
             anyhow::ensure!(
                 identity.is_some_and(|id| id.role == "mcp-membrane" && id.guest_id == membrane),
                 "catalog connection cannot invoke"
@@ -399,6 +435,18 @@ impl IpcServer {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        NativeToolObservation {
+            phase: "invoke",
+            allowed: dispatch.is_ok(),
+            endpoint: endpoint_id,
+            exposed_tool: exposed_name,
+            caller: caller_id,
+            session: session_id,
+            turn: turn_id,
+            operation: operation.as_deref(),
+            elapsed: started.elapsed(),
+        }
+        .emit();
         match dispatch {
             Ok(()) => IpcResponse::success("runner_tool", None),
             Err(error) => {
