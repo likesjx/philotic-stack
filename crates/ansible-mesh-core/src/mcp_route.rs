@@ -40,6 +40,13 @@ pub struct McpRouteRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpRouteTarget {
+    /// Local, version-pinned runner definition. Hotel authorization and live
+    /// registration are rechecked for discovery and every invocation.
+    RunnerTool {
+        runner_id: String,
+        tool_name: String,
+        version: u32,
+    },
     /// Fixed native memory runner, with signed delegated authority. Config-driven only.
     NativeMemory {
         runner_id: String,

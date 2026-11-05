@@ -11,6 +11,97 @@ use crate::server;
 mod native_composition;
 
 #[tokio::test]
+async fn native_graph_legacy_routes_cannot_advertise_or_invoke_runner_contracts() {
+    let h = harness(false, ExposureTier::Local, HashMap::new());
+    let record:ansible_mesh_core::mcp_route::McpRouteRecord=serde_json::from_value(json!({
+        "agent_id":"fixture-owner","tool_name":"node-recall","description":"stale static schema","input_schema":{"type":"object"},
+        "target":{"kind":"runner_tool","runner_id":"life-fixture","tool_name":"life.view.node","version":1},
+        "security":{"auth":{"scheme":"none"}},"updated_at":1
+    })).unwrap();
+    h.state
+        .routing_table
+        .write()
+        .await
+        .upsert_agent_routes("fixture-owner", vec![record]);
+    let (_, listed) = call(&h.state, rpc("tools/list", json!({})), None, true).await;
+    assert_eq!(listed["result"]["tools"], json!([]));
+    let (_, invoked) = call(
+        &h.state,
+        rpc(
+            "tools/call",
+            json!({"name":"node-recall","arguments":{"id":"fixture"}}),
+        ),
+        None,
+        true,
+    )
+    .await;
+    assert!(invoked.get("error").is_some());
+}
+
+#[tokio::test]
+async fn native_graph_membrane_renews_the_granted_epoch_and_forgets_a_lost_lease() {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("renew.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let responder = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        async fn request(stream: &mut tokio::net::UnixStream) -> IpcRequest {
+            let size = stream.read_u32().await.unwrap() as usize;
+            assert!(size < 32768);
+            let mut payload = vec![0; size];
+            stream.read_exact(&mut payload).await.unwrap();
+            serde_json::from_slice(&payload).unwrap()
+        }
+        async fn reply(stream: &mut tokio::net::UnixStream, reply: IpcResponse) {
+            let payload = serde_json::to_vec(&reply).unwrap();
+            stream.write_u32(payload.len() as u32).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+        }
+        assert!(matches!(
+            request(&mut stream).await,
+            IpcRequest::Register(_)
+        ));
+        reply(&mut stream, IpcResponse::success("reg", None)).await;
+        assert!(matches!(
+            request(&mut stream).await,
+            IpcRequest::RenewMcpMembraneLease {
+                lease_epoch: 42,
+                ..
+            }
+        ));
+        reply(
+            &mut stream,
+            IpcResponse::McpMembraneLease {
+                mcp_granted: false,
+                mcp_lease: None,
+            },
+        )
+        .await;
+    });
+    let mut client = PhiloticClient::connect_at(
+        socket.to_str().unwrap(),
+        GuestIdentity {
+            guest_id: "mcp-membrane-renew".into(),
+            role: "mcp-membrane".into(),
+            supported_tools: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let h = harness(false, ExposureTier::Local, HashMap::new());
+    let mut guest = McpMembrane::new(0, "mcp-membrane-renew", h.state);
+    guest.lease_epoch = Some(42);
+    assert!(matches!(
+        guest.renew(&mut client).await.unwrap(),
+        LeaseRenewResult::NeedsReacquire
+    ));
+    assert_eq!(guest.lease_epoch, None);
+    responder.await.unwrap();
+}
+
+#[tokio::test]
 async fn native_pending_rejects_every_unsigned_completion_and_consumes_signed_once() {
     use native_memory::response::{ResponseExpectation, ResponseSigner, ResponseVerifier};
     let dir = tempfile::tempdir().unwrap();
@@ -349,6 +440,7 @@ async fn native_memory_authenticated_membrane_router_two_hotel_roundtrip() {
 fn harness(static_mode: bool, tier: ExposureTier, vault: HashMap<String, [u8; 32]>) -> Harness {
     let (inbound_tx, inbound_rx) = mpsc::channel(16);
     let state = Arc::new(MembraneState {
+        runner_tool_socket: None,
         native_memory_config: None,
         native_pending: Default::default(),
         routing_table: new_shared_table(),

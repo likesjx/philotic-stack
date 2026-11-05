@@ -3,13 +3,14 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-10-17
+last_updated: 2026-11-05
 tags:
 - source-of-truth
 - current-state
 - active-seam
 - transitional
 related_docs:
+- NATIVE_GRAPH_TOOLS_PROPOSAL.md
 - README.md
 - ARCHITECTURE.md
 - GRAPH_AS_SOURCE_OF_TRUTH.md
@@ -46,6 +47,16 @@ tracks_domains:
 ---
 
 # Philotic Architecture Status
+
+Local source candidate (2026-11-05): [runner-owned native graph tools](NATIVE_GRAPH_TOOLS_PROPOSAL.md)
+provide versioned `life.view.node` definitions through the existing LifeGraph
+datasource lifecycle, hotel-owned enrollment/authorization/routing and an
+authorized live MCP projection. Real hotel/UDS, HTTP MCP, LifeGraph runner and
+disposable Memgraph composition passes including runner and hotel restarts.
+Review qualification adds caller-bound stale-cache revocation checks, a passing
+old/current hotel-runner matrix and metadata-only native policy observations.
+Integration, remote CI and production/client acceptance remain pending; this
+inherits the trusted local IPC boundary and preserves external-read coordination.
 
 Local consolidation candidate (2026-10-19): scripted hotel sensors remain behind
 nondefault features in both aiua and data-memorygraphrag. Default cron and heartbeat

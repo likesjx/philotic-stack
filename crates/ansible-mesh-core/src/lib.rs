@@ -54,6 +54,7 @@ pub mod relocation_ceremony;
 pub mod resources;
 pub mod route_composition;
 pub mod router_trace;
+pub mod runner_tool;
 pub mod runtime;
 pub mod sealed_secret;
 pub mod sqlite_storage;

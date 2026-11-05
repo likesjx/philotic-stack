@@ -118,13 +118,38 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
         "starting datasource guest controller"
     );
 
+    let descriptors = (config.providers)()
+        .iter()
+        .flat_map(|provider| provider.tool_descriptors())
+        .collect::<Vec<_>>();
     let identity = GuestIdentity {
         guest_id: config.guest_id.into(),
         role: config.role.into(),
-        supported_tools: Vec::new(),
+        supported_tools: descriptors.iter().map(|tool| tool.name.clone()).collect(),
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
+    if !descriptors.is_empty() {
+        let supports_definitions = matches!(ipc_client.send_request(IpcRequest::GetConfig { key: "__runner_tool_protocol__".into() }).await?,
+            IpcResponse::ConfigData { value_json: Some(value), .. } if value == "1");
+        if supports_definitions {
+            let advertisement = philotic_client::RunnerToolAdvertisement {
+                protocol_version: 1,
+                revision: 1,
+                tools: descriptors,
+            };
+            advertisement.validate().map_err(anyhow::Error::msg)?;
+            match ipc_client
+                .send_request(IpcRequest::AdvertiseRunnerTools { advertisement })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, .. } => {}
+                reply => anyhow::bail!("hotel refused runner definitions: {reply:?}"),
+            }
+        } else {
+            info!("hotel lacks runner descriptor protocol; retaining legacy datasource dispatch");
+        }
+    }
     ipc_client
         .send_request(IpcRequest::SubscribeInbox {
             role: config.role.into(),

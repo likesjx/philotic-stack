@@ -1960,6 +1960,20 @@ pub struct LifeViewNodeInput {
     pub edge_limit: Option<usize>,
 }
 
+/// First native recall operation: exact canonical ID, bounded edges, no
+/// embedding service or caller-supplied query. The runner owns this contract.
+pub fn native_node_recall_descriptor() -> philotic_client::RunnerToolDescriptor {
+    philotic_client::RunnerToolDescriptor {
+        name: "life.view.node".into(), version: 1, read_only: true,
+        description: "Recall one LifeGraph node by canonical ID with bounded related edges. Reads LifeGraph through its existing Memgraph provider; does not confirm or mutate truth.".into(),
+        input_schema: serde_json::json!({"type":"object","additionalProperties":false,
+            "required":["id"],"properties":{
+                "id":{"type":"string","minLength":1,"maxLength":512},
+                "edge_limit":{"type":"integer","minimum":1,"maximum":200,"default":50}
+            }}),
+    }
+}
+
 /// Input for `life.list` — the READ-ONLY deterministic maintenance query
 /// surface (lifegraph-steward-capability-plane seam). Either name a query
 /// from [`ontology::NamedMaintenanceQuery`] or compose typed filters; the

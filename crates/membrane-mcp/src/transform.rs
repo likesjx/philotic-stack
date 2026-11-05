@@ -99,6 +99,9 @@ fn target_parts(
 ) -> (String, String, Option<String>) {
     use ansible_mesh_core::mcp_route::McpRouteTarget;
     match target {
+        McpRouteTarget::RunnerTool { runner_id, .. } => {
+            ("runner_tool".into(), runner_id.clone(), None)
+        }
         McpRouteTarget::NativeMemory {
             runner_id,
             target_node,

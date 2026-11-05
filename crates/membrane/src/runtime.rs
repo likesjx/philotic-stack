@@ -274,7 +274,7 @@ fn refusal_push(
         .and_then(|v| v.as_str());
     if !matches!(
         target_kind,
-        Some("mcp_upstream" | "datasource" | "native_memory")
+        Some("mcp_upstream" | "datasource" | "native_memory" | "runner_tool")
     ) {
         return None;
     }
@@ -342,6 +342,26 @@ pub fn build_inbound_request(
 
     // Signed native tasks are forwarded byte-for-byte; no transport extras or
     // caller identity fields may replace authority. Receiver verifies all pins.
+    if target_kind == Some("runner_tool") {
+        return IpcRequest::InvokeRunnerTool {
+            endpoint_id: envelope.raw_transport["endpoint_id"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            tool_name: envelope.raw_transport["tool"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            version: envelope.raw_transport["runner_tool_version"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            arguments: envelope.raw_transport["args"].clone(),
+            caller_id: envelope.sender.id.clone().unwrap_or_default(),
+            session_id: envelope.session_id.clone(),
+            turn_id: envelope.turn_id.clone(),
+        };
+    }
     if target_kind == Some("native_memory") {
         return IpcRequest::EmitTask {
             target_node: target_node.unwrap_or_else(|| local_node_id.to_string()),
