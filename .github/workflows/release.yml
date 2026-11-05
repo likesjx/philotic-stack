@@ -10,7 +10,7 @@ name: Release
 # Targets — exactly the fleet:
 #   x86_64-unknown-linux-gnu  (ubuntu-24.04: glibc >= 2.38 for the ort
 #                              prebuilt libs, matches vps-jane)
-#   aarch64-apple-darwin      (macos-14: mac-jane, mbp-jane)
+#   aarch64-apple-darwin      (macos-15: mac-jane, mbp-jane)
 #
 # Assets per release:
 #   philotic-<tag>-<os>-<arch>.tar.gz          bin/*, SHA256SUMS, manifest.json
@@ -97,7 +97,7 @@ jobs:
             platform: linux
             artifact: linux-x86_64
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             platform: darwin
             artifact: darwin-arm64
     env:
