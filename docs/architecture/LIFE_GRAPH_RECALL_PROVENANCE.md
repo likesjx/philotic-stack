@@ -43,8 +43,8 @@ continuity handles, not confirmation of LifeGraph truth.
 The existing observed timestamp remains the record's created timestamp; retrieval
 generation time remains separately visible, not substituted for event freshness.
 
-Record deduplication now requires matching complete evidence, policy filters and
-evidence paths as well as duplicate ID or normalized content. A Muninn copy and a
+Record deduplication now requires matching complete evidence, policy filters,
+evidence paths and omitted-conflict references as well as duplicate ID or normalized content. A Muninn copy and a
 provenance-bearing LifeGraph copy remain separate; different source, validation,
 scope filter or evidence path cannot disappear merely because prose or IDs match.
 Equivalent evidence from multiple strategies still collapses; the first retrieval
@@ -53,7 +53,8 @@ Legacy records lacking provenance on both sides retain ID/content deduplication.
 The protected request-local recall selector uses the same equivalence helper,
 after its existing authority check and before complete-record byte admission.
 No protected catalog, manifest binding or permission predicate is relaxed.
-No confidence/authority merge or write-back occurs.
+Omission-only differences remain separate records with their original retrieval
+references; no union, confidence/authority merge or write-back occurs.
 
 The existing complete-record metadata renderer includes the new typed field and
 explicit derived authority/qualification hints. Claim prose renders once, while
@@ -72,7 +73,7 @@ search either store, or claim absent records are globally absent.
 ## Disposition
 
 Implemented locally on `codex/life-recall-provenance`, based on develop merge
-`4c30a79f`. Local regression qualification: 693 Philote, 44 memory-core, 228 graph-contract
+`4c30a79f`. Local regression qualification: 695 Philote, 44 memory-core, 228 graph-contract
 and 57 LifeGraph runner/provider tests passed. Three existing actual-process
 protected acceptance tests also pass (the child fixture is invoked by its parents). Independent review and any
 publication are coordinated separately. Formatting, YAML and diff checks pass;

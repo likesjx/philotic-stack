@@ -4443,6 +4443,116 @@ mod tests {
         }
     }
 
+    fn life_provenance_omission_pair() -> (
+        crate::session::RecalledMemoryRecord,
+        crate::session::RecalledMemoryRecord,
+    ) {
+        let mut envelope = life_provenance_fixture("proposed");
+        envelope["data"]["context_packet"]["omitted_conflict_ids"] = json!([]);
+        envelope["data"]["context_packet"]["ranked_packets"][0]["packet"]["conflict_ids"] =
+            json!([]);
+        let (_, records) = life_recall_records_from_result(&envelope).unwrap();
+        let no_omission = records[0].clone();
+        let mut with_omission = no_omission.clone();
+        with_omission
+            .life_graph_provenance
+            .as_mut()
+            .unwrap()
+            .omitted_conflict_ids = vec!["conflict:only-omitted".into()];
+        (no_omission, with_omission)
+    }
+
+    #[test]
+    fn life_provenance_cache_preserves_omitted_conflicts() {
+        use crate::session::{LifeRecallCacheEntry, SessionState};
+        let (no_omission, with_omission) = life_provenance_omission_pair();
+        let mut state =
+            SessionState::new("synthetic".into(), "synthetic".into(), "synthetic".into());
+        state.start_turn(super::super::tests::def004_working_turn(
+            "omission",
+            "life.recall",
+        ));
+        for (strategy, record) in [
+            ("re_entry_context", no_omission.clone()),
+            ("open_loops_by_context", with_omission.clone()),
+        ] {
+            state.upsert_life_recall_cache(LifeRecallCacheEntry {
+                strategy: strategy.into(),
+                fetched_at: 100,
+                query_text: String::new(),
+                records: vec![record],
+            });
+        }
+        assert_eq!(
+            state.inject_cached_life_context(60, 100, 100_000),
+            2,
+            "omission-only differences must survive cache dedup"
+        );
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories,
+            vec![no_omission, with_omission]
+        );
+        state.settings.injection_budget.recalled_memory_chars = 20_000;
+        let prompt = state.build_prompt("synthetic query");
+        assert!(prompt.contains("conflict:only-omitted"));
+        assert!(
+            prompt.contains("conflict references retained; do not infer resolution from recall")
+        );
+    }
+
+    #[test]
+    fn life_provenance_protected_preserves_omitted_conflicts() {
+        use crate::session::SessionState;
+        struct SyntheticAuthority;
+        impl crate::recall_selection::RecallAuthority for SyntheticAuthority {
+            fn permits(
+                &self,
+                principal: &str,
+                _: &str,
+                _: &str,
+                _: &crate::session::RecalledMemoryRecord,
+            ) -> bool {
+                principal == "synthetic"
+            }
+        }
+        let (no_omission, with_omission) = life_provenance_omission_pair();
+        let records = vec![
+            no_omission.clone(),
+            with_omission.clone(),
+            with_omission.clone(),
+        ];
+        let (selected, counts) = crate::recall_selection::select(
+            Some("synthetic"),
+            "synthetic",
+            "synthetic",
+            Some(&SyntheticAuthority),
+            &records,
+            12,
+            100_000,
+        );
+        assert_eq!(
+            selected,
+            vec![&no_omission, &with_omission],
+            "omission-only differences must survive protected selection"
+        );
+        assert_eq!(counts.duplicates, 1, "exact copies may still collapse");
+        let mut state =
+            SessionState::new("synthetic".into(), "synthetic".into(), "synthetic".into());
+        state.agent_profile.user_principal_id = Some("synthetic".into());
+        let mut turn = super::super::tests::def004_working_turn("omission", "life.recall");
+        turn.recalled_memories = records;
+        state.start_turn(turn);
+        state.settings.injection_budget.recalled_memory_chars = 20_000;
+        let (_, context, _) = state.model_request_payloads_with_recall_authority(
+            "synthetic query",
+            &[],
+            Some(&SyntheticAuthority),
+        );
+        let text = serde_json::to_string(&context).unwrap();
+        assert!(text.contains("conflict:only-omitted"));
+        assert!(text.contains("conflict references retained; do not infer resolution from recall"));
+    }
+
     #[test]
     fn life_provenance_conflicts_survive_dedup_and_whole_record_budgets() {
         use crate::session::{LifeRecallCacheEntry, RecallOutcome, SessionState};

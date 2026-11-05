@@ -3,7 +3,7 @@
 ## LifeGraph recall provenance — 2026-11-05
 
 - Local follow-on from develop `4c30a79f`: retain typed ranked evidence, source/passage and retrieval provenance; preserve authority and differing evidence during deduplication under existing complete-record budgets. [Contract](architecture/LIFE_GRAPH_RECALL_PROVENANCE.md).
-- Local qualification: 693 Philote, 44 memory-core, 228 graph-contract and 57 runner/provider tests, plus three protected actual-process acceptance tests passed. Independent review and publication coordinated separately. No memory migration, deletion, new gateway or deployment.
+- Local qualification: 695 Philote, 44 memory-core, 228 graph-contract and 57 runner/provider tests, plus three protected actual-process acceptance tests passed. Independent review and publication coordinated separately. No memory migration, deletion, new gateway or deployment.
 
 ## Automatic recall outcome contract (2026-11-05)
 

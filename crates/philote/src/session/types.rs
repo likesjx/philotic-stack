@@ -637,7 +637,9 @@ pub struct RecalledMemoryRecord {
 
 impl RecalledMemoryRecord {
     /// Equal prose/identity may collapse only when LifeGraph evidence, scope
-    /// filters and paths agree. No legacy provenance is inferred or promoted.
+    /// filters, paths and omitted-conflict references agree. A retrieval's
+    /// conflict omissions must not disappear behind equal claim evidence.
+    /// No legacy provenance is inferred or promoted.
     pub(crate) fn same_life_graph_evidence(&self, other: &Self) -> bool {
         match (&self.life_graph_provenance, &other.life_graph_provenance) {
             (None, None) => true,
@@ -646,6 +648,7 @@ impl RecalledMemoryRecord {
                     && a.ranked_packet.matched_policy_filters
                         == b.ranked_packet.matched_policy_filters
                     && a.ranked_packet.evidence_path == b.ranked_packet.evidence_path
+                    && a.omitted_conflict_ids == b.omitted_conflict_ids
             }
             _ => false,
         }
