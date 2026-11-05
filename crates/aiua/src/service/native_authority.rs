@@ -43,6 +43,19 @@ pub struct NativeAuthority {
     entries: Mutex<BTreeMap<Uuid, Entry>>,
     issuer: Arc<dyn NativeIntrospector>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    #[cfg(test)]
+    publisher_waiting: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    publisher_never_started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    publisher_boundary: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    publisher_spawned: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// A reservation is deliberately not serializable. Its owner must retain it
@@ -94,6 +107,14 @@ impl NativeAuthority {
             journal: Arc::new(Mutex::new(Journal::open(journal, uid)?)),
             entries: Mutex::new(BTreeMap::new()),
             issuer,
+            #[cfg(test)]
+            publisher_waiting: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            publisher_never_started: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            publisher_boundary: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            publisher_spawned: std::sync::Mutex::new(None),
             clock: Arc::new(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -329,6 +350,92 @@ impl NativeAuthority {
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), change).await??; // Unknown outcome poisons admission.
         fence.finish()?;
         Ok(result)
+    }
+
+    /// Disabled lifecycle building block: no runtime route or configuration
+    /// invokes this operation. A child exit is not proof that descendants are
+    /// quiescent or that grant state was reconciled, so even success leaves the
+    /// durable fence dirty. Without descendant-quiescence evidence the owner
+    /// deliberately retains the fence until runtime shutdown, even after the
+    /// direct child has exited or been reaped. There is no completion path.
+    #[allow(dead_code)]
+    async fn publisher_child_unreconciled(
+        self: &Arc<Self>,
+        mut command: tokio::process::Command,
+        deadline: std::time::Duration,
+    ) -> Result<std::process::ExitStatus> {
+        ensure!(
+            !deadline.is_zero() && deadline <= std::time::Duration::from_secs(30),
+            "invalid publisher deadline"
+        );
+        // Caller cancellation closes this channel, but never aborts the
+        // spawned owner task. The owner retains the fence until it has waited
+        // for the exact direct child or cannot establish its termination.
+        let (caller_alive, mut caller_gone) = tokio::sync::oneshot::channel::<()>();
+        let authority = self.clone();
+        let owner = tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(ready) = authority.publisher_waiting.lock().unwrap().take() {
+                let _ = ready.send(());
+            }
+            let mut fence = authority.fence().await?;
+            // This check is the spawn-authorization linearization point.
+            // Cancellation observed here prevents spawn. Cancellation after
+            // it may still race with spawn and must take the uncertain path.
+            if matches!(
+                caller_gone.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ) {
+                // No child was spawned and no publisher effect began.
+                fence.finish()?;
+                #[cfg(test)]
+                if let Some(done) = authority.publisher_never_started.lock().unwrap().take() {
+                    let _ = done.send(());
+                }
+                return Err(anyhow!("publisher caller cancelled before spawn"));
+            }
+            #[cfg(test)]
+            {
+                let hook = authority.publisher_boundary.lock().unwrap().take();
+                if let Some((ready, proceed)) = hook {
+                    let _ = ready.send(());
+                    let _ = proceed.await;
+                }
+            }
+            command.kill_on_drop(true);
+            let mut child = command.spawn()?;
+            #[cfg(test)]
+            if let Some(spawned) = authority.publisher_spawned.lock().unwrap().take() {
+                let _ = spawned.send(());
+            }
+            let wait = tokio::select! {
+                status = child.wait() => Some(status),
+                _ = tokio::time::sleep(deadline) => None,
+                _ = &mut caller_gone => None,
+            };
+            match wait {
+                Some(Ok(_)) => {}
+                Some(Err(_)) => {
+                    // Unknown status: retain the fence while this runtime lives.
+                    return std::future::pending::<Result<std::process::ExitStatus>>().await;
+                }
+                None => {
+                    if child.kill().await.is_err() {
+                        // A failed kill/wait is not evidence of quiescence.
+                        return std::future::pending::<Result<std::process::ExitStatus>>().await;
+                    }
+                }
+            }
+            // Direct-child exit or reap does not establish descendant
+            // quiescence. Never release the fence on that evidence alone.
+            let _keep_fence = fence;
+            std::future::pending::<Result<std::process::ExitStatus>>().await
+        });
+        let result = owner
+            .await
+            .map_err(|_| anyhow!("publisher owner unavailable"))?;
+        drop(caller_alive);
+        result
     }
 }
 
@@ -906,5 +1013,324 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn publisher_child_exit_keeps_unreconciled_authority_closed() {
+        let f = Fixture::new();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                f.authority
+                    .publisher_child_unreconciled(command, std::time::Duration::from_secs(2))
+            )
+            .await
+            .is_err()
+        );
+        assert!(f.authority.journal.try_lock().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_child_timeout_keeps_unreconciled_authority_closed() {
+        let f = Fixture::new();
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("5");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                f.authority
+                    .publisher_child_unreconciled(command, std::time::Duration::from_millis(25))
+            )
+            .await
+            .is_err()
+        );
+        assert!(f.authority.journal.try_lock().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_child_failure_keeps_unreconciled_authority_closed() {
+        let f = Fixture::new();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 1"]);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                f.authority
+                    .publisher_child_unreconciled(command, std::time::Duration::from_secs(2))
+            )
+            .await
+            .is_err()
+        );
+        assert!(f.authority.journal.try_lock().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_cancelled_before_spawn_does_not_start_or_dirty_authority() {
+        let f = Fixture::new();
+        let mut blocker = f.authority.fence().await.unwrap();
+        let marker = f.dir.join("must-not-start");
+        let path = marker.clone();
+        let owner = f.authority.clone();
+        let (waiting, waiting_rx) = tokio::sync::oneshot::channel();
+        let (never_started, never_started_rx) = tokio::sync::oneshot::channel();
+        *f.authority.publisher_waiting.lock().unwrap() = Some(waiting);
+        *f.authority.publisher_never_started.lock().unwrap() = Some(never_started);
+        let caller = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("printf started > \"$1\"")
+                .arg("synthetic-publisher")
+                .arg(path);
+            owner
+                .publisher_child_unreconciled(command, std::time::Duration::from_secs(2))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.is_err());
+        blocker.finish().unwrap();
+        drop(blocker);
+        tokio::time::timeout(std::time::Duration::from_secs(2), never_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!marker.exists());
+        assert!(f.authority.journal.lock().await.validate().is_ok());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"clean\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_cancelled_after_boundary_may_spawn_but_remains_closed() {
+        let f = Fixture::new();
+        let (at_boundary, at_boundary_rx) = tokio::sync::oneshot::channel();
+        let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
+        let (spawned, spawned_rx) = tokio::sync::oneshot::channel();
+        *f.authority.publisher_boundary.lock().unwrap() = Some((at_boundary, proceed_rx));
+        *f.authority.publisher_spawned.lock().unwrap() = Some(spawned);
+        let owner = f.authority.clone();
+        let caller = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sleep");
+            command.arg("5");
+            owner
+                .publisher_child_unreconciled(command, std::time::Duration::from_secs(2))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), at_boundary_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.is_err());
+        proceed.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), spawned_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(f.authority.journal.try_lock().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_caller_cancellation_reaps_direct_child_and_retains_fence() {
+        let f = Fixture::new();
+        let pid_file = f.dir.join("publisher-pid");
+        let owner = f.authority.clone();
+        let path = pid_file.clone();
+        let caller = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("printf '%s' \"$$\" > \"$1\"; exec /bin/sleep 5")
+                .arg("synthetic-publisher")
+                .arg(path);
+            owner
+                .publisher_child_unreconciled(command, std::time::Duration::from_secs(10))
+                .await
+        });
+        let pid: libc::pid_t = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = contents.parse() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        assert!(caller.await.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(f.authority.journal.try_lock().is_err());
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_parent_exit_does_not_release_fence_while_descendant_runs() {
+        let f = Fixture::new();
+        let marker = f.dir.join("descendant-finished");
+        let owner = f.authority.clone();
+        let path = marker.clone();
+        let caller = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("(/bin/sleep 0.1; printf done > \"$1\") & exit 0")
+                .arg("synthetic-publisher")
+                .arg(path);
+            owner
+                .publisher_child_unreconciled(command, std::time::Duration::from_secs(2))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read(&marker).ok().as_deref() != Some(b"done") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"done");
+        assert!(f.authority.journal.try_lock().is_err());
+        assert_eq!(
+            std::fs::read(f.dir.join("uncertainty")).unwrap(),
+            b"dirty\n"
+        );
+        caller.abort();
+    }
+
+    #[test]
+    fn publisher_runtime_shutdown_leaves_durable_journal_dirty() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut f, replacement) = runtime.block_on(async {
+            let f = Fixture::new();
+            let replacement = Fixture::new();
+            let marker = f.dir.join("publisher-started");
+            let owner = f.authority.clone();
+            let path = marker.clone();
+            tokio::spawn(async move {
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .arg("-c")
+                    .arg("printf started > \"$1\"; exec /bin/sleep 5")
+                    .arg("synthetic-publisher")
+                    .arg(path);
+                let _ = owner
+                    .publisher_child_unreconciled(command, std::time::Duration::from_secs(10))
+                    .await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !marker.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            (f, replacement)
+        });
+        drop(runtime);
+        let binding = f.authority.binding.clone();
+        let issuer = f.authority.issuer.clone();
+        let old = std::mem::replace(&mut f.authority, replacement.authority.clone());
+        drop(old);
+        let path = f.dir.join("uncertainty");
+        assert_eq!(std::fs::read(&path).unwrap(), b"dirty\n");
+        // Verify rejection is due to durable state, not the old owner's lock.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        probe.try_lock().unwrap();
+        drop(probe);
+        let uid = std::fs::metadata(&path).unwrap().uid();
+        assert!(
+            NativeAuthority::new(
+                "hotel".into(),
+                "membrane".into(),
+                "runner".into(),
+                binding,
+                Arc::new(LocalLaunchRegistry::default()),
+                &path,
+                uid,
+                issuer
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_child_keeps_issuer_blocked_after_unreconciled_exit() {
+        let f = Fixture::new();
+        let owner = f.authority.clone();
+        let child = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sleep");
+            command.arg("0.2");
+            owner
+                .publisher_child_unreconciled(command, std::time::Duration::from_secs(2))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read(f.dir.join("uncertainty")).unwrap() != b"dirty\n" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let attempted = ran.clone();
+        let owner = f.authority.clone();
+        let issuer = tokio::spawn(async move {
+            owner
+                .issuer_change(async move {
+                    attempted.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!ran.load(Ordering::SeqCst));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!child.is_finished());
+        assert!(!issuer.is_finished());
+        assert!(!ran.load(Ordering::SeqCst));
+        child.abort();
+        issuer.abort();
     }
 }
