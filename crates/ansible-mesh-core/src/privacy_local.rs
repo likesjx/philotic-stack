@@ -200,6 +200,14 @@ impl VerifiedLocalSession {
     pub fn consumer(&self) -> LocalConsumer {
         self.scope.clone()
     }
+    /// Bind a kernel-observed message sender to this exact live launch.
+    /// Caller must obtain these credentials from the kernel, never from a frame.
+    pub fn verify_message_sender(&self, uid: u32, pid: u32) -> Result<()> {
+        if self.uid != uid || self.pid != pid {
+            bail!("message sender differs from authenticated launch");
+        }
+        self.with_current_launch(|_| Ok(()))
+    }
     pub fn principal(&self) -> Result<AuthenticatedAgent> {
         self.with_current_launch(Ok)
     }
