@@ -245,8 +245,7 @@ impl ReadOwner {
                         if *self.stopping.borrow() {
                             bail!("owner stopping");
                         }
-                        let mut lock = Fence::new(lock);
-                        lock.mark(false)?;
+                        let lock = Fence::begin(lock)?;
                         lease_deadline = Some(Instant::now() + Duration::from_secs(5));
                         gate = Some(lock);
                         mode = match request.operation.as_str() {
@@ -556,8 +555,7 @@ mod tests {
         let task_journal = journal.clone();
         let task_ready = ready.clone();
         let task = tokio::spawn(async move {
-            let mut fence = Fence::new(task_journal.lock_owned().await);
-            fence.mark(false).unwrap();
+            let _fence = Fence::begin(task_journal.lock_owned().await).unwrap();
             task_ready.notify_one();
             std::future::pending::<()>().await;
         });

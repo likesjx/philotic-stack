@@ -104,15 +104,13 @@ impl NativeAuthority {
     }
 
     async fn fence(&self) -> Result<Fence> {
-        let mut fence = Fence::new(
+        Fence::begin(
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 self.journal.clone().lock_owned(),
             )
             .await?,
-        );
-        fence.mark(false)?;
-        Ok(fence)
+        )
     }
     async fn inspect(&self, token: &str) -> Result<Introspection> {
         tokio::time::timeout(
