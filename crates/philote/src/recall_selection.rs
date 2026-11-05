@@ -26,7 +26,8 @@ pub struct RecallCounts {
     pub over_budget: usize,
 }
 /// Selection never changes durable memories. De-duplicate by identity and
-/// normalized content, keeping the first authority-approved item. Oversized
+/// normalized content only when LifeGraph provenance agrees, keeping the first
+/// authority-approved equivalent item. Different evidence is never merged. Oversized
 /// records are omitted whole, rather than silently slicing away provenance.
 pub fn select<'a>(
     principal: Option<&str>,
@@ -39,8 +40,8 @@ pub fn select<'a>(
 ) -> (Vec<&'a RecalledMemoryRecord>, RecallCounts) {
     let mut out = Vec::new();
     let mut counts = RecallCounts::default();
-    let mut ids = std::collections::BTreeSet::new();
-    let mut content = std::collections::BTreeSet::new();
+    let mut ids: std::collections::BTreeMap<_, Vec<&RecalledMemoryRecord>> = Default::default();
+    let mut content: std::collections::BTreeMap<_, Vec<&RecalledMemoryRecord>> = Default::default();
     let mut used = 0usize;
     for r in records {
         counts.considered += 1;
@@ -54,7 +55,15 @@ pub fn select<'a>(
         }
         let key = r.content.split_whitespace().collect::<Vec<_>>().join(" ");
         let identity = r.id.as_ref().map(|id| (r.vault_id.clone(), id.clone()));
-        if identity.as_ref().is_some_and(|k| ids.contains(k)) || content.contains(&key) {
+        let equivalent = |previous: &&RecalledMemoryRecord| r.same_life_graph_evidence(previous);
+        if identity
+            .as_ref()
+            .and_then(|k| ids.get(k))
+            .is_some_and(|rs| rs.iter().any(equivalent))
+            || content
+                .get(&key)
+                .is_some_and(|rs| rs.iter().any(equivalent))
+        {
             counts.duplicates += 1;
             continue;
         }
@@ -64,9 +73,9 @@ pub fn select<'a>(
             continue;
         }
         if let Some(k) = identity {
-            ids.insert(k);
+            ids.entry(k).or_default().push(r);
         }
-        content.insert(key);
+        content.entry(key).or_default().push(r);
         used += cost;
         out.push(r);
         counts.admitted += 1;

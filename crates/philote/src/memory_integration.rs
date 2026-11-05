@@ -110,6 +110,7 @@ pub(super) fn recalled_memory_from_engram(
         annotations,
         recall_reason: recall_reason.map(str::to_string),
         spacetime_frame,
+        life_graph_provenance: None,
     }
 }
 
@@ -301,6 +302,14 @@ pub(super) fn life_recall_records_from_result(
                 source: Some("life-graph".to_string()),
                 created_at: evidence.observed_at.as_deref().and_then(parse_iso_to_unix),
                 recall_reason: Some(format!("life.recall:{strategy} score={:.2}", ranked.score)),
+                life_graph_provenance: Some(crate::session::LifeGraphRecallProvenance {
+                    context_id: packet.context_id.clone(),
+                    query_id: packet.query_id.clone(),
+                    generated_at: packet.generated_at.clone(),
+                    strategy: packet.strategy.clone(),
+                    ranked_packet: ranked.clone(),
+                    omitted_conflict_ids: packet.omitted_conflict_ids.clone(),
+                }),
                 ..Default::default()
             }
         })
@@ -4269,6 +4278,388 @@ mod tests {
         );
         assert_eq!(life_domain_slug_for_agent("agent-coach-01"), Some("human"));
         assert_eq!(life_domain_slug_for_agent("agent-unknown-01"), None);
+    }
+
+    fn life_provenance_fixture(validation: &str) -> Value {
+        json!({"status":"success","data":{"status":"ok","named_strategy":"open_loops_by_context","context_packet":{
+            "context_id":"context:PRIVATE_CONTEXT_CANARY","query_id":"query:PRIVATE_QUERY_CANARY","generated_at":"2026-11-05T10:00:00Z","strategy":"memory_aware_graph_rank","token_budget":800,
+            "omitted_conflict_ids":["conflict:omitted"],"ranked_packets":[{
+                "score":0.99,"matched_policy_filters":["role_appropriate"],"evidence_path":[{"id":"life:scope","label":"Scope","datasource":"life-graph"}],
+                "packet":{"packet_id":"evidence:PRIVATE_PACKET_CANARY","claim_ref":{"id":"life:claim","label":"Claim","datasource":"life-graph"},"claim_summary":"PRIVATE_CONTENT_CANARY — mémoire",
+                    "validation_state":validation,"confidence":0.99,"source_reliability":1.0,"observed_at":"2026-07-01T12:00:00Z","valid_time_range":{"starts_at":"2026-07-01T00:00:00Z","ends_at":"2026-09-01T00:00:00Z"},
+                    "conflict_ids":["conflict:present"],"adjudication_status":"operator_required",
+                    "source_refs":[{"source_id":"muninn:PRIVATE_SOURCE_CANARY","source_kind":"muninn_engram","reliability":{"score":0.9,"basis":"muninn_trust"},"captured_at":"2026-07-01T12:00:00Z","uri":"synthetic:private-source"},{"source_id":"operator:synthetic","source_kind":"operator_confirmation","reliability":{"score":1.0,"basis":"operator_confirmed"}}],
+                    "passage_refs":[{"passage_id":"passage:PRIVATE_PASSAGE_CANARY","source_ref_id":"muninn:PRIVATE_SOURCE_CANARY","excerpt_hash":"synthetic-hash","muninn_engram_id":"muninn:PRIVATE_SOURCE_CANARY","graph_node_id":"life:source"}],
+                    "metadata":{"scope":{"agent":"synthetic-agent","session":"synthetic-session"},"authority":"conflicting_metadata_claim"},"properties":{}
+                }
+            }]
+        }}})
+    }
+
+    #[tokio::test]
+    async fn life_provenance_response_cache_prompt_preserves_evidence_without_logging_it() {
+        use crate::session::RecallOutcome;
+        let socket = format!("/tmp/life-provenance-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let hotel = tokio::spawn(super::super::tests::run_recording_hotel(
+            listener,
+            Default::default(),
+        ));
+        let client = philotic_client::PhiloticClient::connect_at(
+            &socket,
+            philotic_client::GuestIdentity {
+                guest_id: "synthetic".into(),
+                role: "agent".into(),
+                supported_tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let mut runtime = AgentRuntime::new(client, "synthetic");
+        let session = "synthetic-provenance";
+        runtime
+            .ensure_session_loaded(session, "synthetic")
+            .await
+            .unwrap();
+        runtime.sessions.get_mut(session).unwrap().start_turn(
+            super::super::tests::def004_working_turn("provenance", "life.recall"),
+        );
+        let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = RecallTraceWriter(traces.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let envelope = life_provenance_fixture("conflicted");
+        let task: InboundTaskPayload =
+            serde_json::from_value(json!({"session_id":session,"result":envelope})).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.handle_life_recall_prefetch_response(&task)
+        });
+        let state = runtime.sessions.get_mut(session).unwrap();
+        assert_eq!(state.life_recall_cache.len(), 1);
+        let cached = state.life_recall_cache[0].records[0].clone();
+        let now = state.life_recall_cache[0].fetched_at;
+        assert_eq!(state.inject_cached_life_context(60, now, 100_000), 1);
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories[0],
+            cached
+        );
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::Matched
+        );
+        state.settings.injection_budget.recalled_memory_chars = 20_000;
+        let prompt = state.build_prompt("synthetic query");
+        for expected in [
+            "not confirmed LifeGraph truth",
+            "Muninn refs are continuity handles",
+            "conflict:present",
+            "operator_required",
+            "PRIVATE_PASSAGE_CANARY",
+            "PRIVATE_SOURCE_CANARY",
+            "synthetic-session",
+        ] {
+            assert!(prompt.contains(expected), "{expected}");
+        }
+        let logs = String::from_utf8(traces.lock().unwrap().clone()).unwrap();
+        for canary in [
+            "PRIVATE_CONTENT_CANARY",
+            "PRIVATE_SOURCE_CANARY",
+            "PRIVATE_PASSAGE_CANARY",
+            "PRIVATE_CONTEXT_CANARY",
+            "PRIVATE_QUERY_CANARY",
+            "PRIVATE_PACKET_CANARY",
+        ] {
+            assert!(!logs.contains(canary), "{logs}");
+        }
+        drop(runtime);
+        hotel.abort();
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn life_provenance_adapter_preserves_existing_contract_without_promotion() {
+        use data_memorygraphrag::{
+            ContextAuthority, ContextPacket, ContextRefKind, RetrievalContextPacket,
+        };
+        for validation in ["inferred", "proposed", "confirmed", "retired", "conflicted"] {
+            let envelope = life_provenance_fixture(validation);
+            let packet: RetrievalContextPacket =
+                serde_json::from_value(envelope["data"]["context_packet"].clone()).unwrap();
+            let (_, records) = life_recall_records_from_result(&envelope).unwrap();
+            let provenance = records[0].life_graph_provenance.as_ref().unwrap();
+            assert_eq!(provenance.ranked_packet, packet.ranked_packets[0]);
+            assert_eq!(provenance.context_id, packet.context_id);
+            assert_eq!(provenance.query_id, packet.query_id);
+            assert_eq!(provenance.generated_at, packet.generated_at);
+            assert_eq!(provenance.strategy, packet.strategy);
+            assert_eq!(provenance.omitted_conflict_ids, packet.omitted_conflict_ids);
+            let authority = provenance.ranked_packet.packet.context_authority();
+            assert_eq!(
+                authority,
+                if validation == "confirmed" {
+                    ContextAuthority::LifeGraphTruth
+                } else {
+                    ContextAuthority::LifeGraphEvidence
+                }
+            );
+            let canonical = ContextPacket::from_lifegraph_retrieval(&packet, "synthetic", None);
+            assert_eq!(
+                canonical
+                    .refs
+                    .iter()
+                    .find(|r| r.kind == ContextRefKind::LifeGraphNode)
+                    .unwrap()
+                    .authority,
+                authority
+            );
+            assert!(
+                canonical
+                    .refs
+                    .iter()
+                    .any(|r| r.kind == ContextRefKind::MuninnEngram
+                        && r.authority == ContextAuthority::MuninnContinuity)
+            );
+            let saved = serde_json::to_value(&records[0]).unwrap();
+            let restored: crate::session::RecalledMemoryRecord =
+                serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(restored, records[0]);
+            let mut old = saved;
+            old.as_object_mut().unwrap().remove("life_graph_provenance");
+            assert!(
+                serde_json::from_value::<crate::session::RecalledMemoryRecord>(old)
+                    .unwrap()
+                    .life_graph_provenance
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn life_provenance_conflicts_survive_dedup_and_whole_record_budgets() {
+        use crate::session::{LifeRecallCacheEntry, RecallOutcome, SessionState};
+        let (_, records) =
+            life_recall_records_from_result(&life_provenance_fixture("proposed")).unwrap();
+        let original = records[0].clone();
+        let exact_bytes = serde_json::to_vec(&vec![original.clone()]).unwrap().len();
+        assert!(
+            crate::session::apply_life_recall_char_budget(vec![original.clone()], exact_bytes - 1)
+                .is_empty()
+        );
+        assert_eq!(
+            crate::session::apply_life_recall_char_budget(vec![original.clone()], exact_bytes),
+            vec![original.clone()]
+        );
+        let mut different = original.clone();
+        different
+            .life_graph_provenance
+            .as_mut()
+            .unwrap()
+            .ranked_packet
+            .packet
+            .source_refs[0]
+            .source_id = "muninn:other-source".into();
+        let mut confirmed = original.clone();
+        confirmed
+            .life_graph_provenance
+            .as_mut()
+            .unwrap()
+            .ranked_packet
+            .packet
+            .validation_state = data_memorygraphrag::ValidationState::Confirmed;
+        let mut different_scope = original.clone();
+        different_scope
+            .life_graph_provenance
+            .as_mut()
+            .unwrap()
+            .ranked_packet
+            .matched_policy_filters
+            .clear();
+        let mut different_path = original.clone();
+        different_path
+            .life_graph_provenance
+            .as_mut()
+            .unwrap()
+            .ranked_packet
+            .evidence_path[0]
+            .id = "life:different-path".into();
+        let mut muninn = original.clone();
+        muninn.id = Some("muninn:claim".into());
+        muninn.vault_id = Some("self_synthetic".into());
+        muninn.life_graph_provenance = None;
+        let mut state =
+            SessionState::new("synthetic".into(), "synthetic".into(), "synthetic".into());
+        let mut turn = super::super::tests::def004_working_turn("provenance", "life.recall");
+        turn.recalled_memories = vec![muninn];
+        state.start_turn(turn);
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: 100,
+            query_text: String::new(),
+            records: vec![
+                original.clone(),
+                original.clone(),
+                different,
+                confirmed,
+                different_scope,
+                different_path,
+            ],
+        });
+        assert_eq!(
+            state.inject_cached_life_context(60, 100, 100_000),
+            5,
+            "only identical evidence may collapse"
+        );
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().recalled_memories.len(),
+            6
+        );
+        struct SyntheticAuthority;
+        impl crate::recall_selection::RecallAuthority for SyntheticAuthority {
+            fn permits(
+                &self,
+                principal: &str,
+                _: &str,
+                _: &str,
+                _: &crate::session::RecalledMemoryRecord,
+            ) -> bool {
+                principal == "synthetic"
+            }
+        }
+        let mut protected = state
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .recalled_memories
+            .clone();
+        protected.push(original.clone());
+        let (selected, counts) = crate::recall_selection::select(
+            Some("synthetic"),
+            "synthetic",
+            "synthetic",
+            Some(&SyntheticAuthority),
+            &protected,
+            12,
+            100_000,
+        );
+        assert_eq!(
+            selected.len(),
+            6,
+            "protected projection must preserve differing evidence too"
+        );
+        assert_eq!(counts.duplicates, 1);
+        let (denied, counts) = crate::recall_selection::select(
+            Some("other"),
+            "synthetic",
+            "synthetic",
+            Some(&SyntheticAuthority),
+            &protected,
+            12,
+            100_000,
+        );
+        assert!(denied.is_empty());
+        assert_eq!(counts.denied, protected.len());
+        let (omitted, counts) = crate::recall_selection::select(
+            Some("synthetic"),
+            "synthetic",
+            "synthetic",
+            Some(&SyntheticAuthority),
+            &protected,
+            12,
+            0,
+        );
+        assert!(omitted.is_empty());
+        assert_eq!(counts.over_budget, protected.len());
+        let cache = state.life_recall_cache.clone();
+        for budget in [0, 1, 400, 1000, 4000, 40_000] {
+            state.settings.injection_budget.recalled_memory_chars = budget;
+            let projection = state.build_context_projection("synthetic query");
+            let context = state.model_context_from_projection(&projection);
+            let text = context["recalled_memory"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(text.len() <= budget);
+            if budget == 40_000 {
+                for expected in [
+                    "life_graph_evidence",
+                    "life_graph_truth",
+                    "not confirmed LifeGraph truth",
+                    "conflict references retained",
+                    "passage:PRIVATE_PASSAGE_CANARY",
+                    "muninn:other-source",
+                    "2026-09-01T00:00:00Z",
+                    "synthetic-session",
+                    "role_appropriate",
+                ] {
+                    assert!(text.contains(expected), "missing {expected}: {text}");
+                }
+            }
+        }
+        assert_eq!(
+            state.life_recall_cache, cache,
+            "projection must not trim cached provenance"
+        );
+        state
+            .active_turn
+            .as_mut()
+            .unwrap()
+            .recalled_memories
+            .clear();
+        assert_eq!(state.inject_cached_life_context(60, 100, 0), 0);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::Matched,
+            "budget omission is not no-match"
+        );
+        assert_eq!(state.inject_cached_life_context(60, 200, 100_000), 0);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::Unavailable
+        );
+        let mut empty = life_provenance_fixture("proposed");
+        empty["data"]["context_packet"]["ranked_packets"] = json!([]);
+        empty["data"]["context_packet"]["omitted_conflict_ids"] = json!([]);
+        let (_, records) = life_recall_records_from_result(&empty).unwrap();
+        assert!(records.is_empty());
+        state.life_recall_cache.clear();
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: 200,
+            query_text: String::new(),
+            records,
+        });
+        state.inject_cached_life_context(60, 200, 100_000);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::NoMatch
+        );
     }
 
     #[test]

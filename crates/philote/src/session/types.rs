@@ -581,6 +581,20 @@ pub struct MemoryShapingContext {
     pub promotion_policy: Option<String>,
 }
 
+/// Additive, record-local projection of the existing retrieval contract.
+/// Keeps source authority, scope filters and evidence paths together; it is
+/// evidence from the store, not authority granted by the Philote adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeGraphRecallProvenance {
+    pub context_id: String,
+    pub query_id: String,
+    pub generated_at: String,
+    pub strategy: data_memorygraphrag::RetrievalStrategy,
+    pub ranked_packet: data_memorygraphrag::RankedEvidencePacket,
+    #[serde(default)]
+    pub omitted_conflict_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RecalledMemoryRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -615,6 +629,27 @@ pub struct RecalledMemoryRecord {
     pub recall_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacetime_frame: Option<MemorySpacetimeFrame>,
+    /// Full LifeGraph evidence and retrieval provenance, absent on legacy and
+    /// Muninn records. Serialized admission and prompt budgets include it whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub life_graph_provenance: Option<LifeGraphRecallProvenance>,
+}
+
+impl RecalledMemoryRecord {
+    /// Equal prose/identity may collapse only when LifeGraph evidence, scope
+    /// filters and paths agree. No legacy provenance is inferred or promoted.
+    pub(crate) fn same_life_graph_evidence(&self, other: &Self) -> bool {
+        match (&self.life_graph_provenance, &other.life_graph_provenance) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.ranked_packet.packet == b.ranked_packet.packet
+                    && a.ranked_packet.matched_policy_filters
+                        == b.ranked_packet.matched_policy_filters
+                    && a.ranked_packet.evidence_path == b.ranked_packet.evidence_path
+            }
+            _ => false,
+        }
+    }
 }
 
 /// One cached LifeGraph prefetch result, keyed by named recall strategy.
