@@ -10,6 +10,7 @@ tags:
 - active-seam
 - transitional
 related_docs:
+- LIFE_GRAPH_RECALL_PROVENANCE.md
 - AUTOMATIC_RECALL_STATUS.md
 - NATIVE_GRAPH_TOOLS_PROPOSAL.md
 - README.md
@@ -47,9 +48,13 @@ tracks_domains:
 - migration-parity
 ---
 
+## LifeGraph recall provenance (2026-11-05)
+
+Local additive adaptation on `codex/life-recall-provenance`, based on develop `4c30a79f`, preserves typed evidence/source/passage/scope/freshness through cache and bounded prompt projection. Equal prose no longer collapses differing evidence. [Contract and qualification](LIFE_GRAPH_RECALL_PROVENANCE.md). No publication or deployment; independent review pending.
+
 ## Automatic recall outcome contract (2026-11-05)
 
-Implemented on `codex/automatic-recall-status`, based on merged develop `8fa2a79f`: bounded per-lane outcomes distinguish scoped no-match from incomplete recall without changing retrieval or candidate write authority. See [contract](AUTOMATIC_RECALL_STATUS.md). Local verification recorded in the contract; independent review and exact-head CI pending. No deployment.
+Implemented on `codex/automatic-recall-status`, based on merged develop `8fa2a79f`: bounded per-lane outcomes distinguish scoped no-match from incomplete recall without changing retrieval or candidate write authority. See [contract](AUTOMATIC_RECALL_STATUS.md). Integrated via PR #691 at develop `4c30a79f`, with independent review and all eight exact-head CI checks green. No deployment.
 
 
 # Philotic Architecture Status

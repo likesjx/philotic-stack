@@ -239,6 +239,15 @@ where
 }
 
 impl EvidencePacket {
+    /// Canonical context authority follows stored validation, never source
+    /// confidence, reliability, retrieval rank or a continuity reference.
+    pub fn context_authority(&self) -> ContextAuthority {
+        match self.validation_state {
+            ValidationState::Confirmed => ContextAuthority::LifeGraphTruth,
+            _ => ContextAuthority::LifeGraphEvidence,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         let mut violations = Vec::new();
 
@@ -911,10 +920,7 @@ impl ContextPacket {
                 refs.push(ContextRef {
                     ref_id: evidence.claim_ref.id.clone(),
                     kind: ContextRefKind::LifeGraphNode,
-                    authority: match evidence.validation_state {
-                        ValidationState::Confirmed => ContextAuthority::LifeGraphTruth,
-                        _ => ContextAuthority::LifeGraphEvidence,
-                    },
+                    authority: evidence.context_authority(),
                     summary: Some(evidence.claim_summary.clone()),
                     validation_state: Some(evidence.validation_state.clone()),
                     uri: None,
