@@ -1,10 +1,14 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Automatic recall outcome contract (2026-11-05)
+
+Implemented on `codex/automatic-recall-status`, based on merged develop `8fa2a79f`: bounded per-lane outcomes distinguish scoped no-match from incomplete recall without changing retrieval or candidate write authority. See [contract](architecture/AUTOMATIC_RECALL_STATUS.md). Local verification recorded in the contract; independent review and exact-head CI pending. No deployment.
+
 ## Runner-owned native graph tools — 2026-11-05
 
 - Local implementation: LifeGraph owns the `life.view.node@1` recall definition; the existing datasource lifecycle advertises it, the hotel validates enrollment/version/scope and routes directly, and MCP projects the authorized live subset. [Architecture, evidence and limits](architecture/NATIVE_GRAPH_TOOLS_PROPOSAL.md).
 - Real-component composition passed through actual hotel/UDS, HTTP MCP, LifeGraph runner and disposable Memgraph, including denied access and runner/hotel restarts. Integration also fixed orphaned MCP listener tasks and epoch lease renewal.
-- Pending: coordinate review and prompt integration into `develop`; exact-head remote CI and intended-client acceptance; separately authorized deployment. Semantic recall and cross-hotel descriptors remain follow-ups. No production access, credentials or endpoint changed; grant-file recovery belongs to the other workstream.
+- Integrated: [PR #690](https://github.com/likesjx/philotic-stack/pull/690), merge `8fa2a79f`, with all 13 exact-head CI checks passing. Pending: intended-client acceptance and separately authorized deployment. Semantic recall and cross-hotel descriptors remain follow-ups. No production access, credentials or endpoint changed; grant-file recovery belongs to the other workstream.
 - Review qualification: token and endpoint revocation now hide discovery and deny calls even with stale membrane policy; the stale-token test exposed and fixed caller-unbound descriptor lookup. Local old/current hotel-runner binary matrix passes all four cells. Metadata-only native policy events and synthetic leakage canaries are qualified; no global redaction boundary or capture activation is claimed. Preserve pre-model Muninn/LifeGraph hooks; track explicit successful no-match and candidate-memory provenance as follow-on contracts in the proposal.
 
 ## Native endpoint preapproval maintenance — 2026-11-03

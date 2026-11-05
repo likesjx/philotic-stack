@@ -457,6 +457,8 @@ pub struct SessionState {
     pub life_recall_prefetch_dispatched: bool,
     /// Log-once flag for a degraded/unreachable LifeGraph runner. Live-only.
     pub life_autorecall_degraded_logged: bool,
+    /// Latest prefetch failure, live-only; successful cached packets remain usable.
+    pub life_recall_failure: Option<RecallOutcome>,
     /// ID of the `UserTask` created when the agent proposed the current plan.
     /// `None` until a plan_proposal is accepted and persisted to the hotel graph.
     /// Cleared when the task completes, fails, or is cancelled.
@@ -526,6 +528,7 @@ impl SessionState {
             life_recall_cache: Vec::new(),
             life_recall_prefetch_dispatched: false,
             life_autorecall_degraded_logged: false,
+            life_recall_failure: None,
             active_user_task_id: None,
             base_context_window: None,
             pinned_tier_role: None,
@@ -2042,6 +2045,24 @@ impl SessionState {
             return 0;
         }
 
+        let fresh: Vec<_> = self
+            .life_recall_cache
+            .iter()
+            .filter(|entry| entry.fetched_at.saturating_add(max_age_secs) >= now)
+            .collect();
+        let status = if let Some(failure) = self.life_recall_failure {
+            if fresh.iter().any(|entry| !entry.records.is_empty()) {
+                RecallOutcome::Partial
+            } else {
+                failure
+            }
+        } else if fresh.is_empty() {
+            RecallOutcome::Unavailable
+        } else if fresh.iter().any(|entry| !entry.records.is_empty()) {
+            RecallOutcome::Matched
+        } else {
+            RecallOutcome::NoMatch
+        };
         let mut seen_ids: std::collections::HashSet<String> = turn
             .recalled_memories
             .iter()
@@ -2099,6 +2120,9 @@ impl SessionState {
             }
         }
 
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.automatic_recall.life_graph = status;
+        }
         let budgeted = apply_life_recall_char_budget(candidates, char_budget);
         let injected = budgeted.len();
         if injected > 0 {
@@ -4144,18 +4168,12 @@ impl SessionState {
         if crate::runtime::distill::turn_is_distill(turn) {
             return String::new();
         }
-        // A degraded recall must be visible: without this marker a memory
-        // outage is indistinguishable from "nothing relevant stored", and the
-        // model treats absence of recall as absence of history.
-        let degraded_marker = turn.memory_degraded.as_ref().map(|reason| {
-            format!(
-                "[Memory status] Recall was DEGRADED this turn ({reason}). Missing items are \
-                 an outage, not evidence of absence — do not conclude something was never \
-                 discussed or stored.\n"
-            )
-        });
+        let status_marker = turn.automatic_recall.prompt_marker(
+            turn.memory_degraded.is_some(),
+            self.settings.injection_budget.recalled_memory_chars,
+        );
         if turn.recalled_memories.is_empty() {
-            return degraded_marker.unwrap_or_default();
+            return status_marker;
         }
 
         const PREAMBLE: &str = "[Recalled memory]\n\
@@ -4172,7 +4190,7 @@ impl SessionState {
             .settings
             .injection_budget
             .recalled_memory_chars
-            .saturating_sub(PREAMBLE.len());
+            .saturating_sub(PREAMBLE.len() + status_marker.len());
         // Split the budget between lanes; a lane with nothing to show donates
         // its share to the other.
         let has_life = turn
@@ -4222,11 +4240,13 @@ impl SessionState {
                 .map(|pos| pos + 1)
         };
 
-        let mut out = degraded_marker.unwrap_or_default();
-        out.push_str(PREAMBLE);
-        if out.len() > self.settings.injection_budget.recalled_memory_chars {
-            return String::new();
+        if status_marker.len() + PREAMBLE.len()
+            > self.settings.injection_budget.recalled_memory_chars
+        {
+            return status_marker;
         }
+        let mut out = status_marker;
+        out.push_str(PREAMBLE);
         for (pos, (idx, line)) in lines.iter().enumerate() {
             let memory = &turn.recalled_memories[*idx];
             let mut item = format!("{}. {}", pos + 1, line);
@@ -5410,6 +5430,7 @@ impl SessionState {
                     .unwrap_or_default(),
                 // A restored turn re-recalls; never restore a stale outage marker.
                 memory_degraded: None,
+                automatic_recall: Default::default(),
                 active_plan: turn
                     .get("active_plan")
                     .cloned()
@@ -5655,6 +5676,7 @@ impl SessionState {
                 .unwrap_or_default(),
             life_recall_prefetch_dispatched: false,
             life_autorecall_degraded_logged: false,
+            life_recall_failure: None,
             active_user_task_id: checkpoint
                 .get("active_user_task_id")
                 .and_then(serde_json::Value::as_str)
@@ -7262,6 +7284,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -7572,6 +7595,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -8016,6 +8040,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -8079,6 +8104,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9038,6 +9064,7 @@ mod tests {
             )],
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9144,6 +9171,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9288,6 +9316,45 @@ mod tests {
         assert!(prompt.contains("Role toolset profile: codex."));
         assert!(!prompt.contains("Role skillset posture: planning, implementation."));
         assert!(prompt.contains("Role working-memory policy: role_local."));
+    }
+
+    #[test]
+    fn automatic_recall_prompt_status_obeys_budget_and_preserves_provenance() {
+        use super::RecallOutcome;
+        let mut state =
+            SessionState::new("synthetic".into(), "synthetic".into(), "synthetic".into());
+        let mut turn = WorkingTurn::test_turn("synthetic", "What do we know?");
+        turn.automatic_recall.muninn = RecallOutcome::NoMatch;
+        turn.automatic_recall.life_graph = RecallOutcome::Denied;
+        turn.memory_degraded = Some("PRIVATE_ERROR_CANARY".into());
+        state.start_turn(turn);
+        for matched in [false, true] {
+            if matched {
+                let turn = state.active_turn.as_mut().unwrap();
+                turn.automatic_recall.muninn = RecallOutcome::Matched;
+                turn.recalled_memories.push(RecalledMemoryRecord {
+                    id: Some("synthetic-memory".into()),
+                    vault_id: Some("self_synthetic".into()),
+                    concept: "Synthetic".into(),
+                    content: "事実 — synthetic content".into(),
+                    source: Some("synthetic-source".into()),
+                    ..Default::default()
+                });
+            }
+            for budget in [0, 1, 32, 400, 550, 700, 1000, 3000] {
+                state.settings.injection_budget.recalled_memory_chars = budget;
+                let projection = state.project_recalled_memory();
+                assert!(projection.len() <= budget, "{budget}: {}", projection.len());
+                assert!(!projection.contains("PRIVATE_ERROR_CANARY"));
+                if budget == 3000 {
+                    assert!(projection.contains("life_graph_cache=denied"));
+                    assert!(projection.contains("no_match is not global absence"));
+                    if matched {
+                        assert!(projection.contains("synthetic-source"));
+                    }
+                }
+            }
+        }
     }
 
     /// aria-mesh-steward follow-up: the hotel composes per-skill doctrine text
@@ -9677,6 +9744,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9767,6 +9835,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9849,6 +9918,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11728,6 +11798,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11798,6 +11869,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11883,6 +11955,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11969,6 +12042,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -12353,6 +12427,7 @@ mod tests {
                 ..Default::default()
             }],
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -12794,6 +12869,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: Some(plan),
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -13392,6 +13468,7 @@ mod tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,

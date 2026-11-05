@@ -1343,7 +1343,8 @@ impl MemoryEngine for MuninnRestEngine {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(scope = ?scope))]
+    // Query text must not propagate into nested transport logs through span fields.
+    #[instrument(skip(self, context), fields(scope = ?scope))]
     async fn activate(
         &self,
         context: &str,
