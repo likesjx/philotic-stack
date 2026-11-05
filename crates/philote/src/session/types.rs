@@ -638,6 +638,60 @@ pub struct LifeRecallCacheEntry {
     pub records: Vec<RecalledMemoryRecord>,
 }
 
+/// Bounded, content-free outcome of one automatic recall lane. No-match means
+/// only the configured scope, query, relevance gate and (for LifeGraph) cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallOutcome {
+    #[default]
+    NotAttempted,
+    Matched,
+    NoMatch,
+    Unavailable,
+    Denied,
+    Error,
+    Partial,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticRecallStatus {
+    pub muninn: RecallOutcome,
+    pub life_graph: RecallOutcome,
+}
+
+impl AutomaticRecallStatus {
+    /// Whole marker or nothing: never truncate a state or its scope qualification.
+    pub fn prompt_marker(&self, legacy_degraded: bool, budget: usize) -> String {
+        let label = |outcome| match outcome {
+            RecallOutcome::NotAttempted => "not_attempted",
+            RecallOutcome::Matched => "matched",
+            RecallOutcome::NoMatch => "no_match",
+            RecallOutcome::Unavailable => "unavailable",
+            RecallOutcome::Denied => "denied",
+            RecallOutcome::Error => "error",
+            RecallOutcome::Partial => "partial",
+        };
+        if self == &Self::default() && !legacy_degraded {
+            return String::new();
+        }
+        let marker = format!(
+            "[Memory status] muninn={}; life_graph_cache={}. Status is limited to attempted scopes, queries, relevance gates and fresh cached strategies; no_match is not global absence. Unavailable/denied/error/partial means incomplete recall. Matches may be omitted for space. New durable information may be proposed through the existing memory_candidate path with provenance; do not store every question.{}\n",
+            label(self.muninn),
+            label(self.life_graph),
+            if legacy_degraded {
+                " Recall was DEGRADED; missing items do not prove absence."
+            } else {
+                ""
+            },
+        );
+        if marker.len() <= budget {
+            marker
+        } else {
+            String::new()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParacrineThreadStatus {
@@ -767,6 +821,7 @@ impl WorkingTurn {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -836,6 +891,9 @@ pub struct WorkingTurn {
     /// mistakes a memory outage for an empty history. Not checkpoint-critical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_degraded: Option<String>,
+    /// Per-lane retrieval outcome; defaults preserve old checkpoints.
+    #[serde(default)]
+    pub automatic_recall: AutomaticRecallStatus,
     /// Current execution plan if the model has declared one. Updated from model
     /// responses; threaded into context on re-entry.
     pub active_plan: Option<ActivePlan>,
@@ -1015,6 +1073,7 @@ impl WorkingTurn {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -2183,6 +2242,7 @@ mod paracrine_budget_tests {
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
             memory_degraded: None,
+            automatic_recall: Default::default(),
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,

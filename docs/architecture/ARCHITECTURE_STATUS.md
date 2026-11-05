@@ -10,6 +10,7 @@ tags:
 - active-seam
 - transitional
 related_docs:
+- AUTOMATIC_RECALL_STATUS.md
 - NATIVE_GRAPH_TOOLS_PROPOSAL.md
 - README.md
 - ARCHITECTURE.md
@@ -45,6 +46,11 @@ tracks_domains:
 - deployment-distribution
 - migration-parity
 ---
+
+## Automatic recall outcome contract (2026-11-05)
+
+Implemented on `codex/automatic-recall-status`, based on merged develop `8fa2a79f`: bounded per-lane outcomes distinguish scoped no-match from incomplete recall without changing retrieval or candidate write authority. See [contract](AUTOMATIC_RECALL_STATUS.md). Local verification recorded in the contract; independent review and exact-head CI pending. No deployment.
+
 
 # Philotic Architecture Status
 

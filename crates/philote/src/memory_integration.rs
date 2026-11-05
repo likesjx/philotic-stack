@@ -11,6 +11,17 @@
 //! accessible). No behavior change.
 
 use super::*;
+use crate::session::RecallOutcome;
+
+/// Classify structured codes only; messages may contain private provider data.
+fn recall_failure_code(code: &str) -> RecallOutcome {
+    match code {
+        "ACCESS_DENIED" | "PERMISSION_DENIED" | "UNAUTHORIZED" | "FORBIDDEN"
+        | "RUNNER_TOOL_DENIED" => RecallOutcome::Denied,
+        "TARGET_NODE_UNREACHABLE" | "RUNNER_UNAVAILABLE" => RecallOutcome::Unavailable,
+        _ => RecallOutcome::Error,
+    }
+}
 
 /// Covers the entire inline tool, including checkpoint/result IPC after the
 /// probe has answered. An interrupted frame may not escape onto a reused socket.
@@ -259,7 +270,13 @@ fn parse_iso_to_unix(value: &str) -> Option<u64> {
 pub(super) fn life_recall_records_from_result(
     result: &Value,
 ) -> Option<(String, Vec<RecalledMemoryRecord>)> {
+    if result.get("status")?.as_str()? != "success" {
+        return None;
+    }
     let data = result.get("data")?;
+    if data.get("status")?.as_str()? != "ok" {
+        return None;
+    }
     let strategy = data
         .get("named_strategy")
         .and_then(Value::as_str)
@@ -1494,6 +1511,9 @@ impl AgentRuntime {
             return;
         };
 
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            state.life_recall_failure = None;
+        }
         let local_node = local_node_id();
         for strategy in LIFE_AUTORECALL_STRATEGIES {
             let task_json = life_recall_prefetch_task_json(
@@ -1504,7 +1524,7 @@ impl AgentRuntime {
                 strategy,
                 query_text,
             );
-            if let Err(err) = self
+            let failure = match self
                 .ipc_client
                 .send_request(IpcRequest::EmitTask {
                     target_node: target_node.clone(),
@@ -1514,10 +1534,20 @@ impl AgentRuntime {
                 })
                 .await
             {
+                Ok(IpcResponse::Standard {
+                    ok: false, code, ..
+                }) => Some(recall_failure_code(&code)),
+                Ok(IpcResponse::Error(_)) => Some(RecallOutcome::Error),
+                Err(_) => Some(RecallOutcome::Unavailable),
+                Ok(_) => None,
+            };
+            if let Some(failure) = failure {
+                if let Some(state) = self.sessions.get_mut(session_id) {
+                    state.life_recall_failure = Some(failure);
+                }
                 debug!(
                     session_id = %session_id,
                     strategy = %strategy,
-                    error = %err,
                     "LifeGraph auto-recall prefetch emit failed (lane degrades to no-injection)"
                 );
             }
@@ -1538,11 +1568,12 @@ impl AgentRuntime {
         };
 
         if let Some(error) = task.error.as_ref() {
+            state.life_recall_failure =
+                Some(recall_failure_code(error.code.as_deref().unwrap_or("")));
             if !state.life_autorecall_degraded_logged {
                 state.life_autorecall_degraded_logged = true;
                 debug!(
                     session_id = %session_id,
-                    error = %error.message,
                     "LifeGraph auto-recall prefetch failed — lane degrades to no-injection"
                 );
             }
@@ -1554,6 +1585,7 @@ impl AgentRuntime {
             .as_ref()
             .and_then(life_recall_records_from_result)
         else {
+            state.life_recall_failure = Some(RecallOutcome::Error);
             if !state.life_autorecall_degraded_logged {
                 state.life_autorecall_degraded_logged = true;
                 debug!(
@@ -1574,7 +1606,7 @@ impl AgentRuntime {
         });
         info!(
             session_id = %session_id,
-            strategy = %strategy,
+            strategy = if LIFE_AUTORECALL_STRATEGIES.contains(&strategy.as_str()) { strategy.as_str() } else { "unknown" },
             records = record_count,
             "LifeGraph auto-recall cache refreshed"
         );
@@ -1605,6 +1637,9 @@ impl AgentRuntime {
                 return;
             }
             if state.resolve_tool_route("life.recall").is_none() {
+                if let Some(turn) = state.active_turn.as_mut() {
+                    turn.automatic_recall.life_graph = RecallOutcome::Unavailable;
+                }
                 return;
             }
             let max_age_secs = state.settings.memory.life_recall_max_age_secs;
@@ -1785,6 +1820,14 @@ impl AgentRuntime {
         // confidently treat absence of recall as absence of history. Stamp
         // the turn so prompt composition injects a one-line marker.
         self.mark_turn_memory_degraded(session_id, reason);
+        self.set_muninn_recall_outcome(
+            session_id,
+            if reason.starts_with("token_rejected") {
+                RecallOutcome::Denied
+            } else {
+                RecallOutcome::Error
+            },
+        );
         let _ = self
             .emit_turn_event(
                 session_id,
@@ -1804,6 +1847,16 @@ impl AgentRuntime {
             if let Some(turn) = state.active_turn.as_mut() {
                 turn.memory_degraded = Some(reason.to_string());
             }
+        }
+    }
+
+    fn set_muninn_recall_outcome(&mut self, session_id: &str, outcome: RecallOutcome) {
+        if let Some(turn) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.active_turn.as_mut())
+        {
+            turn.automatic_recall.muninn = outcome;
         }
     }
 
@@ -1878,6 +1931,7 @@ impl AgentRuntime {
 
         let memory_user_id = turn_memory_user_id(state);
         let Some(engine) = self.memory_engine_for(&self.agent_id, &memory_user_id) else {
+            self.set_muninn_recall_outcome(session_id, RecallOutcome::Unavailable);
             let decision = memory_core::evaluate_recall(&recall_context);
             info!(
                 session_id = %session_id,
@@ -1897,7 +1951,9 @@ impl AgentRuntime {
         let decision = match engine.evaluate_recall(&recall_context).await {
             Ok(d) => d,
             Err(err) => {
-                warn!(session_id = %session_id, error = %err, "Auto recall skipped: memory engine unavailable.");
+                let _ = err;
+                self.set_muninn_recall_outcome(session_id, RecallOutcome::Unavailable);
+                warn!(session_id = %session_id, "Auto recall skipped: memory engine unavailable.");
                 let _ = self
                     .emit_turn_event(
                         session_id,
@@ -1927,7 +1983,6 @@ impl AgentRuntime {
         info!(
             session_id = %session_id,
             reason = %decision.reason,
-            query = %decision.query.as_deref().unwrap_or(""),
             limit = ?decision.limit,
             "Running auto recall for turn."
         );
@@ -1956,17 +2011,21 @@ impl AgentRuntime {
                 match healed_retry {
                     Some(Ok(r)) => r,
                     Some(Err(retry_err)) => {
-                        warn!(session_id = %session_id, error = %retry_err, "Auto recall failed after token heal — giving up for this turn.");
+                        warn!(session_id = %session_id, "Auto recall failed after token heal — giving up for this turn.");
                         self.emit_auto_recall_failed(
                             session_id,
-                            "token_rejected_after_heal",
+                            if memory_core::token_rejected_vault(&retry_err).is_some() {
+                                "token_rejected_after_heal"
+                            } else {
+                                "engine_error"
+                            },
                             recall_started.elapsed(),
                         )
                         .await;
                         return Ok(());
                     }
                     None => {
-                        warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
+                        warn!(session_id = %session_id, "Auto recall failed: memory engine error.");
                         let reason = if memory_core::token_rejected_vault(&err).is_some() {
                             "token_rejected"
                         } else {
@@ -1998,6 +2057,12 @@ impl AgentRuntime {
             *band_counts
                 .entry(
                     memory_core::engram_relevance_band(engram)
+                        .filter(|band| {
+                            matches!(
+                                *band,
+                                "strong" | "moderate" | "weak" | "filter_match" | "uncalibrated"
+                            )
+                        })
                         .unwrap_or("unknown")
                         .to_string(),
                 )
@@ -2011,10 +2076,7 @@ impl AgentRuntime {
             .cloned()
             .collect();
         if !degraded_vaults.is_empty() {
-            self.mark_turn_memory_degraded(
-                session_id,
-                &format!("vaults unavailable: {}", degraded_vaults.join(", ")),
-            );
+            self.mark_turn_memory_degraded(session_id, "partial_recall");
         }
         let recalled_memories = result
             .engrams
@@ -2022,12 +2084,16 @@ impl AgentRuntime {
             .map(|engram| recalled_memory_from_engram(engram, Some(recall_reason.as_str())))
             .collect::<Vec<_>>();
         let recalled_count = recalled_memories.len();
-        let concept_summary = recalled_memories
-            .iter()
-            .take(3)
-            .map(|memory| memory.concept.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
+        self.set_muninn_recall_outcome(
+            session_id,
+            if !degraded_vaults.is_empty() {
+                RecallOutcome::Partial
+            } else if recalled_count == 0 {
+                RecallOutcome::NoMatch
+            } else {
+                RecallOutcome::Matched
+            },
+        );
 
         if let Some(state) = self.sessions.get_mut(session_id) {
             if let Some(active_turn) = state.active_turn.as_mut() {
@@ -2046,11 +2112,10 @@ impl AgentRuntime {
             dropped_by_gate,
             latency_ms = recall_latency_ms,
             bands = %bands,
-            degraded_vaults = ?degraded_vaults,
-            concepts = %concept_summary,
+            degraded_vault_count = degraded_vaults.len(),
             "Auto recall completed for turn."
         );
-        let mut detail = format!(
+        let detail = format!(
             "Recalled {} memory item(s) in {}ms (dropped {} below relevance{}{})",
             recalled_count,
             recall_latency_ms,
@@ -2063,12 +2128,9 @@ impl AgentRuntime {
             if degraded_vaults.is_empty() {
                 String::new()
             } else {
-                format!("; degraded vaults {}", degraded_vaults.join(","))
+                format!("; degraded vault count {}", degraded_vaults.len())
             },
         );
-        if !concept_summary.is_empty() {
-            detail.push_str(&format!(": {concept_summary}"));
-        }
         let _ = self
             .emit_turn_event(session_id, "memory_auto_recall_completed", Some(detail))
             .await;
@@ -2197,6 +2259,7 @@ impl AgentRuntime {
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
                 memory_degraded: None,
+                automatic_recall: Default::default(),
                 active_plan: None,
                 consecutive_step_failures: 0,
                 streak_extension: 0,
@@ -3261,6 +3324,481 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn automatic_recall_prefetch_structured_admission_failure_over_uds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (code, expected) in [
+            ("ACCESS_DENIED", RecallOutcome::Denied),
+            ("TARGET_NODE_UNREACHABLE", RecallOutcome::Unavailable),
+            ("SYNTHETIC_OTHER", RecallOutcome::Error),
+        ] {
+            let socket = format!("/tmp/recall-admission-{}.sock", Uuid::new_v4().simple());
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let hotel = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                loop {
+                    let Ok(len) = stream.read_u32().await else {
+                        return;
+                    };
+                    let mut bytes = vec![0; len as usize];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    let request: IpcRequest = serde_json::from_slice(&bytes).unwrap();
+                    let reply = match request {
+                        IpcRequest::GetConfig { key } => IpcResponse::ConfigData {
+                            key,
+                            value_json: None,
+                        },
+                        IpcRequest::EmitTask { .. } => {
+                            IpcResponse::error("synthetic", code, "PRIVATE_DENIAL_CANARY")
+                        }
+                        _ => IpcResponse::success("synthetic", None),
+                    };
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    stream.write_u32(bytes.len() as u32).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                }
+            });
+            let client = philotic_client::PhiloticClient::connect_at(
+                &socket,
+                philotic_client::GuestIdentity {
+                    guest_id: "synthetic".into(),
+                    role: "agent".into(),
+                    supported_tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let mut runtime = AgentRuntime::new(client, "synthetic");
+            let session = "synthetic-admission";
+            runtime
+                .ensure_session_loaded(session, "synthetic")
+                .await
+                .unwrap();
+            let state = runtime.sessions.get_mut(session).unwrap();
+            state.start_turn(super::super::tests::def004_working_turn(
+                "admission",
+                "life.recall",
+            ));
+            state.tool_assembly.execution_routes.insert("life.recall".into(),serde_json::from_value(json!({"target_node":"synthetic","target_role":"life-graph-runner","execution_mode":"guest"})).unwrap());
+            runtime
+                .dispatch_life_recall_prefetch(session, "synthetic meaningful recall query")
+                .await;
+            runtime.maybe_inject_life_graph_context(session).await;
+            assert_eq!(
+                runtime.sessions[session]
+                    .active_turn
+                    .as_ref()
+                    .unwrap()
+                    .automatic_recall
+                    .life_graph,
+                expected
+            );
+            let prompt = runtime.sessions[session].build_prompt("synthetic query");
+            assert!(prompt.contains("life_graph_cache="));
+            assert!(!prompt.contains("PRIVATE_DENIAL_CANARY"));
+            drop(runtime);
+            hotel.abort();
+            let _ = std::fs::remove_file(socket);
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecallTraceWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for RecallTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Production REST engine + turn hook + prompt assembly over real loopback
+    /// transports. Hotel authority and Muninn data are synthetic fixtures.
+    #[tokio::test]
+    async fn automatic_recall_outcomes_rest_to_prompt_and_metadata() {
+        use crate::session::{AutomaticRecallStatus, RecallOutcome};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::instrument::WithSubscriber;
+        for (case, status, expected) in [
+            ("matched", 200, RecallOutcome::Matched),
+            ("empty", 200, RecallOutcome::NoMatch),
+            ("failed", 500, RecallOutcome::Partial),
+            ("denied", 401, RecallOutcome::Denied),
+            ("unconfigured", 0, RecallOutcome::Unavailable),
+        ] {
+            let socket = format!("/tmp/recall-outcome-{}.sock", Uuid::new_v4().simple());
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let hotel = tokio::spawn(super::super::tests::run_recording_hotel(
+                listener,
+                emitted.clone(),
+            ));
+            let client = philotic_client::PhiloticClient::connect_at(
+                &socket,
+                philotic_client::GuestIdentity {
+                    guest_id: "synthetic-recall".into(),
+                    role: "agent".into(),
+                    supported_tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let mut runtime = AgentRuntime::new(client, "synthetic-recall");
+            let session = "synthetic-recall-session";
+            runtime
+                .ensure_session_loaded(session, "synthetic")
+                .await
+                .unwrap();
+            runtime.sessions.get_mut(session).unwrap().start_turn(
+                super::super::tests::def004_working_turn("recall-outcome", "memory.recall"),
+            );
+            runtime
+                .sessions
+                .get_mut(session)
+                .unwrap()
+                .active_turn
+                .as_mut()
+                .unwrap()
+                .user_content = "PRIVATE_QUERY_CANARY compare hotel and session status".into();
+            let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = http.local_addr().unwrap();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = requests.clone();
+            let body = if case == "matched" {
+                json!({"total_found":1,"activations":[{"id":"synthetic-memory-id", "concept":"PRIVATE_CONCEPT_CANARY", "content":"PRIVATE_CONTENT_CANARY", "confidence":0.9, "score":0.9, "relevance_band":"strong", "updated_at":null}]}).to_string()
+            } else {
+                json!({"total_found":0,"activations":[],"total_engrams":1}).to_string()
+            };
+            let rest = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = http.accept().await.unwrap();
+                    let body = body.clone();
+                    let observed = observed.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0; 2048];
+                        loop {
+                            let n = stream.read(&mut chunk).await.unwrap();
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let header = String::from_utf8_lossy(&buf[..end]);
+                            let len = header
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                        let first = String::from_utf8_lossy(&buf)
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .to_string();
+                        observed.lock().unwrap().push(first);
+                        let reply = format!(
+                            "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(reply.as_bytes()).await.unwrap();
+                    });
+                }
+            });
+            if status != 0 {
+                let mut config = memory_core::MuninnConfig::local("default");
+                config.base_url = format!("http://{address}");
+                config.default_token = Some("SYNTHETIC_TOKEN_CANARY".into());
+                runtime.muninn_config = Some(config);
+            }
+            let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = RecallTraceWriter(traces.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                runtime
+                    .maybe_auto_recall_turn_memory(session)
+                    .with_subscriber(subscriber),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state = runtime.sessions.get_mut(session).unwrap();
+            let turn = state.active_turn.as_ref().unwrap();
+            assert_eq!(turn.automatic_recall.muninn, expected, "{case}");
+            let marker = turn
+                .automatic_recall
+                .prompt_marker(turn.memory_degraded.is_some(), 2000);
+            let prompt = state.build_prompt("compare hotel and session status");
+            assert!(prompt.contains(marker.trim()), "{case}");
+            assert!(marker.contains("no_match is not global absence"));
+            if case == "matched" {
+                assert!(prompt.contains("PRIVATE_CONTENT_CANARY"));
+            } else {
+                assert!(
+                    state
+                        .active_turn
+                        .as_ref()
+                        .unwrap()
+                        .recalled_memories
+                        .is_empty()
+                );
+            }
+            // Neither the new marker nor recall ledger metadata includes content,
+            // concepts or tokens. Actual memory items retain their provenance.
+            let events = serde_json::to_string(&*emitted.lock().unwrap()).unwrap();
+            let trace_text = String::from_utf8(traces.lock().unwrap().clone()).unwrap();
+            for canary in [
+                "PRIVATE_QUERY_CANARY",
+                "PRIVATE_CONCEPT_CANARY",
+                "PRIVATE_CONTENT_CANARY",
+                "SYNTHETIC_TOKEN_CANARY",
+            ] {
+                assert!(!trace_text.contains(canary), "{case}: {trace_text}");
+                assert!(!marker.contains(canary));
+                assert!(!events.contains(canary), "{case}: {events}");
+            }
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|line: &String| !line.starts_with("POST /api/engrams")),
+                "recall must not write memories"
+            );
+            // A fresh turn does not inherit a previous outcome; old checkpoints
+            // lacking the new field deserialize to NotAttempted as well.
+            let mut saved = serde_json::to_value(state.active_turn.as_ref().unwrap()).unwrap();
+            saved.as_object_mut().unwrap().remove("automatic_recall");
+            let restored: crate::session::WorkingTurn = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.automatic_recall, AutomaticRecallStatus::default());
+            // A new turn/query constructs a new engine with the same server/auth.
+            // Process-shared vault backoff must preserve outage/rejection evidence,
+            // rather than converting an unattempted query into successful no-match.
+            let requests_before = requests.lock().unwrap().len();
+            let state = runtime.sessions.get_mut(session).unwrap();
+            state.active_turn = None;
+            state.start_turn(super::super::tests::def004_working_turn(
+                "recall-second-turn",
+                "memory.recall",
+            ));
+            state.active_turn.as_mut().unwrap().user_content =
+                "A different meaningful query about scoped memory availability".into();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                runtime.maybe_auto_recall_turn_memory(session),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state = &runtime.sessions[session];
+            let expected_second = if matches!(case, "failed" | "denied") {
+                RecallOutcome::Partial
+            } else {
+                expected
+            };
+            assert_eq!(
+                state.active_turn.as_ref().unwrap().automatic_recall.muninn,
+                expected_second,
+                "{case}: second turn"
+            );
+            if matches!(case, "failed" | "denied") {
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    requests_before,
+                    "backoff must still suppress HTTP requests"
+                );
+                assert!(
+                    state
+                        .build_prompt("second query")
+                        .contains("muninn=partial")
+                );
+            }
+            drop(runtime);
+            rest.abort();
+            hotel.abort();
+            let _ = std::fs::remove_file(socket);
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_recall_life_cache_outcomes_and_budget() {
+        use crate::session::{LifeRecallCacheEntry, RecallOutcome};
+        let socket = format!("/tmp/recall-life-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let hotel = tokio::spawn(super::super::tests::run_recording_hotel(
+            listener,
+            Default::default(),
+        ));
+        let client = philotic_client::PhiloticClient::connect_at(
+            &socket,
+            philotic_client::GuestIdentity {
+                guest_id: "synthetic-recall".into(),
+                role: "agent".into(),
+                supported_tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let mut runtime = AgentRuntime::new(client, "synthetic-recall");
+        let session = "synthetic-life";
+        runtime
+            .ensure_session_loaded(session, "synthetic")
+            .await
+            .unwrap();
+        let state = runtime.sessions.get_mut(session).unwrap();
+        state.start_turn(super::super::tests::def004_working_turn(
+            "life-outcome",
+            "life.recall",
+        ));
+        assert_eq!(state.inject_cached_life_context(60, 100, 1000), 0);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::Unavailable
+        );
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: 100,
+            query_text: String::new(),
+            records: vec![],
+        });
+        state.inject_cached_life_context(60, 100, 1000);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::NoMatch
+        );
+        state.life_recall_cache[0]
+            .records
+            .push(crate::session::RecalledMemoryRecord {
+                id: Some("life:synthetic".into()),
+                vault_id: Some("life-graph".into()),
+                concept: "Synthetic".into(),
+                content: "Synthetic bounded content".into(),
+                ..Default::default()
+            });
+        state.inject_cached_life_context(60, 100, 0);
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .life_graph,
+            RecallOutcome::Matched,
+            "budget omission is not no-match"
+        );
+        for failure in [
+            RecallOutcome::Denied,
+            RecallOutcome::Error,
+            RecallOutcome::Unavailable,
+        ] {
+            state.life_recall_failure = Some(failure);
+            state.inject_cached_life_context(60, 100, 0);
+            assert_eq!(
+                state
+                    .active_turn
+                    .as_ref()
+                    .unwrap()
+                    .automatic_recall
+                    .life_graph,
+                RecallOutcome::Partial
+            );
+            state.inject_cached_life_context(60, 200, 0);
+            assert_eq!(
+                state
+                    .active_turn
+                    .as_ref()
+                    .unwrap()
+                    .automatic_recall
+                    .life_graph,
+                failure
+            );
+        }
+        // Exercise the actual asynchronous response adapter as well as cache admission.
+        let _ = state;
+        for (code, expected) in [
+            ("ACCESS_DENIED", RecallOutcome::Denied),
+            ("TARGET_NODE_UNREACHABLE", RecallOutcome::Unavailable),
+            ("SYNTHETIC_UNKNOWN", RecallOutcome::Error),
+        ] {
+            runtime.handle_life_recall_prefetch_response(&serde_json::from_value(json!({
+                "session_id":session,"error":{"kind":"synthetic","code":code,"message":"PRIVATE_ERROR_CANARY"}
+            })).unwrap());
+            let state = runtime.sessions.get_mut(session).unwrap();
+            state.inject_cached_life_context(60, 200, 0);
+            assert_eq!(
+                state
+                    .active_turn
+                    .as_ref()
+                    .unwrap()
+                    .automatic_recall
+                    .life_graph,
+                expected
+            );
+        }
+        runtime.handle_life_recall_prefetch_response(
+            &serde_json::from_value(
+                json!({"session_id":session,"result":{"status":"error","data":{}}}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            runtime.sessions[session].life_recall_failure,
+            Some(RecallOutcome::Error)
+        );
+        runtime
+            .emit_auto_recall_failed(session, "engine_error", std::time::Duration::ZERO)
+            .await;
+        assert_eq!(
+            runtime.sessions[session]
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .automatic_recall
+                .muninn,
+            RecallOutcome::Error
+        );
+        let state = runtime.sessions.get_mut(session).unwrap();
+        // Projection stays within every byte budget, including empty recall,
+        // legacy errors, multibyte content, and matched-but-unshown results.
+        let turn = state.active_turn.as_mut().unwrap();
+        turn.memory_degraded = Some("PRIVATE_ERROR_CANARY".into());
+        for budget in [0, 1, 32, 400, 550, 700, 1000, 2000] {
+            let marker = turn.automatic_recall.prompt_marker(true, budget);
+            assert!(marker.len() <= budget);
+            assert!(!marker.contains("PRIVATE_ERROR_CANARY"));
+            assert!(marker.is_empty() || marker.ends_with('\n'));
+        }
+        drop(runtime);
+        hotel.abort();
+        let _ = std::fs::remove_file(socket);
+    }
 
     fn memory_refresh_payload(session_id: &str, turn_id: &str) -> ToolExecutionPayload {
         ToolExecutionPayload {
