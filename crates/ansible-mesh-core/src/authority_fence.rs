@@ -88,6 +88,14 @@ impl Journal {
 // An aborted/panicking task cannot bypass async cleanup and silently reopen
 // admission in the same daemon. Drop is deliberately conservative; only an
 // acknowledged clean completion can disarm the durable uncertainty guard.
+/// A fence holder cannot mutate the underlying journal directly.
+///
+/// ```compile_fail
+/// use ansible_mesh_core::authority_fence::Fence;
+/// fn bypass(fence: &mut Fence) {
+///     fence.mark(true).unwrap();
+/// }
+/// ```
 pub struct Fence {
     journal: OwnedMutexGuard<Journal>,
     complete: bool,
@@ -96,11 +104,6 @@ impl std::ops::Deref for Fence {
     type Target = Journal;
     fn deref(&self) -> &Journal {
         &self.journal
-    }
-}
-impl std::ops::DerefMut for Fence {
-    fn deref_mut(&mut self) -> &mut Journal {
-        &mut self.journal
     }
 }
 impl Drop for Fence {
@@ -119,13 +122,18 @@ impl Fence {
             journal,
             complete: false,
         };
-        fence.mark(false)?;
+        fence.journal.mark(false)?;
         Ok(fence)
     }
     pub fn finish(&mut self) -> Result<()> {
-        self.mark(true)?;
+        self.journal.mark(true)?;
         self.complete = true;
         Ok(())
+    }
+
+    /// Poison the held journal without permitting callers to mark it clean.
+    pub fn poison(&mut self) {
+        self.journal.poison();
     }
 }
 impl Journal {
@@ -186,5 +194,18 @@ mod tests {
 
         assert!(Fence::begin(journal.clone().lock_owned().await).is_err());
         assert!(journal.lock().await.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn poisoned_fence_cannot_finish_or_reopen_after_restart() {
+        let (_dir, path, uid) = fixture();
+        let journal = Arc::new(Mutex::new(Journal::open(&path, uid).unwrap()));
+        let mut fence = Fence::begin(journal.clone().lock_owned().await).unwrap();
+        fence.poison();
+        assert!(fence.finish().is_err());
+        drop(fence);
+        drop(journal);
+        assert_eq!(std::fs::read(&path).unwrap(), b"dirty\n");
+        assert!(Journal::open(&path, uid).is_err());
     }
 }

@@ -187,7 +187,7 @@ jobs:
   # job warms on develop pushes, so it restores rather than building cold.
   clippy:
     name: clippy (ratchet)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -226,7 +226,7 @@ jobs:
 
   test:
     name: test (macos arm64)
-    runs-on: macos-14
+    runs-on: macos-15
     # Blocking as of proposal:pr-test-gate-viability. The timeout stays generous
     # because a cold runner still has to build 89 test binaries; a warm one
     # finishes in ~10 minutes.
