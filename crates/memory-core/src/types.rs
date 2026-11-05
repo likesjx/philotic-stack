@@ -84,11 +84,13 @@ pub struct ActivationResult {
     pub engrams: Vec<Engram>,
     pub total: usize,
     /// Vaults whose token was rejected (HTTP 401) during a cross-scope
-    /// activation that still returned. Callers can self-heal just these.
+    /// activation that still returned, including skips while rejection backoff
+    /// remains active. Callers can self-heal just these.
     #[serde(default)]
     pub rejected_vaults: Vec<VaultId>,
     /// Vaults that could not be queried for another reason (timeout, network,
-    /// server error) during a cross-scope activation that still returned.
+    /// server error) during a cross-scope activation that still returned,
+    /// including skips while failure backoff remains active.
     #[serde(default)]
     pub failed_vaults: Vec<VaultId>,
 }

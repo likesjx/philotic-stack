@@ -3588,6 +3588,48 @@ mod tests {
             saved.as_object_mut().unwrap().remove("automatic_recall");
             let restored: crate::session::WorkingTurn = serde_json::from_value(saved).unwrap();
             assert_eq!(restored.automatic_recall, AutomaticRecallStatus::default());
+            // A new turn/query constructs a new engine with the same server/auth.
+            // Process-shared vault backoff must preserve outage/rejection evidence,
+            // rather than converting an unattempted query into successful no-match.
+            let requests_before = requests.lock().unwrap().len();
+            let state = runtime.sessions.get_mut(session).unwrap();
+            state.active_turn = None;
+            state.start_turn(super::super::tests::def004_working_turn(
+                "recall-second-turn",
+                "memory.recall",
+            ));
+            state.active_turn.as_mut().unwrap().user_content =
+                "A different meaningful query about scoped memory availability".into();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                runtime.maybe_auto_recall_turn_memory(session),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state = &runtime.sessions[session];
+            let expected_second = if matches!(case, "failed" | "denied") {
+                RecallOutcome::Partial
+            } else {
+                expected
+            };
+            assert_eq!(
+                state.active_turn.as_ref().unwrap().automatic_recall.muninn,
+                expected_second,
+                "{case}: second turn"
+            );
+            if matches!(case, "failed" | "denied") {
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    requests_before,
+                    "backoff must still suppress HTTP requests"
+                );
+                assert!(
+                    state
+                        .build_prompt("second query")
+                        .contains("muninn=partial")
+                );
+            }
             drop(runtime);
             rest.abort();
             hotel.abort();

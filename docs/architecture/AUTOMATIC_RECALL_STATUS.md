@@ -35,6 +35,10 @@ The Muninn lane records its scoped, relevance-gated result before prompt budgeti
 No backend is unavailable; failed evaluation is unavailable; token rejection after
 the existing recovery path is denied; another terminal engine error is error.
 Rejected/failed vaults on an otherwise returned result mean partial, even if empty.
+These fields also preserve recent rejection/failure evidence when backoff skips
+requests on a later query or freshly constructed engine with the same server/auth.
+Confirmed-empty vault skips remain successful empty results; backoff does not add
+HTTP retries or synthesize a new active token rejection.
 Skipped/slash/distill turns retain not_attempted; no retrieval or write is added.
 
 LifeGraph remains asynchronous. Its outcome describes fresh cached strategy packets,
@@ -80,7 +84,7 @@ Cargo target with incremental compilation disabled. Loopback HTTP fixtures exerc
 the real Muninn REST engine, turn hook, UDS client and prompt assembly. The hotel
 responses and memory contents in these tests are synthetic, not production authority
 or a real Muninn service. LifeGraph cache tests exercise real cache admission and
-projection without changing the runner or Memgraph data. Local checks: 43
+projection without changing the runner or Memgraph data. Local checks: 44
 memory-core regressions and 690 Philote regressions, including four focused
 outcome/privacy/budget/UDS tests, all passing. Formatting and diff
 checks and affected-crate Clippy pass with existing repository warnings.

@@ -1393,6 +1393,20 @@ impl MemoryEngine for MuninnRestEngine {
                     return false;
                 }
                 if is_cross_scope && let Some(reason) = self.vault_skip_reason(vault) {
+                    // Backoff avoids a request, not the evidence of incomplete
+                    // recall. Otherwise a different query on the next turn
+                    // turns a recent outage/rejection into a clean no-match.
+                    match reason {
+                        VaultSkipReason::Unreachable => {
+                            had_vault_error = true;
+                            failed_vaults.push((*vault).clone());
+                        }
+                        VaultSkipReason::TokenRejected => {
+                            had_vault_error = true;
+                            rejected_vaults.push((*vault).clone());
+                        }
+                        VaultSkipReason::Empty | VaultSkipReason::NonEmpty => {}
+                    }
                     debug!(
                         vault = %vault,
                         reason = ?reason,
@@ -1896,10 +1910,12 @@ mod tests {
 
         // Different query (no recall-cache hit): both vaults are known empty,
         // so no activation request is sent at all.
-        engine
+        let second = engine
             .activate("a different question", scope.clone(), Some(5))
             .await
             .expect("activate");
+        assert!(second.failed_vaults.is_empty());
+        assert!(second.rejected_vaults.is_empty());
         assert_eq!(activations.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         // A write through the engine forgets the "empty" marks.
@@ -1949,6 +1965,36 @@ mod tests {
         assert!(result.engrams.is_empty());
         assert_eq!(result.failed_vaults.len(), 2);
         assert!(result.rejected_vaults.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_scope_backoff_preserves_failures_across_queries_and_engines() {
+        let scope = MemoryScope::CrossScope(vec![MemoryScope::SelfOnly, MemoryScope::SharedUser]);
+        for status in [500, 401] {
+            let url = spawn_canned_server(status, "{}");
+            let first = engine_against(url.clone())
+                .activate("first distinct query", scope.clone(), Some(5))
+                .await;
+            if status == 401 {
+                assert!(token_rejected_vault(&first.unwrap_err()).is_some());
+            } else {
+                assert_eq!(first.unwrap().failed_vaults.len(), 2);
+            }
+            // Philote constructs a fresh engine each turn. Same endpoint and
+            // auth keys must retain the process-shared backoff evidence.
+            let next = engine_against(url)
+                .activate("second distinct query", scope.clone(), Some(5))
+                .await
+                .unwrap();
+            assert!(next.engrams.is_empty());
+            if status == 401 {
+                assert_eq!(next.rejected_vaults.len(), 2);
+                assert!(next.failed_vaults.is_empty());
+            } else {
+                assert_eq!(next.failed_vaults.len(), 2);
+                assert!(next.rejected_vaults.is_empty());
+            }
+        }
     }
 
     #[test]
