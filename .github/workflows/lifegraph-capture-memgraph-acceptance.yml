@@ -11,6 +11,7 @@ on:
       - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
+      - 'crates/philotic-client/**'
       - 'vendor/neo4rs/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -25,6 +26,7 @@ on:
       - 'scripts/native-memory-durable-smoke.sh'
       - 'crates/ansible-mesh-core/**'
       - 'crates/datasource/**'
+      - 'crates/philotic-client/**'
       - 'vendor/neo4rs/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -110,6 +112,17 @@ jobs:
         env:
           PHILOTIC_SYNTHETIC_NATIVE_MEMGRAPH: '1'
         run: cargo test --locked -p native-memory --test memgraph -- --ignored --test-threads=1
+
+      - name: Build native graph recall composition
+        run: cargo build --locked -p aiua -p data-memorygraphrag --bin aiua --bin life-graph-runner
+
+      - name: Runner-owned definitions and hotel access policy over real UDS
+        run: cargo test --locked -p aiua native_runner_tools -- --nocapture
+
+      - name: Runner definitions through hotel, HTTP MCP, LifeGraph and real Memgraph
+        env:
+          PHILOTIC_GRAPH_TOOL_MEMGRAPH_FIXTURE: '1'
+        run: PHILOTIC_TEST_BIN_DIR="$PWD/target/debug" cargo test --locked -p membrane-mcp real_native_graph_runner_memgraph_mcp_composition -- --ignored --nocapture
 
       - name: Build native two-hotel composition
         run: cargo build --locked -p aiua -p native-memory -p membrane-mcp

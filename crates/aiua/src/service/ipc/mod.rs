@@ -218,6 +218,7 @@ pub(crate) struct RoleSubscriber {
     conn_id: Uuid,
     pub(crate) guest_id: String,
     supported_tools: Vec<String>,
+    runner_tools: Option<philotic_client::RunnerToolAdvertisement>,
     pub(crate) tx: CountedSender,
 }
 
@@ -2806,6 +2807,7 @@ impl IpcServer {
                 conn_id,
                 guest_id: guest_id.to_string(),
                 supported_tools: supported_tools.to_vec(),
+                runner_tools: None,
                 tx: tx.clone(),
             });
         }
@@ -3822,6 +3824,67 @@ impl IpcServer {
         resource_registry: &Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
     ) -> IpcResponse {
         match req {
+            IpcRequest::AdvertiseRunnerTools { advertisement } => {
+                Self::advertise_runner_tools(
+                    graph,
+                    local_node_id,
+                    inboxes,
+                    conn_id,
+                    current_identity.as_ref(),
+                    advertisement,
+                )
+                .await
+            }
+            IpcRequest::GetRunnerTool {
+                endpoint_id,
+                tool_name,
+            } => {
+                match Self::resolve_runner_tool(
+                    graph,
+                    inboxes,
+                    mcp_membrane_leases,
+                    current_identity.as_ref(),
+                    &endpoint_id,
+                    &tool_name,
+                )
+                .await
+                {
+                    Ok((descriptor, _, _, _)) => {
+                        IpcResponse::success("runner_tool", Some(serde_json::json!(descriptor)))
+                    }
+                    Err(error) => IpcResponse::error(
+                        "runner_tool",
+                        "RUNNER_TOOL_UNAVAILABLE",
+                        error.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::InvokeRunnerTool {
+                endpoint_id,
+                tool_name,
+                version,
+                arguments,
+                caller_id,
+                session_id,
+                turn_id,
+            } => {
+                Self::invoke_runner_tool(
+                    graph,
+                    inboxes,
+                    mcp_membrane_leases,
+                    current_identity.as_ref(),
+                    conn_id,
+                    local_node_id,
+                    &endpoint_id,
+                    &tool_name,
+                    version,
+                    arguments,
+                    &caller_id,
+                    &session_id,
+                    &turn_id,
+                )
+                .await
+            }
             // This fallback has no peer proof; it must never resolve authority.
             IpcRequest::ProtectedAuthority(request) => IpcResponse::ProtectedAuthorityReply {
                 protected_authority:
@@ -3918,6 +3981,12 @@ impl IpcServer {
                 IpcResponse::success("reg", None)
             }
             IpcRequest::GetConfig { key } => {
+                if key == "__runner_tool_protocol__" {
+                    return IpcResponse::ConfigData {
+                        key,
+                        value_json: Some("1".into()),
+                    };
+                }
                 Self::handle_get_config(key, local_node_id, graph, inboxes, registry).await
             }
             IpcRequest::GetSecret { secret_ref } => {
@@ -9702,13 +9771,14 @@ impl IpcServer {
                 ),
             )
         };
-        let tool_assembly = compose_tool_assembly(
+        let mut tool_assembly = compose_tool_assembly(
             &bindings,
             &registered_runners,
             &tool_runners,
             &remote_tool_ads,
             local_node_id,
         );
+        Self::project_runner_definitions(inboxes, &mut tool_assembly, local_node_id).await;
         let tool_runner_registry = merge_tool_runners(&registered_runners, &tool_runners);
         let mesh_registry = Self::compose_mesh_registry_snapshot(registry).await;
 
@@ -10572,6 +10642,7 @@ fn posture_str(posture: ansible_mesh_core::autonomy::AutonomyPosture) -> &'stati
     }
 }
 
+mod runner_tools;
 mod tool_assembly;
 #[allow(unused_imports)]
 use self::tool_assembly::*;

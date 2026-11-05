@@ -137,6 +137,17 @@ struct ListenerManager {
     stop_transport: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+impl Drop for ListenerManager {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop_transport.take() {
+            let _ = stop.send(());
+        }
+        if let Some((_, handle)) = self.current.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl ListenerManager {
     fn new(port: u16, state: Arc<MembraneState>) -> Self {
         Self {
@@ -230,6 +241,7 @@ impl ListenerManager {
 
 struct McpMembrane {
     lease_key_value: String,
+    lease_epoch: Option<u64>,
     state: Arc<MembraneState>,
     listener: ListenerManager,
     port: u16,
@@ -239,6 +251,7 @@ impl McpMembrane {
     fn new(port: u16, guest_id: &str, state: Arc<MembraneState>) -> Self {
         Self {
             lease_key_value: guest_id.to_string(),
+            lease_epoch: None,
             listener: ListenerManager::new(port, state.clone()),
             state,
             port,
@@ -264,8 +277,10 @@ impl MembraneGuest for McpMembrane {
         };
         match client.send_request(req).await {
             Ok(IpcResponse::McpMembraneLease {
-                mcp_granted: true, ..
+                mcp_granted: true,
+                mcp_lease,
             }) => {
+                self.lease_epoch = mcp_lease.map(|lease| lease.lease_epoch);
                 info!("MCP membrane lease acquired");
             }
             Ok(IpcResponse::McpMembraneLease {
@@ -602,17 +617,33 @@ impl MembraneGuest for McpMembrane {
     }
 
     async fn renew(&mut self, client: &mut PhiloticClient) -> Result<LeaseRenewResult> {
-        let req = IpcRequest::AcquireMcpMembraneLease {
-            lease_key: self.lease_key_value.clone(),
-            port: self.port,
+        let req = if let Some(epoch) = self.lease_epoch {
+            IpcRequest::RenewMcpMembraneLease {
+                lease_key: self.lease_key_value.clone(),
+                lease_epoch: epoch,
+            }
+        } else {
+            IpcRequest::AcquireMcpMembraneLease {
+                lease_key: self.lease_key_value.clone(),
+                port: self.port,
+            }
         };
         match client.send_request(req).await {
             Ok(IpcResponse::McpMembraneLease {
-                mcp_granted: true, ..
-            }) => Ok(LeaseRenewResult::Ok { epoch: 0 }),
+                mcp_granted: true,
+                mcp_lease,
+            }) => {
+                self.lease_epoch = mcp_lease.map(|lease| lease.lease_epoch);
+                Ok(LeaseRenewResult::Ok {
+                    epoch: self.lease_epoch.unwrap_or(0),
+                })
+            }
             Ok(IpcResponse::McpMembraneLease {
                 mcp_granted: false, ..
-            }) => Ok(LeaseRenewResult::NeedsReacquire),
+            }) => {
+                self.lease_epoch = None;
+                Ok(LeaseRenewResult::NeedsReacquire)
+            }
             Ok(_) => Ok(LeaseRenewResult::Ok { epoch: 0 }),
             Err(e) => Err(e),
         }
@@ -692,6 +723,7 @@ async fn main() -> Result<()> {
     let declared_exposure = Arc::new(std::sync::RwLock::new(None));
 
     let state = Arc::new(MembraneState {
+        runner_tool_socket: args.ipc_socket.clone(),
         native_memory_config: args.native_memory_config.clone(),
         native_pending: Default::default(),
         routing_table: table,

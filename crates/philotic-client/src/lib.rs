@@ -9,6 +9,7 @@ pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
+pub use ansible_mesh_core::runner_tool::{RunnerToolAdvertisement, RunnerToolDescriptor};
 pub use ansible_mesh_core::storage::AgentIdentityRecord;
 pub use ansible_mesh_core::storage::ComponentManifest;
 use anyhow::{Context, Result};
@@ -957,6 +958,25 @@ pub enum RestartReason {
 #[serde(tag = "operation", content = "payload")]
 #[serde(rename_all = "snake_case")]
 pub enum IpcRequest {
+    /// Replace this connection's live tool definitions; never creates grants.
+    AdvertiseRunnerTools {
+        advertisement: ansible_mesh_core::runner_tool::RunnerToolAdvertisement,
+    },
+    /// Endpoint-scoped projection, only for its live leased MCP membrane.
+    GetRunnerTool {
+        endpoint_id: String,
+        tool_name: String,
+    },
+    /// Deterministic local execution with hotel-owned authority and reply pins.
+    InvokeRunnerTool {
+        endpoint_id: String,
+        tool_name: String,
+        version: u32,
+        arguments: serde_json::Value,
+        caller_id: String,
+        session_id: String,
+        turn_id: String,
+    },
     ProtectedAuthority(ansible_mesh_core::privacy_rpc::ProtectedAuthorityRequest),
     /// Connect and register as an active materialized guest
     Register(GuestIdentity),

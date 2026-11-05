@@ -111,6 +111,12 @@ pub enum ProviderOutput {
 pub trait DatasourceProvider: Send + Sync {
     fn id(&self) -> &str;
 
+    /// Empty preserves legacy providers. Definitions belong to the provider,
+    /// while the controller retains registration and invocation lifecycle.
+    fn tool_descriptors(&self) -> Vec<philotic_client::RunnerToolDescriptor> {
+        Vec::new()
+    }
+
     fn supports(&self, task: &DatasourceTask) -> bool;
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput>;

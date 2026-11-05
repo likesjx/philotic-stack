@@ -138,6 +138,8 @@ pub async fn resolve_native_response(
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
+    /// The existing local hotel socket; absent for static HTTP-only tests.
+    pub runner_tool_socket: Option<String>,
     pub native_pending: Arc<Mutex<HashMap<String, NativePending>>>,
     /// Opt-in local file, reread per native call for revocation. Never logged/routed.
     pub native_memory_config: Option<std::path::PathBuf>,
@@ -493,6 +495,57 @@ fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     )
 }
 
+fn is_runner_tool(spec: &ansible_mesh_core::mcp_endpoint::McpToolSpec) -> bool {
+    matches!(
+        &spec.inbound_transform,
+        ansible_mesh_core::mcp_endpoint::McpInboundTransform::FieldMap {
+            target: ansible_mesh_core::mcp_route::McpRouteTarget::RunnerTool { .. },
+            ..
+        }
+    )
+}
+
+async fn runner_tool_descriptor(
+    state: &SharedState,
+    endpoint_id: &str,
+    tool_name: &str,
+) -> Option<philotic_client::RunnerToolDescriptor> {
+    use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+    let socket = state.runner_tool_socket.as_deref()?;
+    let operation = async {
+        // A distinct connection never replaces the membrane's inbox/lease.
+        let mut client = PhiloticClient::connect_at(
+            socket,
+            GuestIdentity {
+                guest_id: format!("mcp-membrane-{endpoint_id}:catalog"),
+                role: "mcp-catalog".into(),
+                supported_tools: vec![],
+            },
+        )
+        .await
+        .ok()?;
+        match client
+            .send_request(IpcRequest::GetRunnerTool {
+                endpoint_id: endpoint_id.into(),
+                tool_name: tool_name.into(),
+            })
+            .await
+            .ok()?
+        {
+            IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } => serde_json::from_value(data).ok(),
+            _ => None,
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), operation)
+        .await
+        .ok()
+        .flatten()
+}
+
 async fn handle_tools_list(
     state: &SharedState,
     id: Value,
@@ -500,9 +553,9 @@ async fn handle_tools_list(
     is_loopback: bool,
 ) -> JsonRpcResponse {
     // Prefer config-driven endpoint table; fall back to legacy route table.
-    let endpoint = state.endpoint_table.read().await;
+    let endpoint_config = state.endpoint_table.read().await.config().cloned();
     let oauth = native_oauth(state);
-    let tools: Vec<McpToolDescriptor> = if let Some(cfg) = endpoint.config() {
+    let mut tools: Vec<McpToolDescriptor> = if let Some(cfg) = endpoint_config.as_ref() {
         let bearer = extract_bearer(auth_header);
         cfg.tools
             .iter()
@@ -527,7 +580,10 @@ async fn handle_tools_list(
                                 )
                                 .ok()
                             })
-                            .is_some(),
+                            .is_some_and(|caller| {
+                                !is_runner_tool(tool)
+                                    || caller.scopes.iter().any(|scope| scope == &tool.name)
+                            }),
                         McpAuthScheme::None => is_loopback,
                     }
                 }
@@ -539,26 +595,56 @@ async fn handle_tools_list(
             })
             .collect()
     } else {
-        drop(endpoint);
         let bearer = extract_bearer(auth_header);
         let table = state.routing_table.read().await;
-        table.visible_descriptors_by(|route| match &route.record.security.auth {
-            McpAuthScheme::BearerToken { grants } => bearer
-                .and_then(|token| {
-                    verify_bearer_token(
-                        &route.record.tool_name,
-                        token,
-                        grants,
-                        &state.vault_cache,
-                        state.vault.as_ref(),
-                    )
-                    .ok()
-                })
-                .is_some(),
-            McpAuthScheme::None => is_loopback,
+        table.visible_descriptors_by(|route| {
+            if matches!(
+                &route.record.target,
+                ansible_mesh_core::mcp_route::McpRouteTarget::RunnerTool { .. }
+            ) {
+                return false;
+            }
+            match &route.record.security.auth {
+                McpAuthScheme::BearerToken { grants } => bearer
+                    .and_then(|token| {
+                        verify_bearer_token(
+                            &route.record.tool_name,
+                            token,
+                            grants,
+                            &state.vault_cache,
+                            state.vault.as_ref(),
+                        )
+                        .ok()
+                    })
+                    .is_some(),
+                McpAuthScheme::None => is_loopback,
+            }
         })
     };
 
+    // Authenticate first, then ask the hotel for the endpoint-authorized live
+    // definition. No names or schemas from an unavailable runner leak through.
+    if let Some(config) = endpoint_config {
+        let mut projected = Vec::new();
+        for mut tool in tools {
+            let spec = config
+                .tools
+                .iter()
+                .find(|spec| spec.name == tool.name)
+                .unwrap();
+            if is_runner_tool(spec) {
+                let Some(descriptor) =
+                    runner_tool_descriptor(state, &config.endpoint_id, &tool.name).await
+                else {
+                    continue;
+                };
+                tool.description = descriptor.description;
+                tool.input_schema = descriptor.input_schema;
+            }
+            projected.push(tool);
+        }
+        tools = projected;
+    }
     let mut result = serde_json::to_value(ToolsListResult { tools }).unwrap();
     if oauth.is_some() {
         if let Some(tools) = result["tools"].as_array_mut() {
@@ -692,7 +778,7 @@ async fn handle_tools_call(
     // ── Config-driven path (McpEndpointConfig) ────────────────────────────
     let endpoint = state.endpoint_table.read().await;
     if endpoint.is_active() {
-        let tool_spec = match endpoint.find_tool(tool_name) {
+        let mut tool_spec = match endpoint.find_tool(tool_name) {
             Some(s) => s.clone(),
             None => {
                 return JsonRpcResponse::err(
@@ -749,10 +835,47 @@ async fn handle_tools_call(
         };
 
         let preapproved = endpoint.is_preapproved(&inbound.action);
+        let endpoint_id = endpoint
+            .config()
+            .map(|config| config.endpoint_id.clone())
+            .unwrap_or_default();
         if oauth.is_some() && inbound.target_kind != "native_memory" {
             return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, "native resource only");
         }
         drop(endpoint);
+
+        let runner_tool_version = if is_runner_tool(&tool_spec) {
+            if !caller.scopes.iter().any(|scope| scope == tool_name) {
+                return JsonRpcResponse::err(
+                    id,
+                    error_code::PERMISSION_DENIED,
+                    "caller lacks native tool scope",
+                );
+            }
+            if !preapproved {
+                return JsonRpcResponse::err(
+                    id,
+                    error_code::PERMISSION_DENIED,
+                    "native runner requires preapproval",
+                );
+            }
+            let Some(descriptor) = runner_tool_descriptor(state, &endpoint_id, tool_name).await
+            else {
+                return JsonRpcResponse::err(
+                    id,
+                    error_code::TOOL_NOT_FOUND,
+                    "runner tool unavailable",
+                );
+            };
+            if let Err(error) = descriptor.validate_arguments(&args) {
+                return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, error);
+            }
+            tool_spec.description = descriptor.description;
+            tool_spec.input_schema = descriptor.input_schema;
+            Some(descriptor.version)
+        } else {
+            None
+        };
 
         // Pre-approval rules are the only approval bypass. Loopback callers get
         // no special treatment: the provisioning turn is the authorization event,
@@ -804,6 +927,8 @@ async fn handle_tools_call(
             // actually saw in `tools/list`.
             raw_transport: json!({
                 "transport": "mcp",
+                "endpoint_id": endpoint_id,
+                "runner_tool_version": runner_tool_version,
                 "tool": tool_name,
                 "target_kind": inbound.target_kind,
                 "target_id": inbound.target_id,
@@ -1077,6 +1202,7 @@ async fn handle_tools_call(
         route.record.target,
         ansible_mesh_core::mcp_route::McpRouteTarget::McpUpstream { .. }
             | ansible_mesh_core::mcp_route::McpRouteTarget::NativeMemory { .. }
+            | ansible_mesh_core::mcp_route::McpRouteTarget::RunnerTool { .. }
     ) {
         return JsonRpcResponse::err(
             id,

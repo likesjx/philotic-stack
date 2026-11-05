@@ -1,5 +1,11 @@
 # Ansible Mesh Architecture Separation Task List
 
+## Runner-owned native graph tools — 2026-11-05
+
+- Local implementation: LifeGraph owns the `life.view.node@1` recall definition; the existing datasource lifecycle advertises it, the hotel validates enrollment/version/scope and routes directly, and MCP projects the authorized live subset. [Architecture, evidence and limits](architecture/NATIVE_GRAPH_TOOLS_PROPOSAL.md).
+- Real-component composition passed through actual hotel/UDS, HTTP MCP, LifeGraph runner and disposable Memgraph, including denied access and runner/hotel restarts. Integration also fixed orphaned MCP listener tasks and epoch lease renewal.
+- Pending: coordinate review and prompt integration into `develop`; exact-head remote CI and intended-client acceptance; separately authorized deployment. Semantic recall and cross-hotel descriptors remain follow-ups. No production access, credentials or endpoint changed; grant-file recovery belongs to the other workstream.
+
 ## Native endpoint preapproval maintenance — 2026-11-03
 
 - Focused draft: hotel-owned atomic expiry update preserves guest/PID/generation/listener state; full provisioning now mints an incarnation to fence delayed maintenance across recreation. [Protocol, tests, limits and rollout](native-preapproval-maintenance.md).

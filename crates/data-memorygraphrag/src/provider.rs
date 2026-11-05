@@ -658,6 +658,9 @@ impl LifeGraphProvider {
 
 #[async_trait]
 impl DatasourceProvider for LifeGraphProvider {
+    fn tool_descriptors(&self) -> Vec<philotic_client::RunnerToolDescriptor> {
+        vec![data_memorygraphrag::native_node_recall_descriptor()]
+    }
     fn id(&self) -> &str {
         "life-graph-memorygraphrag"
     }
