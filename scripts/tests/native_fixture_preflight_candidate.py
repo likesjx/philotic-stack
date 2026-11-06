@@ -7,11 +7,17 @@ The trusted, exclusive runner and host-client assumptions remain external.
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import stat
 
 import native_container_boundary_candidate as boundary
+
+
+def _canonical_destination(value):
+    return (isinstance(value, str) and value.startswith('/') and not value.startswith('//')
+            and posixpath.normpath(value) == value)
 
 
 def _json_one(runner, args):
@@ -30,6 +36,13 @@ def _json_one(runner, args):
 def _artifact_hash(root, relative):
     if not isinstance(relative, str) or not relative or PurePosixPath(relative).is_absolute() or '..' in PurePosixPath(relative).parts:
         raise ValueError('invalid artifact path')
+    try:
+        return _read_artifact_hash(root, relative)
+    except OSError:
+        raise RuntimeError('artifact unavailable') from None
+
+
+def _read_artifact_hash(root, relative):
     path = root.joinpath(relative)
     if path.is_symlink() or not path.resolve(strict=True).is_relative_to(root):
         raise RuntimeError('artifact path unverified')
@@ -70,7 +83,10 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
             or not isinstance(contract['roles'], dict) or set(contract['roles']) != boundary.ROLES
             or not isinstance(contract['artifacts'], dict) or not contract['artifacts']):
         raise ValueError('invalid preflight identities')
-    root, parent = Path(scratch_root).resolve(strict=True), Path(runner_temp).resolve(strict=True)
+    try:
+        root, parent = Path(scratch_root).resolve(strict=True), Path(runner_temp).resolve(strict=True)
+    except (OSError, TypeError, ValueError):
+        raise RuntimeError('fixture scratch unavailable') from None
     if not root.is_dir() or root.parent != parent or root.name != f'native-qualification-{nonce}':
         raise ValueError('fixture scratch unavailable')
     if runner is boundary._docker:
@@ -111,7 +127,11 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
                        for value in attachments.values())):
             raise RuntimeError('fixture network attachments unverified')
         mounts = info.get('Mounts')
-        if not isinstance(mounts, list) or not isinstance(expected['mounts'], list) or not isinstance(expected['tmpfs'], dict):
+        if (not isinstance(mounts, list) or not isinstance(expected['mounts'], list)
+                or not isinstance(expected['tmpfs'], dict)
+                or any(not _canonical_destination(k) or not isinstance(v, str)
+                       or ('ro' in v.split(',') and 'rw' in v.split(','))
+                       for k, v in expected['tmpfs'].items())):
             raise ValueError('invalid mount contract')
         # Preserve existing isolation checks while separately verifying exact
         # named volumes below. No unapproved volume is silently accepted.
@@ -123,7 +143,9 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
         state, host, config = info['State'], info['HostConfig'], info['Config']
         if (state.get('Status') != 'created' or state.get('StartedAt') != '0001-01-01T00:00:00Z'
                 or host.get('PublishAllPorts') is not False
-                or info.get('RestartCount') != 0 or (host.get('Tmpfs') or {}) != expected['tmpfs']
+                or info.get('RestartCount') != 0 or 'Tmpfs' not in host
+                or (host['Tmpfs'] is not None and not isinstance(host['Tmpfs'], dict))
+                or (host['Tmpfs'] or {}) != expected['tmpfs']
                 or config.get('Entrypoint') != expected['entrypoint'] or config.get('Cmd') != expected['command']
                 or not isinstance(config.get('Env'), list)):
             raise RuntimeError('fixture creation contract mismatch')
@@ -131,17 +153,38 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
         if not isinstance(expected['env_sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', expected['env_sha256']) or env_hash != expected['env_sha256']:
             raise RuntimeError('fixture environment mismatch')
         actual_mounts = []
+        reported_tmpfs = set()
         for mount in mounts:
             if not isinstance(mount, dict) or mount.get('Type') not in ('bind', 'volume', 'tmpfs'):
                 raise RuntimeError('unknown fixture mount')
             kind = mount['Type']
-            if kind == 'bind' and Path(mount['Source']).is_socket():
-                raise RuntimeError('socket bind is forbidden')
-            source = (str(Path(mount['Source']).resolve(strict=True)) if kind == 'bind'
-                      else mount.get('Name') if kind == 'volume' else '')
+            if kind == 'tmpfs':
+                destination = mount.get('Destination')
+                if (not isinstance(destination, str) or destination not in expected['tmpfs']
+                        or destination in reported_tmpfs or not isinstance(mount.get('RW'), bool)):
+                    raise RuntimeError('fixture tmpfs metadata invalid')
+                options = expected['tmpfs'][destination].split(',')
+                if ('ro' in options and 'rw' in options) or mount['RW'] != ('ro' not in options):
+                    raise RuntimeError('fixture tmpfs mode mismatch')
+                reported_tmpfs.add(destination)
+                continue
+            if kind == 'bind':
+                try:
+                    raw_source = mount['Source']
+                    if not isinstance(raw_source, str) or not raw_source:
+                        raise ValueError('invalid source')
+                    bind = Path(raw_source)
+                    resolved = bind.resolve(strict=True)
+                    if stat.S_ISSOCK(resolved.stat().st_mode):
+                        raise RuntimeError('socket bind is forbidden')
+                    source = str(resolved)
+                except (OSError, KeyError, TypeError, ValueError):
+                    raise RuntimeError('fixture bind source unavailable') from None
+            else:
+                source = mount.get('Name')
             item = {'type': kind, 'source': source, 'destination': mount.get('Destination'),
                     'rw': mount.get('RW'), 'propagation': mount.get('Propagation')}
-            if not isinstance(item['source'], str) or not isinstance(item['destination'], str) or not isinstance(item['rw'], bool):
+            if not isinstance(item['source'], str) or not _canonical_destination(item['destination']) or not isinstance(item['rw'], bool):
                 raise RuntimeError('fixture mount metadata invalid')
             actual_mounts.append(item)
             if kind == 'volume':
@@ -153,6 +196,10 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
                     raise RuntimeError('fixture volume unverified')
                 observed_volumes.add(source)
         key = lambda item: json.dumps(item, sort_keys=True, separators=(',', ':'))
+        all_destinations = [m['destination'] for m in actual_mounts] + list(expected['tmpfs'])
+        if any(a == b or PurePosixPath(a) in PurePosixPath(b).parents or PurePosixPath(b) in PurePosixPath(a).parents
+               for i, a in enumerate(all_destinations) for b in all_destinations[i+1:]):
+            raise RuntimeError('fixture mount destinations overlap')
         if sorted(map(key, actual_mounts)) != sorted(map(key, expected['mounts'])):
             raise RuntimeError('fixture mount contract mismatch')
         destinations = {m['destination'] for m in actual_mounts} | set(expected['tmpfs'])

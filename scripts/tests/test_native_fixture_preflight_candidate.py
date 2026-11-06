@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import native_fixture_preflight_candidate as preflight
 from test_native_container_boundary_candidate import FakeDocker
@@ -72,6 +73,64 @@ class PreflightTests(unittest.TestCase):
             result = preflight.preflight_fixture(manifest, contract, scratch, root, fake)
             self.assertEqual(result, {'containers': 6, 'volumes': 0, 'state': 'created-not-started'})
             self.assertEqual(fake.kills, [])
+
+    def test_artifact_filesystem_errors_are_sanitized(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            with self.assertRaisesRegex(RuntimeError, '^artifact unavailable$'):
+                preflight._artifact_hash(root, 'missing')
+            (root / 'fixture.bin').write_bytes(b'synthetic')
+            with patch.object(preflight.os, 'open', side_effect=PermissionError('sensitive path')):
+                with self.assertRaisesRegex(RuntimeError, '^artifact unavailable$'):
+                    preflight._artifact_hash(root, 'fixture.bin')
+
+    def test_tmpfs_may_be_reported_in_mounts_or_only_in_host_config(self):
+        for reported in (False, True):
+            with self.subTest(reported=reported), tempfile.TemporaryDirectory() as root:
+                scratch, fake, manifest, contract = self.setup_fixture(root)
+                info = fake.containers[fake.ids['mongo']]
+                info['HostConfig']['Tmpfs'] = {'/data/db': 'rw,size=16m'}
+                contract['roles']['mongo']['tmpfs'] = {'/data/db': 'rw,size=16m'}
+                fake.image_volumes[fake.images['mongo']] = {'/data/db': {}}
+                contract['roles']['mongo']['declared_volumes'] = ['/data/db']
+                if reported:
+                    info['Mounts'].append({'Type':'tmpfs', 'Destination':'/data/db', 'RW':True})
+                self.assertEqual(preflight.preflight_fixture(manifest, contract, scratch, root, fake)['state'], 'created-not-started')
+
+    def test_tmpfs_conflicts_and_missing_bind_metadata_are_refused(self):
+        for fault in ('unlisted', 'duplicate', 'mode', 'ro-mode', 'overlap', 'alias', 'contract-alias', 'nested', 'nested-tmpfs', 'conflicting-options', 'missing-source', 'missing-tmpfs', 'missing-bind'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as root:
+                scratch, fake, manifest, contract = self.setup_fixture(root)
+                info = fake.containers[fake.ids['mongo']]
+                info['HostConfig']['Tmpfs'] = {'/data/db':'rw'}
+                contract['roles']['mongo']['tmpfs'] = {'/data/db':'rw'}
+                tmpfs = {'Type':'tmpfs', 'Destination':'/data/db', 'RW':True}
+                info['Mounts'].append(tmpfs)
+                if fault == 'unlisted': tmpfs['Destination'] = '/unexpected'
+                if fault == 'duplicate': info['Mounts'].append(dict(tmpfs))
+                if fault == 'mode': tmpfs['RW'] = False
+                if fault == 'ro-mode':
+                    info['HostConfig']['Tmpfs'] = {'/data/db':'ro'}
+                    contract['roles']['mongo']['tmpfs'] = {'/data/db':'ro'}
+                if fault == 'overlap': info['Mounts'][0]['Destination'] = '/data/db'
+                if fault == 'alias': tmpfs['Destination'] = '/data/../data/db'
+                if fault == 'contract-alias':
+                    info['HostConfig']['Tmpfs'] = {'/data/../data/db':'rw'}
+                    contract['roles']['mongo']['tmpfs'] = {'/data/../data/db':'rw'}
+                if fault == 'nested-tmpfs':
+                    info['HostConfig']['Tmpfs'] = {'/data/db':'rw', '/data/db/child':'rw'}
+                    contract['roles']['mongo']['tmpfs'] = {'/data/db':'rw', '/data/db/child':'rw'}
+                if fault == 'nested': info['Mounts'][0]['Destination'] = '/data/db/child'
+                if fault == 'conflicting-options':
+                    info['Mounts'].pop()
+                    info['HostConfig']['Tmpfs'] = {'/data/db':'ro,rw'}
+                    contract['roles']['mongo']['tmpfs'] = {'/data/db':'ro,rw'}
+                if fault == 'missing-source': del info['Mounts'][0]['Source']
+                if fault == 'missing-bind': info['Mounts'][0]['Source'] = str(scratch / 'missing')
+                if fault == 'missing-tmpfs': del info['HostConfig']['Tmpfs']
+                with self.assertRaises((RuntimeError, ValueError)):
+                    preflight.preflight_fixture(manifest, contract, scratch, root, fake)
+                self.assertEqual(fake.kills, [])
 
     def test_unexpected_inputs_fail_before_execution(self):
         for fault in ('image', 'network', 'network-driver', 'network-scope', 'extra-attachment', 'wrong-network-id', 'missing-network-settings', 'shared-extra-attachment', 'publish-all', 'missing-publish-all', 'started', 'mount', 'destination', 'propagation', 'duplicate', 'artifact', 'artifact-symlink', 'environment', 'declared-volume', 'unknown-volume'):

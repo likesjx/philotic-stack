@@ -43,6 +43,14 @@ reviewed fixture; deriving expected values from inspection would be circular.
 It rejects every Docker volume until volume teardown is qualified. Checks assume
 a trusted exclusive runner; they do not enumerate host clients or atomically
 bind inspected state to a later start. Real Docker behavior remains untested.
+The bind-source check rejects a socket at the source path; it does not scan a
+bound directory for nested sockets or special files, so it cannot establish
+that containers lack access to sockets within a directory mount. Contract
+`tmpfs` entries are verified against `HostConfig.Tmpfs`; optional Docker
+`Mounts` tmpfs entries must agree with that contract and are not counted as
+separate bind/volume mounts. Real Docker representation remains unverified.
+The candidate rejects noncanonical, duplicate and nested mount destinations;
+it does not attempt to infer safe mount ordering from a caller's contract.
 
 ## Inputs required for a future pinned contract
 
