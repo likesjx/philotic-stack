@@ -41,6 +41,81 @@ fn json_file(path: &Path, value: Value) {
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
+// Cold-start trust qualification only. The caller owns a private CI TempDir;
+// this does not perform a CA transition or establish a writer barrier.
+fn fixture_openssl(mut command: std::process::Command, capture_stderr: bool) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    let stderr = if capture_stderr { std::process::Stdio::piped() } else { std::process::Stdio::null() };
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(stderr);
+    let mut child = command.spawn()?;
+    let capture = if capture_stderr {
+        use std::io::Read as _;
+        let stream = child.stderr.take().expect("piped stderr");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stream.take(16385).read_to_end(&mut bytes).map(|_| bytes);
+            let _ = sender.send(result);
+        });
+        Some(receiver)
+    } else { None };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let bytes = match capture {
+                    Some(receiver) => receiver.recv_timeout(Duration::from_secs(2))??,
+                    None => Vec::new(),
+                };
+                ensure!(bytes.len() <= 16384, "synthetic openssl output too large");
+                return Ok((status, bytes));
+            },
+            Ok(None) if std::time::Instant::now() < deadline => {},
+            _ => {
+                // Kill may race with normal exit; always attempt a bounded
+                // reap and fail if its outcome cannot be confirmed.
+                let _ = child.kill();
+                let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => anyhow::bail!("synthetic openssl interrupted"),
+                        Ok(None) if std::time::Instant::now() < reap_deadline => std::thread::sleep(Duration::from_millis(25)),
+                        _ => anyhow::bail!("synthetic openssl reap unconfirmed"),
+                    }
+                }
+            },
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn separate_authority_tls(root: &Path) -> Result<Value> {
+    ensure!(root.parent() == Some(Path::new("/tmp")) && root.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with("native-oauth-")), "synthetic fixture root required");
+    let ca = root.join("separate-ca.crt");
+    let ca_key = root.join("separate-ca.key");
+    let mut command = std::process::Command::new("/usr/bin/openssl");
+    command.args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=synthetic-authority-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout"]).arg(&ca_key).arg("-out").arg(&ca);
+    ensure!(fixture_openssl(command, false)?.0.success(), "synthetic CA generation failed");
+    std::fs::set_permissions(&ca_key, std::fs::Permissions::from_mode(0o600))?;
+    let mut values = json!({"authorityCa":ca});
+    for (index, role) in ["authority", "website", "management"].into_iter().enumerate() {
+        let key = root.join(format!("separate-{role}.key"));
+        let csr = root.join(format!("separate-{role}.csr"));
+        let cert = root.join(format!("separate-{role}.crt"));
+        let ext = root.join(format!("separate-{role}.ext"));
+        let usage = if role == "authority" { "extendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n" } else { "extendedKeyUsage=clientAuth\n" };
+        std::fs::write(&ext, format!("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n{usage}"))?;
+        let mut command = std::process::Command::new("/usr/bin/openssl");
+        command.args(["req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj"]).arg(format!("/CN=synthetic-{role}")).arg("-keyout").arg(&key).arg("-out").arg(&csr);
+        ensure!(fixture_openssl(command, false)?.0.success(), "synthetic leaf request failed");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        let mut command = std::process::Command::new("/usr/bin/openssl");
+        command.args(["x509", "-req", "-in"]).arg(&csr).arg("-CA").arg(&ca).arg("-CAkey").arg(&ca_key).arg("-set_serial").arg((index+1).to_string()).args(["-days", "1", "-extfile"]).arg(&ext).arg("-out").arg(&cert);
+        ensure!(fixture_openssl(command, false)?.0.success(), "synthetic leaf signing failed");
+        values[format!("{role}Cert")] = json!(cert);
+        values[format!("{role}Key")] = json!(key);
+    }
+    Ok(values)
+}
 fn live_guest_snapshot(db: &Path, hotel: &str, guests: [&str; 3]) -> [(String, String, String); 3] {
     let storage = SqliteGraphStorage::open(db).unwrap();
     let graph = GraphDomain::new(Arc::new(storage.adapter()));
@@ -256,10 +331,15 @@ async fn composition(real: bool) {
         json!({"uri":"127.0.0.1:17687","username":"","password":""}),
     );
     let issuer_config = root.join("issuer.json");
-    json_file(
-        &issuer_config,
-        json!({"port":issuer_port,"authorityPort":port(),"key":key,"cert":cert,"issuer":issuer,"resource":resource,"subject":subject,"token":token,"secret":secret}),
-    );
+    let authority_port = port();
+    let mut issuer_settings = json!({"port":issuer_port,"authorityPort":authority_port,"key":key,"cert":cert,"issuer":issuer,"resource":resource,"subject":subject,"token":token,"secret":secret});
+    let separate_tls = std::env::var("PHILOTIC_TEST_SEPARATE_AUTHORITY_TLS").as_deref() == Ok("1");
+    assert!(!separate_tls || (real && !renewal), "cold-start synthetic real fixture only");
+    let separate = if separate_tls { Some(separate_authority_tls(root).unwrap()) } else { None };
+    if let Some(ref fields) = separate {
+        for (name, value) in fields.as_object().unwrap() { issuer_settings[name] = value.clone(); }
+    }
+    json_file(&issuer_config, issuer_settings);
     let bundle = root.join("mock-issuer.cjs");
     std::fs::write(&bundle, include_bytes!("mock_issuer.cjs")).unwrap();
     std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -519,6 +599,25 @@ async fn composition(real: bool) {
     })
     .await
     .unwrap();
+    if let Some(ref fields) = separate {
+        // Same client identity in both probes: positive CA must handshake;
+        // unrelated HTTPS issuer CA must be rejected. No system roots used.
+        let website_cert = fields["websiteCert"].as_str().unwrap();
+        let website_key = fields["websiteKey"].as_str().unwrap();
+        let new_ca = fields["authorityCa"].as_str().unwrap();
+        for (ca_file, expected) in [(Path::new(new_ca), true), (cert.as_path(), false), (Path::new(new_ca), true)] {
+            let mut probe = std::process::Command::new("/usr/bin/openssl");
+            probe.args(["s_client", "-connect"]).arg(format!("127.0.0.1:{authority_port}"))
+                .args(["-verify_return_error", "-verify_ip", "127.0.0.1", "-no-CApath", "-no-CAstore", "-CAfile"])
+                .arg(ca_file).arg("-cert").arg(website_cert).arg("-key").arg(website_key);
+            let (status, diagnostic) = fixture_openssl(probe, !expected).unwrap();
+            assert_eq!(status.success(), expected, "synthetic authority CA handshake");
+            if !expected {
+                let diagnostic = std::str::from_utf8(&diagnostic).unwrap();
+                assert!(diagnostic.contains("verify error:num=20:") || diagnostic.contains("verify error:num=21:"), "wrong CA must produce certificate verification failure");
+            }
+        }
+    }
     if let Some(bind) = &bridge {
         for (path, expected) in [
             ("/bad-name", 500),
