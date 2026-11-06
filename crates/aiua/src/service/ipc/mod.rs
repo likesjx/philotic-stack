@@ -436,6 +436,9 @@ fn peer_uid_permitted(stream: &UnixStream, hotel_uid: u32, policy: PeerUidPolicy
 pub(crate) type MuninnOutageHealId = Arc<std::sync::Mutex<Option<String>>>;
 
 pub struct IpcServer {
+    // Shared with the native runtime; not used by any handler yet.
+    #[allow(dead_code)]
+    native_authority: Option<Arc<crate::service::native_authority::NativeAuthority>>,
     protected_disposable: Option<Arc<protected_disposable::ProtectedDisposable>>,
     protected_authority: Option<Arc<ansible_mesh_core::privacy_rpc::LocalAuthorityRpc>>,
     socket_path: String,
@@ -1928,6 +1931,7 @@ impl IpcServer {
     ) -> Self {
         let (network_broadcast, _) = tokio::sync::broadcast::channel(16);
         Self {
+            native_authority: None,
             protected_disposable: None,
             protected_authority: None,
             socket_path: socket_path.into(),
@@ -2037,6 +2041,15 @@ impl IpcServer {
 
     pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
         self.muninn_config = config;
+        self
+    }
+
+    /// Share the already-created runtime authority; never open another journal.
+    pub fn with_native_authority(
+        mut self,
+        authority: Option<Arc<crate::service::native_authority::NativeAuthority>>,
+    ) -> Self {
+        self.native_authority = authority;
         self
     }
 

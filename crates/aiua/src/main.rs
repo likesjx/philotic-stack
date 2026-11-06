@@ -8256,11 +8256,15 @@ async fn hotel_main() -> Result<()> {
         crate::service::guest_manager::LocalProcessMaterializer::new(db_path.to_string_lossy())
             .with_hotel_socket(&hotel.ipc_socket_path)
             .with_stderr_sink(stderr_tx);
-    if let Some(path) = &args.native_authority_config {
+    let native_authority = if let Some(path) = &args.native_authority_config {
         let native =
             crate::service::native_authority::runtime::Runtime::load(path, &caps.node_id).await?;
+        let authority = native.authority.clone();
         materializer = materializer.with_native_authority(native);
-    }
+        Some(authority)
+    } else {
+        None
+    };
     let materializer = Box::new(materializer);
     let mut guest_manager_inner = crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
@@ -8389,6 +8393,7 @@ async fn hotel_main() -> Result<()> {
     .with_memory_config(muninn_config_arc.clone())
     .with_training_storage(training_storage.clone())
     .with_materialization_requester(guest_manager.clone())
+    .with_native_authority(native_authority)
     .with_webrtc_signal_tx(webrtc_signal_tx.clone())
     .with_registry(registry.clone())
     .with_operator_surface_channel(operator_surface_tx)
