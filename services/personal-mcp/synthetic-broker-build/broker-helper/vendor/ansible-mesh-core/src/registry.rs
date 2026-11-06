@@ -1,0 +1,743 @@
+use crate::heartbeat::{HotelStateSyncAgent, HotelStateSyncGuest};
+use crate::{NodeCapabilities, NodeHealthSnapshot};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+const DEFAULT_NODE_TTL: Duration = Duration::from_secs(15);
+const PENDING_SYNC_TTL: Duration = Duration::from_secs(30);
+
+/// How long a remote hotel's gossiped roster stays trustworthy. A hotel
+/// re-broadcasts its roster every 30 s, and nothing else refreshes it, so the
+/// 15 s node TTL expired it half of every cycle — an exact-guest lookup on
+/// the roster then failed for 15 s out of 30 and a cross-hotel task fell back
+/// to local handling. Three missed broadcasts (plus slack) is stale.
+pub const HOTEL_STATE_TTL: Duration = Duration::from_secs(90);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityAdvertisement {
+    pub hotel_id: String,
+    pub node_id: String,
+    pub incarnation_id: String,
+    pub target_role: String,
+    pub availability_state: String,
+    pub selection_hint: Option<String>,
+    pub latency_hint_ms: Option<u32>,
+    pub max_concurrent_jobs: Option<u32>,
+    pub active_jobs: u32,
+    pub queue_depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReachability {
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Status and capability info for a discovered mesh node.
+#[derive(Debug, Clone)]
+pub struct NodeStatus {
+    pub capabilities: NodeCapabilities,
+    pub advertisements: Vec<CapabilityAdvertisement>,
+    pub execution_reachability: Option<ExecutionReachability>,
+    /// Latest environment vitals reported by this node; None if the node
+    /// has never sent health data or is running an older build.
+    pub node_health: Option<NodeHealthSnapshot>,
+    pub last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCapabilitySync {
+    capabilities: NodeCapabilities,
+    execution_reachability: Option<ExecutionReachability>,
+    node_health: Option<NodeHealthSnapshot>,
+    chunk_total: u32,
+    received_chunks: BTreeMap<u32, Vec<CapabilityAdvertisement>>,
+    started_at: Instant,
+}
+
+/// In-memory snapshot of a remote hotel's guest and agent roster.
+/// Populated from `HotelStateSync` beacon messages; never persisted to DB.
+#[derive(Debug, Clone)]
+pub struct RemoteHotelState {
+    pub hotel_name: String,
+    pub node_id: String,
+    pub guests: Vec<HotelStateSyncGuest>,
+    pub agents: Vec<HotelStateSyncAgent>,
+    pub last_seen: Instant,
+}
+
+/// Registry for storing and querying known mesh nodes.
+#[derive(Debug, Default)]
+pub struct NodeRegistry {
+    nodes: HashMap<String, NodeStatus>,
+    pending_capability_syncs: HashMap<(String, Uuid), PendingCapabilitySync>,
+    /// In-memory roster of remote hotels, keyed by node_id.
+    remote_hotel_states: HashMap<String, RemoteHotelState>,
+}
+
+impl NodeRegistry {
+    pub fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+            pending_capability_syncs: HashMap::new(),
+            remote_hotel_states: HashMap::new(),
+        }
+    }
+
+    fn is_fresh(status: &NodeStatus) -> bool {
+        status.last_seen.elapsed() <= DEFAULT_NODE_TTL
+    }
+
+    pub fn freshness_ttl_secs() -> u64 {
+        DEFAULT_NODE_TTL.as_secs()
+    }
+
+    /// Returns `true` if the node was not seen recently (stale or first-ever), which means
+    /// the caller should treat the incoming heartbeat as a reconnect event.
+    pub fn is_node_stale(&self, node_id: &str) -> bool {
+        self.nodes
+            .get(node_id)
+            .map(|s| !Self::is_fresh(s))
+            .unwrap_or(true)
+    }
+
+    pub fn observe_heartbeat(
+        &mut self,
+        capabilities: NodeCapabilities,
+        execution_reachability: Option<ExecutionReachability>,
+        node_health: Option<NodeHealthSnapshot>,
+    ) {
+        let node_id = capabilities.node_id.clone();
+        if let Some(existing) = self.nodes.get_mut(&node_id) {
+            existing.capabilities = capabilities;
+            existing.execution_reachability = execution_reachability;
+            existing.node_health = node_health;
+            existing.last_seen = Instant::now();
+            return;
+        }
+
+        self.nodes.insert(
+            node_id,
+            NodeStatus {
+                capabilities,
+                advertisements: Vec::new(),
+                execution_reachability,
+                node_health,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    /// Test-only support: backdate a node's `last_seen` so freshness-gated
+    /// paths can be exercised without real waits. Hidden from docs; never
+    /// call from production code.
+    #[doc(hidden)]
+    pub fn backdate_last_seen(&mut self, node_id: &str, age: Duration) {
+        if let Some(status) = self.nodes.get_mut(node_id) {
+            if let Some(backdated) = Instant::now().checked_sub(age) {
+                status.last_seen = backdated;
+            }
+        }
+    }
+
+    /// Transitional compatibility shim for older call sites that still update a whole node in
+    /// one shot. New code should prefer `observe_heartbeat` and `observe_capability_sync_chunk`.
+    pub fn update_node(
+        &mut self,
+        capabilities: NodeCapabilities,
+        advertisements: Vec<CapabilityAdvertisement>,
+        execution_reachability: Option<ExecutionReachability>,
+        _node_health: Option<NodeHealthSnapshot>,
+    ) {
+        let sync_id = Uuid::new_v4();
+        self.observe_capability_sync_chunk(
+            capabilities,
+            execution_reachability,
+            None,
+            sync_id,
+            0,
+            1,
+            advertisements,
+        );
+    }
+
+    // Each parameter is an independently-optional signal from a different
+    // subsystem, and callers pass different subsets. Collapsing them into a
+    // struct would move the same eight fields one level down without making
+    // any call site clearer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_capability_sync_chunk(
+        &mut self,
+        capabilities: NodeCapabilities,
+        execution_reachability: Option<ExecutionReachability>,
+        node_health: Option<NodeHealthSnapshot>,
+        sync_id: Uuid,
+        chunk_index: u32,
+        chunk_total: u32,
+        advertisements: Vec<CapabilityAdvertisement>,
+    ) {
+        self.prune_pending_syncs();
+        let node_id = capabilities.node_id.clone();
+        let pending = self
+            .pending_capability_syncs
+            .entry((node_id.clone(), sync_id))
+            .or_insert_with(|| PendingCapabilitySync {
+                capabilities: capabilities.clone(),
+                execution_reachability: execution_reachability.clone(),
+                node_health: node_health.clone(),
+                chunk_total,
+                received_chunks: BTreeMap::new(),
+                started_at: Instant::now(),
+            });
+
+        pending.capabilities = capabilities;
+        pending.execution_reachability = execution_reachability;
+        pending.node_health = node_health;
+        pending.chunk_total = chunk_total;
+        pending.received_chunks.insert(chunk_index, advertisements);
+
+        if pending.received_chunks.len() as u32 != pending.chunk_total {
+            return;
+        }
+
+        let mut merged = Vec::new();
+        for index in 0..pending.chunk_total {
+            let Some(chunk) = pending.received_chunks.get(&index) else {
+                return;
+            };
+            merged.extend(chunk.clone());
+        }
+
+        let completed = self
+            .pending_capability_syncs
+            .remove(&(node_id.clone(), sync_id))
+            .expect("pending sync should exist when all chunks were received");
+
+        self.nodes.insert(
+            node_id,
+            NodeStatus {
+                capabilities: completed.capabilities,
+                advertisements: merged,
+                execution_reachability: completed.execution_reachability,
+                node_health: completed.node_health,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    /// Returns true if the node is fresh AND has not reported degraded vitals.
+    /// A node with no health data is considered healthy (old build / first boot).
+    pub fn is_node_healthy(&self, node_id: &str) -> bool {
+        let Some(status) = self.nodes.get(node_id) else {
+            return false;
+        };
+        if !Self::is_fresh(status) {
+            return false;
+        }
+        let Some(ref h) = status.node_health else {
+            return true;
+        };
+        h.disk_free_pct.is_none_or(|v| v > 10.0)
+            && h.mem_free_pct.is_none_or(|v| v > 5.0)
+            && h.load_avg_1m.is_none_or(|v| v < 16.0)
+    }
+
+    fn prune_pending_syncs(&mut self) {
+        self.pending_capability_syncs
+            .retain(|_, pending| pending.started_at.elapsed() <= PENDING_SYNC_TTL);
+    }
+
+    /// Retrieve capabilities for a specific node.
+    pub fn get_node(&self, node_id: &str) -> Option<&NodeStatus> {
+        self.nodes.get(node_id)
+    }
+
+    pub fn active_nodes(&self) -> impl Iterator<Item = &NodeStatus> {
+        self.nodes.values().filter(|status| Self::is_fresh(status))
+    }
+
+    /// Store or update the guest/agent roster received from a remote hotel.
+    pub fn observe_hotel_state(
+        &mut self,
+        node_id: String,
+        hotel_name: String,
+        guests: Vec<HotelStateSyncGuest>,
+        agents: Vec<HotelStateSyncAgent>,
+    ) {
+        self.remote_hotel_states.insert(
+            node_id.clone(),
+            RemoteHotelState {
+                hotel_name,
+                node_id,
+                guests,
+                agents,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    /// Iterate over all known remote hotel states.
+    pub fn remote_hotel_states(&self) -> impl Iterator<Item = &RemoteHotelState> {
+        self.remote_hotel_states.values()
+    }
+
+    pub fn find_nodes_with_tool<'a>(
+        &'a self,
+        tool: &'a str,
+    ) -> impl Iterator<Item = &'a NodeStatus> {
+        self.nodes
+            .values()
+            .filter(|status| Self::is_fresh(status))
+            .filter(move |status| status.capabilities.tools.iter().any(|t| t == tool))
+    }
+
+    pub fn find_nodes_with_role<'a>(
+        &'a self,
+        role: &'a crate::NodeRole,
+    ) -> impl Iterator<Item = &'a NodeStatus> {
+        self.nodes
+            .values()
+            .filter(|status| Self::is_fresh(status))
+            .filter(move |status| status.capabilities.roles.contains(role))
+    }
+
+    pub fn advertisements_for_role<'a>(
+        &'a self,
+        target_role: &'a str,
+    ) -> impl Iterator<Item = &'a CapabilityAdvertisement> {
+        self.active_nodes().flat_map(move |status| {
+            status
+                .advertisements
+                .iter()
+                .filter(move |advertisement| advertisement.target_role == target_role)
+        })
+    }
+
+    /// Find the fresh node currently hosting a specific guest by incarnation_id (guest_id).
+    pub fn find_node_for_incarnation(&self, guest_id: &str) -> Option<&NodeStatus> {
+        self.nodes.values().find(|status| {
+            Self::is_fresh(status)
+                && status
+                    .advertisements
+                    .iter()
+                    .any(|ad| ad.incarnation_id == guest_id)
+        })
+    }
+
+    /// Find the node_id hosting a specific guest, checking both live capability advertisements
+    /// and HotelStateSync remote roster entries. Use this for cross-hotel routing lookups.
+    pub fn find_node_id_for_guest(&self, guest_id: &str) -> Option<String> {
+        if let Some(status) = self.find_node_for_incarnation(guest_id) {
+            return Some(status.capabilities.node_id.clone());
+        }
+        self.remote_hotel_states
+            .values()
+            .filter(|state| state.last_seen.elapsed() <= HOTEL_STATE_TTL)
+            .find(|state| {
+                state
+                    .guests
+                    .iter()
+                    // Include inactive guests: the remote hotel will materialize them on receipt.
+                    .any(|g| g.guest_id == guest_id)
+            })
+            .map(|state| state.node_id.clone())
+    }
+
+    /// The remote hotel that runs `agent_id`, from fresh gossiped rosters.
+    ///
+    /// A guest lookup needs the exact guest id, but a Telegram seat — or any
+    /// caller that means "this agent" — addresses the base agent
+    /// (`agent-beacon`) while the roster lists its guests
+    /// (`agent-beacon:orchestrator`). See [`best_host_for_agent`].
+    pub fn find_node_id_for_agent(&self, agent_id: &str) -> Option<String> {
+        best_host_for_agent(
+            self.remote_hotel_states
+                .values()
+                .filter(|state| state.last_seen.elapsed() <= HOTEL_STATE_TTL),
+            agent_id,
+        )
+        .map(|state| state.node_id.clone())
+    }
+}
+
+/// Is `guest_id` the agent itself or one of its role incarnations?
+fn guest_is_of_agent(guest_id: &str, agent_id: &str) -> bool {
+    guest_id == agent_id
+        || guest_id
+            .strip_prefix(agent_id)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// Pick the remote hotel that hosts `agent_id`.
+///
+/// Only hotels whose roster lists the agent's identity qualify — a bare
+/// name like a hotel's own prefix never matches. Several can: an identity is
+/// replicated to standby hotels that do not run the agent. Rank by how much
+/// of the agent is actually there — an active guest, then any guest, then the
+/// identity alone — and break ties by node id so the answer is stable
+/// between two calls (a HashMap's order is not).
+pub fn best_host_for_agent<'a>(
+    states: impl Iterator<Item = &'a RemoteHotelState>,
+    agent_id: &str,
+) -> Option<&'a RemoteHotelState> {
+    states
+        .filter(|state| state.agents.iter().any(|a| a.agent_id == agent_id))
+        .min_by_key(|state| {
+            let of_agent = |g: &&HotelStateSyncGuest| guest_is_of_agent(&g.guest_id, agent_id);
+            let rank = if state.guests.iter().filter(of_agent).any(|g| g.active) {
+                0
+            } else if state.guests.iter().any(|g| of_agent(&g)) {
+                1
+            } else {
+                2
+            };
+            (rank, state.node_id.clone())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NodeConstraints, NodeRole};
+
+    fn caps(node_id: &str) -> NodeCapabilities {
+        NodeCapabilities {
+            node_id: node_id.into(),
+            roles: vec![NodeRole::AnsibleNode],
+            models: vec![],
+            tools: vec![],
+            constraints: NodeConstraints {
+                max_concurrent_jobs: Some(4),
+                latency_hint_ms: Some(12),
+                trust_level: None,
+            },
+            build_version: String::new(),
+        }
+    }
+
+    fn advertisement(node_id: &str, target_role: &str) -> CapabilityAdvertisement {
+        CapabilityAdvertisement {
+            hotel_id: "aria-architect-hotel".into(),
+            node_id: node_id.into(),
+            incarnation_id: format!("{node_id}:{target_role}"),
+            target_role: target_role.into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_fallback".into()),
+            latency_hint_ms: Some(12),
+            max_concurrent_jobs: Some(4),
+            active_jobs: 1,
+            queue_depth: 0,
+        }
+    }
+
+    #[test]
+    fn heartbeat_observation_preserves_existing_advertisements() {
+        let mut registry = NodeRegistry::new();
+        let node_id = "aria-architect-hotel-ansible-01";
+        registry.observe_capability_sync_chunk(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+            Uuid::new_v4(),
+            0,
+            1,
+            vec![advertisement(node_id, "model")],
+        );
+
+        registry.observe_heartbeat(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            Some(NodeHealthSnapshot {
+                guest_count: Some(3),
+                ..NodeHealthSnapshot::default()
+            }),
+        );
+
+        let node = registry.get_node(node_id).expect("node should exist");
+        assert_eq!(node.advertisements.len(), 1);
+        assert_eq!(
+            node.node_health
+                .as_ref()
+                .and_then(|value| value.guest_count),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn capability_sync_reassembles_chunked_advertisements() {
+        let mut registry = NodeRegistry::new();
+        let sync_id = Uuid::new_v4();
+        let node_id = "aria-node";
+
+        registry.observe_capability_sync_chunk(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+            sync_id,
+            1,
+            2,
+            vec![advertisement(node_id, "tool.echo")],
+        );
+        assert!(registry.get_node(node_id).is_none());
+
+        registry.observe_capability_sync_chunk(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+            sync_id,
+            0,
+            2,
+            vec![advertisement(node_id, "model")],
+        );
+
+        let node = registry.get_node(node_id).expect("node should exist");
+        assert_eq!(node.advertisements.len(), 2);
+        assert_eq!(node.advertisements[0].target_role, "model");
+        assert_eq!(node.advertisements[1].target_role, "tool.echo");
+    }
+
+    #[test]
+    fn advertisements_for_role_filters_across_nodes() {
+        let mut registry = NodeRegistry::new();
+        let first_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
+            caps("fixture-node"),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "fixture-vps".into(),
+                port: 9002,
+            }),
+            None,
+            first_sync,
+            0,
+            1,
+            vec![advertisement("fixture-node", "membrane")],
+        );
+
+        let second_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
+            caps("aria-node"),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+            second_sync,
+            0,
+            1,
+            vec![advertisement("aria-node", "model")],
+        );
+
+        let model_ads: Vec<_> = registry.advertisements_for_role("model").collect();
+        assert_eq!(model_ads.len(), 1);
+        assert_eq!(model_ads[0].incarnation_id, "aria-node:model");
+    }
+
+    #[test]
+    fn active_nodes_filters_stale_entries() {
+        let mut registry = NodeRegistry::new();
+        registry.observe_heartbeat(caps("fresh-node"), None, None);
+        registry.observe_heartbeat(caps("stale-node"), None, None);
+
+        registry
+            .nodes
+            .get_mut("stale-node")
+            .expect("stale node should exist")
+            .last_seen = Instant::now() - (DEFAULT_NODE_TTL + Duration::from_secs(1));
+
+        let active: Vec<_> = registry.active_nodes().collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].capabilities.node_id, "fresh-node");
+    }
+
+    #[test]
+    fn advertisements_for_role_ignores_stale_nodes() {
+        let mut registry = NodeRegistry::new();
+        let fresh_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
+            caps("fresh-node"),
+            None,
+            None,
+            fresh_sync,
+            0,
+            1,
+            vec![advertisement("fresh-node", "model")],
+        );
+        let stale_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
+            caps("stale-node"),
+            None,
+            None,
+            stale_sync,
+            0,
+            1,
+            vec![advertisement("stale-node", "model")],
+        );
+
+        registry
+            .nodes
+            .get_mut("stale-node")
+            .expect("stale node should exist")
+            .last_seen = Instant::now() - (DEFAULT_NODE_TTL + Duration::from_secs(1));
+
+        let ads: Vec<_> = registry.advertisements_for_role("model").collect();
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].node_id, "fresh-node");
+    }
+
+    fn guest(guest_id: &str, active: bool) -> HotelStateSyncGuest {
+        HotelStateSyncGuest {
+            guest_id: guest_id.into(),
+            role: "agent".into(),
+            active,
+        }
+    }
+
+    fn agent(agent_id: &str) -> HotelStateSyncAgent {
+        HotelStateSyncAgent {
+            agent_id: agent_id.into(),
+            persona_name: agent_id.into(),
+        }
+    }
+
+    /// The incident's shape: Beacon runs on the vps, sample-laptop only holds her
+    /// identity (and a stray non-agent guest whose name merely contains it),
+    /// and sample-mac — the caller — knows neither.
+    fn beacon_roster() -> NodeRegistry {
+        let mut registry = NodeRegistry::new();
+        registry.observe_hotel_state(
+            "sample-laptop-aiua-01".into(),
+            "sample-laptop".into(),
+            vec![guest("sample-laptop:agent-graph-agent-beacon", true)],
+            vec![agent("agent-beacon")],
+        );
+        registry.observe_hotel_state(
+            "sample-server-aiua-01".into(),
+            "sample-server".into(),
+            vec![
+                guest("agent-beacon:orchestrator", true),
+                guest("agent-beacon:Chronos", true),
+            ],
+            vec![agent("agent-beacon")],
+        );
+        registry
+    }
+
+    #[test]
+    fn a_base_agent_id_resolves_to_the_hotel_that_runs_it() {
+        let registry = beacon_roster();
+        // The Telegram seat addresses the base agent; only roles are listed.
+        assert_eq!(registry.find_node_id_for_guest("agent-beacon"), None);
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("sample-server-aiua-01"),
+            "the hotel with a live guest wins over one that only holds the identity"
+        );
+        assert_eq!(registry.find_node_id_for_agent("agent-nobody"), None);
+        assert_eq!(
+            registry.find_node_id_for_agent("sample-laptop"),
+            None,
+            "a hotel's own name is not an agent"
+        );
+    }
+
+    #[test]
+    fn a_host_with_only_dormant_guests_beats_one_with_only_the_identity() {
+        let mut registry = NodeRegistry::new();
+        registry.observe_hotel_state(
+            "a-aiua-01".into(),
+            "a".into(),
+            vec![],
+            vec![agent("agent-x")],
+        );
+        registry.observe_hotel_state(
+            "b-aiua-01".into(),
+            "b".into(),
+            vec![guest("agent-x:orchestrator", false)],
+            vec![agent("agent-x")],
+        );
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-x").as_deref(),
+            Some("b-aiua-01"),
+            "the remote hotel will materialize a dormant guest on receipt"
+        );
+    }
+
+    #[test]
+    fn an_agent_id_is_not_a_prefix_match() {
+        let mut registry = NodeRegistry::new();
+        registry.observe_hotel_state(
+            "a-aiua-01".into(),
+            "a".into(),
+            vec![guest("agent-beacon-two:orchestrator", true)],
+            vec![agent("agent-beacon")],
+        );
+        registry.observe_hotel_state(
+            "b-aiua-01".into(),
+            "b".into(),
+            vec![guest("agent-beacon:orchestrator", true)],
+            vec![agent("agent-beacon")],
+        );
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("b-aiua-01")
+        );
+    }
+
+    /// A roster is re-broadcast every 30 s; it must not expire at 15 s.
+    #[test]
+    fn a_roster_survives_between_its_broadcasts_and_expires_after_missed_ones() {
+        let mut registry = beacon_roster();
+        registry
+            .remote_hotel_states
+            .get_mut("sample-server-aiua-01")
+            .unwrap()
+            .last_seen = Instant::now() - Duration::from_secs(40);
+        assert_eq!(
+            registry
+                .find_node_id_for_guest("agent-beacon:orchestrator")
+                .as_deref(),
+            Some("sample-server-aiua-01"),
+            "40 s old is between broadcasts, not stale"
+        );
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("sample-server-aiua-01")
+        );
+
+        registry
+            .remote_hotel_states
+            .get_mut("sample-server-aiua-01")
+            .unwrap()
+            .last_seen = Instant::now() - (HOTEL_STATE_TTL + Duration::from_secs(1));
+        assert_eq!(
+            registry.find_node_id_for_guest("agent-beacon:orchestrator"),
+            None
+        );
+        assert_ne!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("sample-server-aiua-01"),
+            "a hotel that stopped broadcasting is not a route"
+        );
+    }
+}

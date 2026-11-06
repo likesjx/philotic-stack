@@ -1,0 +1,1930 @@
+//! `AgentGraphStorage` — per-agent cognitive graph persistence trait.
+//!
+//! This is the storage substrate for Seam 3 (`agent-graph-toolrunner`) of the
+//! agent-resource-model workstream. It extends the concept of `GraphStorage`
+//! (which serves the hotel-wide context graph) with domain operations specific
+//! to an individual agent's cognitive harness.
+//!
+//! # Authority boundary
+//!
+//! - The hotel CG (via `GraphStorage`) owns rights, provisioning grants, and
+//!   routing state. Only the hotel writes there.
+//! - The agent graph (this trait) owns cognitive configuration, resource grant
+//!   *copies*, tool preferences, resource declarations, and experience traces.
+//!   The agent writes here; the hotel writes grant/revoke records on its behalf.
+//!
+//! # Backend
+//!
+//! `SqliteAgentGraphStorage` uses an **embedded per-agent SQLite file**.
+//! Choosing a per-agent file favors portability (the file travels with the
+//! agent across hotels during mesh migration) over operational simplicity.
+//! A shared-namespace backend is achievable via a single impl swap later.
+
+use crate::resources::{ResourceDeclaration, ResourceType};
+use anyhow::Result;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Records
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A copy of a hotel-issued resource grant, stored in the agent graph.
+///
+/// The hotel CG is authoritative; this is a cache. On revocation, the hotel
+/// sends `ResourceRevoked` and this record becomes stale — the agent graph
+/// copy does not grant authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResourceGrant {
+    pub agent_id: String,
+    /// Stable instance identifier issued by the hotel.
+    pub instance_id: String,
+    pub resource_type: ResourceType,
+    /// Unix epoch (seconds) when the grant was received.
+    pub granted_at: u64,
+}
+
+/// Per-agent preference for a named tool.
+///
+/// `preference_level`: `-1` = suppress (never project this tool),
+/// `0` = default (no opinion), `1` = prefer (always project if available).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentToolPreference {
+    pub agent_id: String,
+    pub tool_name: String,
+    pub preference_level: i32,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    /// Unix epoch (seconds) of last write — used for LWW mesh sync.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Per-agent routing preference for a stage/capability/provider/model slice.
+///
+/// These preferences are advisory cognitive policy, not hard routing truth.
+/// They let the agent express preferred routing posture while leaving hotel
+/// authority and shared model-graph truth outside the agent graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRoutingPreference {
+    pub agent_id: String,
+    pub preference_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(default)]
+    pub preference_level: i32,
+    #[serde(default)]
+    pub weight: i32,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Per-agent learned reflex preference for posture/affordance shaping.
+///
+/// These preferences are agent-owned overlay policy, not hotel grants and not
+/// session overrides. They should project as agent-learned reflex layers
+/// beneath explicit session overrides and above hotel defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReflexPreference {
+    pub agent_id: String,
+    pub preference_key: String,
+    #[serde(default)]
+    pub precedence: i32,
+    #[serde(default)]
+    pub reflexes_json: serde_json::Value,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// A routing pipeline rule declared by an agent.
+///
+/// Stored in a separate table from `reflex_preferences` to prevent pipeline
+/// rule structs from leaking into reflex composition / `reflex_policy_agent_layers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingPipelineRule {
+    pub agent_id: String,
+    pub rule_id: String,
+    #[serde(default)]
+    pub rule_json: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// A single entry in the agent experience ledger.
+///
+/// Feeds the RL training pipeline via the router-listener tap (Seam 5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentExperienceTrace {
+    /// ULID — lexicographically sortable, unique.
+    pub trace_id: String,
+    pub agent_id: String,
+    /// e.g. `"tool_call"`, `"resource_request"`, `"model_invocation"`, `"approval_decision"`
+    pub event_type: String,
+    pub input_json: serde_json::Value,
+    pub output_json: serde_json::Value,
+    /// e.g. `"success"`, `"failure"`, `"approved_by_operator"`, `"denied_by_operator"`, `"timeout"`, `"revoked"`
+    pub outcome: String,
+    #[serde(default)]
+    pub outcome_detail: Option<String>,
+    /// Unix epoch (seconds).
+    pub timestamp: u64,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Mesh-sync snapshot types (Seam 4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A tool preference entry inside an `AgentGraphSnapshot`.
+///
+/// Mirrors `AgentToolPreference` but omits `agent_id` (implicit from the
+/// snapshot envelope) and carries the LWW timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPreference {
+    pub tool_name: String,
+    pub preference_level: i32,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    pub updated_at: u64,
+}
+
+/// A routing preference entry inside an `AgentGraphSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRoutingPreference {
+    pub preference_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(default)]
+    pub preference_level: i32,
+    #[serde(default)]
+    pub weight: i32,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    pub updated_at: u64,
+}
+
+/// A learned reflex preference entry inside an `AgentGraphSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotReflexPreference {
+    pub preference_key: String,
+    #[serde(default)]
+    pub precedence: i32,
+    #[serde(default)]
+    pub reflexes_json: serde_json::Value,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    pub updated_at: u64,
+}
+
+/// A resource declaration entry inside an `AgentGraphSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDeclaration {
+    pub resource_type: ResourceType,
+    #[serde(default)]
+    pub config_hint: Option<String>,
+    pub updated_at: u64,
+}
+
+/// Portable snapshot of an agent's cognitive configuration for mesh propagation.
+///
+/// # Two-tier authority invariant
+///
+/// Resource **grants** are intentionally excluded. Grants are hotel-CG-owned;
+/// only the issuing hotel writes them. Accepting grants from peer mesh nodes
+/// would violate the authority boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentGraphSnapshot {
+    pub agent_id: String,
+    /// Node ID of the exporting hotel.
+    pub source_node_id: String,
+    /// Unix epoch (seconds) when the snapshot was taken.
+    pub exported_at: u64,
+    pub preferences: Vec<SnapshotPreference>,
+    #[serde(default)]
+    pub routing_preferences: Vec<SnapshotRoutingPreference>,
+    #[serde(default)]
+    pub reflex_preferences: Vec<SnapshotReflexPreference>,
+    pub declarations: Vec<SnapshotDeclaration>,
+}
+
+/// Summary of what changed when `apply_snapshot` was called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeResult {
+    pub preferences_applied: usize,
+    pub preferences_skipped: usize,
+    pub routing_preferences_applied: usize,
+    pub routing_preferences_skipped: usize,
+    pub reflex_preferences_applied: usize,
+    pub reflex_preferences_skipped: usize,
+    pub declarations_applied: usize,
+    pub declarations_skipped: usize,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Trait
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Per-agent cognitive graph storage.
+///
+/// All methods are scoped to a single agent. Implementors are expected to own
+/// one storage unit (file, namespace partition, etc.) per agent.
+pub trait AgentGraphStorage: Send + Sync {
+    // ── Resource grants ──────────────────────────────────────────────────────
+
+    /// Persist a copy of a hotel-issued resource grant.
+    fn upsert_resource_grant(&self, grant: &AgentResourceGrant) -> Result<()>;
+
+    /// Return all active resource grant copies for this agent.
+    fn list_resource_grants(&self) -> Result<Vec<AgentResourceGrant>>;
+
+    /// Remove a resource grant copy (called on `ResourceRevoked`).
+    fn remove_resource_grant(&self, instance_id: &str) -> Result<()>;
+
+    // ── Tool preferences ─────────────────────────────────────────────────────
+
+    /// Upsert a tool preference entry.
+    fn upsert_tool_preference(&self, pref: &AgentToolPreference) -> Result<()>;
+
+    /// Return all tool preferences for this agent.
+    fn list_tool_preferences(&self) -> Result<Vec<AgentToolPreference>>;
+
+    /// Return the preference for a specific tool, or `None` if not set.
+    fn get_tool_preference(&self, tool_name: &str) -> Result<Option<AgentToolPreference>>;
+
+    // ── Routing preferences ──────────────────────────────────────────────────
+
+    /// Upsert a routing preference entry.
+    fn upsert_routing_preference(&self, pref: &AgentRoutingPreference) -> Result<()>;
+
+    /// Return all routing preferences for this agent.
+    fn list_routing_preferences(&self) -> Result<Vec<AgentRoutingPreference>>;
+
+    /// Return one routing preference by stable key, or `None` if not set.
+    fn get_routing_preference(
+        &self,
+        preference_key: &str,
+    ) -> Result<Option<AgentRoutingPreference>>;
+
+    // ── Reflex preferences ───────────────────────────────────────────────────
+
+    /// Upsert a learned reflex preference entry.
+    fn upsert_reflex_preference(&self, pref: &AgentReflexPreference) -> Result<()>;
+
+    /// Return all learned reflex preferences for this agent.
+    fn list_reflex_preferences(&self) -> Result<Vec<AgentReflexPreference>>;
+
+    /// Return one learned reflex preference by stable key, or `None` if not set.
+    fn get_reflex_preference(&self, preference_key: &str) -> Result<Option<AgentReflexPreference>>;
+
+    // ── Routing pipeline rules ───────────────────────────────────────────────
+
+    /// Upsert a routing pipeline rule (replace-by-rule_id semantics).
+    fn upsert_pipeline_rule(&self, rule: &RoutingPipelineRule) -> Result<()>;
+
+    /// Remove a routing pipeline rule by rule_id. Returns true if a row was deleted.
+    fn remove_pipeline_rule(&self, rule_id: &str) -> Result<bool>;
+
+    /// Return all routing pipeline rules for this agent.
+    fn list_pipeline_rules(&self) -> Result<Vec<RoutingPipelineRule>>;
+
+    /// Return one routing pipeline rule by rule_id, or `None` if not found.
+    fn get_pipeline_rule(&self, rule_id: &str) -> Result<Option<RoutingPipelineRule>>;
+
+    // ── Resource declarations ────────────────────────────────────────────────
+
+    /// Upsert a static resource declaration.
+    ///
+    /// One declaration per `resource_type` — upsert replaces the config_hint.
+    fn upsert_resource_declaration(&self, decl: &ResourceDeclaration) -> Result<()>;
+
+    /// Return all static resource declarations for this agent.
+    fn list_resource_declarations(&self) -> Result<Vec<ResourceDeclaration>>;
+
+    /// Remove a static resource declaration.
+    fn remove_resource_declaration(&self, resource_type: &ResourceType) -> Result<()>;
+
+    // ── Experience traces ────────────────────────────────────────────────────
+
+    /// Append an experience trace entry.
+    fn record_experience_trace(&self, trace: &AgentExperienceTrace) -> Result<()>;
+
+    /// Return the most recent `limit` experience traces, newest first.
+    fn list_experience_traces(&self, limit: usize) -> Result<Vec<AgentExperienceTrace>>;
+
+    /// Return traces matching a specific `event_type`, newest first.
+    fn list_traces_by_event_type(
+        &self,
+        event_type: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentExperienceTrace>>;
+
+    // ── Mesh sync (Seam 4) ───────────────────────────────────────────────────
+
+    /// Export the agent's cognitive configuration as a portable snapshot.
+    ///
+    /// Grants are excluded — see `AgentGraphSnapshot` for the authority
+    /// boundary rationale.
+    fn export_snapshot(&self, source_node_id: &str) -> Result<AgentGraphSnapshot>;
+
+    /// Apply an inbound mesh snapshot using Last-Writer-Wins conflict resolution.
+    ///
+    /// For each preference and declaration: if the snapshot's `updated_at`
+    /// is strictly greater than the locally stored value, the local record is
+    /// overwritten; otherwise it is skipped.
+    ///
+    /// Grants in the snapshot (there are none by design) are never applied.
+    fn apply_snapshot(&self, snapshot: &AgentGraphSnapshot) -> Result<MergeResult>;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SqliteAgentGraphStorage
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// SQLite-backed per-agent graph storage.
+///
+/// One `.db` file per agent. The `agent_id` is stored as a column in every
+/// table for readability; the file itself is the scope boundary.
+pub struct SqliteAgentGraphStorage {
+    agent_id: String,
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteAgentGraphStorage {
+    /// Open (or create) the agent graph database at `path`.
+    pub fn open(agent_id: impl Into<String>, path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        let storage = Self {
+            agent_id: agent_id.into(),
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        storage.init_schema()?;
+        Ok(storage)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS resource_grants (
+                instance_id   TEXT PRIMARY KEY,
+                agent_id      TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                granted_at    INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_preferences (
+                agent_id         TEXT NOT NULL,
+                tool_name        TEXT NOT NULL,
+                preference_level INTEGER NOT NULL DEFAULT 0,
+                config_json      TEXT NOT NULL DEFAULT '{}',
+                updated_at       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, tool_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS routing_preferences (
+                agent_id         TEXT NOT NULL,
+                preference_key   TEXT NOT NULL,
+                stage_kind       TEXT,
+                capability       TEXT,
+                provider_hint    TEXT,
+                model_ref        TEXT,
+                preference_level INTEGER NOT NULL DEFAULT 0,
+                weight           INTEGER NOT NULL DEFAULT 0,
+                config_json      TEXT NOT NULL DEFAULT '{}',
+                updated_at       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, preference_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS reflex_preferences (
+                agent_id         TEXT NOT NULL,
+                preference_key   TEXT NOT NULL,
+                precedence       INTEGER NOT NULL DEFAULT 0,
+                reflexes_json    TEXT NOT NULL DEFAULT '{}',
+                config_json      TEXT NOT NULL DEFAULT '{}',
+                updated_at       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, preference_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS routing_pipeline_rules (
+                agent_id      TEXT NOT NULL,
+                rule_id       TEXT NOT NULL,
+                rule_json     TEXT NOT NULL DEFAULT '{}',
+                updated_at    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, rule_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS resource_declarations (
+                agent_id      TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                config_hint   TEXT,
+                updated_at    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, resource_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS experience_traces (
+                trace_id       TEXT PRIMARY KEY,
+                agent_id       TEXT NOT NULL,
+                event_type     TEXT NOT NULL,
+                input_json     TEXT NOT NULL,
+                output_json    TEXT NOT NULL,
+                outcome        TEXT NOT NULL,
+                outcome_detail TEXT,
+                timestamp      INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_traces_agent_ts
+                ON experience_traces (agent_id, timestamp DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_traces_event_type
+                ON experience_traces (agent_id, event_type, timestamp DESC);
+
+            COMMIT;
+            ",
+        )?;
+        // Idempotent migrations for existing databases that predate updated_at.
+        // ALTER TABLE ADD COLUMN errors if the column already exists — swallow it.
+        let _ = conn.execute_batch(
+            "ALTER TABLE tool_preferences ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE routing_preferences ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE reflex_preferences ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE resource_declarations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
+        Ok(())
+    }
+
+    fn now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
+impl AgentGraphStorage for SqliteAgentGraphStorage {
+    // ── Resource grants ──────────────────────────────────────────────────────
+
+    fn upsert_resource_grant(&self, grant: &AgentResourceGrant) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rt = serde_json::to_string(&grant.resource_type)?;
+        conn.execute(
+            "INSERT INTO resource_grants (instance_id, agent_id, resource_type, granted_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(instance_id) DO UPDATE SET
+               agent_id = excluded.agent_id,
+               resource_type = excluded.resource_type,
+               granted_at = excluded.granted_at",
+            params![grant.instance_id, grant.agent_id, rt, grant.granted_at],
+        )?;
+        Ok(())
+    }
+
+    fn list_resource_grants(&self) -> Result<Vec<AgentResourceGrant>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT instance_id, agent_id, resource_type, granted_at
+             FROM resource_grants ORDER BY granted_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut grants = Vec::new();
+        for row in rows {
+            let (instance_id, agent_id, rt_str, granted_at) = row?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            grants.push(AgentResourceGrant {
+                instance_id,
+                agent_id,
+                resource_type,
+                granted_at,
+            });
+        }
+        Ok(grants)
+    }
+
+    fn remove_resource_grant(&self, instance_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM resource_grants WHERE instance_id = ?1",
+            params![instance_id],
+        )?;
+        Ok(())
+    }
+
+    // ── Tool preferences ─────────────────────────────────────────────────────
+
+    fn upsert_tool_preference(&self, pref: &AgentToolPreference) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let config = serde_json::to_string(&pref.config_json)?;
+        let updated_at = if pref.updated_at > 0 {
+            pref.updated_at
+        } else {
+            Self::now_epoch()
+        };
+        conn.execute(
+            "INSERT INTO tool_preferences (agent_id, tool_name, preference_level, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(agent_id, tool_name) DO UPDATE SET
+               preference_level = excluded.preference_level,
+               config_json = excluded.config_json,
+               updated_at = excluded.updated_at",
+            params![pref.agent_id, pref.tool_name, pref.preference_level, config, updated_at],
+        )?;
+        Ok(())
+    }
+
+    fn list_tool_preferences(&self) -> Result<Vec<AgentToolPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, tool_name, preference_level, config_json, updated_at
+             FROM tool_preferences WHERE agent_id = ?1 ORDER BY tool_name",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })?;
+        let mut prefs = Vec::new();
+        for row in rows {
+            let (agent_id, tool_name, level, cfg_str, updated_at) = row?;
+            prefs.push(AgentToolPreference {
+                agent_id,
+                tool_name,
+                preference_level: level,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+        Ok(prefs)
+    }
+
+    fn get_tool_preference(&self, tool_name: &str) -> Result<Option<AgentToolPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, tool_name, preference_level, config_json, updated_at
+             FROM tool_preferences WHERE agent_id = ?1 AND tool_name = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.agent_id, tool_name])?;
+        if let Some(row) = rows.next()? {
+            let cfg_str: String = row.get(3)?;
+            return Ok(Some(AgentToolPreference {
+                agent_id: row.get(0)?,
+                tool_name: row.get(1)?,
+                preference_level: row.get(2)?,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at: row.get(4)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    // ── Routing preferences ──────────────────────────────────────────────────
+
+    fn upsert_routing_preference(&self, pref: &AgentRoutingPreference) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let config = serde_json::to_string(&pref.config_json)?;
+        let updated_at = if pref.updated_at > 0 {
+            pref.updated_at
+        } else {
+            Self::now_epoch()
+        };
+        conn.execute(
+            "INSERT INTO routing_preferences
+             (agent_id, preference_key, stage_kind, capability, provider_hint, model_ref, preference_level, weight, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(agent_id, preference_key) DO UPDATE SET
+               stage_kind = excluded.stage_kind,
+               capability = excluded.capability,
+               provider_hint = excluded.provider_hint,
+               model_ref = excluded.model_ref,
+               preference_level = excluded.preference_level,
+               weight = excluded.weight,
+               config_json = excluded.config_json,
+               updated_at = excluded.updated_at",
+            params![
+                pref.agent_id,
+                pref.preference_key,
+                pref.stage_kind,
+                pref.capability,
+                pref.provider_hint,
+                pref.model_ref,
+                pref.preference_level,
+                pref.weight,
+                config,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_routing_preferences(&self) -> Result<Vec<AgentRoutingPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, preference_key, stage_kind, capability, provider_hint, model_ref, preference_level, weight, config_json, updated_at
+             FROM routing_preferences WHERE agent_id = ?1 ORDER BY preference_key",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i32>(6)?,
+                row.get::<_, i32>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, u64>(9)?,
+            ))
+        })?;
+        let mut prefs = Vec::new();
+        for row in rows {
+            let (
+                agent_id,
+                preference_key,
+                stage_kind,
+                capability,
+                provider_hint,
+                model_ref,
+                preference_level,
+                weight,
+                cfg_str,
+                updated_at,
+            ) = row?;
+            prefs.push(AgentRoutingPreference {
+                agent_id,
+                preference_key,
+                stage_kind,
+                capability,
+                provider_hint,
+                model_ref,
+                preference_level,
+                weight,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+        Ok(prefs)
+    }
+
+    fn get_routing_preference(
+        &self,
+        preference_key: &str,
+    ) -> Result<Option<AgentRoutingPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, preference_key, stage_kind, capability, provider_hint, model_ref, preference_level, weight, config_json, updated_at
+             FROM routing_preferences WHERE agent_id = ?1 AND preference_key = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.agent_id, preference_key])?;
+        if let Some(row) = rows.next()? {
+            let cfg_str: String = row.get(8)?;
+            return Ok(Some(AgentRoutingPreference {
+                agent_id: row.get(0)?,
+                preference_key: row.get(1)?,
+                stage_kind: row.get(2)?,
+                capability: row.get(3)?,
+                provider_hint: row.get(4)?,
+                model_ref: row.get(5)?,
+                preference_level: row.get(6)?,
+                weight: row.get(7)?,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at: row.get(9)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    // ── Reflex preferences ───────────────────────────────────────────────────
+
+    fn upsert_reflex_preference(&self, pref: &AgentReflexPreference) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let reflexes = serde_json::to_string(&pref.reflexes_json)?;
+        let config = serde_json::to_string(&pref.config_json)?;
+        let updated_at = if pref.updated_at > 0 {
+            pref.updated_at
+        } else {
+            Self::now_epoch()
+        };
+        conn.execute(
+            "INSERT INTO reflex_preferences
+             (agent_id, preference_key, precedence, reflexes_json, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent_id, preference_key) DO UPDATE SET
+               precedence = excluded.precedence,
+               reflexes_json = excluded.reflexes_json,
+               config_json = excluded.config_json,
+               updated_at = excluded.updated_at",
+            params![
+                pref.agent_id,
+                pref.preference_key,
+                pref.precedence,
+                reflexes,
+                config,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_reflex_preferences(&self) -> Result<Vec<AgentReflexPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, preference_key, precedence, reflexes_json, config_json, updated_at
+             FROM reflex_preferences WHERE agent_id = ?1 ORDER BY preference_key",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u64>(5)?,
+            ))
+        })?;
+        let mut prefs = Vec::new();
+        for row in rows {
+            let (agent_id, preference_key, precedence, reflexes_str, cfg_str, updated_at) = row?;
+            prefs.push(AgentReflexPreference {
+                agent_id,
+                preference_key,
+                precedence,
+                reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+        Ok(prefs)
+    }
+
+    fn get_reflex_preference(&self, preference_key: &str) -> Result<Option<AgentReflexPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, preference_key, precedence, reflexes_json, config_json, updated_at
+             FROM reflex_preferences WHERE agent_id = ?1 AND preference_key = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.agent_id, preference_key])?;
+        if let Some(row) = rows.next()? {
+            let reflexes_str: String = row.get(3)?;
+            let cfg_str: String = row.get(4)?;
+            return Ok(Some(AgentReflexPreference {
+                agent_id: row.get(0)?,
+                preference_key: row.get(1)?,
+                precedence: row.get(2)?,
+                reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    // ── Routing pipeline rules ───────────────────────────────────────────────
+
+    fn upsert_pipeline_rule(&self, rule: &RoutingPipelineRule) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rule_str = serde_json::to_string(&rule.rule_json).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT INTO routing_pipeline_rules (agent_id, rule_id, rule_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (agent_id, rule_id) DO UPDATE SET
+               rule_json  = excluded.rule_json,
+               updated_at = excluded.updated_at
+             WHERE excluded.updated_at >= routing_pipeline_rules.updated_at",
+            params![self.agent_id, rule.rule_id, rule_str, Self::now_epoch()],
+        )?;
+        Ok(())
+    }
+
+    fn remove_pipeline_rule(&self, rule_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM routing_pipeline_rules WHERE agent_id = ?1 AND rule_id = ?2",
+            params![self.agent_id, rule_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn list_pipeline_rules(&self) -> Result<Vec<RoutingPipelineRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, rule_id, rule_json, updated_at
+             FROM routing_pipeline_rules WHERE agent_id = ?1 ORDER BY rule_id",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut rules = Vec::new();
+        for row in rows {
+            let (agent_id, rule_id, rule_str, updated_at) = row?;
+            rules.push(RoutingPipelineRule {
+                agent_id,
+                rule_id,
+                rule_json: serde_json::from_str(&rule_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+        Ok(rules)
+    }
+
+    fn get_pipeline_rule(&self, rule_id: &str) -> Result<Option<RoutingPipelineRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, rule_id, rule_json, updated_at
+             FROM routing_pipeline_rules WHERE agent_id = ?1 AND rule_id = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.agent_id, rule_id])?;
+        if let Some(row) = rows.next()? {
+            let rule_str: String = row.get(2)?;
+            return Ok(Some(RoutingPipelineRule {
+                agent_id: row.get(0)?,
+                rule_id: row.get(1)?,
+                rule_json: serde_json::from_str(&rule_str).unwrap_or_default(),
+                updated_at: row.get(3)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    // ── Resource declarations ────────────────────────────────────────────────
+
+    fn upsert_resource_declaration(&self, decl: &ResourceDeclaration) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rt = serde_json::to_string(&decl.resource_type)?;
+        let updated_at = Self::now_epoch();
+        conn.execute(
+            "INSERT INTO resource_declarations (agent_id, resource_type, config_hint, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, resource_type) DO UPDATE SET
+               config_hint = excluded.config_hint,
+               updated_at = excluded.updated_at",
+            params![self.agent_id, rt, decl.config_hint, updated_at],
+        )?;
+        Ok(())
+    }
+
+    fn list_resource_declarations(&self) -> Result<Vec<ResourceDeclaration>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT resource_type, config_hint FROM resource_declarations WHERE agent_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut decls = Vec::new();
+        for row in rows {
+            let (rt_str, config_hint) = row?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            decls.push(ResourceDeclaration {
+                resource_type,
+                config_hint,
+            });
+        }
+        Ok(decls)
+    }
+
+    fn remove_resource_declaration(&self, resource_type: &ResourceType) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rt = serde_json::to_string(resource_type)?;
+        conn.execute(
+            "DELETE FROM resource_declarations WHERE agent_id = ?1 AND resource_type = ?2",
+            params![self.agent_id, rt],
+        )?;
+        Ok(())
+    }
+
+    // ── Experience traces ────────────────────────────────────────────────────
+
+    fn record_experience_trace(&self, trace: &AgentExperienceTrace) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let input = serde_json::to_string(&trace.input_json)?;
+        let output = serde_json::to_string(&trace.output_json)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO experience_traces
+             (trace_id, agent_id, event_type, input_json, output_json, outcome, outcome_detail, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                trace.trace_id,
+                trace.agent_id,
+                trace.event_type,
+                input,
+                output,
+                trace.outcome,
+                trace.outcome_detail,
+                trace.timestamp
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_experience_traces(&self, limit: usize) -> Result<Vec<AgentExperienceTrace>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT trace_id, agent_id, event_type, input_json, output_json, outcome, outcome_detail, timestamp
+             FROM experience_traces WHERE agent_id = ?1
+             ORDER BY timestamp DESC LIMIT ?2",
+        )?;
+        self.collect_traces(&mut stmt, params![self.agent_id, limit as i64])
+    }
+
+    fn list_traces_by_event_type(
+        &self,
+        event_type: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentExperienceTrace>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT trace_id, agent_id, event_type, input_json, output_json, outcome, outcome_detail, timestamp
+             FROM experience_traces WHERE agent_id = ?1 AND event_type = ?2
+             ORDER BY timestamp DESC LIMIT ?3",
+        )?;
+        self.collect_traces(&mut stmt, params![self.agent_id, event_type, limit as i64])
+    }
+
+    // ── Mesh sync (Seam 4) ───────────────────────────────────────────────────
+
+    fn export_snapshot(&self, source_node_id: &str) -> Result<AgentGraphSnapshot> {
+        let conn = self.conn.lock().unwrap();
+
+        // Export tool preferences with timestamps.
+        let mut pref_stmt = conn.prepare(
+            "SELECT tool_name, preference_level, config_json, updated_at
+             FROM tool_preferences WHERE agent_id = ?1",
+        )?;
+        let pref_rows = pref_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut preferences = Vec::new();
+        for row in pref_rows {
+            let (tool_name, preference_level, cfg_str, updated_at) = row?;
+            preferences.push(SnapshotPreference {
+                tool_name,
+                preference_level,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+
+        let mut routing_pref_stmt = conn.prepare(
+            "SELECT preference_key, stage_kind, capability, provider_hint, model_ref, preference_level, weight, config_json, updated_at
+             FROM routing_preferences WHERE agent_id = ?1",
+        )?;
+        let routing_pref_rows = routing_pref_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i32>(5)?,
+                row.get::<_, i32>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, u64>(8)?,
+            ))
+        })?;
+        let mut routing_preferences = Vec::new();
+        for row in routing_pref_rows {
+            let (
+                preference_key,
+                stage_kind,
+                capability,
+                provider_hint,
+                model_ref,
+                preference_level,
+                weight,
+                cfg_str,
+                updated_at,
+            ) = row?;
+            routing_preferences.push(SnapshotRoutingPreference {
+                preference_key,
+                stage_kind,
+                capability,
+                provider_hint,
+                model_ref,
+                preference_level,
+                weight,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+
+        let mut reflex_pref_stmt = conn.prepare(
+            "SELECT preference_key, precedence, reflexes_json, config_json, updated_at
+             FROM reflex_preferences WHERE agent_id = ?1",
+        )?;
+        let reflex_pref_rows = reflex_pref_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })?;
+        let mut reflex_preferences = Vec::new();
+        for row in reflex_pref_rows {
+            let (preference_key, precedence, reflexes_str, cfg_str, updated_at) = row?;
+            reflex_preferences.push(SnapshotReflexPreference {
+                preference_key,
+                precedence,
+                reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+
+        // Export resource declarations with timestamps.
+        let mut decl_stmt = conn.prepare(
+            "SELECT resource_type, config_hint, updated_at
+             FROM resource_declarations WHERE agent_id = ?1",
+        )?;
+        let decl_rows = decl_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        let mut declarations = Vec::new();
+        for row in decl_rows {
+            let (rt_str, config_hint, updated_at) = row?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            declarations.push(SnapshotDeclaration {
+                resource_type,
+                config_hint,
+                updated_at,
+            });
+        }
+
+        Ok(AgentGraphSnapshot {
+            agent_id: self.agent_id.clone(),
+            source_node_id: source_node_id.to_string(),
+            exported_at: Self::now_epoch(),
+            preferences,
+            routing_preferences,
+            reflex_preferences,
+            declarations,
+        })
+    }
+
+    fn apply_snapshot(&self, snapshot: &AgentGraphSnapshot) -> Result<MergeResult> {
+        let conn = self.conn.lock().unwrap();
+        let mut preferences_applied = 0usize;
+        let mut preferences_skipped = 0usize;
+        let mut routing_preferences_applied = 0usize;
+        let mut routing_preferences_skipped = 0usize;
+        let mut reflex_preferences_applied = 0usize;
+        let mut reflex_preferences_skipped = 0usize;
+        let mut declarations_applied = 0usize;
+        let mut declarations_skipped = 0usize;
+
+        for pref in &snapshot.preferences {
+            // LWW: only apply if incoming updated_at is strictly greater than stored.
+            let config_str =
+                serde_json::to_string(&pref.config_json).unwrap_or_else(|_| "{}".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO tool_preferences (agent_id, tool_name, preference_level, config_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(agent_id, tool_name) DO UPDATE SET
+                   preference_level = excluded.preference_level,
+                   config_json = excluded.config_json,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > tool_preferences.updated_at",
+                params![
+                    snapshot.agent_id,
+                    pref.tool_name,
+                    pref.preference_level,
+                    config_str,
+                    pref.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                preferences_applied += 1;
+            } else {
+                preferences_skipped += 1;
+            }
+        }
+
+        for pref in &snapshot.routing_preferences {
+            let config_str =
+                serde_json::to_string(&pref.config_json).unwrap_or_else(|_| "{}".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO routing_preferences
+                 (agent_id, preference_key, stage_kind, capability, provider_hint, model_ref, preference_level, weight, config_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(agent_id, preference_key) DO UPDATE SET
+                   stage_kind = excluded.stage_kind,
+                   capability = excluded.capability,
+                   provider_hint = excluded.provider_hint,
+                   model_ref = excluded.model_ref,
+                   preference_level = excluded.preference_level,
+                   weight = excluded.weight,
+                   config_json = excluded.config_json,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > routing_preferences.updated_at",
+                params![
+                    snapshot.agent_id,
+                    pref.preference_key,
+                    pref.stage_kind,
+                    pref.capability,
+                    pref.provider_hint,
+                    pref.model_ref,
+                    pref.preference_level,
+                    pref.weight,
+                    config_str,
+                    pref.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                routing_preferences_applied += 1;
+            } else {
+                routing_preferences_skipped += 1;
+            }
+        }
+
+        for pref in &snapshot.reflex_preferences {
+            let reflexes_str =
+                serde_json::to_string(&pref.reflexes_json).unwrap_or_else(|_| "{}".to_string());
+            let config_str =
+                serde_json::to_string(&pref.config_json).unwrap_or_else(|_| "{}".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO reflex_preferences
+                 (agent_id, preference_key, precedence, reflexes_json, config_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent_id, preference_key) DO UPDATE SET
+                   precedence = excluded.precedence,
+                   reflexes_json = excluded.reflexes_json,
+                   config_json = excluded.config_json,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > reflex_preferences.updated_at",
+                params![
+                    snapshot.agent_id,
+                    pref.preference_key,
+                    pref.precedence,
+                    reflexes_str,
+                    config_str,
+                    pref.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                reflex_preferences_applied += 1;
+            } else {
+                reflex_preferences_skipped += 1;
+            }
+        }
+
+        for decl in &snapshot.declarations {
+            let rt_str = serde_json::to_string(&decl.resource_type)
+                .unwrap_or_else(|_| "\"unknown\"".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO resource_declarations (agent_id, resource_type, config_hint, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(agent_id, resource_type) DO UPDATE SET
+                   config_hint = excluded.config_hint,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > resource_declarations.updated_at",
+                params![
+                    snapshot.agent_id,
+                    rt_str,
+                    decl.config_hint,
+                    decl.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                declarations_applied += 1;
+            } else {
+                declarations_skipped += 1;
+            }
+        }
+
+        Ok(MergeResult {
+            preferences_applied,
+            preferences_skipped,
+            routing_preferences_applied,
+            routing_preferences_skipped,
+            reflex_preferences_applied,
+            reflex_preferences_skipped,
+            declarations_applied,
+            declarations_skipped,
+        })
+    }
+}
+
+impl SqliteAgentGraphStorage {
+    fn collect_traces(
+        &self,
+        stmt: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<AgentExperienceTrace>> {
+        let rows = stmt.query_map(params, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, u64>(7)?,
+            ))
+        })?;
+        let mut traces = Vec::new();
+        for row in rows {
+            let (trace_id, agent_id, event_type, input, output, outcome, detail, ts) = row?;
+            traces.push(AgentExperienceTrace {
+                trace_id,
+                agent_id,
+                event_type,
+                input_json: serde_json::from_str(&input).unwrap_or_default(),
+                output_json: serde_json::from_str(&output).unwrap_or_default(),
+                outcome,
+                outcome_detail: detail,
+                timestamp: ts,
+            });
+        }
+        Ok(traces)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::ResourceType;
+    use tempfile::NamedTempFile;
+
+    // Returns both the storage and the NamedTempFile so the caller keeps the
+    // file alive for the duration of the test. Dropping the file would make the
+    // SQLite connection report "database file has moved".
+    fn open_tmp(agent_id: &str) -> (SqliteAgentGraphStorage, NamedTempFile) {
+        let f = NamedTempFile::new().unwrap();
+        let s = SqliteAgentGraphStorage::open(agent_id, f.path()).unwrap();
+        (s, f)
+    }
+
+    // ── resource grants ───────────────────────────────────────────────────────
+
+    #[test]
+    fn grant_upsert_and_list() {
+        let (s, _f) = open_tmp("aria");
+        let grant = AgentResourceGrant {
+            agent_id: "aria".into(),
+            instance_id: "inst-1".into(),
+            resource_type: ResourceType::ModelRouter,
+            granted_at: 1_000_000,
+        };
+        s.upsert_resource_grant(&grant).unwrap();
+        let grants = s.list_resource_grants().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].instance_id, "inst-1");
+        assert_eq!(grants[0].resource_type, ResourceType::ModelRouter);
+    }
+
+    #[test]
+    fn grant_remove() {
+        let (s, _f) = open_tmp("aria");
+        let grant = AgentResourceGrant {
+            agent_id: "aria".into(),
+            instance_id: "inst-2".into(),
+            resource_type: ResourceType::ToolRunner,
+            granted_at: 1_000_001,
+        };
+        s.upsert_resource_grant(&grant).unwrap();
+        s.remove_resource_grant("inst-2").unwrap();
+        assert!(s.list_resource_grants().unwrap().is_empty());
+    }
+
+    // ── tool preferences ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_preference_upsert_get() {
+        let (s, _f) = open_tmp("example-agent");
+        let pref = AgentToolPreference {
+            agent_id: "example-agent".into(),
+            tool_name: "bash.exec".into(),
+            preference_level: 1,
+            config_json: serde_json::json!({"timeout_secs": 30}),
+            updated_at: 0,
+        };
+        s.upsert_tool_preference(&pref).unwrap();
+        let got = s.get_tool_preference("bash.exec").unwrap().unwrap();
+        assert_eq!(got.preference_level, 1);
+        assert_eq!(got.config_json["timeout_secs"], 30);
+    }
+
+    #[test]
+    fn tool_preference_suppressed() {
+        let (s, _f) = open_tmp("example-agent");
+        s.upsert_tool_preference(&AgentToolPreference {
+            agent_id: "example-agent".into(),
+            tool_name: "dangerous.tool".into(),
+            preference_level: -1,
+            config_json: serde_json::json!({}),
+            updated_at: 0,
+        })
+        .unwrap();
+        let prefs = s.list_tool_preferences().unwrap();
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].preference_level, -1);
+    }
+
+    #[test]
+    fn get_tool_preference_missing_returns_none() {
+        let (s, _f) = open_tmp("x");
+        assert!(s.get_tool_preference("missing.tool").unwrap().is_none());
+    }
+
+    #[test]
+    fn routing_preference_upsert_get() {
+        let (s, _f) = open_tmp("example-agent");
+        let pref = AgentRoutingPreference {
+            agent_id: "example-agent".into(),
+            preference_key: "voice-ingress-elevenlabs".into(),
+            stage_kind: Some("ingress".into()),
+            capability: Some("voice.transcribe".into()),
+            provider_hint: Some("elevenlabs".into()),
+            model_ref: None,
+            preference_level: 1,
+            weight: 90,
+            config_json: serde_json::json!({"reason": "low latency voice ingress"}),
+            updated_at: 0,
+        };
+        s.upsert_routing_preference(&pref).unwrap();
+        let got = s
+            .get_routing_preference("voice-ingress-elevenlabs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.stage_kind.as_deref(), Some("ingress"));
+        assert_eq!(got.capability.as_deref(), Some("voice.transcribe"));
+        assert_eq!(got.provider_hint.as_deref(), Some("elevenlabs"));
+        assert_eq!(got.weight, 90);
+    }
+
+    #[test]
+    fn routing_preference_list_returns_rows() {
+        let (s, _f) = open_tmp("example-agent");
+        s.upsert_routing_preference(&AgentRoutingPreference {
+            agent_id: "example-agent".into(),
+            preference_key: "cognition-gemini-flash".into(),
+            stage_kind: Some("cognition".into()),
+            capability: Some("text.generate".into()),
+            provider_hint: Some("google".into()),
+            model_ref: Some("gemini-flash".into()),
+            preference_level: 1,
+            weight: 75,
+            config_json: serde_json::json!({}),
+            updated_at: 0,
+        })
+        .unwrap();
+        let prefs = s.list_routing_preferences().unwrap();
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].preference_key, "cognition-gemini-flash");
+    }
+
+    #[test]
+    fn reflex_preference_upsert_get() {
+        let (s, _f) = open_tmp("example-agent");
+        let pref = AgentReflexPreference {
+            agent_id: "example-agent".into(),
+            preference_key: "trusted-operator-mesh".into(),
+            precedence: 70,
+            reflexes_json: serde_json::json!({
+                "remote_tool_reflex": "allow",
+                "credential_scope_reflex": "mesh_scoped"
+            }),
+            config_json: serde_json::json!({"reason": "trusted operator history"}),
+            updated_at: 0,
+        };
+        s.upsert_reflex_preference(&pref).unwrap();
+        let got = s
+            .get_reflex_preference("trusted-operator-mesh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.precedence, 70);
+        assert_eq!(got.reflexes_json["remote_tool_reflex"], "allow");
+    }
+
+    #[test]
+    fn reflex_preference_list_returns_rows() {
+        let (s, _f) = open_tmp("example-agent");
+        s.upsert_reflex_preference(&AgentReflexPreference {
+            agent_id: "example-agent".into(),
+            preference_key: "guard-remote-tools".into(),
+            precedence: 65,
+            reflexes_json: serde_json::json!({
+                "remote_tool_reflex": "deny"
+            }),
+            config_json: serde_json::json!({}),
+            updated_at: 0,
+        })
+        .unwrap();
+        let prefs = s.list_reflex_preferences().unwrap();
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].preference_key, "guard-remote-tools");
+    }
+
+    // ── resource declarations ─────────────────────────────────────────────────
+
+    #[test]
+    fn declaration_upsert_list_remove() {
+        let (s, _f) = open_tmp("aria");
+        s.upsert_resource_declaration(&ResourceDeclaration {
+            resource_type: ResourceType::AgentGraph,
+            config_hint: None,
+        })
+        .unwrap();
+        s.upsert_resource_declaration(&ResourceDeclaration {
+            resource_type: ResourceType::ModelRouter,
+            config_hint: Some("gemini".into()),
+        })
+        .unwrap();
+        assert_eq!(s.list_resource_declarations().unwrap().len(), 2);
+
+        s.remove_resource_declaration(&ResourceType::ModelRouter)
+            .unwrap();
+        let remaining = s.list_resource_declarations().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].resource_type, ResourceType::AgentGraph);
+    }
+
+    // ── experience traces ─────────────────────────────────────────────────────
+
+    #[test]
+    fn trace_record_and_recall() {
+        let (s, _f) = open_tmp("aria");
+        for i in 0..5u64 {
+            s.record_experience_trace(&AgentExperienceTrace {
+                trace_id: format!("trace-{i:02}"),
+                agent_id: "aria".into(),
+                event_type: "tool_call".into(),
+                input_json: serde_json::json!({"tool": "bash.exec", "seq": i}),
+                output_json: serde_json::json!({"exit_code": 0}),
+                outcome: "success".into(),
+                outcome_detail: None,
+                timestamp: 1_000_000 + i,
+            })
+            .unwrap();
+        }
+        let traces = s.list_experience_traces(3).unwrap();
+        assert_eq!(traces.len(), 3);
+        // Newest first.
+        assert_eq!(traces[0].trace_id, "trace-04");
+    }
+
+    #[test]
+    fn trace_filter_by_event_type() {
+        let (s, _f) = open_tmp("aria");
+        s.record_experience_trace(&AgentExperienceTrace {
+            trace_id: "t-1".into(),
+            agent_id: "aria".into(),
+            event_type: "tool_call".into(),
+            input_json: serde_json::json!({}),
+            output_json: serde_json::json!({}),
+            outcome: "success".into(),
+            outcome_detail: None,
+            timestamp: 1,
+        })
+        .unwrap();
+        s.record_experience_trace(&AgentExperienceTrace {
+            trace_id: "t-2".into(),
+            agent_id: "aria".into(),
+            event_type: "resource_request".into(),
+            input_json: serde_json::json!({}),
+            output_json: serde_json::json!({}),
+            outcome: "success".into(),
+            outcome_detail: None,
+            timestamp: 2,
+        })
+        .unwrap();
+
+        let tool_traces = s.list_traces_by_event_type("tool_call", 10).unwrap();
+        assert_eq!(tool_traces.len(), 1);
+        assert_eq!(tool_traces[0].trace_id, "t-1");
+    }
+
+    #[test]
+    fn trace_insert_or_ignore_is_idempotent() {
+        let (s, _f) = open_tmp("x");
+        let trace = AgentExperienceTrace {
+            trace_id: "dup-id".into(),
+            agent_id: "x".into(),
+            event_type: "tool_call".into(),
+            input_json: serde_json::json!({}),
+            output_json: serde_json::json!({}),
+            outcome: "success".into(),
+            outcome_detail: None,
+            timestamp: 1,
+        };
+        s.record_experience_trace(&trace).unwrap();
+        s.record_experience_trace(&trace).unwrap(); // should not error
+        assert_eq!(s.list_experience_traces(10).unwrap().len(), 1);
+    }
+
+    // ── mesh sync (Seam 4) ────────────────────────────────────────────────────
+
+    #[test]
+    fn export_snapshot_round_trip() {
+        let (s, _f) = open_tmp("aria");
+        s.upsert_tool_preference(&AgentToolPreference {
+            agent_id: "aria".into(),
+            tool_name: "bash.exec".into(),
+            preference_level: 1,
+            config_json: serde_json::json!({"timeout_secs": 30}),
+            updated_at: 1_000,
+        })
+        .unwrap();
+        s.upsert_resource_declaration(&ResourceDeclaration {
+            resource_type: ResourceType::ModelRouter,
+            config_hint: Some("gemini".into()),
+        })
+        .unwrap();
+
+        let snap = s.export_snapshot("node-a").unwrap();
+        assert_eq!(snap.agent_id, "aria");
+        assert_eq!(snap.source_node_id, "node-a");
+        assert_eq!(snap.preferences.len(), 1);
+        assert_eq!(snap.preferences[0].tool_name, "bash.exec");
+        assert!(snap.routing_preferences.is_empty());
+        assert!(snap.reflex_preferences.is_empty());
+        assert_eq!(snap.declarations.len(), 1);
+        assert_eq!(
+            snap.declarations[0].resource_type,
+            ResourceType::ModelRouter
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_lww_newer_wins() {
+        let (local, _f) = open_tmp("aria");
+        // Seed local with old value.
+        local
+            .upsert_tool_preference(&AgentToolPreference {
+                agent_id: "aria".into(),
+                tool_name: "bash.exec".into(),
+                preference_level: 0,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            })
+            .unwrap();
+
+        // Snapshot has a newer timestamp — should win.
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 2_000,
+            preferences: vec![SnapshotPreference {
+                tool_name: "bash.exec".into(),
+                preference_level: 1,
+                config_json: serde_json::json!({"timeout_secs": 60}),
+                updated_at: 1_000,
+            }],
+            routing_preferences: vec![],
+            reflex_preferences: vec![],
+            declarations: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.preferences_applied, 1);
+        assert_eq!(result.preferences_skipped, 0);
+
+        let pref = local.get_tool_preference("bash.exec").unwrap().unwrap();
+        assert_eq!(pref.preference_level, 1);
+        assert_eq!(pref.config_json["timeout_secs"], 60);
+    }
+
+    #[test]
+    fn apply_snapshot_routing_preference_lww_newer_wins() {
+        let (local, _f) = open_tmp("aria");
+        local
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: "aria".into(),
+                preference_key: "voice-ingress".into(),
+                stage_kind: Some("ingress".into()),
+                capability: Some("voice.transcribe".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: None,
+                preference_level: 0,
+                weight: 10,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            })
+            .unwrap();
+
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 2_000,
+            preferences: vec![],
+            routing_preferences: vec![SnapshotRoutingPreference {
+                preference_key: "voice-ingress".into(),
+                stage_kind: Some("ingress".into()),
+                capability: Some("voice.transcribe".into()),
+                provider_hint: Some("elevenlabs".into()),
+                model_ref: None,
+                preference_level: 1,
+                weight: 90,
+                config_json: serde_json::json!({"reason": "voice specialist"}),
+                updated_at: 1_000,
+            }],
+            declarations: vec![],
+            reflex_preferences: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.routing_preferences_applied, 1);
+        assert_eq!(result.routing_preferences_skipped, 0);
+
+        let pref = local
+            .get_routing_preference("voice-ingress")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.provider_hint.as_deref(), Some("elevenlabs"));
+        assert_eq!(pref.weight, 90);
+    }
+
+    #[test]
+    fn apply_snapshot_reflex_preference_lww_newer_wins() {
+        let (local, _f) = open_tmp("aria");
+        local
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: "aria".into(),
+                preference_key: "operator-mesh".into(),
+                precedence: 60,
+                reflexes_json: serde_json::json!({"remote_tool_reflex": "deny"}),
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            })
+            .unwrap();
+
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 2_000,
+            preferences: vec![],
+            routing_preferences: vec![],
+            reflex_preferences: vec![SnapshotReflexPreference {
+                preference_key: "operator-mesh".into(),
+                precedence: 75,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned trust"}),
+                updated_at: 1_000,
+            }],
+            declarations: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.reflex_preferences_applied, 1);
+        assert_eq!(result.reflex_preferences_skipped, 0);
+
+        let pref = local
+            .get_reflex_preference("operator-mesh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.precedence, 75);
+        assert_eq!(pref.reflexes_json["remote_tool_reflex"], "allow");
+    }
+
+    #[test]
+    fn apply_snapshot_lww_older_skipped() {
+        let (local, _f) = open_tmp("aria");
+        // Seed local with newer value.
+        local
+            .upsert_tool_preference(&AgentToolPreference {
+                agent_id: "aria".into(),
+                tool_name: "bash.exec".into(),
+                preference_level: 1,
+                config_json: serde_json::json!({"timeout_secs": 60}),
+                updated_at: 2_000,
+            })
+            .unwrap();
+
+        // Snapshot has an older timestamp — local should win.
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 1_000,
+            preferences: vec![SnapshotPreference {
+                tool_name: "bash.exec".into(),
+                preference_level: -1,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            }],
+            routing_preferences: vec![],
+            reflex_preferences: vec![],
+            declarations: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.preferences_applied, 0);
+        assert_eq!(result.preferences_skipped, 1);
+
+        // Local value unchanged.
+        let pref = local.get_tool_preference("bash.exec").unwrap().unwrap();
+        assert_eq!(pref.preference_level, 1);
+    }
+
+    #[test]
+    fn apply_snapshot_authority_invariant_grants_excluded() {
+        // Snapshots have no grants field — this test confirms the type itself
+        // enforces the invariant and apply_snapshot only touches preferences
+        // and declarations.
+        let (local, _f) = open_tmp("aria");
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 1_000,
+            preferences: vec![],
+            routing_preferences: vec![],
+            reflex_preferences: vec![],
+            declarations: vec![SnapshotDeclaration {
+                resource_type: ResourceType::ToolRunner,
+                config_hint: None,
+                updated_at: 1_000,
+            }],
+        };
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.declarations_applied, 1);
+        // No grants were touched — grants list is still empty.
+        assert!(local.list_resource_grants().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_snapshot_new_preference_inserted() {
+        let (local, _f) = open_tmp("aria");
+        // No existing data.
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 1_000,
+            preferences: vec![SnapshotPreference {
+                tool_name: "new.tool".into(),
+                preference_level: 1,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            }],
+            routing_preferences: vec![],
+            reflex_preferences: vec![],
+            declarations: vec![],
+        };
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.preferences_applied, 1);
+        let pref = local.get_tool_preference("new.tool").unwrap().unwrap();
+        assert_eq!(pref.preference_level, 1);
+    }
+
+    // ── routing pipeline rules ────────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_rule_upsert_get_list() {
+        let (s, _f) = open_tmp("example-agent");
+        let rule = RoutingPipelineRule {
+            agent_id: "example-agent".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({
+                "match": { "frame_kind": ["audio", "voice"] },
+                "stages": [{ "capability": "voice.transcribe", "mode": "blob" }],
+                "deliver_as": "user_message"
+            }),
+            updated_at: 0,
+        };
+        s.upsert_pipeline_rule(&rule).unwrap();
+
+        let got = s.get_pipeline_rule("voice-transcribe").unwrap().unwrap();
+        assert_eq!(got.rule_id, "voice-transcribe");
+        assert_eq!(got.rule_json["deliver_as"], "user_message");
+
+        let all = s.list_pipeline_rules().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].rule_id, "voice-transcribe");
+    }
+
+    #[test]
+    fn pipeline_rule_upsert_replaces_by_rule_id() {
+        let (s, _f) = open_tmp("example-agent");
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "example-agent".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({ "deliver_as": "user_message" }),
+            updated_at: 0,
+        })
+        .unwrap();
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "example-agent".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({ "deliver_as": "tool_result" }),
+            updated_at: 0,
+        })
+        .unwrap();
+
+        let all = s.list_pipeline_rules().unwrap();
+        assert_eq!(all.len(), 1, "upsert must not duplicate rows");
+        assert_eq!(all[0].rule_json["deliver_as"], "tool_result");
+    }
+
+    #[test]
+    fn pipeline_rule_remove_returns_true_when_deleted() {
+        let (s, _f) = open_tmp("example-agent");
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "example-agent".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({}),
+            updated_at: 0,
+        })
+        .unwrap();
+        assert!(s.remove_pipeline_rule("voice-transcribe").unwrap());
+        assert!(s.list_pipeline_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pipeline_rule_remove_returns_false_when_missing() {
+        let (s, _f) = open_tmp("example-agent");
+        assert!(!s.remove_pipeline_rule("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn pipeline_rules_do_not_appear_in_reflex_preferences() {
+        // Verify the separation invariant: pipeline rules stored in routing_pipeline_rules
+        // must NOT bleed into list_reflex_preferences() used for reflex composition.
+        let (s, _f) = open_tmp("example-agent");
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "example-agent".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({ "stages": [] }),
+            updated_at: 0,
+        })
+        .unwrap();
+        let reflex_prefs = s.list_reflex_preferences().unwrap();
+        assert!(
+            reflex_prefs.is_empty(),
+            "pipeline rules must not appear in reflex_preferences"
+        );
+    }
+}
