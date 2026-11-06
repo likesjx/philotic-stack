@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+ansible-mesh-core = { path = "../ansible-mesh-core" }
 exec-guard = { path = "../exec-guard" }
 memory-core = { path = "../memory-core" }
 clap = { version = "4", features = ["derive"] }
