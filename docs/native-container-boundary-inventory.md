@@ -44,6 +44,22 @@ It rejects every Docker volume until volume teardown is qualified. Checks assume
 a trusted exclusive runner; they do not enumerate host clients or atomically
 bind inspected state to a later start. Real Docker behavior remains untested.
 
+## Inputs required for a future pinned contract
+
+The historical receipt records packaged hotel, membrane and runner binaries,
+issuer bundle, test adapter and Node hashes; the workflow also verifies runtime
+and website artifact provenance. A complete new contract must independently pin
+the exact driver source and compiled binary, runtime userland, instrumented
+issuer and adapter, Node, all six images, fixture and bridge scripts, limits,
+and every synthetic certificate, configuration and mount used. It must bind
+those inputs to the reviewed candidate, not derive expectations from Docker
+inspection. The historical receipt did not hash the compiled driver and the
+runtime userland came from a mutable base and package repositories. The new
+in-process hotel and instrumented issuer are distinct from the prior release.
+Generated synthetic inputs require verified generation provenance without
+disclosing secrets. The required artifact set is not yet enforced in code;
+this incomplete inventory cannot authorize real fixture execution.
+
 The old workflow uses fixed `native-package-*` names and no fixture labels.
 The local split-workflow draft uses unique names/labels, but has not been run.
 Both mount `$PWD` and a separate runner scratch path; the proposed checker

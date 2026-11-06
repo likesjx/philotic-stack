@@ -39,7 +39,10 @@ def _artifact_hash(root, relative):
         first = os.fstat(stream.fileno())
         if not stat.S_ISREG(first.st_mode) or first.st_size > 536870912:
             raise RuntimeError('fixture artifact is not a bounded regular file')
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        hasher = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            hasher.update(chunk)
+        digest = hasher.hexdigest()
         last = os.fstat(stream.fileno())
     current = path.stat(follow_symlinks=False)
     if ((first.st_dev, first.st_ino, first.st_size, first.st_mtime_ns) != (last.st_dev, last.st_ino, last.st_size, last.st_mtime_ns)
@@ -83,7 +86,8 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
     network = _json_one(runner, ['network', 'inspect', network_id])
     network_name = f'native-qualification-{nonce}-network'
     if (network.get('Id') != network_id or network.get('Name') != network_name
-            or network.get('Internal') is not True or network.get('Labels', {}).get('com.philotic.fixture') != nonce
+            or network.get('Internal') is not True or network.get('Driver') != 'bridge'
+            or network.get('Scope') != 'local' or network.get('Labels', {}).get('com.philotic.fixture') != nonce
             or network.get('Containers') != {}):
         raise RuntimeError('network not isolated and empty')
 
@@ -99,6 +103,13 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
         if image_info.get('Id') != image or not isinstance(declared, dict) or sorted(declared) != sorted(expected['declared_volumes']):
             raise RuntimeError('image or declared volume mismatch')
         info = boundary._inspect(runner, containers[role])
+        settings = info.get('NetworkSettings')
+        attachments = settings.get('Networks') if isinstance(settings, dict) else None
+        expected_attachments = {network_name} if role in ('anchor', 'proxy') else set()
+        if (not isinstance(attachments, dict) or set(attachments) != expected_attachments
+                or any(not isinstance(value, dict) or value.get('NetworkID') != network_id
+                       for value in attachments.values())):
+            raise RuntimeError('fixture network attachments unverified')
         mounts = info.get('Mounts')
         if not isinstance(mounts, list) or not isinstance(expected['mounts'], list) or not isinstance(expected['tmpfs'], dict):
             raise ValueError('invalid mount contract')
@@ -111,6 +122,7 @@ def preflight_fixture(manifest, contract, scratch_root, runner_temp, runner=boun
             raise RuntimeError('fixture started before preflight')
         state, host, config = info['State'], info['HostConfig'], info['Config']
         if (state.get('Status') != 'created' or state.get('StartedAt') != '0001-01-01T00:00:00Z'
+                or host.get('PublishAllPorts') is not False
                 or info.get('RestartCount') != 0 or (host.get('Tmpfs') or {}) != expected['tmpfs']
                 or config.get('Entrypoint') != expected['entrypoint'] or config.get('Cmd') != expected['command']
                 or not isinstance(config.get('Env'), list)):

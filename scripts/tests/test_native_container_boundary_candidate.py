@@ -20,7 +20,7 @@ class FakeDocker:
             self.containers[ident] = {
                 'Id': ident, 'Image': self.images[role], 'Name': f'/native-qualification-{self.nonce}-{role}',
                 'Config': {'Labels': {'com.philotic.fixture': self.nonce}},
-                'HostConfig': {'Privileged': False, 'PidMode': '', 'PortBindings': {},
+                'HostConfig': {'Privileged': False, 'PidMode': '', 'PortBindings': {}, 'PublishAllPorts': False,
                                'CapDrop': ['ALL'], 'SecurityOpt': ['no-new-privileges:true'],
                                'CapAdd': None, 'Devices': [], 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0},
                                'NetworkMode': mode},
@@ -74,6 +74,20 @@ class FakeDocker:
 
 
 class FixtureBoundaryTests(unittest.TestCase):
+    def test_publish_all_ports_or_missing_value_fails_before_stop(self):
+        for value in (True, None):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as root:
+                scratch = Path(root) / f'native-qualification-{"a" * 32}'; scratch.mkdir()
+                fake = FakeDocker(scratch)
+                host = fake.containers[fake.ids['anchor']]['HostConfig']
+                if value is None:
+                    del host['PublishAllPorts']
+                else:
+                    host['PublishAllPorts'] = value
+                with self.assertRaises(RuntimeError):
+                    candidate.terminate_fixture(fake.manifest(), scratch, root, fake)
+                self.assertEqual(fake.kills, [])
+
     def test_all_exact_containers_are_stopped_and_checked(self):
         with tempfile.TemporaryDirectory() as root:
             scratch = Path(root) / f'native-qualification-{"a" * 32}'; scratch.mkdir()

@@ -46,7 +46,7 @@ def _validate(info, role, ident, image, nonce, scratch, expected_network):
         if (info['Id'] != ident or info['Image'] != image or info['Name'].lstrip('/') != f'native-qualification-{nonce}-{role}'
                 or config['Labels']['com.philotic.fixture'] != nonce
                 or host['Privileged'] is not False or host['PidMode'] not in ('', 'private')
-                or host.get('PortBindings') not in ({}, None)
+                or host.get('PortBindings') not in ({}, None) or host.get('PublishAllPorts') is not False
                 or 'ALL' not in (host.get('CapDrop') or [])
                 or host.get('CapAdd') not in (None, []) or host.get('Devices') not in (None, [])
                 or host.get('RestartPolicy', {}).get('Name') != 'no'

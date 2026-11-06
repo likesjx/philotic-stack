@@ -17,11 +17,15 @@ class PreflightDocker(FakeDocker):
         self.image_volumes = {image: {} for image in self.images.values()}
         self.extra_network = False
         self.extra_volume = None
-        for role, info in self.containers.items():
+        for role, ident in self.ids.items():
+            info = self.containers[ident]
             info['State'] = {'Running': False, 'Pid': 0, 'Restarting': False, 'Dead': False,
                              'Status': 'created', 'StartedAt': '0001-01-01T00:00:00Z'}
             info['RestartCount'] = 0
             info['HostConfig']['Tmpfs'] = {}
+            info['HostConfig']['PublishAllPorts'] = False
+            info['NetworkSettings'] = {'Networks': ({f'native-qualification-{self.nonce}-network': {'NetworkID': self.network}}
+                                                   if role in ('anchor', 'proxy') else {})}
             info['Config'].update({'Env': ['CI=true'], 'Entrypoint': ['/bin/true'], 'Cmd': []})
             info['Mounts'] = [{'Type': 'bind', 'Source': str(scratch), 'Destination': '/fixture',
                                'RW': False, 'Propagation': 'rprivate'}]
@@ -30,7 +34,9 @@ class PreflightDocker(FakeDocker):
         if args[:2] == ['network', 'inspect']:
             containers = {'e' * 64: {}} if self.extra_network else {}
             info = {'Id': self.network, 'Name': f'native-qualification-{self.nonce}-network',
-                    'Internal': True, 'Labels': {'com.philotic.fixture': self.nonce}, 'Containers': containers}
+                    'Internal': True, 'Driver': getattr(self, 'network_driver', 'bridge'),
+                    'Scope': getattr(self, 'network_scope', 'local'),
+                    'Labels': {'com.philotic.fixture': self.nonce}, 'Containers': containers}
             return SimpleNamespace(returncode=0, stdout=json.dumps([info]))
         if args[:2] == ['image', 'inspect']:
             return SimpleNamespace(returncode=0, stdout=json.dumps([{'Id': args[2], 'Config': {'Volumes': self.image_volumes[args[2]]}}]))
@@ -68,12 +74,20 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(fake.kills, [])
 
     def test_unexpected_inputs_fail_before_execution(self):
-        for fault in ('image', 'network', 'started', 'mount', 'destination', 'propagation', 'duplicate', 'artifact', 'artifact-symlink', 'environment', 'declared-volume', 'unknown-volume'):
+        for fault in ('image', 'network', 'network-driver', 'network-scope', 'extra-attachment', 'wrong-network-id', 'missing-network-settings', 'shared-extra-attachment', 'publish-all', 'missing-publish-all', 'started', 'mount', 'destination', 'propagation', 'duplicate', 'artifact', 'artifact-symlink', 'environment', 'declared-volume', 'unknown-volume'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as root:
                 scratch, fake, manifest, contract = self.setup_fixture(root)
                 info = fake.containers[fake.ids['runtime']]
                 if fault == 'image': contract['images']['runtime'] = 'sha256:' + 'd' * 64
                 if fault == 'network': fake.extra_network = True
+                if fault == 'network-driver': fake.network_driver = 'overlay'
+                if fault == 'network-scope': fake.network_scope = 'swarm'
+                if fault == 'extra-attachment': fake.containers[fake.ids['anchor']]['NetworkSettings']['Networks']['unexpected'] = {'NetworkID': 'e' * 64}
+                if fault == 'wrong-network-id': fake.containers[fake.ids['proxy']]['NetworkSettings']['Networks'][f'native-qualification-{fake.nonce}-network']['NetworkID'] = 'e' * 64
+                if fault == 'missing-network-settings': del fake.containers[fake.ids['anchor']]['NetworkSettings']
+                if fault == 'shared-extra-attachment': info['NetworkSettings']['Networks']['unexpected'] = {'NetworkID': 'e' * 64}
+                if fault == 'publish-all': fake.containers[fake.ids['anchor']]['HostConfig']['PublishAllPorts'] = True
+                if fault == 'missing-publish-all': del fake.containers[fake.ids['proxy']]['HostConfig']['PublishAllPorts']
                 if fault == 'started': info['State'].update(Running=True, Pid=123, Status='running')
                 if fault == 'mount': info['Mounts'][0]['RW'] = True
                 if fault == 'destination': info['Mounts'][0]['Destination'] = '/unexpected'
