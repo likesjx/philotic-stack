@@ -2,6 +2,8 @@
 //! claims as identity. All peers use the hotel's concrete supervised processes.
 //! Tokens stay in volatile local authority storage, never in routed envelopes.
 mod control;
+#[cfg(target_os = "linux")]
+mod credential_receive;
 pub mod runtime;
 use ansible_mesh_core::{
     authority_fence::{Fence, Journal},

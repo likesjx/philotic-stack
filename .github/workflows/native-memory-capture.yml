@@ -47,6 +47,19 @@ jobs:
       - run: cargo test --locked -p native-memory -p membrane -p membrane-mcp
       - run: cargo test --locked -p ansible-mesh-core --lib
       - run: cargo test --locked -p aiua native_authority
+      - name: Check isolated credential receive selection and ancillary cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_name=service::native_authority::credential_receive::tests::candidate_truncated_rights_are_closed_before_rejection
+          cargo test --locked -p aiua "$test_name" -- --list --ignored | grep -Fx "$test_name: test"
+          cargo test --locked -p aiua "$test_name" -- --exact --ignored --test-threads=1
+          test_name=service::native_authority::credential_receive::tests::owned_child_fragmented_frame_rejects_replaced_launch
+          cargo test --locked -p aiua "$test_name" -- --list --ignored | grep -Fx "$test_name: test"
+          cargo test --locked -p aiua "$test_name" -- --exact --ignored --test-threads=1
+          test_name=service::native_authority::credential_receive::tests::registered_child_delegated_sender_is_denied
+          cargo test --locked -p aiua "$test_name" -- --list --ignored | grep -Fx "$test_name: test"
+          cargo test --locked -p aiua "$test_name" -- --exact --ignored --test-threads=1
       - run: cargo test --locked -p aiua manager_never_signals_stored_pid
       - run: cargo test --locked -p aiua concrete_child_retirement_and_replacement
       - run: cargo test --locked -p aiua native_preapproval
