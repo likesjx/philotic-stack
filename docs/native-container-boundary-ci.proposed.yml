@@ -1,0 +1,28 @@
+# Review artifact only: this file is outside .github/workflows and cannot run.
+# The real fixture job must remain disabled until the inventory in
+# native-container-boundary-inventory.md is established and reviewed.
+name: Native fixture boundary candidate
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  contract-only:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run fake-daemon boundary contract tests only
+        working-directory: scripts/tests
+        run: python3 -B -m unittest test_native_fixture_preflight_candidate test_native_container_boundary_candidate -v
+  real-fixture:
+    if: ${{ false }}
+    needs: contract-only
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Unqualified fixture must not execute
+        run: |
+          echo 'Blocked: exact mounts, volumes, clients, provenance, observation and cleanup are unverified.' >&2
+          exit 1
