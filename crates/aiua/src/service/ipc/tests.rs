@@ -24,6 +24,70 @@ fn register_skill_test_graph() -> GraphDomain {
     GraphDomain::new(Arc::new(graph_store.adapter()))
 }
 
+#[test]
+fn ipc_shares_native_authority_without_reopening_journal() {
+    use crate::service::native_authority::{NativeAuthority, NativeIntrospector};
+    use ansible_mesh_core::privacy_local::LocalLaunchRegistry;
+    use native_memory::oauth::{Binding, Introspection};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    struct NoIssuer;
+    #[async_trait::async_trait]
+    impl NativeIntrospector for NoIssuer {
+        async fn inspect(&self, _: &str) -> anyhow::Result<Introspection> {
+            anyhow::bail!("unused")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let journal = dir.path().join("journal");
+    std::fs::write(&journal, b"clean\n").unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let uid = std::fs::metadata(&journal).unwrap().uid();
+    let launches = Arc::new(LocalLaunchRegistry::default());
+    let authority = NativeAuthority::new(
+        "hotel".into(),
+        "membrane".into(),
+        "runner".into(),
+        Binding {
+            issuer: "https://issuer.example".into(),
+            resource: "https://example.test/mcp".into(),
+            client_id: "test".into(),
+            subject: "synthetic".into(),
+            grant_version: "0:1".into(),
+            owner: "synthetic".into(),
+            namespace: "pilot".into(),
+            operations: vec!["remember".into(), "recall".into()],
+        },
+        launches.clone(),
+        &journal,
+        uid,
+        Arc::new(NoIssuer),
+    )
+    .unwrap();
+    let weak = Arc::downgrade(&authority);
+    let (tx, _rx) = mpsc::channel(1);
+    let server = IpcServer::new("unused", "hotel", tx, Arc::new(register_skill_test_graph()));
+    assert!(server.native_authority.is_none());
+    let server = server.with_native_authority(Some(authority.clone()));
+    assert!(Arc::ptr_eq(
+        server.native_authority.as_ref().unwrap(),
+        &authority
+    ));
+    assert!(
+        server
+            .native_authority
+            .as_ref()
+            .unwrap()
+            .owns_launches(&launches)
+    );
+    drop(authority);
+    assert!(weak.upgrade().is_some());
+    assert!(ansible_mesh_core::authority_fence::Journal::open(&journal, uid).is_err());
+    drop(server);
+    assert!(weak.upgrade().is_none());
+    assert!(ansible_mesh_core::authority_fence::Journal::open(&journal, uid).is_ok());
+}
+
 #[tokio::test]
 async fn native_preapproval_ipc_owner_drift_and_reconciliation() {
     use ansible_mesh_core::domain::mcp_maintenance::endpoint_digest;
