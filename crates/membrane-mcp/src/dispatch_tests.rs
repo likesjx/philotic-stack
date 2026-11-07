@@ -1157,12 +1157,17 @@ async fn native_admission_unavailable_logs_safe_correlated_event() {
             self.0.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     let output = Arc::new(StdMutex::new(Vec::new()));
     let writer = output.clone();
-    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
-        .with_writer(move || Capture(writer.clone())).finish();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || Capture(writer.clone()))
+        .finish();
     let _subscriber = tracing::subscriber::set_default(subscriber);
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("ingress.json");
@@ -1175,34 +1180,58 @@ async fn native_admission_unavailable_logs_safe_correlated_event() {
     std::fs::write(&config,serde_json::to_vec(&json!({"oauth":oauth,"issuer":"test-node","key_id":"test-key",
         "signing_seed":vec![7;32],"grants":{"caller-1":grant},"response_verifiers":[{"destination":"memory-hotel",
         "runner":"memory-1","key_id":"result-key","public_key":ed25519_dalek::SigningKey::from_bytes(&[8;32]).verifying_key().to_bytes()}]})).unwrap()).unwrap();
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config,std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let mut h = harness(false,ExposureTier::Local,HashMap::new());
-    Arc::get_mut(&mut h.state).unwrap().native_memory_config=Some(config);
-    let tool=McpToolSpec {
-        name:"native-memory.remember".into(),description:"synthetic".into(),input_schema:json!({"type":"object"}),
-        inbound_transform:McpInboundTransform::FieldMap {action:"native-memory.remember".into(),
-            target:McpRouteTarget::NativeMemory {runner_id:"memory-1".into(),target_node:"memory-hotel".into()},mappings:vec![]},
-        outbound_transform:McpOutboundTransform::PassThrough,
-        auth:Some(McpAuthScheme::BearerToken {grants:vec![]}),handler:None,
+    let mut h = harness(false, ExposureTier::Local, HashMap::new());
+    Arc::get_mut(&mut h.state).unwrap().native_memory_config = Some(config);
+    let tool = McpToolSpec {
+        name: "native-memory.remember".into(),
+        description: "synthetic".into(),
+        input_schema: json!({"type":"object"}),
+        inbound_transform: McpInboundTransform::FieldMap {
+            action: "native-memory.remember".into(),
+            target: McpRouteTarget::NativeMemory {
+                runner_id: "memory-1".into(),
+                target_node: "memory-hotel".into(),
+            },
+            mappings: vec![],
+        },
+        outbound_transform: McpOutboundTransform::PassThrough,
+        auth: Some(McpAuthScheme::BearerToken { grants: vec![] }),
+        handler: None,
     };
-    h.set_endpoint(endpoint_with(vec![tool],None)).await;
-    let sentinel="SYNTHETIC_SECRET_TOKEN_QUERY_CONTENT";
+    h.set_endpoint(endpoint_with(vec![tool], None)).await;
+    let sentinel = "SYNTHETIC_SECRET_TOKEN_QUERY_CONTENT";
     let (_,response)=call(&h.state,rpc("tools/call",json!({"name":"native-memory.remember","arguments":{
         "event":"event-1","command":{"operation":"remember","id":"note-1","subject":"practice",
         "content":sentinel,"source":"synthetic://test","source_version":"1","lineage":"source-1"}}})),
         Some(&format!("Bearer {sentinel}")),true).await;
-    assert_eq!(response["error"]["message"],"native OAuth denied");
-    let logs=String::from_utf8(output.lock().unwrap().clone()).unwrap();
-    let event=logs.lines().find(|line| line.contains("stage=\"native_authorization\"")).expect("native authorization event");
+    assert_eq!(response["error"]["message"], "native OAuth denied");
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let event = logs
+        .lines()
+        .find(|line| line.contains("stage=\"native_authorization\""))
+        .expect("native authorization event");
     assert!(event.contains("category=\"unavailable\""));
     assert!(event.contains("outcome=\"admission_unverified\""));
-    let id=event.split("turn_id=").nth(1).and_then(|tail|tail.split_whitespace().next()).expect("correlation ID");
+    let id = event
+        .split("turn_id=")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .expect("correlation ID");
     assert!(uuid::Uuid::parse_str(id).is_ok());
-    let dispatch=logs.lines().find(|line|line.contains("dispatching via transform engine")).expect("dispatch event");
-    let dispatch_id=dispatch.split("turn_id=").nth(1).and_then(|tail|tail.split_whitespace().next()).expect("dispatch correlation ID");
-    assert_eq!(id,dispatch_id);
+    let dispatch = logs
+        .lines()
+        .find(|line| line.contains("dispatching via transform engine"))
+        .expect("dispatch event");
+    let dispatch_id = dispatch
+        .split("turn_id=")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .expect("dispatch correlation ID");
+    assert_eq!(id, dispatch_id);
     assert!(!logs.contains(sentinel));
 }

@@ -689,9 +689,16 @@ async fn handle_tools_list(
 // underlying control-channel error may combine peer denial and policy denial;
 // do not infer a more specific cause or format the error or request.
 #[derive(Clone, Copy)]
-enum NativeAuthorityStage { Admission, Release }
+enum NativeAuthorityStage {
+    Admission,
+    Release,
+}
 
-fn log_native_authority_failure(turn_id: &str, error: native_memory::Error, stage: NativeAuthorityStage) {
+fn log_native_authority_failure(
+    turn_id: &str,
+    error: native_memory::Error,
+    stage: NativeAuthorityStage,
+) {
     let correlation = uuid::Uuid::parse_str(turn_id)
         .map(|id| id.to_string())
         .unwrap_or_else(|_| "invalid".to_owned());
@@ -1088,7 +1095,11 @@ async fn handle_tools_call(
                 let handle = match admitted {
                     Ok(handle) => handle,
                     Err(error) => {
-                        log_native_authority_failure(&turn_id, error, NativeAuthorityStage::Admission);
+                        log_native_authority_failure(
+                            &turn_id,
+                            error,
+                            NativeAuthorityStage::Admission,
+                        );
                         return JsonRpcResponse::err(
                             id,
                             error_code::PERMISSION_DENIED,
@@ -1364,15 +1375,20 @@ mod native_logging_tests {
             self.0.lock().unwrap().extend_from_slice(data);
             Ok(data.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
     fn admission_log_uses_only_validated_id_and_fixed_category() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = output.clone();
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
-            .with_writer(move || Capture(writer.clone())).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
         tracing::subscriber::with_default(subscriber, || {
             for (error, category) in [
                 (native_memory::Error::Denied, "denied"),
@@ -1385,18 +1401,33 @@ mod native_logging_tests {
                 (native_memory::Error::Cancelled, "cancelled"),
             ] {
                 output.lock().unwrap().clear();
-                log_native_authority_failure("00000000-0000-4000-8000-000000000001", error, NativeAuthorityStage::Admission);
+                log_native_authority_failure(
+                    "00000000-0000-4000-8000-000000000001",
+                    error,
+                    NativeAuthorityStage::Admission,
+                );
                 let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
                 assert!(text.contains("00000000-0000-4000-8000-000000000001"));
-                assert!(text.contains(&format!("category=\"{category}\"")), "wrong fixed category");
+                assert!(
+                    text.contains(&format!("category=\"{category}\"")),
+                    "wrong fixed category"
+                );
             }
             output.lock().unwrap().clear();
-            log_native_authority_failure("sentinel-secret-token-query-content", native_memory::Error::Denied, NativeAuthorityStage::Admission);
+            log_native_authority_failure(
+                "sentinel-secret-token-query-content",
+                native_memory::Error::Denied,
+                NativeAuthorityStage::Admission,
+            );
             let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
             assert!(!text.contains("sentinel-secret-token-query-content"));
             assert!(text.contains("turn_id=invalid"));
             output.lock().unwrap().clear();
-            log_native_authority_failure("00000000-0000-4000-8000-000000000001", native_memory::Error::Unavailable, NativeAuthorityStage::Release);
+            log_native_authority_failure(
+                "00000000-0000-4000-8000-000000000001",
+                native_memory::Error::Unavailable,
+                NativeAuthorityStage::Release,
+            );
             let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
             assert!(text.contains("stage=\"native_release\""));
             assert!(text.contains("outcome=\"release_unverified\""));
