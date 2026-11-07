@@ -685,6 +685,40 @@ async fn handle_tools_list(
     JsonRpcResponse::ok(id, result)
 }
 
+// Log only a validated, non-authorizing turn ID and a fixed category. The
+// underlying control-channel error may combine peer denial and policy denial;
+// do not infer a more specific cause or format the error or request.
+#[derive(Clone, Copy)]
+enum NativeAuthorityStage {
+    Admission,
+    Release,
+}
+
+fn log_native_authority_failure(
+    turn_id: &str,
+    error: native_memory::Error,
+    stage: NativeAuthorityStage,
+) {
+    let correlation = uuid::Uuid::parse_str(turn_id)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "invalid".to_owned());
+    let category = match error {
+        native_memory::Error::Denied => "denied",
+        native_memory::Error::Invalid => "invalid",
+        native_memory::Error::Expired => "expired",
+        native_memory::Error::Replay => "replay",
+        native_memory::Error::Conflict => "conflict",
+        native_memory::Error::Unavailable => "unavailable",
+        native_memory::Error::Uncertain => "uncertain",
+        native_memory::Error::Cancelled => "cancelled",
+    };
+    let (stage, outcome) = match stage {
+        NativeAuthorityStage::Admission => ("native_authorization", "admission_unverified"),
+        NativeAuthorityStage::Release => ("native_release", "release_unverified"),
+    };
+    warn!(turn_id = %correlation, stage, outcome, category, "native authority operation failed");
+}
+
 /// Map a classified auth failure to its MCP error code.
 fn auth_error_code(e: &AuthError) -> i32 {
     match e {
@@ -1058,12 +1092,20 @@ async fn handle_tools_call(
                     }
                 }
                 .await;
-                let Ok(handle) = admitted else {
-                    return JsonRpcResponse::err(
-                        id,
-                        error_code::PERMISSION_DENIED,
-                        "native OAuth denied",
-                    );
+                let handle = match admitted {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        log_native_authority_failure(
+                            &turn_id,
+                            error,
+                            NativeAuthorityStage::Admission,
+                        );
+                        return JsonRpcResponse::err(
+                            id,
+                            error_code::PERMISSION_DENIED,
+                            "native OAuth denied",
+                        );
+                    }
                 };
                 let digest = match native_memory::response::request_binding(&routed.signed_request)
                 {
@@ -1175,7 +1217,8 @@ async fn handle_tools_call(
                 Ok((client, deadline)) => {
                     response.native_release = Some((client, turn_id.clone(), digest, deadline))
                 }
-                Err(_) => {
+                Err(error) => {
+                    log_native_authority_failure(&turn_id, error, NativeAuthorityStage::Release);
                     state.native_pending.lock().await.remove(&turn_id);
                     return JsonRpcResponse::err(
                         response.id,
@@ -1317,4 +1360,77 @@ async fn handle_tools_call(
         |content| serde_json::from_str(content).unwrap_or(json!({ "text": content })),
     )
     .await
+}
+
+#[cfg(test)]
+mod native_logging_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn admission_log_uses_only_validated_id_and_fixed_category() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for (error, category) in [
+                (native_memory::Error::Denied, "denied"),
+                (native_memory::Error::Invalid, "invalid"),
+                (native_memory::Error::Expired, "expired"),
+                (native_memory::Error::Replay, "replay"),
+                (native_memory::Error::Conflict, "conflict"),
+                (native_memory::Error::Unavailable, "unavailable"),
+                (native_memory::Error::Uncertain, "uncertain"),
+                (native_memory::Error::Cancelled, "cancelled"),
+            ] {
+                output.lock().unwrap().clear();
+                log_native_authority_failure(
+                    "00000000-0000-4000-8000-000000000001",
+                    error,
+                    NativeAuthorityStage::Admission,
+                );
+                let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                assert!(text.contains("00000000-0000-4000-8000-000000000001"));
+                assert!(
+                    text.contains(&format!("category=\"{category}\"")),
+                    "wrong fixed category"
+                );
+            }
+            output.lock().unwrap().clear();
+            log_native_authority_failure(
+                "sentinel-secret-token-query-content",
+                native_memory::Error::Denied,
+                NativeAuthorityStage::Admission,
+            );
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(!text.contains("sentinel-secret-token-query-content"));
+            assert!(text.contains("turn_id=invalid"));
+            output.lock().unwrap().clear();
+            log_native_authority_failure(
+                "00000000-0000-4000-8000-000000000001",
+                native_memory::Error::Unavailable,
+                NativeAuthorityStage::Release,
+            );
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(text.contains("stage=\"native_release\""));
+            assert!(text.contains("outcome=\"release_unverified\""));
+        });
+    }
 }
