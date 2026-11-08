@@ -420,6 +420,55 @@ impl GraphAdapter for SqliteGraphAdapter {
         tx.commit()?;
         Ok(true)
     }
+    fn compare_exchange_optional_nodes(
+        &self,
+        updates: &[(Option<GraphNode>, GraphNode)],
+    ) -> Result<bool> {
+        let mut keys = std::collections::BTreeSet::new();
+        anyhow::ensure!(!updates.is_empty(), "empty compare-exchange");
+        for (old, new) in updates {
+            anyhow::ensure!(
+                old.as_ref().is_none_or(|old| old.node_key == new.node_key)
+                    && keys.insert(&new.node_key),
+                "invalid compare-exchange keys"
+            );
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (old, new) in updates {
+            let found = tx
+                .query_row(
+                    "SELECT kind,label,data_json FROM graph_nodes WHERE node_key=?1",
+                    [&new.node_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match (old, found) {
+                (None, None) => {}
+                (Some(old), Some((kind, label, data)))
+                    if kind == old.kind
+                        && label == old.label
+                        && serde_json::from_str::<serde_json::Value>(&data)? == old.data => {}
+                _ => return Ok(false),
+            }
+        }
+        for (old, new) in updates {
+            let data = serde_json::to_string(&new.data)?;
+            if old.is_some() {
+                tx.execute("UPDATE graph_nodes SET kind=?1,label=?2,data_json=?3,updated_at=CURRENT_TIMESTAMP WHERE node_key=?4", params![new.kind, new.label, data, new.node_key])?;
+            } else {
+                tx.execute("INSERT INTO graph_nodes (node_key,kind,label,data_json,updated_at) VALUES (?1,?2,?3,?4,CURRENT_TIMESTAMP)", params![new.node_key, new.kind, new.label, data])?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
     fn upsert_node(&self, node: &GraphNode) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -826,6 +875,152 @@ impl SqliteGraphStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn optional_cas_node(key: &str, value: i64) -> GraphNode {
+        GraphNode {
+            node_key: key.into(),
+            kind: "test".into(),
+            label: None,
+            data: serde_json::json!({"value":value}),
+        }
+    }
+
+    #[test]
+    fn optional_node_cas_conflicts_and_rolls_back_atomically() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let adapter = storage.adapter();
+        let a = optional_cas_node("a", 1);
+        let a2 = optional_cas_node("a", 2);
+        let b = optional_cas_node("b", 3);
+        adapter.upsert_node(&a).unwrap();
+        assert!(!adapter
+            .compare_exchange_optional_nodes(&[(Some(a2.clone()), a2.clone()), (None, b.clone())])
+            .unwrap());
+        assert_eq!(adapter.get_node("a").unwrap(), Some(a.clone()));
+        assert_eq!(adapter.get_node("b").unwrap(), None);
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(Some(a.clone()), a2.clone()), (None, b.clone())])
+            .unwrap());
+        assert!(!adapter
+            .compare_exchange_optional_nodes(&[(None, b.clone())])
+            .unwrap());
+        assert!(adapter.compare_exchange_optional_nodes(&[]).is_err());
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(None, b.clone()), (None, b.clone())])
+            .is_err());
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(Some(a.clone()), b.clone())])
+            .is_err());
+        storage.raw_conn().lock().unwrap().execute_batch("CREATE TRIGGER reject_c BEFORE INSERT ON graph_nodes WHEN NEW.node_key='c' BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+        let c = optional_cas_node("c", 4);
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(Some(a2.clone()), a.clone()), (None, c)])
+            .is_err());
+        assert_eq!(adapter.get_node("a").unwrap(), Some(a2));
+        assert_eq!(adapter.get_node("b").unwrap(), Some(b));
+        assert_eq!(adapter.get_node("c").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_node_cas_concurrent_creation_has_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.db");
+        let first = SqliteGraphStorage::open(&path).unwrap().adapter();
+        let second = SqliteGraphStorage::open(&path).unwrap().adapter();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, adapter)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    adapter
+                        .compare_exchange_optional_nodes(&[(
+                            None,
+                            optional_cas_node("new", i as i64),
+                        )])
+                        .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|&&won| won).count(), 1);
+        let reopened = SqliteGraphStorage::open(&path).unwrap().adapter();
+        assert!(reopened.get_node("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn optional_node_cas_mixed_contention_and_lost_response_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.db");
+        let first = SqliteGraphStorage::open(&path).unwrap().adapter();
+        let second = SqliteGraphStorage::open(&path).unwrap().adapter();
+        let original = optional_cas_node("present", 1);
+        first.upsert_node(&original).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, adapter)| {
+                let barrier = barrier.clone();
+                let original = original.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    adapter
+                        .compare_exchange_optional_nodes(&[
+                            (Some(original), optional_cas_node("present", i as i64 + 2)),
+                            (None, optional_cas_node("new", i as i64 + 2)),
+                        ])
+                        .unwrap()
+                })
+            })
+            .collect();
+        let won: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(won.iter().filter(|&&x| x).count(), 1);
+        // Model a discarded success response, not an actual commit error.
+        let reopened = SqliteGraphStorage::open(&path).unwrap().adapter();
+        let present = reopened.get_node("present").unwrap().unwrap();
+        let created = reopened.get_node("new").unwrap().unwrap();
+        assert_eq!(present.data, created.data);
+        assert!(!reopened
+            .compare_exchange_optional_nodes(&[
+                (Some(original), optional_cas_node("present", 9)),
+                (None, optional_cas_node("new", 9))
+            ])
+            .unwrap());
+    }
+
+    #[test]
+    fn optional_node_cas_default_adapter_refuses() {
+        struct Unsupported;
+        impl GraphAdapter for Unsupported {
+            fn upsert_node(&self, _: &GraphNode) -> Result<()> {
+                unreachable!()
+            }
+            fn get_node(&self, _: &str) -> Result<Option<GraphNode>> {
+                unreachable!()
+            }
+            fn delete_node(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            fn list_nodes_by_kind(&self, _: &str) -> Result<Vec<GraphNode>> {
+                unreachable!()
+            }
+            fn upsert_edge(&self, _: &GraphEdge) -> Result<()> {
+                unreachable!()
+            }
+            fn delete_edge(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            fn list_edges_from(&self, _: &str, _: Option<&str>) -> Result<Vec<GraphEdge>> {
+                unreachable!()
+            }
+        }
+        assert!(Unsupported
+            .compare_exchange_optional_nodes(&[(None, optional_cas_node("a", 1))])
+            .is_err());
+    }
 
     fn plan_for(sql: &str) -> String {
         let storage = SqliteGraphStorage::open_in_memory().unwrap();
