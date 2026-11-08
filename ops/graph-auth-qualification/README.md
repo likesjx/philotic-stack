@@ -9,7 +9,7 @@ Uses the same graph image as the existing passing fixture:
 
 The candidate creates one empty graph with the server binary's MEMGRAPH_PASSFILE mechanism. It validates the file before executing the server, then verifies:
 1. The only initial account is the expected synthetic account; its password works.
-2. Wrong password, empty password, fully empty basic credentials, Bolt scheme=none and nonexistent username are rejected with the driver's explicit Unauthorized authentication error, not an arbitrary failure.
+2. Wrong password, empty password, fully empty basic credentials, Bolt scheme=none and nonexistent username are rejected with the server's explicit authentication-failure code (Neo.ClientError.Security.Unauthorized or Memgraph.ClientError.Security.Unauthenticated), not an arbitrary failure.
 3. Positive queries work before and after the negative checks.
 4. Authentication survives a controlled stop/start with a verified zero exit status and retained data.
 5. Changing the bootstrap passfile does not overwrite the already-created user's password on restart.
@@ -53,3 +53,5 @@ No Docker/listener attempt was made locally. No VPS changes, credentials, grants
 ## Local review result
 
 Independent review found a cleanup false-pass (success recorded before scratch removal), missing unauthenticated scheme=none coverage, insufficient positive-failure categories, and unchecked restart exit status. These are corrected and regression-tested. No Docker compatibility or actual authentication result is claimed from those checks.
+
+The first real-image run (42519316128) reached correct-password and single-user verification, then failed our negative-case classifier. The upstream v3.10.1 Bolt state source emits Memgraph.ClientError.Security.Unauthenticated, not Neo4j's Unauthorized code: https://github.com/memgraph/memgraph/blob/0e77b786fc03fe4f92a18b9730940e11c62a0c32/src/communication/bolt/v1/states/init.hpp . The correction accepts only those two explicit auth codes from a typed Neo4j protocol error; unrelated errors still fail. Negative cases now carry fixed case labels in failures. This run does not prove all denials or restart behavior. Cleanup passed.

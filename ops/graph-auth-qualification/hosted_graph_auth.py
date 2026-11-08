@@ -103,7 +103,9 @@ def ready(ident, nonce, image, phase):
         safe = result.stdout.strip()
         if safe != "graph_auth:failed:transport_unavailable":
             allowed = {"positive_response", "unexpected_initial_users",
-                       "denial_not_authentication", "unauthorized_connection_accepted",
+                       *("denial_" + case + "_" + reason
+                         for case in ("wrong_password", "empty_password", "empty_basic", "no_auth_scheme", "unknown_user")
+                         for reason in ("not_authentication", "accepted")),
                        "positive_authentication_denied", "dependency_unavailable",
                        "driver_or_query_failure"}
             category = safe.removeprefix("graph_auth:failed:")

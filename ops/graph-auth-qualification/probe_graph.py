@@ -6,12 +6,14 @@ from launch_graph import read_private
 USER = "beta_fixture"
 URI = "bolt://127.0.0.1:7687"
 UNAUTHORIZED = "Neo.ClientError.Security.Unauthorized"
+MEMGRAPH_UNAUTHENTICATED = "Memgraph.ClientError.Security.Unauthenticated"
+AUTH_CODES = {UNAUTHORIZED, MEMGRAPH_UNAUTHENTICATED}
 
 class ProbeFailure(Exception):
     pass
 
 def classify(error, auth_error):
-    if isinstance(error, auth_error) and getattr(error, "code", None) == UNAUTHORIZED:
+    if isinstance(error, auth_error) and getattr(error, "code", None) in AUTH_CODES:
         return "authentication_denied"
     return "other_failure"
 
@@ -32,14 +34,14 @@ def accepted(factory, password):
     if query(factory, USER, password, "SHOW USERS") != [[USER]]:
         raise ProbeFailure("unexpected_initial_users")
 
-def denied(factory, auth_error, username, password):
+def denied(factory, auth_error, username, password, case="unspecified"):
     try:
         query(factory, username, password, "RETURN 1 AS ok")
     except Exception as error:
         if classify(error, auth_error) == "authentication_denied":
             return
-        raise ProbeFailure("denial_not_authentication") from None
-    raise ProbeFailure("unauthorized_connection_accepted")
+        raise ProbeFailure("denial_" + case + "_not_authentication") from None
+    raise ProbeFailure("denial_" + case + "_accepted")
 
 def check(factory, auth_error, credentials, phase):
     if (set(credentials) != {"password", "replacement"} or
@@ -54,11 +56,11 @@ def check(factory, auth_error, credentials, phase):
         if classify(error, auth_error) == "authentication_denied":
             raise ProbeFailure("positive_authentication_denied") from None
         raise
-    denied(factory, auth_error, USER, credentials["replacement"])
-    denied(factory, auth_error, USER, "")
-    denied(factory, auth_error, "", "")
-    denied(factory, auth_error, None, None)  # Bolt scheme=none, not empty basic.
-    denied(factory, auth_error, "absent_fixture_user", credentials["password"])
+    denied(factory, auth_error, USER, credentials["replacement"], "wrong_password")
+    denied(factory, auth_error, USER, "", "empty_password")
+    denied(factory, auth_error, "", "", "empty_basic")
+    denied(factory, auth_error, None, None, "no_auth_scheme")  # Bolt scheme=none, not empty basic.
+    denied(factory, auth_error, "absent_fixture_user", credentials["password"], "unknown_user")
     # Bracket all denials with positive queries so unavailability is not a pass.
     try:
         accepted(factory, credentials["password"])
@@ -74,7 +76,7 @@ def check(factory, auth_error, credentials, phase):
 if __name__ == "__main__":
     try:
         from neo4j import GraphDatabase
-        from neo4j.exceptions import AuthError, ServiceUnavailable
+        from neo4j.exceptions import Neo4jError, ServiceUnavailable
     except ImportError:
         print("graph_auth:failed:dependency_unavailable")
         sys.exit(1)
@@ -82,7 +84,7 @@ if __name__ == "__main__":
         if len(sys.argv) != 3:
             raise ProbeFailure("usage")
         credentials = json.loads(read_private(sys.argv[1]))
-        check(GraphDatabase.driver, AuthError, credentials, sys.argv[2])
+        check(GraphDatabase.driver, Neo4jError, credentials, sys.argv[2])
         print("graph_auth:" + sys.argv[2] + ":passed")
     except ProbeFailure as e:
         print("graph_auth:failed:" + str(e))

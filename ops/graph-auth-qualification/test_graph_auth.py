@@ -92,17 +92,24 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(len(fake.calls), 9)
             self.assertTrue(any(kw["auth"] is None for _,kw in fake.calls))
     def test_unauthenticated_server_fails(self):
-        with self.assertRaisesRegex(probe.ProbeFailure, "unauthorized_connection_accepted"):
+        with self.assertRaisesRegex(probe.ProbeFailure, "denial_wrong_password_accepted"):
             probe.check(Fake(accept_all=True), AuthError, {"password":PASSWORD,"replacement":OTHER}, "fresh")
     def test_correct_credentials_auth_failure_is_explicit(self):
         with self.assertRaisesRegex(probe.ProbeFailure, "positive_authentication_denied"):
             probe.check(Fake(failure=AuthError()), AuthError, {"password":PASSWORD,"replacement":OTHER}, "fresh")
     def test_transport_failure_is_not_denial(self):
-        with self.assertRaisesRegex(probe.ProbeFailure, "denial_not_authentication"):
+        with self.assertRaisesRegex(probe.ProbeFailure, "denial_unspecified_not_authentication"):
             probe.denied(Fake(failure=ConnectionError("private")), AuthError, probe.USER, OTHER)
+    def test_memgraph_specific_auth_code(self):
+        err=AuthError("do not print"); err.code=probe.MEMGRAPH_UNAUTHENTICATED
+        probe.denied(Fake(failure=err),AuthError,probe.USER,OTHER,"wrong_password")
+    def test_arbitrary_memgraph_error_is_not_denial(self):
+        err=AuthError("private"); err.code="Memgraph.ClientError.Statement.SessionLimitReached"
+        with self.assertRaisesRegex(probe.ProbeFailure,"denial_wrong_password_not_authentication"):
+            probe.denied(Fake(failure=err),AuthError,probe.USER,OTHER,"wrong_password")
     def test_wrong_error_code_is_not_denial(self):
         err = AuthError("private"); err.code = "Neo.ClientError.Security.Forbidden"
-        with self.assertRaisesRegex(probe.ProbeFailure, "denial_not_authentication"):
+        with self.assertRaisesRegex(probe.ProbeFailure, "denial_unspecified_not_authentication"):
             probe.denied(Fake(failure=err), AuthError, probe.USER, OTHER)
     def test_bad_credentials_refused(self):
         with self.assertRaises(probe.ProbeFailure):
@@ -166,7 +173,7 @@ class HostedTests(unittest.TestCase):
             self.assertEqual(call.call_args_list[1].args[0],["wait",ident])
             self.assertEqual(call.call_args_list[2].args[0],["rm",ident])
     def test_semantic_probe_failure_not_retried(self):
-        result=type("R",(),{"returncode":1,"stdout":"graph_auth:failed:unauthorized_connection_accepted"})()
+        result=type("R",(),{"returncode":1,"stdout":"graph_auth:failed:denial_wrong_password_accepted"})()
         with patch.object(hosted,"owned",return_value={"State":{"Running":True}}), patch.object(hosted,"probe",return_value=result) as call, patch.object(hosted.time,"sleep") as sleep:
             with self.assertRaises(hosted.Failure): hosted.ready("a"*64,"b"*32,"sha256:"+"c"*64,"fresh")
             self.assertEqual(call.call_count,1);sleep.assert_not_called()
