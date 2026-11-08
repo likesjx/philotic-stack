@@ -5,9 +5,9 @@
 //! these traits via `Arc<dyn XxxStorage>`, making the storage engine a
 //! pluggable deployment-time decision.
 
+use crate::NodeCapabilities;
 use crate::event::EventEnvelope;
 use crate::graph::{GraphEdge, GraphNode};
-use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -299,6 +299,18 @@ pub trait GraphAdapter: Send + Sync {
     /// security-sensitive operation with a read/write loop.
     fn compare_exchange_nodes(&self, _updates: &[(GraphNode, GraphNode)]) -> Result<bool> {
         anyhow::bail!("atomic node compare-exchange unsupported")
+    }
+    /// Atomically replace or insert each node if every expected complete node
+    /// matches, or if `None` expects the replacement key to be absent. Keys
+    /// must be unique and expected/replacement keys must agree. False means a
+    /// known comparison conflict; an error may represent an uncertain commit.
+    /// Equality covers GraphNode fields, not storage timestamps or ABA history.
+    /// Unsupported backends must refuse rather than emulate non-atomically.
+    fn compare_exchange_optional_nodes(
+        &self,
+        _updates: &[(Option<GraphNode>, GraphNode)],
+    ) -> Result<bool> {
+        anyhow::bail!("atomic optional node compare-exchange unsupported")
     }
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn get_node(&self, node_key: &str) -> Result<Option<GraphNode>>;
