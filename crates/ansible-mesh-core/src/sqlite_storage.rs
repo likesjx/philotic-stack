@@ -9,7 +9,7 @@ use crate::graph::{GraphEdge, GraphNode};
 use crate::storage::{CursorStorage, EventStorage, GraphAdapter};
 use anyhow::{Context, Result};
 use rusqlite::types::{Type, ValueRef};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -893,47 +893,29 @@ mod tests {
         let a2 = optional_cas_node("a", 2);
         let b = optional_cas_node("b", 3);
         adapter.upsert_node(&a).unwrap();
-        assert!(
-            !adapter
-                .compare_exchange_optional_nodes(&[
-                    (Some(a2.clone()), a2.clone()),
-                    (None, b.clone())
-                ])
-                .unwrap()
-        );
+        assert!(!adapter
+            .compare_exchange_optional_nodes(&[(Some(a2.clone()), a2.clone()), (None, b.clone())])
+            .unwrap());
         assert_eq!(adapter.get_node("a").unwrap(), Some(a.clone()));
         assert_eq!(adapter.get_node("b").unwrap(), None);
-        assert!(
-            adapter
-                .compare_exchange_optional_nodes(&[
-                    (Some(a.clone()), a2.clone()),
-                    (None, b.clone())
-                ])
-                .unwrap()
-        );
-        assert!(
-            !adapter
-                .compare_exchange_optional_nodes(&[(None, b.clone())])
-                .unwrap()
-        );
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(Some(a.clone()), a2.clone()), (None, b.clone())])
+            .unwrap());
+        assert!(!adapter
+            .compare_exchange_optional_nodes(&[(None, b.clone())])
+            .unwrap());
         assert!(adapter.compare_exchange_optional_nodes(&[]).is_err());
-        assert!(
-            adapter
-                .compare_exchange_optional_nodes(&[(None, b.clone()), (None, b.clone())])
-                .is_err()
-        );
-        assert!(
-            adapter
-                .compare_exchange_optional_nodes(&[(Some(a.clone()), b.clone())])
-                .is_err()
-        );
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(None, b.clone()), (None, b.clone())])
+            .is_err());
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(Some(a.clone()), b.clone())])
+            .is_err());
         storage.raw_conn().lock().unwrap().execute_batch("CREATE TRIGGER reject_c BEFORE INSERT ON graph_nodes WHEN NEW.node_key='c' BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
         let c = optional_cas_node("c", 4);
-        assert!(
-            adapter
-                .compare_exchange_optional_nodes(&[(Some(a2.clone()), a.clone()), (None, c)])
-                .is_err()
-        );
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(Some(a2.clone()), a.clone()), (None, c)])
+            .is_err());
         assert_eq!(adapter.get_node("a").unwrap(), Some(a2));
         assert_eq!(adapter.get_node("b").unwrap(), Some(b));
         assert_eq!(adapter.get_node("c").unwrap(), None);
@@ -1001,14 +983,12 @@ mod tests {
         let present = reopened.get_node("present").unwrap().unwrap();
         let created = reopened.get_node("new").unwrap().unwrap();
         assert_eq!(present.data, created.data);
-        assert!(
-            !reopened
-                .compare_exchange_optional_nodes(&[
-                    (Some(original), optional_cas_node("present", 9)),
-                    (None, optional_cas_node("new", 9))
-                ])
-                .unwrap()
-        );
+        assert!(!reopened
+            .compare_exchange_optional_nodes(&[
+                (Some(original), optional_cas_node("present", 9)),
+                (None, optional_cas_node("new", 9))
+            ])
+            .unwrap());
     }
 
     #[test]
@@ -1037,11 +1017,9 @@ mod tests {
                 unreachable!()
             }
         }
-        assert!(
-            Unsupported
-                .compare_exchange_optional_nodes(&[(None, optional_cas_node("a", 1))])
-                .is_err()
-        );
+        assert!(Unsupported
+            .compare_exchange_optional_nodes(&[(None, optional_cas_node("a", 1))])
+            .is_err());
     }
 
     fn plan_for(sql: &str) -> String {

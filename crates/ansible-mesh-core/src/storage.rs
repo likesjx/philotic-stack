@@ -5,9 +5,9 @@
 //! these traits via `Arc<dyn XxxStorage>`, making the storage engine a
 //! pluggable deployment-time decision.
 
-use crate::NodeCapabilities;
 use crate::event::EventEnvelope;
 use crate::graph::{GraphEdge, GraphNode};
+use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
