@@ -27,6 +27,8 @@ pub mod integration;
 pub mod keychain;
 pub mod ledger;
 pub mod local_agent_tools;
+#[cfg(all(test, unix))]
+mod linux_custody_fixture;
 pub mod materializer;
 pub mod mcp_endpoint;
 pub mod mcp_route;
