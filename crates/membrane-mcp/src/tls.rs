@@ -1,6 +1,6 @@
 //! Optional direct transport security. Proxy identity never grants user authority.
-use anyhow::{ensure, Context, Result};
-use axum::{extract::ConnectInfo, Extension, Router};
+use anyhow::{Context, Result, ensure};
+use axum::{Extension, Router, extract::ConnectInfo};
 use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -13,8 +13,8 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
 use tokio_rustls::{
-    rustls::{self, server::WebPkiClientVerifier, RootCertStore},
     TlsAcceptor,
+    rustls::{self, RootCertStore, server::WebPkiClientVerifier},
 };
 
 #[derive(Deserialize)]
