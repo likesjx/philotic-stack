@@ -128,6 +128,21 @@ impl VaultResolver for IpcVaultResolver {
 ///
 /// Narrowing (ceiling drops below the declared tier) rebinds immediately;
 /// widening only happens after re-validation against the declared tier.
+// Replay uses persisted configuration and the hotel ceiling, not the status summary.
+fn endpoint_status_replay(
+    data: &serde_json::Value,
+) -> (
+    Option<McpEndpointConfig>,
+    Option<ansible_mesh_core::ExposureTier>,
+) {
+    (
+        data.get("config")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        data.get("hotel_ceiling")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+    )
+}
+
 struct ListenerManager {
     port: u16,
     state: Arc<MembraneState>,
@@ -345,18 +360,14 @@ impl MembraneGuest for McpMembrane {
                     data: Some(data),
                     ..
                 }) => {
-                    if let Some(config) = data.get("config").and_then(|value| {
-                        serde_json::from_value::<McpEndpointConfig>(value.clone()).ok()
-                    }) {
+                    let (config, ceiling) = endpoint_status_replay(&data);
+                    if let Some(config) = config {
                         *self.state.declared_exposure.write().unwrap() = Some(config.exposure);
                         let mut table = self.state.endpoint_table.write().await;
                         table.update(config);
                         info!("replayed persisted MCP endpoint config on startup");
                     }
-                    if let Some(tier) = data
-                        .get("hotel_ceiling")
-                        .and_then(|value| serde_json::from_value(value.clone()).ok())
-                    {
+                    if let Some(tier) = ceiling {
                         *self.state.ingress_tier.write().unwrap() = tier;
                     }
                     // Declared exposure and/or ceiling may have changed the
@@ -781,5 +792,30 @@ async fn main() -> Result<()> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod endpoint_status_replay_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn endpoint_status_replay_handles_nullable_active_without_losing_ceiling() {
+        for active in [json!(null), json!(false)] {
+            let (config, ceiling) = endpoint_status_replay(&json!({
+                "active": active, "config": null, "hotel_ceiling": "lan"
+            }));
+            assert!(config.is_none());
+            assert_eq!(ceiling, Some(ansible_mesh_core::ExposureTier::Lan));
+        }
+        let (config, ceiling) = endpoint_status_replay(&json!({
+            "active": true, "config": {"endpoint_id":"e", "owner_agent_id":"a",
+              "port": 1234, "tools": [], "updated_at": 1}, "hotel_ceiling": "local"
+        }));
+        assert_eq!(config.unwrap().endpoint_id, "e");
+        assert_eq!(ceiling, Some(ansible_mesh_core::ExposureTier::Local));
+        let (config, _) = endpoint_status_replay(&json!({"active": null, "config": {"bad": true}}));
+        assert!(config.is_none());
     }
 }
