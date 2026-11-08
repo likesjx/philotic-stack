@@ -18241,3 +18241,124 @@ async fn mcp_endpoint_status_distinguishes_inactive_unknown_and_persisted_config
     assert!(data["config_sha256"].is_null());
     assert_eq!(data["hotel_ceiling"], "local");
 }
+
+#[tokio::test]
+async fn apply_agent_bundle_rejects_reserved_config_destinations_before_side_effects() {
+    use philotic_client::{AgentMigrationBundle, ConfigEntryExport, VaultEntryExport};
+    let graph = register_skill_test_graph();
+    graph
+        .upsert_hotel(&HotelRecord {
+            hotel_name: "destination".into(),
+            capabilities: NodeCapabilities {
+                node_id: "node".into(),
+                roles: vec![],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+                build_version: String::new(),
+            },
+            mesh_host: None,
+            mesh_port: 1,
+            blob_port: 2,
+            execution_port: 3,
+            ipc_socket_path: "/unused".into(),
+            active_pid: None,
+        })
+        .unwrap();
+    let bundle = AgentMigrationBundle {
+        migration_id: "migration".into(),
+        source_hotel: "source".into(),
+        agent_id: "agent".into(),
+        agent_key: "agent".into(),
+        agent_identity: AgentIdentityRecord {
+            agent_id: "agent".into(),
+            persona_name: "synthetic".into(),
+            authority_hotel: "source".into(),
+            bundle_json: serde_json::json!({}),
+        },
+        apartments: vec![],
+        role_incarnations: vec![],
+        vault_entries: vec![],
+        config_entries: vec![ConfigEntryExport {
+            key: "telegram_allowed_users_agent".into(),
+            value_json: "[]".into(),
+        }],
+        guests: vec![],
+        timestamp: 1,
+    };
+    graph
+        .set_config_value("__mcp_endpoint__:pilot", "null")
+        .unwrap();
+    for vault in [false, true] {
+        let mut bad = bundle.clone();
+        if vault {
+            bad.vault_entries.push(VaultEntryExport {
+                config_key: "__mcp_preapproval__:pilot".into(),
+                vault_name: "test".into(),
+                plaintext: "synthetic-secret".into(),
+                allowed_roles: vec![],
+            });
+        } else {
+            bad.config_entries.push(ConfigEntryExport {
+                key: "__mcp_endpoint__:pilot".into(),
+                value_json: "{}".into(),
+            });
+        }
+        let err = IpcServer::handle_apply_agent_bundle(
+            &graph,
+            "node",
+            None,
+            &serde_json::to_string(&bad).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("reserved MCP config key"));
+        assert!(!err.to_string().contains("synthetic-secret"));
+        assert!(graph.get_agent_identity("agent").unwrap().is_none());
+        assert!(
+            graph
+                .get_config_value("telegram_allowed_users_agent")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            graph
+                .get_config_value("__mcp_endpoint__:pilot")
+                .unwrap()
+                .as_deref(),
+            Some("null")
+        );
+        assert!(
+            graph
+                .get_config_value("__mcp_preapproval__:pilot")
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        IpcServer::handle_apply_agent_bundle(
+            &graph,
+            "node",
+            None,
+            &serde_json::to_string(&bundle).unwrap()
+        )
+        .await
+        .unwrap(),
+        "agent"
+    );
+    assert_eq!(
+        graph
+            .get_config_value("telegram_allowed_users_agent")
+            .unwrap()
+            .as_deref(),
+        Some("[]")
+    );
+    assert_eq!(
+        graph
+            .get_agent_identity("agent")
+            .unwrap()
+            .unwrap()
+            .authority_hotel,
+        "destination"
+    );
+}

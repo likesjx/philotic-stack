@@ -8972,6 +8972,19 @@ impl IpcServer {
     ) -> anyhow::Result<String> {
         let bundle: AgentMigrationBundle = serde_json::from_str(bundle_json)
             .context("failed to deserialise AgentMigrationBundle")?;
+        // Check both destinations before any identity, vault, config or guest writes.
+        // Reserved MCP state must pass through its dedicated provisioning handlers.
+        anyhow::ensure!(
+            !bundle
+                .config_entries
+                .iter()
+                .any(|entry| entry.key.starts_with("__mcp_"))
+                && !bundle
+                    .vault_entries
+                    .iter()
+                    .any(|entry| entry.config_key.starts_with("__mcp_")),
+            "migration bundle contains a reserved MCP config key"
+        );
         let dest_hotel = Self::local_hotel_name(graph, local_node_id)
             .ok_or_else(|| anyhow::anyhow!("local hotel record missing"))?;
         let source_hotel = &bundle.source_hotel;
