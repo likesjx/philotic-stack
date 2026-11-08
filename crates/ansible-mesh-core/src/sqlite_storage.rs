@@ -379,23 +379,35 @@ impl SqliteGraphAdapter {
 
 #[cfg(test)]
 thread_local! {
-    static NATIVE_EXPIRY_TEST_HOOK: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static NATIVE_EXPIRY_TEST_HOOK: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>, bool)>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 pub(crate) fn install_native_expiry_test_hook(
     ready: std::sync::mpsc::Sender<()>,
     proceed: std::sync::mpsc::Receiver<()>,
 ) {
-    NATIVE_EXPIRY_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some((ready, proceed)));
+    NATIVE_EXPIRY_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some((ready, proceed, false)));
+}
+/// Only for an externally supervised synthetic process that must be killed.
+#[cfg(test)]
+pub(crate) fn install_native_expiry_kill_fixture_hook(
+    ready: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+) {
+    NATIVE_EXPIRY_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some((ready, proceed, true)));
 }
 #[cfg(test)]
 fn pause_native_before_commit_for_test() -> Result<()> {
     let hook = NATIVE_EXPIRY_TEST_HOOK.with(|hook| hook.borrow_mut().take());
-    if let Some((ready, proceed)) = hook {
+    if let Some((ready, proceed, until_killed)) = hook {
         ready.send(()).context("test hook receiver dropped")?;
-        proceed
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .context("test hook timed out")?;
+        if until_killed {
+            proceed.recv().context("kill fixture hook disconnected")?;
+        } else {
+            proceed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .context("test hook timed out")?;
+        }
     }
     Ok(())
 }

@@ -22,6 +22,7 @@ const PREFIX: &str = "philotic-custody-fixture-";
 const CHILD_ENV: &str = "PHILOTIC_CUSTODY_FIXTURE_CHILD";
 const ROOT_ENV: &str = "PHILOTIC_CUSTODY_FIXTURE_ROOT";
 const UID_ENV: &str = "PHILOTIC_CUSTODY_FIXTURE_UID";
+const PLAN_HASH_ENV: &str = "PHILOTIC_CUSTODY_FIXTURE_PLAN_HASH";
 
 fn fixture_path(path: &Path) -> Result<()> {
     ensure!(
@@ -177,6 +178,26 @@ fn start_child(
         command.spawn().context("synthetic child spawn failed")?,
         Arc::clone(cleanup_ok),
     ))
+}
+
+fn start_domain_child(root: &Path, hash: &str, cleanup_ok: &Arc<AtomicBool>) -> Result<OwnedChild> {
+    let child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "linux_custody_fixture::interrupted_domain_writer",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env(CHILD_ENV, "domain-writer")
+        .env(ROOT_ENV, root)
+        .env(PLAN_HASH_ENV, hash)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("synthetic domain child spawn failed")?;
+    Ok(OwnedChild(child, Arc::clone(cleanup_ok)))
 }
 
 fn await_ready(child: &mut OwnedChild, marker: &'static str) -> Result<()> {
@@ -343,9 +364,71 @@ fn interrupted_writer() -> Result<()> {
     bail!("parent failed to interrupt synthetic writer")
 }
 
+#[test]
+#[ignore = "owned child only; launched by the disposable Linux test"]
+fn interrupted_domain_writer() -> Result<()> {
+    ensure!(cfg!(target_os = "linux"), "Linux fixture required");
+    ensure!(
+        std::env::var(CHILD_ENV).as_deref() == Ok("domain-writer"),
+        "child role required"
+    );
+    ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "synthetic root writer required"
+    );
+    let root = fixture_child_path()?;
+    let hash = std::env::var(PLAN_HASH_ENV)?;
+    ensure!(
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid synthetic plan hash"
+    );
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (proceed_tx, proceed_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        crate::sqlite_storage::install_native_expiry_kill_fixture_hook(ready_tx, proceed_rx);
+        let generation = "b".repeat(64);
+        let expected = crate::maintenance_plan::PlanExpectation {
+            exact_sha256: &hash,
+            operator: "admin",
+            hotel: "hotel",
+            database_id: "hotel-db",
+            endpoint: "pilot",
+            owner: "owner",
+            generation_sha256: &generation,
+        };
+        crate::domain::mcp_maintenance::execute_offline_maintenance_fixture(
+            &root.join("interrupted-domain.db"),
+            &root.join("interrupted-plan/plan.json"),
+            0,
+            0,
+            &expected,
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(15))
+        .context("synthetic domain precommit not reached")?;
+    println!("SYNTHETIC_DOMAIN_PRECOMMIT_READY");
+    std::io::stdout().flush()?;
+    let _keep_sender_open = proceed_tx;
+    let _keep_worker = worker;
+    // Only the fixture parent can end this process. Its bounded owner guard
+    // kills/reaps the process on failures; there is no timeout that could let
+    // the transaction roll back before the parent sends SIGKILL.
+    loop {
+        std::thread::park();
+    }
+}
+
 // Actual domain/receipt code, but still a synthetic in-process operation.
 // This does not establish systemd activation inhibition or issuer revocation.
-fn exercise_offline_domain(root: &Path) -> Result<()> {
+fn exercise_offline_domain(
+    root: &Path,
+    interrupted: bool,
+    children_reaped: &Arc<AtomicBool>,
+) -> Result<()> {
     use crate::{
         domain::{
             mcp_maintenance::{endpoint_digest, execute_offline_maintenance_fixture},
@@ -356,7 +439,11 @@ fn exercise_offline_domain(root: &Path) -> Result<()> {
         storage::GraphAdapter,
     };
     use sha2::{Digest, Sha256};
-    let db = root.join("state.db");
+    let db = root.join(if interrupted {
+        "interrupted-domain.db"
+    } else {
+        "state.db"
+    });
     let storage = SqliteGraphStorage::open(&db)?; // synthetic setup only
     let graph = GraphDomain::new(Arc::new(storage.adapter()));
     let original = serde_json::json!({"endpoint_id":"pilot","owner_agent_id":"owner","port":19101,
@@ -374,7 +461,11 @@ fn exercise_offline_domain(root: &Path) -> Result<()> {
     drop(graph);
     drop(storage);
     fs::set_permissions(&db, fs::Permissions::from_mode(0o600))?;
-    let plan_dir = root.join("plan");
+    let plan_dir = root.join(if interrupted {
+        "interrupted-plan"
+    } else {
+        "plan"
+    });
     fs::create_dir(&plan_dir)?;
     fs::set_permissions(&plan_dir, fs::Permissions::from_mode(0o750))?;
     let now = std::time::SystemTime::now()
@@ -386,7 +477,7 @@ fn exercise_offline_domain(root: &Path) -> Result<()> {
         "operation_id":"01234567-89ab-4cde-8fab-0123456789ab","operator":"admin","hotel":"hotel",
         "database_id":"hotel-db","endpoint":"pilot","owner":"owner","expected_endpoint_sha256":old_digest,
         "generation_sha256":generation,"approval_reference":"approval","issued_at":now,
-        "authorize_until":now+100,"rule_expires_at":now+200}),
+        "authorize_until":now+600,"rule_expires_at":now+900}),
     )?;
     let plan = plan_dir.join("plan.json");
     fs::write(&plan, &bytes)?;
@@ -401,6 +492,74 @@ fn exercise_offline_domain(root: &Path) -> Result<()> {
         owner: "owner",
         generation_sha256: &generation,
     };
+    if interrupted {
+        let mut writer = start_domain_child(root, &hash, children_reaped)?;
+        await_ready(&mut writer, "SYNTHETIC_DOMAIN_PRECOMMIT_READY")?;
+        writer
+            .0
+            .kill()
+            .context("synthetic domain writer stop failed")?;
+        ensure!(
+            await_exit(&mut writer)?.signal() == Some(libc::SIGKILL),
+            "synthetic domain writer was not killed as expected"
+        );
+        drop(writer);
+        let storage = SqliteGraphStorage::open_existing_maintenance_fixture(&db)?;
+        let adapter = storage.adapter();
+        let key = "config:__native_maintenance_receipt__:01234567-89ab-4cde-8fab-0123456789ab";
+        let receipt = adapter
+            .get_node(key)?
+            .context("synthetic receipt slot missing")?
+            .data;
+        ensure!(
+            receipt["state"] == "empty" && receipt["plan_digest"] == hash,
+            "interrupted receipt mismatch"
+        );
+        let graph = GraphDomain::new(Arc::new(adapter));
+        let observed: serde_json::Value = serde_json::from_str(
+            &graph
+                .get_config_value("__mcp_endpoint__:pilot")?
+                .context("endpoint missing")?,
+        )?;
+        let index: serde_json::Value = serde_json::from_str(
+            &graph
+                .get_config_value("__mcp_preapproval__:pilot")?
+                .context("index missing")?,
+        )?;
+        ensure!(
+            observed == original && index == original["preapproval_rules"],
+            "interrupted transaction left partial update"
+        );
+        let mut revoked = observed;
+        revoked["preapproval_rules"] = serde_json::json!([]);
+        graph.set_config_value("__mcp_endpoint__:pilot", &revoked.to_string())?;
+        graph.set_config_value("__mcp_preapproval__:pilot", "[]")?;
+        drop(graph);
+        drop(storage);
+        let err = execute_offline_maintenance_fixture(&db, &plan, 0, 0, &expected).unwrap_err();
+        ensure!(
+            format!("{err:#}").contains("existing receipt requires reconciliation"),
+            "interrupted operation was retried"
+        );
+        let storage = SqliteGraphStorage::open_existing_maintenance_fixture(&db)?;
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let current: serde_json::Value = serde_json::from_str(
+            &graph
+                .get_config_value("__mcp_endpoint__:pilot")?
+                .context("endpoint missing")?,
+        )?;
+        let current_index: serde_json::Value = serde_json::from_str(
+            &graph
+                .get_config_value("__mcp_preapproval__:pilot")?
+                .context("index missing")?,
+        )?;
+        ensure!(
+            current == revoked && current_index == serde_json::json!([]),
+            "later synthetic revocation changed"
+        );
+        println!("synthetic_domain_interrupt_and_later_endpoint_revocation_observed");
+        return Ok(());
+    }
     execute_offline_maintenance_fixture(&db, &plan, 0, 0, &expected)?;
     let storage = SqliteGraphStorage::open_existing_maintenance_fixture(&db)?;
     let adapter = storage.adapter();
@@ -451,6 +610,7 @@ fn exercise_offline_domain(root: &Path) -> Result<()> {
         index == serde_json::json!([]),
         "synthetic revocation index changed"
     );
+    println!("synthetic_domain_success_and_endpoint_revocation_observed");
     Ok(())
 }
 
@@ -548,7 +708,8 @@ fn disposable_linux_filesystem_and_interruption() -> Result<()> {
             })?;
         ensure!(value == 1, "uncommitted synthetic write survived");
         drop(conn);
-        exercise_offline_domain(&root)?;
+        exercise_offline_domain(&root, false, &children_reaped)?;
+        exercise_offline_domain(&root, true, &children_reaped)?;
         Ok(())
     })).map_err(|_| anyhow::anyhow!("synthetic fixture panicked")).and_then(|r| r);
     if !cleanup_target_matches(
