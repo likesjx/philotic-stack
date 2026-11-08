@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable hosted Linux only; exact synthetic containers, no network."""
+"""Disposable hosted Linux only; containers are network-isolated; pull uses registry."""
 import json
 import os
 import pathlib
@@ -39,21 +39,25 @@ def main():
             and pathlib.Path('/sys/fs/cgroup/cgroup.controllers').is_file()):
         raise RuntimeError('exclusive disposable Linux runner required')
     nonce=uuid.uuid4().hex
-    owned={}; uncertain=False; outcome='inconclusive'; failures=[]
+    owned={}; uncertain=False; outcome='inconclusive'; failures=[]; stage='pull'
     try:
         call(['pull',IMAGE])
         for role in ('mongo','runtime'):
             name='philotic-cgroup-observe-'+nonce+'-'+role
             # Record the name before creation; resolve uncertain create during cleanup.
             owned[role]={'name':name,'id':None}
+            stage=role+'_create'
             ident=call(['create','--name',name,'--label',LABEL+'='+nonce,'--network','none',
                         '--restart=no','--cap-drop','ALL','--security-opt','no-new-privileges',
                         '--memory','64m','--pids-limit','16',IMAGE,'sleep','300'])
             if not ID.fullmatch(ident): raise RuntimeError('synthetic creation uncertain')
             owned[role]['id']=ident
+            stage=role+'_inspect'
             item=inspect(ident,nonce)
             if item.get('Name')!='/'+name: raise RuntimeError('synthetic name uncertain')
+            stage=role+'_start'
             call(['start',ident])
+        stage='retire'
         try:
             retire_owned_runtime(docker,owned['runtime']['id'],owned['mongo']['id'],nonce)
             outcome='stopped_and_cgroup_empty'
@@ -63,6 +67,7 @@ def main():
             else: raise
     except BaseException:
         uncertain=True
+        print('synthetic_failure_stage='+stage)
     finally:
         for item in reversed(list(owned.values())):
             try:
@@ -78,6 +83,8 @@ def main():
                 if after: raise RuntimeError('removal uncertain')
             except BaseException:
                 failures.append('cleanup_uncertain')
+    if failures:
+        print('synthetic_cleanup_failure=owned_container')
     print('synthetic_cgroup_observation='+outcome)
     print('synthetic_container_cleanup='+('uncertain' if failures or uncertain else 'confirmed'))
     if uncertain or failures or outcome!='stopped_and_cgroup_empty': raise SystemExit(1)
