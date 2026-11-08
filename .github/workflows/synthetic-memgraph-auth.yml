@@ -19,10 +19,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Cheap no-service checks
-        run: python3 -B -m unittest discover -s ops/graph-auth-qualification -p 'test_*.py' -v
+        run: |
+          python3 -B -m unittest discover -s ops/graph-auth-qualification -p 'test_*.py' -v
       - name: Install hash-pinned pure Python test driver
-        run: python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-compile --target "$RUNNER_TEMP/graph-auth-deps" -r ops/graph-auth-qualification/requirements.txt
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-compile --target "$RUNNER_TEMP/graph-auth-deps" -r ops/graph-auth-qualification/requirements.txt
       - name: Pull exact graph image
-        run: docker pull memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27
+        run: |
+          docker pull memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27
       - name: Initial user, denial and persistent authentication
-        run: python3 -B ops/graph-auth-qualification/hosted_graph_auth.py --deps "$RUNNER_TEMP/graph-auth-deps"
+        run: |
+          python3 -B ops/graph-auth-qualification/hosted_graph_auth.py --deps "$RUNNER_TEMP/graph-auth-deps"
