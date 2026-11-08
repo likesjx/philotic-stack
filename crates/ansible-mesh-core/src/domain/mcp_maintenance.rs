@@ -104,6 +104,14 @@ impl GraphDomain {
             // Explicit reconciliation after reading the current digest. No
             // durable write or version increment; permits re-enqueueing a lost
             // push. An old request digest still fails above.
+            anyhow::ensure!(
+                self.adapter.compare_exchange_nodes_before(
+                    &[(old.clone(), old), (old_index.clone(), old_index)],
+                    now,
+                    new_expiry,
+                )?,
+                "endpoint changed concurrently"
+            );
             return Ok((expected_digest.to_owned(), config));
         }
         anyhow::ensure!(
@@ -134,8 +142,11 @@ impl GraphDomain {
         let mut new_index = old_index.clone();
         new_index.data["value"] = serde_json::to_string(&value["preapproval_rules"])?.into();
         anyhow::ensure!(
-            self.adapter
-                .compare_exchange_nodes(&[(old, new), (old_index, new_index)])?,
+            self.adapter.compare_exchange_nodes_before(
+                &[(old, new), (old_index, new_index)],
+                now,
+                new_expiry
+            )?,
             "endpoint changed concurrently"
         );
         Ok((endpoint_digest(&value)?, serde_json::from_value(value)?))
@@ -148,6 +159,12 @@ mod tests {
     use crate::sqlite_storage::SqliteGraphStorage;
     use std::sync::Barrier;
 
+    fn wall_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
     fn seed(graph: &GraphDomain) -> serde_json::Value {
         let value = serde_json::json!({"endpoint_id":"pilot","owner_agent_id":"owner","port":19101,
         "exposure":"local","tools":[],"allow_unauthenticated":false,"updated_at":10,
@@ -177,16 +194,17 @@ mod tests {
     #[test]
     fn native_maintenance_preserves_unknown_fields_and_rejects_retry_drift() {
         let graph = graph();
+        let now = wall_now();
         let mut value = seed(&graph);
         value["future_field"] = "preserved".into();
         save(&graph, &value);
         let digest = endpoint_digest(&value).unwrap();
         let (next, _) = graph
-            .extend_native_preapprovals("pilot", "owner", &digest, 200, "approval", 20)
+            .extend_native_preapprovals("pilot", "owner", &digest, now + 200, "approval", now)
             .unwrap();
         assert_ne!(digest, next);
         assert!(graph
-            .extend_native_preapprovals("pilot", "owner", &digest, 200, "approval", 20)
+            .extend_native_preapprovals("pilot", "owner", &digest, now + 200, "approval", now)
             .is_err());
         let actual: serde_json::Value = serde_json::from_str(
             &graph
@@ -196,11 +214,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual["future_field"], "preserved");
-        assert_eq!(actual["preapproval_rules"][0]["expires_at"], 200);
+        assert_eq!(actual["preapproval_rules"][0]["expires_at"], now + 200);
     }
     #[test]
     fn native_maintenance_negative_controls_leave_both_records_unchanged() {
         for case in 0..8 {
+            let now = wall_now();
             let graph = graph();
             let mut value = seed(&graph);
             match case {
@@ -229,12 +248,12 @@ mod tests {
                     if case == 6 {
                         100
                     } else if case == 7 {
-                        100000
+                        now + 86401
                     } else {
-                        200
+                        now + 200
                     },
                     "approval",
-                    20
+                    now
                 )
                 .is_err());
             assert_eq!(
@@ -265,6 +284,7 @@ mod tests {
                 .unwrap()
                 .adapter(),
         ));
+        let now = wall_now();
         let barrier = Arc::new(Barrier::new(2));
         let workers: Vec<_> = [first.clone(), second]
             .into_iter()
@@ -278,9 +298,9 @@ mod tests {
                         "pilot",
                         "owner",
                         &digest,
-                        200 + i as u64,
+                        now + 200 + i as u64,
                         "approval",
-                        20,
+                        now,
                     )
                     .is_ok()
                 })
@@ -310,6 +330,164 @@ mod tests {
         .unwrap();
         assert_eq!(saved["preapproval_rules"], index);
     }
+    // The actual SQLite lock wait must not allow an expired rule update.
+    #[test]
+    fn native_maintenance_expiry_during_locked_wait_refuses_without_writes() {
+        use std::sync::{mpsc, Mutex, OnceLock};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        static BUSY_SIGNAL: OnceLock<Mutex<Option<mpsc::Sender<()>>>> = OnceLock::new();
+        fn busy(attempt: i32) -> bool {
+            if attempt == 0 {
+                if let Some(tx) = BUSY_SIGNAL.get().unwrap().lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            attempt < 1200
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hotel.db");
+        let storage = SqliteGraphStorage::open(&path).unwrap();
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let value = seed(&graph);
+        let digest = endpoint_digest(&value).unwrap();
+        let (started, ready) = mpsc::channel();
+        *BUSY_SIGNAL.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(started);
+        storage
+            .raw_conn()
+            .lock()
+            .unwrap()
+            .busy_handler(Some(busy))
+            .unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expiry = now + 4;
+        let worker = std::thread::spawn(move || {
+            graph.extend_native_preapprovals("pilot", "owner", &digest, expiry, "synthetic", now)
+        });
+        // A SQLite busy callback proves the CAS attempted its write transaction
+        // while the other connection held the lock.
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                < expiry
+        );
+        while SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            <= expiry
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(worker.join().unwrap().is_err());
+        let reopened =
+            GraphDomain::new(Arc::new(SqliteGraphStorage::open(&path).unwrap().adapter()));
+        let value: serde_json::Value = serde_json::from_str(
+            &reopened
+                .get_config_value("__mcp_endpoint__:pilot")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["preapproval_rules"][0]["expires_at"], 100);
+        let index: serde_json::Value = serde_json::from_str(
+            &reopened
+                .get_config_value("__mcp_preapproval__:pilot")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index, value["preapproval_rules"]);
+        assert!(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                > expiry
+        );
+    }
+
+    #[test]
+    fn native_maintenance_expiry_before_commit_rolls_back_both_records() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hotel.db");
+        let graph = GraphDomain::new(Arc::new(SqliteGraphStorage::open(&path).unwrap().adapter()));
+        let value = seed(&graph);
+        let digest = endpoint_digest(&value).unwrap();
+        let now = wall_now();
+        let expiry = now + 4;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::sqlite_storage::install_native_expiry_test_hook(ready_tx, proceed_rx);
+            graph.extend_native_preapprovals("pilot", "owner", &digest, expiry, "synthetic", now)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                < expiry
+        );
+        while SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            <= expiry
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        proceed_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        let reopened =
+            GraphDomain::new(Arc::new(SqliteGraphStorage::open(&path).unwrap().adapter()));
+        let actual: serde_json::Value = serde_json::from_str(
+            &reopened
+                .get_config_value("__mcp_endpoint__:pilot")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let index: serde_json::Value = serde_json::from_str(
+            &reopened
+                .get_config_value("__mcp_preapproval__:pilot")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, value);
+        assert_eq!(index, value["preapproval_rules"]);
+    }
+
+    #[test]
+    fn native_maintenance_replay_validates_without_writes() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let value = seed(&graph);
+        let now = wall_now();
+        let expiry = now + 200;
+        let digest = endpoint_digest(&value).unwrap();
+        let (next, _) = graph
+            .extend_native_preapprovals("pilot", "owner", &digest, expiry, "approval", now)
+            .unwrap();
+        storage.raw_conn().lock().unwrap().execute_batch("CREATE TRIGGER reject_replay BEFORE UPDATE ON graph_nodes BEGIN SELECT RAISE(ABORT, 'replay wrote'); END;").unwrap();
+        let (replayed, _) = graph
+            .extend_native_preapprovals("pilot", "owner", &next, expiry, "approval", now)
+            .unwrap();
+        assert_eq!(replayed, next);
+    }
+
     #[test]
     fn native_maintenance_storage_failure_rolls_back_first_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -320,6 +498,7 @@ mod tests {
                 .adapter(),
         ));
         let value = seed(&graph);
+        let now = wall_now();
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("CREATE TRIGGER reject_index BEFORE UPDATE ON graph_nodes WHEN NEW.node_key='config:__mcp_preapproval__:pilot' BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
         assert!(graph
@@ -327,9 +506,9 @@ mod tests {
                 "pilot",
                 "owner",
                 &endpoint_digest(&value).unwrap(),
-                200,
+                now + 200,
                 "approval",
-                20
+                now
             )
             .is_err());
         assert_eq!(
@@ -342,6 +521,7 @@ mod tests {
     }
     #[test]
     fn native_maintenance_owner_drift_is_checked_inside_snapshot() {
+        let now = wall_now();
         let graph = graph();
         let mut value = seed(&graph);
         value["owner_agent_id"] = "new-owner".into();
@@ -353,9 +533,9 @@ mod tests {
                 "pilot",
                 "owner",
                 &endpoint_digest(&value).unwrap(),
-                200,
+                now + 200,
                 "approval",
-                20
+                now
             )
             .is_err());
         assert_eq!(

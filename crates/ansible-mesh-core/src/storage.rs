@@ -300,6 +300,18 @@ pub trait GraphAdapter: Send + Sync {
     fn compare_exchange_nodes(&self, _updates: &[(GraphNode, GraphNode)]) -> Result<bool> {
         anyhow::bail!("atomic node compare-exchange unsupported")
     }
+    /// Compare existing nodes and update only while the rule expiry remains
+    /// in the future and within 24 hours at the locked check and immediately
+    /// before commit. A commit can still complete after the final check.
+    /// Unsupported adapters must fail closed; errors may be uncertain.
+    fn compare_exchange_nodes_before(
+        &self,
+        _updates: &[(GraphNode, GraphNode)],
+        _sampled_at: u64,
+        _expires_at: u64,
+    ) -> Result<bool> {
+        anyhow::bail!("deadline-checked node compare-exchange unsupported")
+    }
     /// Atomically replace or insert each node if every expected complete node
     /// matches, or if `None` expects the replacement key to be absent. Keys
     /// must be unique and expected/replacement keys must agree. False means a
