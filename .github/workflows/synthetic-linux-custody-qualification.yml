@@ -14,7 +14,6 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/synthetic-custody-target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -23,6 +22,8 @@ jobs:
         with:
           toolchain: "1.94.0"
       - name: Build isolated test binary as runner
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/synthetic-custody-target
         shell: bash
         run: |
           set -euo pipefail
