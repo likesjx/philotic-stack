@@ -377,6 +377,49 @@ impl SqliteGraphAdapter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static NATIVE_EXPIRY_TEST_HOOK: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn install_native_expiry_test_hook(
+    ready: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+) {
+    NATIVE_EXPIRY_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some((ready, proceed)));
+}
+#[cfg(test)]
+fn pause_native_before_commit_for_test() -> Result<()> {
+    let hook = NATIVE_EXPIRY_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some((ready, proceed)) = hook {
+        ready.send(()).context("test hook receiver dropped")?;
+        proceed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .context("test hook timed out")?;
+    }
+    Ok(())
+}
+
+// The system wall clock is the existing expiry authority. This checks under
+// the transaction lock and just before COMMIT, not after durable completion.
+fn check_native_expiry(expires_at: u64, not_before: u64) -> Result<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("native expiry clock unavailable")?
+        .as_secs();
+    validate_native_expiry_at(expires_at, not_before, now)?;
+    Ok(now)
+}
+
+fn validate_native_expiry_at(expires_at: u64, not_before: u64, now: u64) -> Result<()> {
+    anyhow::ensure!(now >= not_before, "native expiry clock moved backwards");
+    anyhow::ensure!(
+        expires_at > now && expires_at <= now.saturating_add(86_400),
+        "native expiry invalid at transaction"
+    );
+    Ok(())
+}
+
 impl GraphAdapter for SqliteGraphAdapter {
     fn compare_exchange_nodes(&self, updates: &[(GraphNode, GraphNode)]) -> Result<bool> {
         let mut keys = std::collections::BTreeSet::new();
@@ -417,6 +460,60 @@ impl GraphAdapter for SqliteGraphAdapter {
             tx.execute("UPDATE graph_nodes SET kind=?1,label=?2,data_json=?3,updated_at=CURRENT_TIMESTAMP WHERE node_key=?4",
                 params![new.kind,new.label,serde_json::to_string(&new.data)?,new.node_key])?;
         }
+        tx.commit()?;
+        Ok(true)
+    }
+    fn compare_exchange_nodes_before(
+        &self,
+        updates: &[(GraphNode, GraphNode)],
+        sampled_at: u64,
+        expires_at: u64,
+    ) -> Result<bool> {
+        let mut keys = std::collections::BTreeSet::new();
+        anyhow::ensure!(!updates.is_empty(), "empty compare-exchange");
+        for (old, new) in updates {
+            anyhow::ensure!(
+                old.node_key == new.node_key && keys.insert(&old.node_key),
+                "invalid compare-exchange keys"
+            );
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let locked_at = check_native_expiry(expires_at, sampled_at)?;
+        for (old, _) in updates {
+            let found = tx
+                .query_row(
+                    "SELECT kind,label,data_json FROM graph_nodes WHERE node_key=?1",
+                    [&old.node_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((kind, label, data)) = found else {
+                return Ok(false);
+            };
+            if kind != old.kind
+                || label != old.label
+                || serde_json::from_str::<serde_json::Value>(&data)? != old.data
+            {
+                return Ok(false);
+            }
+        }
+        for (old, new) in updates {
+            if old == new {
+                continue;
+            }
+            tx.execute("UPDATE graph_nodes SET kind=?1,label=?2,data_json=?3,updated_at=CURRENT_TIMESTAMP WHERE node_key=?4",
+                params![new.kind,new.label,serde_json::to_string(&new.data)?,new.node_key])?;
+        }
+        #[cfg(test)]
+        pause_native_before_commit_for_test()?;
+        check_native_expiry(expires_at, locked_at)?;
         tx.commit()?;
         Ok(true)
     }
@@ -1020,6 +1117,40 @@ mod tests {
         assert!(Unsupported
             .compare_exchange_optional_nodes(&[(None, optional_cas_node("a", 1))])
             .is_err());
+        let node = optional_cas_node("a", 1);
+        assert!(Unsupported
+            .compare_exchange_nodes_before(&[(node.clone(), node)], 1, 2)
+            .is_err());
+    }
+
+    #[test]
+    fn native_expiry_checks_seconds_bounds_and_clock_regression() {
+        assert!(validate_native_expiry_at(100, 80, 99).is_ok());
+        assert!(validate_native_expiry_at(100, 80, 100).is_err());
+        assert!(validate_native_expiry_at(100, 80, 79).is_err());
+        assert!(validate_native_expiry_at(86_501, 100, 100).is_err());
+        assert!(validate_native_expiry_at(86_500, 100, 100).is_ok());
+    }
+
+    #[test]
+    fn deadline_checked_snapshot_rejects_changed_index_without_writes() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let adapter = storage.adapter();
+        let a = optional_cas_node("endpoint", 1);
+        let b = optional_cas_node("index", 1);
+        adapter.upsert_node(&a).unwrap();
+        adapter.upsert_node(&b).unwrap();
+        let later = optional_cas_node("index", 2);
+        adapter.upsert_node(&later).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!adapter
+            .compare_exchange_nodes_before(&[(a.clone(), a.clone()), (b.clone(), b)], now, now + 30)
+            .unwrap());
+        assert_eq!(adapter.get_node("endpoint").unwrap(), Some(a));
+        assert_eq!(adapter.get_node("index").unwrap(), Some(later));
     }
 
     fn plan_for(sql: &str) -> String {

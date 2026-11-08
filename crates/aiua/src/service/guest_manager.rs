@@ -1574,6 +1574,10 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut digest = endpoint_digest(&value).unwrap();
         for n in 0..100 {
             digest = graph
@@ -1581,9 +1585,9 @@ mod tests {
                     "pilot",
                     "owner",
                     &digest,
-                    200 + n,
+                    now + 200 + n,
                     "synthetic approval",
-                    20,
+                    now,
                 )
                 .unwrap()
                 .0;
