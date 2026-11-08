@@ -25,6 +25,18 @@ account, remote authentication, delegation, or socket permission is introduced.
 
 # Protocol
 
+`GetMcpEndpointStatus` reports persisted state only. `state: "absent"` means no
+stored record; `"tombstone"` means the stored value is JSON null; `"configured"`
+means a typed configuration with the requested endpoint ID was read. Neither a
+tombstone nor a configured record proves issuer revocation, approval-index
+consistency, or that the membrane applied it. `active` is false for absence and
+a tombstone, true for a configured record, and **null** for `"unknown"` state.
+Unknown means a read error or invalid configuration (`status_reason` is a fixed
+category); never coerce it to inactive or proceed with maintenance. The response
+continues to include the full valid configuration. It is not a secret-minimized
+projection or independent per-agent authentication. `effective_state_verified`
+is always false for this status response.
+
 1. Read `GetMcpEndpointStatus`, including `config_sha256`. Inspect the exact owner,
    namespace-related tool definitions, destination, authentication and two finite
    native approvals. Obtain action-specific operator approval for the new expiry.

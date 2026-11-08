@@ -18118,3 +18118,126 @@ fn mcp_owner_check_refuses_an_unregistered_connection() {
         "agent-bjork-01"
     ));
 }
+
+// Direct dispatcher checks: no socket or live data.
+async fn synthetic_endpoint_status_request(server: &IpcServer) -> IpcResponse {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let outbound = CountedSender::new(tx, None, None);
+    let mut subscriptions = Vec::new();
+    let mut identity = None;
+    let mut followups = Vec::new();
+    IpcServer::process_request(
+        IpcRequest::GetMcpEndpointStatus {
+            endpoint_id: "synthetic-pilot".into(),
+        },
+        &server.local_node_id,
+        &server.socket_path,
+        &server.dispatcher_tx,
+        server.graph.as_ref(),
+        &server.inboxes,
+        &server.parked_inbound,
+        &server.pending_pipelines,
+        &server.pending_capability_calls,
+        server.materialization_requester.as_deref(),
+        &server.telegram_poll_leases,
+        &server.desktop_membrane_leases,
+        &server.mcp_membrane_leases,
+        &server.discord_gateway_leases,
+        &server.subagent_leases,
+        &server.subagent_hooks,
+        &server.registry,
+        &server.peer_sockets,
+        server.webrtc_signal_tx.as_ref(),
+        server.heal_queue.as_deref(),
+        Uuid::new_v4(),
+        &outbound,
+        &mut subscriptions,
+        &mut identity,
+        &mut followups,
+        server.operator_surface_tx.as_ref(),
+        &server.resource_registry,
+    )
+    .await
+}
+fn synthetic_status_data(response: IpcResponse) -> serde_json::Value {
+    match response {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        } => data,
+        _ => panic!("synthetic status response unavailable"),
+    }
+}
+#[tokio::test]
+async fn mcp_endpoint_status_distinguishes_inactive_unknown_and_persisted_config() {
+    use ansible_mesh_core::{
+        ExposureTier, PerimeterSnapshot, domain::mcp_maintenance::endpoint_digest,
+        mcp_endpoint::McpEndpointConfig,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic-hotel.db");
+    let graph = Arc::new(GraphDomain::new(Arc::new(
+        SqliteGraphStorage::open(&path).unwrap().adapter(),
+    )));
+    let (tx, _rx) = test_dispatcher_channel();
+    let server = IpcServer::new("unused", "synthetic-node", tx, graph.clone());
+    let ceiling = PerimeterSnapshot {
+        ceiling: ExposureTier::Lan,
+        ..Default::default()
+    };
+    graph
+        .set_config_value(
+            "__hotel_perimeter__",
+            &serde_json::to_string(&ceiling).unwrap(),
+        )
+        .unwrap();
+    let key = "__mcp_endpoint__:synthetic-pilot";
+    let data = synthetic_status_data(synthetic_endpoint_status_request(&server).await);
+    assert_eq!(data["state"], "absent");
+    assert_eq!(data["active"], false);
+    assert!(data["config"].is_null());
+    assert_eq!(data["hotel_ceiling"], "lan");
+    assert_eq!(data["effective_state_verified"], false);
+    graph.set_config_value(key, "null").unwrap();
+    let data = synthetic_status_data(synthetic_endpoint_status_request(&server).await);
+    assert_eq!(data["state"], "tombstone");
+    assert_eq!(data["active"], false);
+    assert!(data["config"].is_null());
+    for raw in [
+        "{SENTINEL_SECRET",
+        "{\"endpoint_id\":\"synthetic-pilot\"}",
+        "{\"endpoint_id\":\"other\",\"owner_agent_id\":\"owner\",\"port\":1,\"tools\":[],\"updated_at\":1}",
+        "{\"endpoint_id\":\"synthetic-pilot\",\"owner_agent_id\":\"\",\"port\":1,\"tools\":[],\"updated_at\":1}",
+    ] {
+        graph.set_config_value(key, raw).unwrap();
+        let data = synthetic_status_data(synthetic_endpoint_status_request(&server).await);
+        assert_eq!(data["state"], "unknown");
+        assert_eq!(data["status_reason"], "invalid_config");
+        assert!(data["active"].is_null());
+        assert!(data["config"].is_null());
+        assert!(data["config_sha256"].is_null());
+        assert_eq!(data["hotel_ceiling"], "lan");
+        assert!(!data.to_string().contains("SENTINEL_SECRET"));
+    }
+    let valid = serde_json::json!({"endpoint_id":"synthetic-pilot","owner_agent_id":"owner","port":19101,"tools":[],"updated_at":1,"future_field":{"preserved":true}});
+    graph.set_config_value(key, &valid.to_string()).unwrap();
+    let data = synthetic_status_data(synthetic_endpoint_status_request(&server).await);
+    assert_eq!(data["state"], "configured");
+    assert_eq!(data["active"], true);
+    assert_eq!(data["config"], valid);
+    assert_eq!(data["config_sha256"], endpoint_digest(&valid).unwrap());
+    assert!(serde_json::from_value::<McpEndpointConfig>(data["config"].clone()).is_ok());
+    assert_eq!(data["hotel_ceiling"], "lan");
+    assert_eq!(data["effective_state_verified"], false);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE graph_nodes;").unwrap();
+    drop(conn);
+    let data = synthetic_status_data(synthetic_endpoint_status_request(&server).await);
+    assert_eq!(data["state"], "unknown");
+    assert_eq!(data["status_reason"], "read_error");
+    assert!(data["active"].is_null());
+    assert!(data["config"].is_null());
+    assert!(data["config_sha256"].is_null());
+    assert_eq!(data["hotel_ceiling"], "local");
+}

@@ -7877,13 +7877,36 @@ impl IpcServer {
             }
 
             IpcRequest::GetMcpEndpointStatus { endpoint_id } => {
-                use ansible_mesh_core::{ExposureTier, PerimeterSnapshot};
+                use ansible_mesh_core::{
+                    ExposureTier, PerimeterSnapshot, mcp_endpoint::McpEndpointConfig,
+                };
                 let config_key = format!("__mcp_endpoint__:{endpoint_id}");
-                let config: Option<serde_json::Value> = graph
-                    .get_config_value(&config_key)
-                    .ok()
-                    .flatten()
-                    .and_then(|j| serde_json::from_str(&j).ok());
+                // Missing and the explicit revocation tombstone are known inactive
+                // states. Read failures or invalid stored JSON are unknown, not inactive.
+                let (state, config, reason) = match graph.get_config_value(&config_key) {
+                    Err(_) => ("unknown", None, Some("read_error")),
+                    Ok(None) => ("absent", None, None),
+                    Ok(Some(raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(serde_json::Value::Null) => ("tombstone", None, None),
+                        Ok(value) => {
+                            match serde_json::from_value::<McpEndpointConfig>(value.clone()) {
+                                Ok(typed)
+                                    if typed.endpoint_id == endpoint_id
+                                        && !typed.owner_agent_id.is_empty() =>
+                                {
+                                    ("configured", Some(value), None)
+                                }
+                                _ => ("unknown", None, Some("invalid_config")),
+                            }
+                        }
+                        Err(_) => ("unknown", None, Some("invalid_config")),
+                    },
+                };
+                let active = match state {
+                    "configured" => Some(true),
+                    "absent" | "tombstone" => Some(false),
+                    _ => None,
+                };
                 let ceiling = graph
                     .get_config_value("__hotel_perimeter__")
                     .ok()
@@ -7898,7 +7921,10 @@ impl IpcServer {
                         "config": config,
                         "config_sha256": config.as_ref().and_then(|v| ansible_mesh_core::domain::mcp_maintenance::endpoint_digest(v).ok()),
                         "hotel_ceiling": ceiling,
-                        "active": config.is_some(),
+                        "active": active,
+                        "state": state,
+                        "status_reason": reason,
+                        "effective_state_verified": false,
                     })),
                 )
             }
