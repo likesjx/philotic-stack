@@ -27,6 +27,9 @@ pub mod integration;
 pub mod keychain;
 pub mod ledger;
 pub mod local_agent_tools;
+#[cfg(all(test, unix))]
+mod linux_custody_fixture;
+pub mod maintenance_plan;
 pub mod materializer;
 pub mod mcp_endpoint;
 pub mod mcp_route;
@@ -47,6 +50,8 @@ pub mod privacy_storage;
 pub mod procedure;
 #[cfg(unix)]
 pub mod process_artifact;
+#[cfg(unix)]
+pub mod protected_config;
 pub mod provenance;
 pub mod provider_keys;
 pub mod registry;

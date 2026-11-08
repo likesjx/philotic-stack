@@ -312,6 +312,18 @@ pub trait GraphAdapter: Send + Sync {
     ) -> Result<bool> {
         anyhow::bail!("deadline-checked node compare-exchange unsupported")
     }
+    /// Also checks an independently supplied administrator deadline while
+    /// holding the write lock and immediately before commit. The deadline is
+    /// not authentication, and completion may occur after the final check.
+    fn compare_exchange_nodes_before_authorized(
+        &self,
+        _updates: &[(GraphNode, GraphNode)],
+        _sampled_at: u64,
+        _rule_expires_at: u64,
+        _authorize_until: u64,
+    ) -> Result<bool> {
+        anyhow::bail!("authorization-deadline compare-exchange unsupported")
+    }
     /// Atomically replace or insert each node if every expected complete node
     /// matches, or if `None` expects the replacement key to be absent. Keys
     /// must be unique and expected/replacement keys must agree. False means a

@@ -1,0 +1,56 @@
+name: Synthetic offline domain custody qualification
+
+on:
+  push:
+    branches: [codex/synthetic-offline-domain-custody]
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-custody:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master at review
+        with:
+          toolchain: "1.94.0"
+      - name: Build isolated test binary as runner
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/synthetic-custody-target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ansible-mesh-core --lib --no-run --message-format=json > "$RUNNER_TEMP/synthetic-custody-build.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)
+          records = []
+          with open(pathlib.Path(os.environ['RUNNER_TEMP']) / 'synthetic-custody-build.json', encoding='utf-8') as stream:
+              for line in stream:
+                  obj = json.loads(line)
+                  if obj.get('reason') == 'compiler-artifact' and obj.get('target', {}).get('name') == 'ansible_mesh_core' and obj.get('profile', {}).get('test') and obj.get('executable'):
+                      records.append(pathlib.Path(obj['executable']))
+          if len(records) != 1 or records[0].is_symlink():
+              raise SystemExit('test binary selection uncertain')
+          binary = records[0].resolve(strict=True)
+          if not binary.is_file() or root not in binary.parents:
+              raise SystemExit('test binary location uncertain')
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'synthetic-custody-binary').write_text(str(binary), encoding='utf-8')
+          PY
+      - name: Run one root-owned synthetic filesystem fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$(cat "$RUNNER_TEMP/synthetic-custody-binary")"
+          sha256sum "$binary"
+          uname -r
+          "$binary" --list --ignored | grep -Fx 'linux_custody_fixture::disposable_linux_filesystem_and_interruption: test'
+          sudo -n env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted PHILOTIC_DISPOSABLE_LINUX_CUSTODY=1 "$binary" --exact linux_custody_fixture::disposable_linux_filesystem_and_interruption --ignored --nocapture | tee "$RUNNER_TEMP/synthetic-custody-result.txt"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/synthetic-custody-result.txt"

@@ -420,6 +420,73 @@ fn validate_native_expiry_at(expires_at: u64, not_before: u64, now: u64) -> Resu
     Ok(())
 }
 
+impl SqliteGraphAdapter {
+    fn compare_exchange_deadlines(
+        &self,
+        updates: &[(GraphNode, GraphNode)],
+        sampled_at: u64,
+        expires_at: u64,
+        authorize_until: Option<u64>,
+    ) -> Result<bool> {
+        let mut keys = std::collections::BTreeSet::new();
+        anyhow::ensure!(!updates.is_empty(), "empty compare-exchange");
+        for (old, new) in updates {
+            anyhow::ensure!(
+                old.node_key == new.node_key && keys.insert(&old.node_key),
+                "invalid compare-exchange keys"
+            );
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let locked_at = check_native_expiry(expires_at, sampled_at)?;
+        if let Some(deadline) = authorize_until {
+            anyhow::ensure!(locked_at < deadline, "administrator authorization expired");
+        }
+        for (old, _) in updates {
+            let found = tx
+                .query_row(
+                    "SELECT kind,label,data_json FROM graph_nodes WHERE node_key=?1",
+                    [&old.node_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((kind, label, data)) = found else {
+                return Ok(false);
+            };
+            if kind != old.kind
+                || label != old.label
+                || serde_json::from_str::<serde_json::Value>(&data)? != old.data
+            {
+                return Ok(false);
+            }
+        }
+        for (old, new) in updates {
+            if old == new {
+                continue;
+            }
+            tx.execute("UPDATE graph_nodes SET kind=?1,label=?2,data_json=?3,updated_at=CURRENT_TIMESTAMP WHERE node_key=?4",
+                params![new.kind,new.label,serde_json::to_string(&new.data)?,new.node_key])?;
+        }
+        #[cfg(test)]
+        pause_native_before_commit_for_test()?;
+        let before_commit = check_native_expiry(expires_at, locked_at)?;
+        if let Some(deadline) = authorize_until {
+            anyhow::ensure!(
+                before_commit < deadline,
+                "administrator authorization expired"
+            );
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+}
+
 impl GraphAdapter for SqliteGraphAdapter {
     fn compare_exchange_nodes(&self, updates: &[(GraphNode, GraphNode)]) -> Result<bool> {
         let mut keys = std::collections::BTreeSet::new();
@@ -469,53 +536,16 @@ impl GraphAdapter for SqliteGraphAdapter {
         sampled_at: u64,
         expires_at: u64,
     ) -> Result<bool> {
-        let mut keys = std::collections::BTreeSet::new();
-        anyhow::ensure!(!updates.is_empty(), "empty compare-exchange");
-        for (old, new) in updates {
-            anyhow::ensure!(
-                old.node_key == new.node_key && keys.insert(&old.node_key),
-                "invalid compare-exchange keys"
-            );
-        }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let locked_at = check_native_expiry(expires_at, sampled_at)?;
-        for (old, _) in updates {
-            let found = tx
-                .query_row(
-                    "SELECT kind,label,data_json FROM graph_nodes WHERE node_key=?1",
-                    [&old.node_key],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((kind, label, data)) = found else {
-                return Ok(false);
-            };
-            if kind != old.kind
-                || label != old.label
-                || serde_json::from_str::<serde_json::Value>(&data)? != old.data
-            {
-                return Ok(false);
-            }
-        }
-        for (old, new) in updates {
-            if old == new {
-                continue;
-            }
-            tx.execute("UPDATE graph_nodes SET kind=?1,label=?2,data_json=?3,updated_at=CURRENT_TIMESTAMP WHERE node_key=?4",
-                params![new.kind,new.label,serde_json::to_string(&new.data)?,new.node_key])?;
-        }
-        #[cfg(test)]
-        pause_native_before_commit_for_test()?;
-        check_native_expiry(expires_at, locked_at)?;
-        tx.commit()?;
-        Ok(true)
+        self.compare_exchange_deadlines(updates, sampled_at, expires_at, None)
+    }
+    fn compare_exchange_nodes_before_authorized(
+        &self,
+        updates: &[(GraphNode, GraphNode)],
+        sampled_at: u64,
+        expires_at: u64,
+        authorize_until: u64,
+    ) -> Result<bool> {
+        self.compare_exchange_deadlines(updates, sampled_at, expires_at, Some(authorize_until))
     }
     fn compare_exchange_optional_nodes(
         &self,
@@ -823,6 +853,60 @@ pub struct SqliteGraphStorage {
     adapter: SqliteGraphAdapter,
 }
 
+// Point-in-time fixture checks only. They do not prove ACL exclusion, protect
+// the pathname between checks and SQLite's open, or exclude live writers.
+#[cfg(all(test, unix))]
+fn verify_maintenance_fixture_paths(path: &Path, expected_uid: u32) -> Result<()> {
+    use std::{ffi::OsString, os::unix::fs::MetadataExt, path::Component};
+    anyhow::ensure!(path.is_absolute(), "absolute database path required");
+    let mut prefix = std::path::PathBuf::from("/");
+    let mut components = path.components().peekable();
+    anyhow::ensure!(
+        components.next() == Some(Component::RootDir),
+        "invalid path"
+    );
+    anyhow::ensure!(components.peek().is_some(), "database basename required");
+    while let Some(component) = components.next() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!("invalid path component");
+        };
+        prefix.push(part);
+        let m = std::fs::symlink_metadata(&prefix).context("database path unavailable")?;
+        if components.peek().is_some() {
+            anyhow::ensure!(
+                m.file_type().is_dir()
+                    && (m.uid() == 0 || m.uid() == expected_uid)
+                    && m.mode() & 0o7022 == 0,
+                "unsafe database ancestor"
+            );
+        } else {
+            anyhow::ensure!(
+                m.file_type().is_file()
+                    && m.uid() == expected_uid
+                    && m.nlink() == 1
+                    && m.mode() & 0o7137 == 0,
+                "unsafe database file"
+            );
+        }
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name: OsString = path.as_os_str().to_owned();
+        name.push(suffix);
+        match std::fs::symlink_metadata(&name) {
+            Ok(m) => anyhow::ensure!(
+                m.file_type().is_file()
+                    && m.uid() == expected_uid
+                    && m.nlink() == 1
+                    && m.mode() & 0o7137 == 0,
+                "unsafe database sidecar"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => anyhow::bail!("database sidecar unavailable"),
+        }
+    }
+    Ok(())
+}
+
 fn json_column_as_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
     match row.get_ref(index)? {
         ValueRef::Text(bytes) => String::from_utf8(bytes.to_vec()).map_err(|err| {
@@ -840,6 +924,31 @@ fn json_column_as_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Res
 }
 
 impl SqliteGraphStorage {
+    /// Test-only building block for an offline maintenance opener. This does
+    /// not establish directory/sidecar custody, writer exclusion, schema
+    /// authenticity, or administrator authorization and is not a command.
+    #[cfg(all(test, unix))]
+    pub(crate) fn open_existing_maintenance_fixture(db_path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        // The identity is a synthetic local fixture expectation, not proof
+        // of caller authorization or exclusive ACL custody.
+        verify_maintenance_fixture_paths(db_path, unsafe { libc::geteuid() })?;
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .context("existing database open failed")?;
+        // This checks the columns needed by the narrow CAS; it is not a full
+        // schema-version or integrity validation. Never call init_schema here.
+        conn.prepare(
+            "SELECT node_key, kind, label, data_json, updated_at FROM graph_nodes LIMIT 0",
+        )
+        .context("required graph schema unavailable")?;
+        let conn = Arc::new(Mutex::new(conn));
+        let adapter = SqliteGraphAdapter::new(conn.clone());
+        Ok(Self { conn, adapter })
+    }
+
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(db_path).context("Failed to open GraphStorage SQLite DB")?;
         let conn = Arc::new(Mutex::new(conn));
@@ -972,6 +1081,165 @@ impl SqliteGraphStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_fixture_opener_requires_existing_graph_without_initializing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // macOS may present its temporary directory through a symlinked /var.
+        // Resolve the synthetic fixture directory, not an untrusted DB path.
+        let root = dir.path().canonicalize().unwrap();
+        let missing = root.join("missing.db");
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&missing).is_err());
+        assert!(!missing.exists());
+
+        let malformed = root.join("old.db");
+        let conn = Connection::open(&malformed).unwrap();
+        conn.execute_batch("CREATE TABLE graph_nodes (node_key TEXT PRIMARY KEY)")
+            .unwrap();
+        drop(conn);
+        std::fs::set_permissions(&malformed, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&malformed).is_err());
+        let conn = Connection::open(&malformed).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='node_config'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+
+        let existing = root.join("existing.db");
+        let original = SqliteGraphStorage::open(&existing).unwrap();
+        let node = optional_cas_node("existing", 1);
+        original.adapter().upsert_node(&node).unwrap();
+        drop(original);
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let opened = SqliteGraphStorage::open_existing_maintenance_fixture(&existing).unwrap();
+        assert_eq!(opened.adapter().get_node("existing").unwrap(), Some(node));
+        assert!(
+            SqliteGraphStorage::open_existing_maintenance_fixture(Path::new("relative.db"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_fixture_opener_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.db");
+        drop(SqliteGraphStorage::open(&existing).unwrap());
+        let link = dir.path().join("alias.db");
+        symlink(&existing, &link).unwrap();
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_fixture_refuses_unsafe_owner_modes_links_and_sidecars() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let database = root.join("existing.db");
+        drop(SqliteGraphStorage::open(&database).unwrap());
+        let uid = std::fs::metadata(&database).unwrap().uid();
+        assert!(verify_maintenance_fixture_paths(Path::new("/"), uid).is_err());
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(verify_maintenance_fixture_paths(&database, uid.wrapping_add(1)).is_err());
+        let hardlink = root.join("hardlink.db");
+        std::fs::hard_link(&database, &hardlink).unwrap();
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&database).is_err());
+        std::fs::remove_file(&hardlink).unwrap();
+        let sidecar = root.join("existing.db-wal");
+        let target = root.join("untouched");
+        std::fs::write(&target, b"do not change").unwrap();
+        symlink(&target, &sidecar).unwrap();
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&database).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not change");
+        assert!(std::fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&database).is_err());
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(SqliteGraphStorage::open_existing_maintenance_fixture(&database).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = root.join("alias");
+        symlink(&root, &alias).unwrap();
+        assert!(
+            SqliteGraphStorage::open_existing_maintenance_fixture(&alias.join("existing.db"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_fixture_receipt_and_two_nodes_commit_together() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("existing.db");
+        let seeded = SqliteGraphStorage::open(&path).unwrap();
+        let endpoint = optional_cas_node("endpoint", 1);
+        let index = optional_cas_node("index", 1);
+        seeded.adapter().upsert_node(&endpoint).unwrap();
+        seeded.adapter().upsert_node(&index).unwrap();
+        drop(seeded);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let storage = SqliteGraphStorage::open_existing_maintenance_fixture(&path).unwrap();
+        let adapter = storage.adapter();
+        let mut receipt = optional_cas_node("receipt:test-operation", 0);
+        assert!(adapter
+            .compare_exchange_optional_nodes(&[(None, receipt.clone())])
+            .unwrap());
+        let mut next_endpoint = endpoint.clone();
+        next_endpoint.data["value"] = 2.into();
+        let mut next_index = index.clone();
+        next_index.data["value"] = 2.into();
+        let empty_receipt = receipt.clone();
+        receipt.data = serde_json::json!({"operation":"test-operation", "plan_digest":"synthetic", "state":"committed"});
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let changes = [
+            (endpoint, next_endpoint.clone()),
+            (index, next_index.clone()),
+            (empty_receipt, receipt.clone()),
+        ];
+        assert!(adapter
+            .compare_exchange_nodes_before(&changes, now, now + 60)
+            .unwrap());
+        drop(adapter);
+        drop(storage);
+        // Simulate a lost response, not a failed or uncertain COMMIT.
+        let reopened = SqliteGraphStorage::open_existing_maintenance_fixture(&path).unwrap();
+        assert_eq!(
+            reopened.adapter().get_node("endpoint").unwrap(),
+            Some(next_endpoint)
+        );
+        assert_eq!(
+            reopened.adapter().get_node("index").unwrap(),
+            Some(next_index)
+        );
+        assert_eq!(
+            reopened
+                .adapter()
+                .get_node("receipt:test-operation")
+                .unwrap(),
+            Some(receipt)
+        );
+        assert!(!reopened
+            .adapter()
+            .compare_exchange_nodes_before(&changes, now, now + 60)
+            .unwrap());
+    }
 
     fn optional_cas_node(key: &str, value: i64) -> GraphNode {
         GraphNode {
