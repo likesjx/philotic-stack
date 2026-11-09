@@ -1,0 +1,424 @@
+{
+  "native-core": {
+    "id": "native-core",
+    "project": "likesjx/philotic-stack",
+    "coverage": [
+      "Current-source egress guard and negative tests",
+      "Release artifact/version contracts",
+      "Worktree retirement safety using disposable repositories",
+      "Personal-MCP Node suite, including loopback HTTP and broker integration"
+    ],
+    "not_covered": [
+      "Rust compilation, workspace tests or macOS-only clippy/tests",
+      "Real Memgraph/Mongo, container or browser qualification",
+      "Budget-blocked fresh-authority receipt-capture job",
+      "GitHub required checks, publication or deployment"
+    ],
+    "stages": [
+      {
+        "id": "egress-inventory",
+        "argv": [
+          "{python}",
+          "-B",
+          "scripts/check-outbound-egress-inventory.py"
+        ],
+        "inputs": [
+          "scripts/check-outbound-egress-inventory.py",
+          "docs/architecture/outbound-egress-inventory.json"
+        ],
+        "timeout_seconds": 60
+      },
+      {
+        "id": "egress-negative-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_outbound_egress_inventory.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "release-manifest-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_release_manifest.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "worktree-retirement-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_worktree_gc.py",
+          "-v"
+        ],
+        "tools": [
+          "python3",
+          "git"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "gateway-integration",
+        "argv": [
+          "node",
+          "--test",
+          "--test-reporter=tap",
+          "{glob:services/personal-mcp/*.test.mjs}"
+        ],
+        "tools": [
+          "node"
+        ],
+        "inputs": [
+          "services/personal-mcp/package.json"
+        ],
+        "test_kind": "tap",
+        "timeout_seconds": 600
+      }
+    ]
+  },
+  "issuer-contracts": {
+    "id": "issuer-contracts",
+    "project": "likesjx/jaredlikes-com",
+    "coverage": [
+      "Current-source Python issuer/activation contracts with synthetic engines",
+      "Issuer admission and offline CLI contracts (CLI requires prepared mongodb dependency)"
+    ],
+    "not_covered": [
+      "TypeScript/Next build and npm dependency tests",
+      "Real Mongo, browser, Docker and cross-service composition",
+      "Budget-blocked fresh-authority receipt-capture job",
+      "Production, permissions, deployment or GitHub check changes"
+    ],
+    "stages": [
+      {
+        "id": "issuer-contract-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "ops/ansible/issuer",
+          "-p",
+          "test_*.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "ops/ansible/issuer"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "issuer-admission-tests",
+        "argv": [
+          "node",
+          "--test",
+          "--test-reporter=tap",
+          "ops/issuer-admission/operation.test.mjs",
+          "ops/issuer-admission/cli.test.mjs",
+          "ops/issuer-admission/disabled-bootstrap.test.mjs"
+        ],
+        "tools": [
+          "node",
+          "python3"
+        ],
+        "inputs": [
+          "ops/issuer-admission/operation.test.mjs",
+          "ops/issuer-admission/cli.test.mjs",
+          "ops/issuer-admission/disabled-bootstrap.test.mjs"
+        ],
+        "test_kind": "tap",
+        "timeout_seconds": 300
+      }
+    ]
+  },
+  "native-linux-build": {
+    "id": "native-linux-build",
+    "project": "likesjx/philotic-stack",
+    "coverage": [
+      "Native-core checks first",
+      "Offline Linux compile of the release/packages.toml package set"
+    ],
+    "not_covered": [
+      "macOS-only full workspace test/clippy",
+      "Database/container qualification",
+      "Budget-blocked job and publishing"
+    ],
+    "stages": [
+      {
+        "id": "egress-inventory",
+        "argv": [
+          "{python}",
+          "-B",
+          "scripts/check-outbound-egress-inventory.py"
+        ],
+        "inputs": [
+          "scripts/check-outbound-egress-inventory.py",
+          "docs/architecture/outbound-egress-inventory.json"
+        ],
+        "timeout_seconds": 60
+      },
+      {
+        "id": "egress-negative-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_outbound_egress_inventory.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "release-manifest-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_release_manifest.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "worktree-retirement-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_worktree_gc.py",
+          "-v"
+        ],
+        "tools": [
+          "python3",
+          "git"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "gateway-integration",
+        "argv": [
+          "node",
+          "--test",
+          "--test-reporter=tap",
+          "{glob:services/personal-mcp/*.test.mjs}"
+        ],
+        "tools": [
+          "node"
+        ],
+        "inputs": [
+          "services/personal-mcp/package.json"
+        ],
+        "test_kind": "tap",
+        "timeout_seconds": 600
+      },
+      {
+        "id": "linux-compile",
+        "needs": [
+          "egress-inventory",
+          "egress-negative-tests",
+          "release-manifest-tests",
+          "worktree-retirement-tests",
+          "gateway-integration"
+        ],
+        "system": "Linux",
+        "tools": [
+          "cargo",
+          "rustc",
+          "pkg-config",
+          "bash"
+        ],
+        "inputs": [
+          "Cargo.toml",
+          "Cargo.lock",
+          "release/packages.toml",
+          "scripts/release-packages.sh"
+        ],
+        "argv": [
+          "bash",
+          "-euo",
+          "pipefail",
+          "-c",
+          "test \"$(rustc --version | cut -d\" \" -f2)\" = \"1.94.0\"; read -r -a flags <<< \"$(scripts/release-packages.sh cargo-flags --platform linux)\"; test \"${#flags[@]}\" -gt 0; cargo check --offline --locked --target x86_64-unknown-linux-gnu --bins \"${flags[@]}\""
+        ],
+        "timeout_seconds": 3600
+      }
+    ]
+  },
+  "native-portable-verification": {
+    "id": "native-portable-verification",
+    "project": "likesjx/philotic-stack",
+    "coverage": [
+      "Current committed source egress inventory and 36 Python contract/worktree safety checks on macOS."
+    ],
+    "not_covered": [
+      "This limited verification does not replace native-core or native-linux-build.",
+      "Node Unix socket/integration suite omitted here because earlier Linux execution encountered unresolved restrictions; its failed results remain in coverage.",
+      "All Linux platform/fixture qualification, Rust, containers, browser, production, GitHub and blocked receipt-capture scope."
+    ],
+    "stages": [
+      {
+        "id": "egress-inventory",
+        "argv": [
+          "{python}",
+          "-B",
+          "scripts/check-outbound-egress-inventory.py"
+        ],
+        "inputs": [
+          "scripts/check-outbound-egress-inventory.py",
+          "docs/architecture/outbound-egress-inventory.json"
+        ],
+        "timeout_seconds": 60
+      },
+      {
+        "id": "egress-negative-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_outbound_egress_inventory.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "release-manifest-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_release_manifest.py",
+          "-v"
+        ],
+        "tools": [
+          "python3"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      },
+      {
+        "id": "worktree-retirement-tests",
+        "argv": [
+          "{python}",
+          "-B",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "scripts/tests",
+          "-p",
+          "test_worktree_gc.py",
+          "-v"
+        ],
+        "tools": [
+          "python3",
+          "git"
+        ],
+        "inputs": [
+          "scripts/tests"
+        ],
+        "test_kind": "unittest",
+        "timeout_seconds": 300
+      }
+    ]
+  }
+}

@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-11-09",
+  "full_ci_passed": false,
+  "selected_application_profiles_passed": false,
+  "scope": "Ordinary source fallback CI. Historical Linux application evidence is separate from current local harness tests and source-export reproducibility.",
+  "linux_execution": {
+    "platform": "Debian 13, x86_64, glibc 2.41, UID 1000",
+    "node_version": "24.22.1",
+    "python_version": "3.12.14",
+    "runner_sha256": "ff7d1b92bdde935f0f50387fda12925bc96310e7ddb7b9bd36a54e3376af8f16",
+    "source_bundle_sha256": "d94ea876b94bcb1e1856ab343622b7cd9d4c23ce27be8bd9f6efdb705205b626",
+    "sources": [
+      {
+        "project": "likesjx/philotic-stack",
+        "source_sha": "b4c44b86292ffa07f72f27f4560a77f531f46816",
+        "manifest_sha256": "e08539cf37270c10e197b29908cffdaae4ad8934d5696b4a126d5c2b98737af2"
+      },
+      {
+        "project": "likesjx/jaredlikes-com",
+        "source_sha": "e408c470065cdb307cadd518a5703723e2a9e135",
+        "manifest_sha256": "f8a049f514009823b1bb5940913930d1f4be24bdf2097f5da628e1bd1a4e2b4e"
+      }
+    ],
+    "stages": [
+      {
+        "id": "egress-inventory",
+        "status": "passed",
+        "total": null
+      },
+      {
+        "id": "egress-negative-tests",
+        "status": "passed",
+        "total": 3,
+        "passed": 3,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      {
+        "id": "release-manifest-tests",
+        "status": "passed",
+        "total": 14,
+        "passed": 14,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      {
+        "id": "worktree-retirement-tests",
+        "status": "passed",
+        "total": 19,
+        "passed": 19,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      {
+        "id": "gateway-integration",
+        "status": "failed",
+        "total": 140,
+        "passed": 130,
+        "failed": 10,
+        "errors": 0,
+        "skipped": 0,
+        "blockers": [
+          "Six handoff Unix sockets: EPERM; path length 104 bytes.",
+          "Four owner Unix sockets: EINVAL; path length 113 bytes. Path length plausibly explains EINVAL, not verified by retry."
+        ]
+      },
+      {
+        "id": "issuer-contract-tests",
+        "status": "failed",
+        "total": 141,
+        "passed": 135,
+        "failed": 0,
+        "errors": 4,
+        "skipped": 2,
+        "blockers": [
+          "UID1000 fixture conflicts with production trusted-parent UID0/1001 guard.",
+          "Two root/real-Compose cases skipped."
+        ]
+      },
+      {
+        "id": "issuer-admission-tests",
+        "status": "failed",
+        "total": 22,
+        "passed": 21,
+        "failed": 1,
+        "errors": 0,
+        "skipped": 0,
+        "blockers": [
+          "CLI static mongodb import missing from dependency-free snapshot."
+        ]
+      },
+      {
+        "id": "linux-compile",
+        "status": "not-run",
+        "total": null,
+        "blockers": [
+          "Rust/Cargo unavailable.",
+          "Native-core prerequisite has failed socket tests.",
+          "Prepared locked dependencies and attested build-copy handling needed."
+        ]
+      }
+    ],
+    "counts_correction": "Original issuer report incorrectly records zero skips. Raw log shows two. This separate ledger corrects presentation; raw evidence is unchanged.",
+    "evidence_sha256": {
+      "evidence-native-core/report.json": "6fe3b029fc237d3a9b1904b933477b5b9c52cce20ce0065bae9dc216a6a4fbe4",
+      "evidence-native-core/egress-inventory.log": "6a122b5acfa68bbfee438c7c3b68f26478090e37d33a0a202497f13b37a9f1ec",
+      "evidence-native-core/egress-negative-tests.log": "28ae388f859f591c7839b83aca35a84027b5ee89de6d7207a0bf59064040f92e",
+      "evidence-native-core/release-manifest-tests.log": "c2adb7c3ff3aae785ac2134ce01dbc917b321315ff6fbb59bfbd3fce444f311f",
+      "evidence-native-core/worktree-retirement-tests.log": "63dafff6dae698de7629e936cbf0e3347466f6a0ef9c9d6c08e9ff3af33ea356",
+      "evidence-native-core/gateway-integration.log": "75d58ed3a6618f2833bab87483122bf92c191f0b7d34b2974a28abf4acf3d6a0",
+      "evidence-issuer-contracts/report.json": "3d2ba1458009de8a0b4f7e004d26347d1d440bc0ddd9967fc1eb5a3440605fa7",
+      "evidence-issuer-contracts/issuer-contract-tests.log": "57c56ba1ec166dfd0096e2159c8c79c8e19825942c8807949c5103919ef58f2f",
+      "evidence-issuer-contracts/issuer-admission-tests.log": "7fbb9621f8533e79bdc5c1294c71ef27ab23d7a6db428ed338f74f8185b69bed"
+    },
+    "passed_integration": [
+      "Actual loopback HTTP discovery and both recalls (Node test75).",
+      "Separate-connection revision/revocation (Node test110).",
+      "Synthetic issuer OAuth discovery/registration/consent/PKCE/token exchange/revocation (Node tests126-130).",
+      "Issuer synthetic mutation/CAS/reconciliation contracts."
+    ],
+    "not_qualified": [
+      "Unix owner/handoff",
+      "Real Mongo/Memgraph",
+      "Containers/browser",
+      "Root/real Compose",
+      "Rust compile/link/workspace/macOS gates",
+      "Budget-blocked receipt-capture",
+      "Production/deployment/GitHub required checks"
+    ]
+  },
+  "implementation": {
+    "status": "tested-locally",
+    "tests_per_draft": 92,
+    "expected_failures": 0,
+    "skipped": 0,
+    "review": "Independent read-only review found no new blockers after reporting fixes.",
+    "changes": [
+      "Fail-closed summary counters for TODO/cancel/expected-failure/fail/error and inconsistent summaries.",
+      "Python version and executable path/hash evidence without new version probes.",
+      "Git prerequisite for worktree-retirement suite.",
+      "Corrected ONNX offline check-only and Opus pkg-config provisioning guidance."
+    ],
+    "qualification_limit": "Synthetic runner, lifecycle and artifact tests are not Linux or application qualification. Immediate OS-delivered cancellation remains unqualified; only a mocked regression is used."
+  },
+  "provisioning": {
+    "npm": "Already approved for exact twelve lock-pinned official-registry packages, scripts disabled. Two EAI_AGAIN failures, zero downloads/installations. No retry until supported authorized network route exists.",
+    "cache": "All twelve exact tarballs found and integrity-verified read-only on Pro. Not copied, imported, installed or executed; not an authorized bypass.",
+    "rust": "Rust1.94.0, locked registry dependencies and libopus-dev remain separately unapproved. No ONNX acquisition needed for pinned offline cargo check; linking remains separate.",
+    "environment": "No verified personal-dot registry exception control. Supported personal setup clarification remains necessary. No policy changes, alternate routing or restricted operation retries."
+  },
+  "cleanup": {
+    "worktrees_removed": 0,
+    "reason": "Both offload drafts contain dirty workflows/.gitignore/justfile and untracked implementation. Preserve both and original evidence; no safe retirement established."
+  },
+  "current_source_reproducibility": {
+    "status": "passed",
+    "scope": "Source export and non-executing dependency planning only; no application-test qualification",
+    "full_ci_passed": false,
+    "python": "3.14.3 (main, Feb  3 2026, 15:32:20) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "source_exports": [
+      {
+        "project": "likesjx/philotic-stack",
+        "source_sha": "732bf080197842f4cc0fbc1d82c02e7494f370db",
+        "file_count": 985,
+        "manifest_sha256": "d302369e3c762e0287670f98de9f3a91bb5b5fa0de588365fd9a3ebee8809129",
+        "two_exports_identical": true,
+        "application_tests_run": false
+      },
+      {
+        "project": "likesjx/jaredlikes-com",
+        "source_sha": "e408c470065cdb307cadd518a5703723e2a9e135",
+        "file_count": 331,
+        "manifest_sha256": "7ecc952d86fda83479fb772726f311f1af353db55f031f77a83e3a3f134820e2",
+        "two_exports_identical": true,
+        "application_tests_run": false,
+        "dependency_plan_sha256": "27566adcc427e34ab286832ef2e69c8df7388ae731174cc5a1048549655245df",
+        "package_count": 12,
+        "two_dependency_plans_identical": true
+      }
+    ],
+    "exporter_sha256": "bc05b6851320cc6f56188edda42c750524fc521de811e62fb79413e9c218a697",
+    "planner_sha256": "8fcd90866eb28b1ac55c7f70f66237201a5c264ba03ef3628a0ec61b172396e5"
+  },
+  "current_portable_source_verification": {
+    "status": "passed",
+    "profile": "native-portable-verification",
+    "source": {
+      "project": "likesjx/philotic-stack",
+      "source_sha": "732bf080197842f4cc0fbc1d82c02e7494f370db",
+      "source_tree": "3bfca4f201657344ec22926b0e77f7df76a25934",
+      "reference": "732bf080197842f4cc0fbc1d82c02e7494f370db",
+      "manifest_sha256": "d302369e3c762e0287670f98de9f3a91bb5b5fa0de588365fd9a3ebee8809129"
+    },
+    "platform": {
+      "system": "Darwin",
+      "release": "27.2.0",
+      "machine": "arm64"
+    },
+    "python": {
+      "version": "3.14.3 (main, Feb  3 2026, 15:32:20) [Clang 17.0.0 (clang-1700.6.3.2)]",
+      "executable": "/opt/homebrew/opt/python@3.14/bin/python3.14",
+      "sha256": "cbf84109626aa1013bbe408fbb9590bd0f1c1548f038b2221c6b8b87de26ca43"
+    },
+    "runner_sha256": "ee671f0bb64962d02505840639033af61146da78b62f05a6a1ad288e7b4df070",
+    "profile_sha256": "e2958232b32df6de20becf34eea21729876bbbf116360058f17b4692d3304a61",
+    "tests": 36,
+    "failed": 0,
+    "skipped": 0,
+    "egress_inventory": "passed",
+    "full_ci_passed": false,
+    "not_covered": [
+      "This limited verification does not replace native-core or native-linux-build.",
+      "Node Unix socket/integration suite omitted here because earlier Linux execution encountered unresolved restrictions; its failed results remain in coverage.",
+      "All Linux platform/fixture qualification, Rust, containers, browser, production, GitHub and blocked receipt-capture scope."
+    ],
+    "evidence_sha256": {
+      "egress-inventory.log": "6a122b5acfa68bbfee438c7c3b68f26478090e37d33a0a202497f13b37a9f1ec",
+      "egress-negative-tests.log": "aa31a15e1b2a90629bdee300e39544a7769d6d46ff9d682f0981ee21586c72e6",
+      "release-manifest-tests.log": "c85097a866ffe035b53c4d16d483e3d2e946458865b9fe1c8746aa0c04de9641",
+      "report.json": "5cc8f36e6ac670d4e8d13f7a1ea25fbc9b663f60bde63f1b0f476e987a951d04",
+      "worktree-retirement-tests.log": "9310696f4ebd8b94bf6626717c0cb47119d9e626b197357dd866f1969bc509b6"
+    }
+  }
+}

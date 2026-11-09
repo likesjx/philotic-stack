@@ -1239,3 +1239,10 @@ close-workstream:
     
     echo ""
     echo "✅ Workstream closed"
+
+# Ordinary source checks only; no GitHub, Docker, installation or deployment.
+fallback-doctor profile source sha:
+    python3 -B scripts/offload/fallback.py --profile {{quote(profile)}} --source-root {{quote(source)}} --expect-sha {{quote(sha)}} --doctor
+
+fallback-ci profile source sha evidence:
+    python3 -B scripts/offload/fallback.py --profile {{quote(profile)}} --source-root {{quote(source)}} --expect-sha {{quote(sha)}} --evidence {{quote(evidence)}}
