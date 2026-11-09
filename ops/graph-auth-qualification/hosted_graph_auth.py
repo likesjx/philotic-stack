@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 from entry_inventory import inventory, InventoryFailure
+from safe_graph_copy import copy_closed_fixture, CopyFailure
 
 IMAGE = "memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27"
 LABEL = "com.philotic.graph-auth-qualification"
@@ -131,7 +132,7 @@ def main(deps):
     if (os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("CI") != "true"
             or os.environ.get("RUNNER_OS") != "Linux"
             or os.environ.get("GITHUB_REPOSITORY") != "likesjx/philotic-stack"
-            or os.environ.get("GITHUB_REF") != "refs/heads/codex/synthetic-memgraph-layout"):
+            or os.environ.get("GITHUB_REF") != "refs/heads/codex/synthetic-memgraph-link-restore"):
         raise Failure("approved_disposable_job_required")
     source = Path(__file__).resolve().parent
     deps = Path(deps).resolve(strict=True)
@@ -141,6 +142,8 @@ def main(deps):
     if uid == 0:
         raise Failure("nonroot_fixture_uid_required")
     nonce = secrets.token_hex(16)
+    restore_nonce = secrets.token_hex(16)
+    if restore_nonce==nonce: raise Failure("nonce_collision")
     image_info=json.loads(call(["image", "inspect", IMAGE]))
     if type(image_info) is not list or len(image_info)!=1 or IMAGE not in (image_info[0].get("RepoDigests") or []):
         raise Failure("image_digest")
@@ -151,7 +154,9 @@ def main(deps):
         raise Failure("exclusive_empty_runner_required")
     root = Path(tempfile.mkdtemp(prefix="graph-auth-", dir=os.environ["RUNNER_TEMP"]))
     ident = None
+    restore_ident = None
     creation_attempted = False
+    restore_attempted = False
     cleanup_ok = False
     stage = "prepare"
     try:
@@ -212,31 +217,58 @@ def main(deps):
         stage = "inventory"
         counts=inventory(root / "state")
         print("graph_layout:inventory:" + json.dumps(counts,sort_keys=True,separators=(",",":")), flush=True)
+        stage = "copy"
+        copy_closed_fixture(root / "state",root / "restore")
+        print("graph_copy:verified",flush=True)
+        stage = "create_restore"
+        restore_attempted = True
+        restore_ident = call(["create", "--pull", "never", "--name", "graph-auth-" + restore_nonce,
+                      "--label", LABEL + "=" + restore_nonce, "--network", "none",
+                      "--user", str(uid) + ":" + str(gid), "--cap-drop", "ALL",
+                      "--security-opt", "no-new-privileges", "--read-only",
+                      "--restart", "no", "--memory", "2g", "--cpus", "2", "--pids-limit", "256",
+                      "--log-driver", "json-file", "--log-opt", "max-size=1m",
+                      "--log-opt", "max-file=1", "--entrypoint", "python3",
+                      "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
+                      "--tmpfs", "/var/log/memgraph:rw,nosuid,nodev,size=64m,uid=" + str(uid) + ",gid=" + str(gid),
+                      "--mount", "type=bind,src=" + str(root / "restore") + ",dst=/var/lib/memgraph",
+                      "--mount", "type=bind,src=" + str(root / "fixture") + ",dst=/fixture,readonly",
+                      "--mount", "type=bind,src=" + str(source) + ",dst=/qualification,readonly",
+                      "--mount", "type=bind,src=" + str(deps) + ",dst=/deps,readonly",
+                      IMAGE, "/qualification/launch_graph.py"])
+        if not ID.fullmatch(restore_ident) or restore_ident==ident: raise Failure("restore_create_uncertain")
+        restore_contract=dict(mount_contract);restore_contract["/var/lib/memgraph"]=(str(root/"restore"),True)
+        isolated(owned(restore_ident,restore_nonce,image),restore_contract)
+        stage = "restore_start"
+        call(["start",restore_ident]);ready(restore_ident,restore_nonce,image,"restart")
+        stage = "restore_observe"
+        run_layout_probe(restore_ident,"observe")
+        print("graph_restore:record:passed",flush=True)
     except Exception as e:
-        safe = str(e) if isinstance(e, Failure) else "unexpected_local_failure"
+        safe = str(e) if isinstance(e, Failure) else e.category if isinstance(e, CopyFailure) else "unexpected_local_failure"
         print("graph_auth:stage=" + stage + ":failure=" + safe, flush=True)
         raise Failure("qualification_failed") from None
     finally:
+        failures=[]
+        for current,attempted,resource_nonce in ((restore_ident,restore_attempted,restore_nonce),(ident,creation_attempted,nonce)):
+            try:
+                if current is None and attempted:
+                    ids=call(["ps","-aq","--no-trunc","--filter","label="+LABEL+"="+resource_nonce]).split()
+                    if len(ids)!=1 or not ID.fullmatch(ids[0]):raise Failure("create_reconciliation")
+                    current=ids[0]
+                if current is not None:remove(current,resource_nonce,image)
+            except Exception:failures.append("owned_resource")
         try:
-            # Reconcile a lost create response by the exact unpredictable label.
-            if ident is None and creation_attempted:
-                ids = call(["ps", "-aq", "--no-trunc", "--filter", "label=" + LABEL + "=" + nonce]).split()
-                if len(ids) == 1 and ID.fullmatch(ids[0]):
-                    ident = ids[0]
-                else:
-                    raise Failure("create_reconciliation")
-            if ident is not None:
-                remove(ident, nonce, image)
-            if call(["ps", "-aq", "--no-trunc"]) or call(["volume", "ls", "-q"]):
-                raise Failure("cleanup_remaining")
-            remove_scratch(root)
-            cleanup_ok = True
-            print("graph_auth:cleanup:passed", flush=True)
-        except Exception:
-            print("graph_auth:cleanup:inconclusive", flush=True)
-        if not cleanup_ok:
-            raise Failure("cleanup_inconclusive")
-    print("graph_auth:qualification:passed; production_unchanged", flush=True)
+            if call(["ps","-aq","--no-trunc"]) or call(["volume","ls","-q"]):failures.append("inventory")
+        except Exception:failures.append("inventory")
+        if not failures:
+            try:remove_scratch(root)
+            except Exception:failures.append("scratch")
+        if failures:
+            print("graph_auth:cleanup:inconclusive",flush=True)
+            raise Failure("cleanup_inconclusive") from None
+        print("graph_auth:cleanup:passed",flush=True)
+    print("graph_restore:qualification:passed; production_unchanged", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -169,7 +169,7 @@ class HostedTests(unittest.TestCase):
                 if args[0] == "create": return ident
                 return ""
             env={"GITHUB_ACTIONS":"true","CI":"true","RUNNER_OS":"Linux",
-                 "GITHUB_REPOSITORY":"likesjx/philotic-stack","GITHUB_REF":"refs/heads/codex/synthetic-memgraph-layout","RUNNER_TEMP":directory}
+                 "GITHUB_REPOSITORY":"likesjx/philotic-stack","GITHUB_REF":"refs/heads/codex/synthetic-memgraph-link-restore","RUNNER_TEMP":directory}
             output=io.StringIO()
             with patch.dict(os.environ,env), patch.object(hosted,"call",side_effect=calls), patch.object(hosted,"owned",return_value={}), patch.object(hosted,"isolated"), patch.object(hosted,"ready"), patch.object(hosted,"remove"), patch.object(hosted,"stop_for_restart"), patch.object(hosted,"remove_scratch",side_effect=OSError("busy")), contextlib.redirect_stdout(output):
                 with self.assertRaisesRegex(hosted.Failure,"cleanup_inconclusive"):
