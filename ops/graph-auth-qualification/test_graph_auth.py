@@ -136,6 +136,21 @@ class HostedTests(unittest.TestCase):
                          ("CapDrop",[]),("SecurityOpt",[]),("PortBindings",{"7687/tcp":[{}]})):
             changed=json.loads(json.dumps(row));changed["HostConfig"][k]=value
             with self.subTest(key=k), self.assertRaises(hosted.Failure): hosted.isolated(changed)
+    def test_exact_mount_sources_and_modes_are_checked(self):
+        row = {"HostConfig":{"NetworkMode":"none","Privileged":False,"RestartPolicy":{"Name":"no"},"PidMode":"","IpcMode":"private","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]},"Mounts":[]}
+        expected={"/var/lib/memgraph":("/tmp/state",True),"/fixture":("/tmp/fixture",False),"/qualification":("/tmp/source",False),"/deps":("/tmp/deps",False)}
+        for dest,(source,rw) in expected.items():row['Mounts'].append({'Type':'bind','Destination':dest,'Source':os.path.realpath(source),'RW':rw})
+        hosted.isolated(row,expected)
+        row['Mounts'][0]['Source']='/wrong'
+        with self.assertRaisesRegex(hosted.Failure,'mount_contract'):hosted.isolated(row,expected)
+        row['Mounts'][0]['Source']=os.path.realpath('/tmp/state');row['Mounts'][0]['RW']=False
+        with self.assertRaisesRegex(hosted.Failure,'mount_contract'):hosted.isolated(row,expected)
+    def test_layout_probe_uncertain_seed_is_not_retried(self):
+        result=type('R',(),{'returncode':1,'stdout':'SECRET'})()
+        with patch.object(hosted,'command',return_value=result) as call:
+            with self.assertRaisesRegex(hosted.Failure,'seed_failed_or_unknown') as caught:hosted.run_layout_probe('a'*64,'seed')
+        self.assertEqual(call.call_count,1);self.assertNotIn('SECRET',str(caught.exception))
+
     def test_cleanup_only_verified_id(self):
         ident="a"*64
         with patch.object(hosted,"owned",side_effect=hosted.Failure("identity")), patch.object(hosted,"call") as call:
@@ -150,11 +165,11 @@ class HostedTests(unittest.TestCase):
             (deps/"neo4j/__init__.py").write_text("")
             ident="a"*64
             def calls(args, *extra):
-                if args[:2] == ["image","inspect"]: return '[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
+                if args[:2] == ["image","inspect"]: return json.dumps([{'Id':'sha256:'+'b'*64,'RepoDigests':[hosted.IMAGE]}])
                 if args[0] == "create": return ident
                 return ""
             env={"GITHUB_ACTIONS":"true","CI":"true","RUNNER_OS":"Linux",
-                 "GITHUB_REPOSITORY":"likesjx/philotic-stack","RUNNER_TEMP":directory}
+                 "GITHUB_REPOSITORY":"likesjx/philotic-stack","GITHUB_REF":"refs/heads/codex/synthetic-memgraph-layout","RUNNER_TEMP":directory}
             output=io.StringIO()
             with patch.dict(os.environ,env), patch.object(hosted,"call",side_effect=calls), patch.object(hosted,"owned",return_value={}), patch.object(hosted,"isolated"), patch.object(hosted,"ready"), patch.object(hosted,"remove"), patch.object(hosted,"stop_for_restart"), patch.object(hosted,"remove_scratch",side_effect=OSError("busy")), contextlib.redirect_stdout(output):
                 with self.assertRaisesRegex(hosted.Failure,"cleanup_inconclusive"):

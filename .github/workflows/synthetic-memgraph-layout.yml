@@ -1,0 +1,32 @@
+name: Synthetic Memgraph entry inventory
+on:
+  push:
+    branches: [codex/synthetic-memgraph-layout]
+    paths:
+      - "ops/graph-auth-qualification/**"
+      - ".github/workflows/synthetic-memgraph-layout.yml"
+permissions:
+  contents: read
+concurrency:
+  group: synthetic-memgraph-layout
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - name: Cheap no-service checks
+        run: |
+          python3 -B -m unittest discover -s ops/graph-auth-qualification -p 'test_*.py' -v
+      - name: Install hash-pinned pure Python test driver
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-compile --target "$RUNNER_TEMP/graph-auth-deps" -r ops/graph-auth-qualification/requirements.txt
+      - name: Pull exact graph image
+        run: |
+          docker pull memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27
+      - name: Synthetic write, restart and bounded entry inventory
+        run: |
+          python3 -B ops/graph-auth-qualification/hosted_graph_auth.py --deps "$RUNNER_TEMP/graph-auth-deps"

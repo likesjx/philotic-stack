@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from entry_inventory import inventory, InventoryFailure
 
 IMAGE = "memgraph/memgraph-mage@sha256:e8e03640071c57de6a13f2f4c5f9ed1789797dc5e8e771bbe62203b20e1b8c27"
 LABEL = "com.philotic.graph-auth-qualification"
@@ -45,7 +46,7 @@ def owned(ident, nonce, image):
         raise Failure("container_identity")
     return r
 
-def isolated(r):
+def isolated(r, expected_sources=None):
     h = r["HostConfig"]
     if (h["NetworkMode"] != "none" or h["Privileged"]
             or h["RestartPolicy"]["Name"] != "no"
@@ -61,6 +62,13 @@ def isolated(r):
         raise Failure("mount_contract")
     if any(m["Type"] not in ("bind", "tmpfs") for m in r.get("Mounts", [])):
         raise Failure("unexpected_volume")
+    if expected_sources is not None:
+        binds=[m for m in r.get("Mounts", []) if m["Type"]=="bind"]
+        if len(binds)!=len(expected_sources):raise Failure("mount_contract")
+        for m in binds:
+            expected=expected_sources.get(m["Destination"])
+            if expected is None or m.get("Source")!=os.path.realpath(expected[0]) or m.get("RW") is not expected[1]:
+                raise Failure("mount_contract")
 
 def remove(ident, nonce, image):
     r = owned(ident, nonce, image)
@@ -87,6 +95,12 @@ def remove_scratch(root):
 def probe(ident, phase):
     return command(["exec", "--env", "PYTHONPATH=/deps", ident, "python3",
                     "/qualification/probe_graph.py", "/fixture/credentials.json", phase], 40)
+
+def run_layout_probe(ident, phase):
+    if phase not in ('seed','observe'): raise Failure('invalid_probe_phase')
+    result=command(["exec", "--env", "PYTHONPATH=/deps", ident, "python3", "/qualification/layout_probe.py", "/fixture/credentials.json", phase], 40)
+    if result.returncode or result.stdout.strip() != 'graph_layout:'+phase+':passed': raise Failure(phase+'_failed_or_unknown')
+    print('graph_layout:'+('seed:acknowledged' if phase=='seed' else 'observe:passed'),flush=True)
 
 def ready(ident, nonce, image, phase):
     # Retry only read-only connection assertions. Any semantic failure stops now.
@@ -116,7 +130,8 @@ def ready(ident, nonce, image, phase):
 def main(deps):
     if (os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("CI") != "true"
             or os.environ.get("RUNNER_OS") != "Linux"
-            or os.environ.get("GITHUB_REPOSITORY") != "likesjx/philotic-stack"):
+            or os.environ.get("GITHUB_REPOSITORY") != "likesjx/philotic-stack"
+            or os.environ.get("GITHUB_REF") != "refs/heads/codex/synthetic-memgraph-layout"):
         raise Failure("approved_disposable_job_required")
     source = Path(__file__).resolve().parent
     deps = Path(deps).resolve(strict=True)
@@ -126,10 +141,13 @@ def main(deps):
     if uid == 0:
         raise Failure("nonroot_fixture_uid_required")
     nonce = secrets.token_hex(16)
-    image = json.loads(call(["image", "inspect", IMAGE]))[0]["Id"]
+    image_info=json.loads(call(["image", "inspect", IMAGE]))
+    if type(image_info) is not list or len(image_info)!=1 or IMAGE not in (image_info[0].get("RepoDigests") or []):
+        raise Failure("image_digest")
+    image = image_info[0]["Id"]
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
         raise Failure("image_identity")
-    if call(["ps", "-aq"]):
+    if call(["ps", "-aq"]) or call(["volume", "ls", "-q"]):
         raise Failure("exclusive_empty_runner_required")
     root = Path(tempfile.mkdtemp(prefix="graph-auth-", dir=os.environ["RUNNER_TEMP"]))
     ident = None
@@ -164,10 +182,14 @@ def main(deps):
                       IMAGE, "/qualification/launch_graph.py"])
         if not ID.fullmatch(ident):
             raise Failure("create_uncertain")
-        isolated(owned(ident, nonce, image))
+        mount_contract={"/var/lib/memgraph":(str(root/"state"),True),"/fixture":(str(root/"fixture"),False),
+                        "/qualification":(str(source),False),"/deps":(str(deps),False)}
+        isolated(owned(ident, nonce, image),mount_contract)
         stage = "fresh"
         call(["start", ident])
         ready(ident, nonce, image, stage)
+        stage = "seed"
+        run_layout_probe(ident,"seed")
         stage = "restart"
         stop_for_restart(ident)
         call(["start", ident])
@@ -178,6 +200,18 @@ def main(deps):
         passfile.write_text("beta_fixture:" + replacement + "\n")
         call(["start", ident])
         ready(ident, nonce, image, stage)
+        stage = "observe"
+        run_layout_probe(ident,"observe")
+        stage = "stop_for_inventory"
+        stop_for_restart(ident)
+        stopped=owned(ident, nonce, image)
+        if (stopped["State"].get("Running") is not False or stopped["State"].get("ExitCode") != 0
+            or stopped["State"].get("Dead") is not False or stopped["State"].get("Pid") != 0):
+            raise Failure("stopped_state_unverified")
+        isolated(stopped,mount_contract)
+        stage = "inventory"
+        counts=inventory(root / "state")
+        print("graph_layout:inventory:" + json.dumps(counts,sort_keys=True,separators=(",",":")), flush=True)
     except Exception as e:
         safe = str(e) if isinstance(e, Failure) else "unexpected_local_failure"
         print("graph_auth:stage=" + stage + ":failure=" + safe, flush=True)
@@ -189,11 +223,11 @@ def main(deps):
                 ids = call(["ps", "-aq", "--no-trunc", "--filter", "label=" + LABEL + "=" + nonce]).split()
                 if len(ids) == 1 and ID.fullmatch(ids[0]):
                     ident = ids[0]
-                elif ids:
+                else:
                     raise Failure("create_reconciliation")
             if ident is not None:
                 remove(ident, nonce, image)
-            if call(["ps", "-aq", "--no-trunc", "--filter", "label=" + LABEL + "=" + nonce]):
+            if call(["ps", "-aq", "--no-trunc"]) or call(["volume", "ls", "-q"]):
                 raise Failure("cleanup_remaining")
             remove_scratch(root)
             cleanup_ok = True
