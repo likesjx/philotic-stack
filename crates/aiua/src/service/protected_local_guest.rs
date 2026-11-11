@@ -3,26 +3,53 @@
 use ansible_mesh_core::privacy_local::{LaunchPrincipal, LocalLaunchRegistry, SupervisedProcess};
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-struct OwnedChild(Arc<Mutex<Child>>);
+struct OwnedChild {
+    child: Arc<Mutex<Child>>,
+    attempt: Uuid,
+    started: Instant,
+    exit_logged: AtomicBool,
+}
+
+fn exit_fields(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        (status.code(), None)
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
 impl SupervisedProcess for OwnedChild {
     fn pid(&self) -> Result<u32> {
-        self.0
+        self.child
             .try_lock()
             .map_err(|_| anyhow!("supervisor child busy"))?
             .id()
             .ok_or_else(|| anyhow!("child exited"))
     }
     fn alive(&self) -> Result<bool> {
-        Ok(self
-            .0
+        let status = self
+            .child
             .try_lock()
             .map_err(|_| anyhow!("supervisor child busy"))?
-            .try_wait()?
-            .is_none())
+            .try_wait()?;
+        if let Some(status) = status.filter(|_| !self.exit_logged.swap(true, Ordering::Relaxed)) {
+            let (exit_code, signal) = exit_fields(status);
+            tracing::warn!(event = "protected_child_lifecycle", stage = "child_exit", outcome = "exited", attempt_id = %self.attempt, elapsed_ms = elapsed_ms(self.started), exit_code = ?exit_code, signal = ?signal);
+        }
+        Ok(status.is_none())
     }
 }
 
@@ -56,9 +83,42 @@ impl ProtectedLocalGuest {
         expected_uid: u32,
         principal: LaunchPrincipal,
     ) -> Result<Self> {
+        Self::adopt_observed(
+            child,
+            registry,
+            guest,
+            expected_uid,
+            principal,
+            Uuid::new_v4(),
+            Instant::now(),
+        )
+    }
+    pub(super) fn adopt_observed(
+        child: Child,
+        registry: Arc<LocalLaunchRegistry>,
+        guest: &str,
+        expected_uid: u32,
+        principal: LaunchPrincipal,
+        attempt: Uuid,
+        started: Instant,
+    ) -> Result<Self> {
         let child = Arc::new(Mutex::new(child));
-        let process: Arc<dyn SupervisedProcess> = Arc::new(OwnedChild(child.clone()));
-        let generation = registry.attach_new(guest, expected_uid, principal, process)?;
+        let process: Arc<dyn SupervisedProcess> = Arc::new(OwnedChild {
+            child: child.clone(),
+            attempt,
+            started,
+            exit_logged: AtomicBool::new(false),
+        });
+        let generation = match registry.attach_new(guest, expected_uid, principal, process) {
+            Ok(generation) => {
+                tracing::info!(event = "protected_child_startup", stage = "adoption", outcome = "accepted", attempt_id = %attempt, elapsed_ms = elapsed_ms(started));
+                generation
+            }
+            Err(error) => {
+                tracing::warn!(event = "protected_child_startup", stage = "adoption", outcome = "rejected", attempt_id = %attempt, elapsed_ms = elapsed_ms(started));
+                return Err(error);
+            }
+        };
         Ok(Self {
             native_authority: None,
             child,
@@ -116,7 +176,141 @@ impl Drop for ProtectedLocalGuest {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::io::{self, Write};
     use tokio::net::UnixListener;
+
+    #[derive(Clone)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_diag_exit_fields_distinguish_exit_code_and_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            exit_fields(std::process::ExitStatus::from_raw(7 << 8)),
+            (Some(7), None)
+        );
+        assert_eq!(
+            exit_fields(std::process::ExitStatus::from_raw(15)),
+            (None, Some(15))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_diag_early_exit_is_correlated_once_and_does_not_log_child_input() {
+        let captured = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let attempt = Uuid::new_v4();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 7"])
+            .env("SYNTHETIC_SECRET", "do-not-log-this");
+        command.kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
+        let owned = OwnedChild {
+            child: Arc::new(Mutex::new(child)),
+            attempt,
+            started: Instant::now(),
+            exit_logged: AtomicBool::new(false),
+        };
+        assert!(!owned.alive().unwrap());
+        assert!(!owned.alive().unwrap());
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("protected_child_lifecycle").count(), 1);
+        assert!(output.contains(&attempt.to_string()));
+        assert!(output.contains("exit_code=Some(7)"));
+        assert!(!output.contains("do-not-log-this"));
+        assert!(!output.contains("/bin/sh"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_diag_adoption_rejection_keeps_exit_and_rejection_correlated() {
+        let captured = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let attempt = Uuid::new_v4();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 7"])
+            .env("SYNTHETIC_SECRET", "do-not-log-this");
+        command.kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        child.wait().await.unwrap();
+        let result = ProtectedLocalGuest::adopt_observed(
+            child,
+            Arc::new(LocalLaunchRegistry::default()),
+            "sensitive-guest-name",
+            unsafe { libc::geteuid() },
+            LaunchPrincipal {
+                stable_agent_id: "synthetic".into(),
+                roles: BTreeSet::new(),
+            },
+            attempt,
+            Instant::now(),
+        );
+        assert!(result.is_err());
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches(&attempt.to_string()).count(), 2);
+        assert!(output.contains("child_exit"));
+        assert!(output.contains("rejected"));
+        assert!(!output.contains("sensitive-guest-name"));
+        assert!(!output.contains("do-not-log-this"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_diag_live_child_adoption_is_logged_without_identity() {
+        let captured = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let attempt = Uuid::new_v4();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("10").kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let guest = ProtectedLocalGuest::adopt_observed(
+            child,
+            Arc::new(LocalLaunchRegistry::default()),
+            "private-guest-name",
+            unsafe { libc::geteuid() },
+            LaunchPrincipal {
+                stable_agent_id: "synthetic".into(),
+                roles: BTreeSet::new(),
+            },
+            attempt,
+            Instant::now(),
+        )
+        .unwrap();
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(&attempt.to_string()));
+        assert!(output.contains("accepted"));
+        assert!(!output.contains("private-guest-name"));
+        drop(guest);
+    }
     #[test]
     #[ignore = "synthetic child helper invoked only by its parent test"]
     fn owned_child_peer() {

@@ -13,6 +13,34 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+fn protected_spawn_error_category(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::WouldBlock => "resource_unavailable",
+        std::io::ErrorKind::OutOfMemory => "out_of_memory",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        _ => "other",
+    }
+}
+
+fn spawn_protected(
+    command: &mut TokioCommand,
+    attempt: uuid::Uuid,
+    started: std::time::Instant,
+) -> Result<tokio::process::Child> {
+    match command.spawn() {
+        Ok(child) => {
+            tracing::info!(event = "protected_child_startup", stage = "spawn", outcome = "started", attempt_id = %attempt, elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            Ok(child)
+        }
+        Err(error) => {
+            tracing::warn!(event = "protected_child_startup", stage = "spawn", outcome = "failed", category = protected_spawn_error_category(error.kind()), attempt_id = %attempt, elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            Err(anyhow::anyhow!("protected child spawn failed"))
+        }
+    }
+}
+
 /// A single stderr line emitted by a guest process.
 pub struct GuestStderrLine {
     pub guest_id: String,
@@ -231,9 +259,22 @@ impl Materializer for LocalProcessMaterializer {
             command.stderr(std::process::Stdio::piped());
             command.stdout(std::process::Stdio::piped());
 
+            let observation = self
+                .native_runtime
+                .as_ref()
+                .filter(|runtime| runtime.selected(guest_id))
+                .map(|_| (uuid::Uuid::new_v4(), std::time::Instant::now()));
             let protected = if let Some(runtime) = &self.native_runtime {
                 if runtime.selected(guest_id) {
-                    Some(runtime.prepare(guest_id, config_json, &mut command)?)
+                    match runtime.prepare(guest_id, config_json, &mut command) {
+                        Ok(principal) => Some(principal),
+                        Err(_) => {
+                            let (attempt, started) =
+                                observation.expect("selected protected launch has observation");
+                            tracing::warn!(event = "protected_child_startup", stage = "preparation", outcome = "rejected", attempt_id = %attempt, elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                            return Err(anyhow::anyhow!("protected child preparation rejected"));
+                        }
+                    }
                 } else {
                     None
                 }
@@ -241,12 +282,16 @@ impl Materializer for LocalProcessMaterializer {
                 None
             };
 
-            let mut child = command.spawn().with_context(|| {
-                format!(
-                    "Failed to spawn OS child process for guest '{}' using command '{}'",
-                    guest_id, resolved_cmd
-                )
-            })?;
+            let mut child = if let Some((attempt, started)) = observation {
+                spawn_protected(&mut command, attempt, started)?
+            } else {
+                command.spawn().with_context(|| {
+                    format!(
+                        "Failed to spawn OS child process for guest '{}' using command '{}'",
+                        guest_id, resolved_cmd
+                    )
+                })?
+            };
             let child_pid = child.id().unwrap_or(0);
 
             // Take stderr BEFORE moving child into the map.
@@ -298,12 +343,15 @@ impl Materializer for LocalProcessMaterializer {
 
             if let Some(principal) = protected {
                 let runtime = self.native_runtime.as_ref().unwrap();
-                let protected = super::protected_local_guest::ProtectedLocalGuest::adopt(
+                let (attempt, started) = observation.expect("protected launch has observation");
+                let protected = super::protected_local_guest::ProtectedLocalGuest::adopt_observed(
                     child,
                     runtime.launches.clone(),
                     guest_id,
                     unsafe { libc::geteuid() },
                     principal,
+                    attempt,
+                    started,
                 )?
                 .with_native_authority(runtime.authority.clone())?;
                 self.protected_children.insert(guest_id.into(), protected);
@@ -1389,6 +1437,58 @@ impl GuestMaterializationRequester for GuestManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protected_diag_spawn_categories_do_not_include_error_messages() {
+        use std::io::{Error, ErrorKind};
+        let error = Error::new(
+            ErrorKind::PermissionDenied,
+            "synthetic-secret-path-and-token",
+        );
+        assert_eq!(
+            super::protected_spawn_error_category(error.kind()),
+            "permission_denied"
+        );
+        assert_eq!(
+            super::protected_spawn_error_category(ErrorKind::NotFound),
+            "not_found"
+        );
+        assert_eq!(
+            super::protected_spawn_error_category(ErrorKind::Other),
+            "other"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_diag_spawn_failure_logs_category_without_command_or_error_text() {
+        use std::io::{self, Write};
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Writer(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let attempt = uuid::Uuid::new_v4();
+        let mut command = tokio::process::Command::new("/nonexistent/synthetic-secret-path");
+        command.env("SYNTHETIC_SECRET", "do-not-log-this");
+        assert!(super::spawn_protected(&mut command, attempt, std::time::Instant::now()).is_err());
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(&attempt.to_string()));
+        assert!(output.contains("not_found"));
+        assert!(!output.contains("synthetic-secret-path"));
+        assert!(!output.contains("do-not-log-this"));
+    }
     use super::*;
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::graph::{GraphEdge, GraphNode};
