@@ -203,15 +203,39 @@ def main() -> None:
         raise SystemExit("philotic-web unit puts the vault key in the environment")
     roster = (ANSIBLE / "roles/vps_account_separation/defaults/main.yml").read_text()
     example = (ANSIBLE / "roles/vps_account_separation/examples/agents.yml.example").read_text()
-    for name in ("pepper", "priti", "bill", "claude"):
-        if f"name: {name}" not in roster or f"name: {name}" not in example:
-            raise SystemExit(f"agent roster is missing {name}")
-    if "group: agent-ops" in roster or "group: agent-readonly" in roster:
-        raise SystemExit("agent roster defaults must not assign a group")
-    refused_roster = playbook([])
+
+    def assigned_groups(text: str) -> dict[str, str]:
+        current = None
+        found: dict[str, str] = {}
+        for line in text.splitlines():
+            stripped = line.strip().lstrip("-").strip()
+            if stripped.startswith("name:"):
+                current = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("group:") and current:
+                found[current] = stripped.split(":", 1)[1].strip()
+                current = None
+        return found
+
+    expected = {
+        "pepper": "agent-ops",
+        "priti": "agent-ops",
+        "bill": "agent-ops",
+        "claude": "agent-ops",
+    }
+    if assigned_groups(roster) != expected or assigned_groups(example) != expected:
+        raise SystemExit(f"roster groups are {assigned_groups(roster)} / {assigned_groups(example)}")
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = Path(tmp) / "missing-group.yml"
+        missing.write_text(
+            "vps_accounts_agents:\n"
+            "  - name: future\n"
+            "    description: unset-group\n"
+            "    public_key: \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholderFutureAgentKeyNotReal future\"\n"
+        )
+        refused_roster = playbook(["-e", f"@{missing}"])
     if refused_roster.returncode == 0 or "needs group" not in refused_roster.stdout + refused_roster.stderr:
         raise SystemExit("roster without groups did not fail closed")
-    if user_exists("agent-pepper") or user_exists("jared-admin"):
+    if user_exists("agent-pepper") or user_exists("agent-future") or user_exists("jared-admin"):
         raise SystemExit("group fail-closed still created users")
     for name in ("jared-admin", "philotic-approval", "philotic", "agent-ops-example", "agent-read-example"):
         if user_exists(name):

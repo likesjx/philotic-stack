@@ -28,17 +28,22 @@ vps_accounts_deploy_user: deploy
 vps_accounts_deploy_pipeline_keys: []
 
 # One account per external agent. name becomes agent-<name>.
-# group is required and has no default. public_key is supplied at apply time
-# and is not stored in this file. A missing group fails the play.
+# Jared assigned these four to agent-ops. group is still required: a later
+# agent with no group fails the play. public_key is supplied at apply time
+# and is not stored here.
 vps_accounts_agents:
   - name: pepper
     description: muse
+    group: agent-ops
   - name: priti
     description: ChatGPT
+    group: agent-ops
   - name: bill
     description: Grok Bot
+    group: agent-ops
   - name: claude
     description: claude
+    group: agent-ops
 
 vps_accounts_request_restart_bin: /usr/local/sbin/philotic-request-restart
 vps_accounts_ansible_entrypoint: /usr/local/sbin/philotic-ansible-entrypoint

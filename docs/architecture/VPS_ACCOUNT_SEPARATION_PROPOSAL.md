@@ -39,7 +39,7 @@ Account layout:
 
 - `jared-admin`: personal account, `NOPASSWD: ALL`, only the public keys supplied in inventory, each key restricted with `from="100.64.0.0/10"`. No automation identity.
 - `philotic-approval`: system user, uid 970 (hypothesis: free on the VPS; not 999 or 1001), shell `nologin`, no sudo, not in `deploy`, `docker`, or the agent groups. Owns `/var/lib/philotic-approval`.
-- `agent-<name>`: one account per external agent. The roster and public keys are inventory inputs. `agent-ops` may read journals (when `systemd-journal` exists) and may run only `/usr/local/sbin/philotic-request-restart`. `agent-readonly` gets the journal group and no sudo. The helper records a request file. It does not restart anything.
+- `agent-<name>`: one account per external agent. The roster is pepper (muse), priti (ChatGPT), bill (Grok Bot), and claude, all in `agent-ops`. Public keys stay out of git and are supplied at apply time. A later entry with no `group` fails the play. `agent-ops` may read journals (when `systemd-journal` exists) and may run only `/usr/local/sbin/philotic-request-restart`. `agent-readonly` gets the journal group and no sudo. The helper records a request file. It does not restart anything.
 
 `deploy` stays as it is today: sudo, docker group, and its current authorized keys. Narrowing tasks exist and run only when `vps_accounts_narrow_deploy=true`. sshd `PermitRootLogin no` and `PasswordAuthentication no` are installed only when `vps_accounts_harden_sshd=true`, and the role never reloads sshd.
 
