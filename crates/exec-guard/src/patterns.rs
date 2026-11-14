@@ -36,7 +36,7 @@
 /// alternative for the separate-token shape, the value token (`root`) isn't
 /// consumed by either branch and the match never realigns onto the real
 /// command word, so `sudo -u root rm -rf /` would silently bypass the floor.
-const CMDPOS: &str = concat!(
+pub(crate) const CMDPOS: &str = concat!(
     r"(?:^|[;&|\n`]|\$\()",
     r"\s*",
     r"(?:sudo\s+(?:(?:-[ugUpChD]|--(?:user|group|other-user|prompt|close-from|host|chdir))\s+\S+\s+|-[^\s]+\s+)*)?",

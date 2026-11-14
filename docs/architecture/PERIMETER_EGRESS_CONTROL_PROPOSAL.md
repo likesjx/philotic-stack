@@ -4,7 +4,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-07-28
+last_updated: 2026-08-26
 tags:
 - egress
 - perimeter
@@ -32,8 +32,16 @@ implemented_by:
 - crates/philotic-web/src/serve.rs
 - docs/architecture/outbound-egress-inventory.json
 - scripts/check-outbound-egress-inventory.py
+- crates/exec-guard/src/net_egress.rs
+- crates/ansible-mesh-core/src/mcp_upstream.rs
+- crates/tool-runner/src/main.rs
+- crates/philote/src/runtime.rs
+- crates/philotic-web/src/explain.rs
+- crates/aiua/src/main.rs
 active_seams:
 - outbound-fleet-enforcement
+- shell-egress-fence
+- skilldag-egress-capability
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -82,10 +90,85 @@ This means Philotic should not silently allow every guest to make arbitrary outb
 
 Accepted for the current slice. The bounded general-API execution boundary,
 content-free audit, direct-client inventory, and first governed migration are
-implemented. Specialized exceptions and remaining migration work keep the
+implemented. The shell egress fence (below) closes the `bash.exec` bypass of
+this boundary. Specialized exceptions and remaining migration work keep the
 broader perimeter enforcement program open.
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+### Implemented Slice: Shell Egress Fence (2026-08-26)
+
+The governed outbound fabric (binding-scoped `http:<binding>.request` tools with
+host allowlists, DNS pinning, the secret-ref credential boundary, and a
+content-free audit trail) was being bypassed by a single tool: `bash.exec`. The
+L0 `exec-guard` floor blocks only unrecoverable destruction and has no network
+predicate, so `curl`/`wget`/`nc`/`/dev/tcp`/interpreter-socket one-liners
+egressed with no allowlist, no credential boundary, and no audit — on macOS
+`Direct` mode there is also no sandbox network enforcement. This is General
+HTTP / Tool Egress (§2 above) escaping the perimeter through the shell.
+
+The fence closes the *accidental and lightly-injected* path:
+
+- **Detector, config-free, in `exec-guard`** — `detect_network_egress` recognizes
+  the raw fetch/exfil primitives and extracts the target host when it is written
+  literally. It is a detector, not a policy: it reads no config, exactly like the
+  L0 hardline floor.
+- **Policy at the call site** — both raw-shell dispatch points
+  (`tool_runner::execute_bash_tool`, `philote::runtime::run_bash_command`) reuse
+  `McpEgressPolicy` (loopback + tailnet CGNAT always allowed; everything else must
+  be allowlisted). A resolvable loopback/tailnet host passes; any other host, and
+  any host that cannot be statically proven, is denied and the model is redirected
+  to the governed binding path. Fail-closed on an unresolvable host mirrors the
+  MCP stdio allowlist's empty-default-deny.
+- **Config surface (transitional)** — `PHILOTIC_SHELL_EGRESS_ALLOW` (env var,
+  same host grammar as the MCP egress policy) widens the allowlist. This matches
+  the `PHILOTIC_SANDBOX_SOCKET` env idiom and is deliberately transitional; the
+  durable home is a hotel config node unified with `mcp_egress_policy`
+  (**next seam: `shell-egress-fence` → config-node unification**).
+
+Honest scope (named per AGENTS.md §2.4, Proven vs Intended): this is a regex over
+shell text under exec-guard's stated threat model — an honest-but-wrong or
+lightly-injected agent, **not** containment against a process that already
+controls the guest binary. It loses to base64, a written-then-run script, or
+`exec 3<>/dev/tcp`, and macOS `Direct` mode still has no kernel-level network
+enforcement. What it buys: the ungoverned shell door closes for the common case
+and the governed door becomes the obvious one. Deliberately out of scope for this
+slice: `git`, `gh`, `ssh`/`scp`, and package managers (`brew`/`cargo`/`npm`/`pip`)
+— network-capable dev/admin tooling with their own semantics.
+
+### Implemented Slice: Governed Egress as a SkillDAG Capability — `net.http` (2026-08-26)
+
+Closing the shell door only helps if the governed door is a real, granted
+capability. `IntegrationBinding` already carries a SkillDAG gate
+(`grant_skills` — "at least one named skill must be in the session's effective
+skill set"), but no egress skill was seeded, so bindings either left the gate
+empty (agent-only) or referenced a skill that did not exist.
+
+This slice seeds a `net.http` skill (validated) and assigns it to **every**
+philote toolset profile (all ten seeded profiles), so any binding may gate on
+`grant_skills: ["net.http"]` and know every philote is eligible. The seed
+reconciler unions new seed entries into already-deployed profiles while
+preserving operator edits, so the fleet picks it up on the next boot without a
+wipe.
+
+The design is deliberately **scoped eligibility**, not blanket access:
+
+- `net.http` is a *pure eligibility gate* — it implies no tools, so it adds no
+  standing tool surface to any philote. The real `http:<binding>.request` tools
+  project dynamically, per binding the agent is granted, during session snapshot
+  composition.
+- It is *necessary but not sufficient*: `IntegrationBinding.is_available_to`
+  requires the agent to hold `net.http` **and** be granted by the binding
+  (`owner`/`grant_agents`), and the binding's host allowlist, exit placement, and
+  approval flag still scope what and where. Holding the skill with no binding
+  granting the agent reaches nothing.
+
+So "each philote has access" means each philote is *eligible* for governed
+egress; an operator authorizes specific destinations by registering a binding
+that grants the agent and gates on `net.http`. No broad "fetch anything" binding
+is seeded — that was the rejected blanket-access option. Next seam:
+`shell-egress-fence` config-node unification also gives operators a first-class
+place to attach `net.http`-gated bindings.
 
 ## Why This Needs Its Own Proposal
 
