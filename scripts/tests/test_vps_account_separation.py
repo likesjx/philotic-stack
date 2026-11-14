@@ -185,6 +185,17 @@ def main() -> None:
     if shutil.which("ansible-playbook") is None or shutil.which("visudo") is None:
         raise SystemExit("ansible-playbook and visudo are required")
     sudo(["true"])
+    defaults = (ANSIBLE / "roles/philotic_hotel/defaults/main.yml").read_text()
+    unit = (ANSIBLE / "roles/philotic_hotel/templates/philotic-hotel.service.j2").read_text()
+    secrets = (ANSIBLE / "roles/philotic_hotel/templates/secrets.env.j2").read_text()
+    if "philotic_vault_key_via_load_credential: false" not in defaults:
+        raise SystemExit("vault LoadCredential flag is not default-off")
+    if "LoadCredential=philotic-vault-master-key" not in unit:
+        raise SystemExit("unit template is missing the gated LoadCredential line")
+    if "philotic_vault_key_via_load_credential" not in unit.split("LoadCredential")[0]:
+        raise SystemExit("LoadCredential is not behind the flag")
+    if "not (philotic_vault_key_via_load_credential" not in secrets:
+        raise SystemExit("secrets.env does not omit the vault key when the flag is on")
     for name in ("jared-admin", "philotic-approval", "philotic", "agent-ops-example", "agent-read-example"):
         if user_exists(name):
             raise SystemExit(f"{name} already exists; refusing to reuse it")

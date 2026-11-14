@@ -70,6 +70,11 @@ Environment="PHILOTIC_HEAL_DECISIONS_FALLBACK=1"
 Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.db"
 {% endif %}
 
+{% if philotic_vault_key_via_load_credential | default(false) | bool %}
+# Root-owned credential. Not in the environment of the hotel or its guests.
+LoadCredential=philotic-vault-master-key:{{ philotic_vault_key_credential_path }}
+{% endif %}
+
 # Hotel secrets (vault master key, provider keys) — rendered from Ansible vault
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
 

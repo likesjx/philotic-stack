@@ -422,6 +422,19 @@
 
 # ── systemd service ────────────────────────────────────────────────────────────
 
+- name: Install the vault master key credential file
+  ansible.builtin.copy:
+    dest: "{{ philotic_vault_key_credential_path }}"
+    content: "{{ vault_philotic_vault_master_key }}"
+    owner: root
+    group: root
+    mode: "0400"
+  no_log: true
+  when:
+    - philotic_vault_key_via_load_credential | bool
+    - vault_philotic_vault_master_key is defined
+  tags: [config]
+
 - name: Deploy philotic-hotel systemd unit
   template:
     src: philotic-hotel.service.j2

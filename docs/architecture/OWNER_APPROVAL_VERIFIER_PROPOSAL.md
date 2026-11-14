@@ -55,7 +55,7 @@ S0 is accepted with A1. S1 through S6 are not this slice. The graph's S1 verifie
 
 Test-only broker, burn store, guest env scrub, and unit templates. The broker is not enabled on a host. In-hotel guests still share the hotel uid, so a guest running as `philotic` can open the broker socket. The filesystem still stops that guest from writing `approval.db` directly. Separating guest uids is later work.
 
-Known deploy risk, not fixed here: `philotic-web` reads `PHILOTIC_VAULT_MASTER_KEY` from its environment (`crates/philotic-web/src/serve.rs`, `start.rs`). After this binary is installed, spawned guests will not inherit that key. Do not ship the binary until that guest has another way to unlock what it must unlock.
+Known deploy risk, addressed in this slice: `philotic-web` used to read `PHILOTIC_VAULT_MASTER_KEY` from its environment. Guest spawn still strips that variable. Web now prefers `$CREDENTIALS_DIRECTORY/philotic-vault-master-key`, then `PHILOTIC_VAULT_MASTER_KEY_FILE`, and only then the environment variable. The hotel writes the mode-0400 file for the web guest when it still has the key in its own environment. `philotic_vault_key_via_load_credential` defaults off, so the unit keeps `EnvironmentFile` until the cutover in the runbook. Do not ship a hotel that scrubs the key without this handoff.
 
 ## Verification
 

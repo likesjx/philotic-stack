@@ -242,6 +242,108 @@ pub(crate) fn apply_guest_spawn_env(command: &mut TokioCommand, config_json: &se
     }
 }
 
+/// philotic-web needs the vault key and must not receive it as an environment
+/// variable. When the hotel was started under systemd LoadCredential, pass
+/// only `CREDENTIALS_DIRECTORY`. Otherwise write the hotel's key to a mode-0400
+/// file and pass that path. Other guests get neither.
+fn hand_philotic_web_vault_key(command: &mut TokioCommand, resolved_cmd: &str) -> Result<()> {
+    let name = std::path::Path::new(resolved_cmd)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if name != Some("philotic-web") {
+        return Ok(());
+    }
+    if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+        let path = std::path::PathBuf::from(&dir).join("philotic-vault-master-key");
+        if path.is_file() {
+            command.env("CREDENTIALS_DIRECTORY", dir);
+            return Ok(());
+        }
+    }
+    if std::env::var("PHILOTIC_WEB_VAULT_KEY_FILE_HANDOFF").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    let Ok(raw) = std::env::var("PHILOTIC_VAULT_MASTER_KEY") else {
+        return Ok(());
+    };
+    let raw = zeroize::Zeroizing::new(raw);
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains('\n') || raw.contains('\0') {
+        return Ok(());
+    }
+    let path = web_vault_key_file()?;
+    write_mode_0400(&path, raw)
+        .with_context(|| format!("write philotic-web vault key file {}", path.display()))?;
+    command.env("PHILOTIC_VAULT_MASTER_KEY_FILE", &path);
+    Ok(())
+}
+
+fn web_vault_key_file() -> Result<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("PHILOTIC_WEB_VAULT_KEY_FILE") {
+        if !path.is_empty() {
+            return Ok(std::path::PathBuf::from(path));
+        }
+    }
+    let dir = if let Ok(dir) = std::env::var("PHILOTIC_WEB_VAULT_KEY_DIR") {
+        std::path::PathBuf::from(dir)
+    } else if let Ok(dir) = std::env::var("RUNTIME_DIRECTORY") {
+        std::path::PathBuf::from(dir)
+    } else if std::path::Path::new("/run/philotic").is_dir() {
+        std::path::PathBuf::from("/run/philotic")
+    } else {
+        std::env::temp_dir().join(format!("philotic-web-vault-{}", unsafe { libc::geteuid() }))
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms)?;
+    }
+    Ok(dir.join("philotic-web-vault-master-key"))
+}
+
+fn write_mode_0400(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing to write through a symlink");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o400);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Materializer for LocalProcessMaterializer {
     async fn spawn_guest(
@@ -285,6 +387,7 @@ impl Materializer for LocalProcessMaterializer {
                 }
             }
             apply_guest_spawn_env(&mut command, config_json);
+            hand_philotic_web_vault_key(&mut command, &resolved_cmd)?;
             // Always override with hotel's own socket path.  Prefer the value
             // supplied at construction time; fall back to the process env (for
             // cases where the hotel was started with the var already set).
@@ -2855,6 +2958,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn philotic_web_gets_a_mode_0400_key_file_and_other_guests_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("philotic-web");
+        std::fs::write(&bin, "#!/bin/sh\nenv | sort > \"$1\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+        let web_dump = dir.path().join("web.env");
+        let other_dump = dir.path().join("other.env");
+        let key_file = dir.path().join("handed-key");
+        let secret = "synthetic-not-a-secret";
+        let _key = EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", secret);
+        let _path = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE", key_file.to_str().unwrap());
+        let _handoff = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE_HANDOFF", "1");
+        let mut materializer = LocalProcessMaterializer::new(":memory:");
+        materializer
+            .spawn_guest(
+                "web",
+                &json!({
+                    "command": bin.to_str().unwrap(),
+                    "args": [web_dump.to_str().unwrap()]
+                }),
+            )
+            .await
+            .unwrap();
+        materializer
+            .spawn_guest(
+                "other",
+                &json!({
+                    "command": "/bin/sh",
+                    "args": ["-c", format!("env | sort > '{}'", other_dump.display())]
+                }),
+            )
+            .await
+            .unwrap();
+        let web_body = wait_for_dump(&web_dump);
+        let other_body = wait_for_dump(&other_dump);
+        let _ = materializer.reclaim_guest("web").await;
+        let _ = materializer.reclaim_guest("other").await;
+        assert!(
+            !web_body.contains(secret),
+            "web environment contained the vault key"
+        );
+        assert!(
+            web_body.contains("PHILOTIC_VAULT_MASTER_KEY_FILE="),
+            "{web_body}"
+        );
+        assert!(!other_body.contains(secret), "{other_body}");
+        assert!(!other_body.contains("PHILOTIC_VAULT_MASTER_KEY_FILE="));
+        let written = std::fs::read_to_string(&key_file).unwrap();
+        assert_eq!(written, secret);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::symlink_metadata(&key_file).unwrap().mode() & 0o777,
+                0o400
+            );
+        }
+    }
+
+    fn wait_for_dump(path: &std::path::Path) -> String {
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
     }
 
     #[test]

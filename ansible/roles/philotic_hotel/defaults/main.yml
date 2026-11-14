@@ -19,6 +19,11 @@ philotic_group: "philotic"
 # root-owned and the service user cannot replace them. Default keeps the
 # current owner so an ordinary hotel deploy does not chown or restart for this.
 philotic_bin_owner_root: false
+# Off until the reboot-window cutover. When false, secrets.env still carries
+# PHILOTIC_VAULT_MASTER_KEY and the unit does not gain LoadCredential=.
+# The hotel binary hands philotic-web a mode-0400 file instead of the env var.
+philotic_vault_key_via_load_credential: false
+philotic_vault_key_credential_path: "/etc/philotic/philotic-vault-master-key"
 philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub caches models at $HOME/.cache/huggingface
 
 # Artifacts — binaries delivered from the control machine or a CI artifact store.
