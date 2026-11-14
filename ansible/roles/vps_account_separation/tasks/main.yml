@@ -11,6 +11,16 @@
       Refusing an approval uid that collides with philotic (999), the configured
       hotel uid, or deploy (1001).
 
+- name: Refuse an agent with no explicit group
+  ansible.builtin.fail:
+    msg: >-
+      Agent {{ item.name }} ({{ item.description | default('unspecified') }})
+      needs group set to agent-ops or agent-readonly. There is no default.
+  when: item.group | default('') not in ['agent-ops', 'agent-readonly']
+  loop: "{{ vps_accounts_agents }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+
 - name: Validate agent roster entries
   ansible.builtin.assert:
     that:
@@ -114,7 +124,7 @@
     append: false
     create_home: true
     password_lock: true
-    comment: "External agent {{ item.name }} ({{ item.group }})"
+    comment: "External agent {{ item.name }} ({{ item.description | default(item.group) }})"
   loop: "{{ vps_accounts_agents }}"
   loop_control:
     label: "{{ item.name }}"

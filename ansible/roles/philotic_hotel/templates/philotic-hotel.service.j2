@@ -70,6 +70,13 @@ Environment="PHILOTIC_HEAL_DECISIONS_FALLBACK=1"
 Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.db"
 {% endif %}
 
+{% if philotic_web_separate_unit | default(false) | bool %}
+# philotic-web runs as its own user. Do not hand it the vault key from here.
+Environment=PHILOTIC_WEB_SEPARATE_UNIT=1
+Environment=PHILOTIC_WEB_UNIT_UID={{ philotic_web_uid }}
+Environment=PHILOTIC_WEB_SOCKET_GROUP={{ philotic_web_socket_group }}
+{% endif %}
+
 {% if philotic_vault_key_via_load_credential | default(false) | bool %}
 # Root-owned credential. Not in the environment of the hotel or its guests.
 LoadCredential=philotic-vault-master-key:{{ philotic_vault_key_credential_path }}

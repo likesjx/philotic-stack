@@ -194,8 +194,25 @@ def main() -> None:
         raise SystemExit("unit template is missing the gated LoadCredential line")
     if "philotic_vault_key_via_load_credential" not in unit.split("LoadCredential")[0]:
         raise SystemExit("LoadCredential is not behind the flag")
-    if "not (philotic_vault_key_via_load_credential" not in secrets:
-        raise SystemExit("secrets.env does not omit the vault key when the flag is on")
+    if "philotic_web_separate_unit: false" not in defaults:
+        raise SystemExit("philotic-web separate unit flag is not default-off")
+    web_unit = (ANSIBLE / "roles/philotic_hotel/templates/philotic-web.service.j2").read_text()
+    if "User={{ philotic_web_user }}" not in web_unit or "LoadCredential=philotic-vault-master-key" not in web_unit:
+        raise SystemExit("philotic-web unit is missing its user or LoadCredential")
+    if "PHILOTIC_VAULT_MASTER_KEY=" in web_unit:
+        raise SystemExit("philotic-web unit puts the vault key in the environment")
+    roster = (ANSIBLE / "roles/vps_account_separation/defaults/main.yml").read_text()
+    example = (ANSIBLE / "roles/vps_account_separation/examples/agents.yml.example").read_text()
+    for name in ("pepper", "priti", "bill", "claude"):
+        if f"name: {name}" not in roster or f"name: {name}" not in example:
+            raise SystemExit(f"agent roster is missing {name}")
+    if "group: agent-ops" in roster or "group: agent-readonly" in roster:
+        raise SystemExit("agent roster defaults must not assign a group")
+    refused_roster = playbook([])
+    if refused_roster.returncode == 0 or "needs group" not in refused_roster.stdout + refused_roster.stderr:
+        raise SystemExit("roster without groups did not fail closed")
+    if user_exists("agent-pepper") or user_exists("jared-admin"):
+        raise SystemExit("group fail-closed still created users")
     for name in ("jared-admin", "philotic-approval", "philotic", "agent-ops-example", "agent-read-example"):
         if user_exists(name):
             raise SystemExit(f"{name} already exists; refusing to reuse it")

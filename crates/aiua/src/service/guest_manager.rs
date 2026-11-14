@@ -253,6 +253,11 @@ fn hand_philotic_web_vault_key(command: &mut TokioCommand, resolved_cmd: &str) -
     if name != Some("philotic-web") {
         return Ok(());
     }
+    // The separate systemd unit receives the key through its own
+    // LoadCredential= directory, which the hotel uid cannot read.
+    if std::env::var("PHILOTIC_WEB_SEPARATE_UNIT").as_deref() == Ok("1") {
+        return Ok(());
+    }
     if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
         let path = std::path::PathBuf::from(&dir).join("philotic-vault-master-key");
         if path.is_file() {
@@ -276,6 +281,19 @@ fn hand_philotic_web_vault_key(command: &mut TokioCommand, resolved_cmd: &str) -
         .with_context(|| format!("write philotic-web vault key file {}", path.display()))?;
     command.env("PHILOTIC_VAULT_MASTER_KEY_FILE", &path);
     Ok(())
+}
+
+fn philotic_web_separate_unit() -> bool {
+    std::env::var("PHILOTIC_WEB_SEPARATE_UNIT").as_deref() == Ok("1")
+}
+
+fn config_is_philotic_web(config: &serde_json::Value) -> bool {
+    config
+        .get("command")
+        .and_then(|value| value.as_str())
+        .and_then(|cmd| std::path::Path::new(cmd).file_name())
+        .and_then(|name| name.to_str())
+        == Some("philotic-web")
 }
 
 fn web_vault_key_file() -> Result<std::path::PathBuf> {
@@ -988,6 +1006,14 @@ impl GuestManager {
             // --- SPAWNING ---
             let config: serde_json::Value =
                 serde_json::from_str(&rec.config_json).unwrap_or_default();
+            if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+                info!(
+                    "Guest [{}] is philotic-web and PHILOTIC_WEB_SEPARATE_UNIT=1; leaving it to philotic-web.service",
+                    rec.guest_id
+                );
+                Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
+                continue;
+            }
 
             let mut mat = self.materializer.lock().await;
             match mat.spawn_guest(&rec.guest_id, &config).await {
@@ -1123,6 +1149,14 @@ impl GuestManager {
 
         let config: serde_json::Value =
             serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+            info!(
+                "On-demand materialization: Guest [{}] is owned by philotic-web.service",
+                current_rec.guest_id
+            );
+            Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+            return Ok(false);
+        }
         match mat.spawn_guest(&current_rec.guest_id, &config).await {
             Ok(new_pid) => {
                 info!(
@@ -1175,6 +1209,14 @@ impl GuestManager {
 
         let config: serde_json::Value =
             serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+            info!(
+                "Restart materialization: Guest [{}] is owned by philotic-web.service",
+                current_rec.guest_id
+            );
+            Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+            return Ok(false);
+        }
         let new_pid = mat.spawn_guest(&current_rec.guest_id, &config).await?;
         self.graph
             .set_guest_pid(&self.hotel_name, &current_rec.guest_id, Some(&new_pid))?;
@@ -1371,6 +1413,18 @@ impl GuestManager {
                     }
                     let config: serde_json::Value =
                         serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+                    if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+                        info!(
+                            "Supervisor: Guest [{}] is owned by philotic-web.service",
+                            current_rec.guest_id
+                        );
+                        Self::clear_guest_pid(
+                            self.graph.as_ref(),
+                            &self.hotel_name,
+                            &current_rec.guest_id,
+                        );
+                        continue;
+                    }
                     info!(
                         "Supervisor: Guest [{}] is marked active but has no ID. Spawning...",
                         current_rec.guest_id
@@ -2979,6 +3033,7 @@ mod tests {
         let _key = EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", secret);
         let _path = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE", key_file.to_str().unwrap());
         let _handoff = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE_HANDOFF", "1");
+        let _separate = EnvGuard::set("PHILOTIC_WEB_SEPARATE_UNIT", "0");
         let mut materializer = LocalProcessMaterializer::new(":memory:");
         materializer
             .spawn_guest(
@@ -3024,6 +3079,36 @@ mod tests {
                 0o400
             );
         }
+    }
+
+    #[tokio::test]
+    async fn separate_web_unit_does_not_write_the_handoff_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("philotic-web");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+        let key_file = dir.path().join("must-not-exist");
+        let _key = EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", "synthetic-not-a-secret");
+        let _path = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE", key_file.to_str().unwrap());
+        let _flag = EnvGuard::set("PHILOTIC_WEB_SEPARATE_UNIT", "1");
+        let mut materializer = LocalProcessMaterializer::new(":memory:");
+        materializer
+            .spawn_guest(
+                "web",
+                &json!({
+                    "command": bin.to_str().unwrap()
+                }),
+            )
+            .await
+            .expect("separate-unit mode still lets a direct spawn return");
+        let _ = materializer.reclaim_guest("web").await;
+        assert!(!key_file.exists());
     }
 
     fn wait_for_dump(path: &std::path::Path) -> String {

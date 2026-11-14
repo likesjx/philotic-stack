@@ -1,10 +1,19 @@
 ---
-# Example inputs. Do not put a real public key in git.
-# Generate a key on the agent's own machine and pass only the public line.
+# Named external agents. group is required and intentionally unset.
+# Set each one to agent-ops or agent-readonly before applying the role.
+# Do not put a real public key in git.
 vps_accounts_narrow_deploy: false
 vps_accounts_harden_sshd: false
 vps_accounts_jared_admin_keys: []
-vps_accounts_agents: []
-# - name: example
-#   group: agent-readonly
-#   public_key: "ssh-ed25519 REPLACE_WITH_THAT_AGENTS_PUBLIC_KEY example-agent"
+vps_accounts_agents:
+  - name: pepper
+    description: muse
+  - name: priti
+    description: ChatGPT
+  - name: bill
+    description: Grok Bot
+  - name: claude
+    description: claude
+# Each entry also needs:
+#   group: agent-ops
+#   public_key: "ssh-ed25519 REPLACE_WITH_THAT_AGENTS_PUBLIC_KEY agent-name"
