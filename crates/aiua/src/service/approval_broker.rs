@@ -272,11 +272,22 @@ fn io_err(err: rusqlite::Error) -> io::Error {
 }
 
 fn peer_uid(stream: &UnixStream) -> io::Result<Option<u32>> {
-    #[cfg(target_os = "linux")]
+    // Linux SO_PEERCRED and macOS getpeereid both surface through tokio.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     {
         Ok(Some(stream.peer_cred()?.uid()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
     {
         let _ = stream;
         Err(denied())
