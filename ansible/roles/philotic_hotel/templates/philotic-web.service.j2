@@ -1,0 +1,26 @@
+# Installed only when philotic_web_separate_unit is true.
+# The vault key is a systemd credential for this user, not a file the hotel
+# uid can read. This unit is not enabled or started by the role.
+[Unit]
+Description=Philotic web console
+After=network-online.target philotic-hotel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ philotic_web_user }}
+Group={{ philotic_web_group }}
+SupplementaryGroups={{ philotic_web_socket_group }}
+ExecStart={{ philotic_runtime_bin_dir }}/philotic-web serve --port {{ philotic_web_port }} --db {{ philotic_data_dir }}/aiua_context.db
+Environment=PHILOTIC_HOTEL_SOCKET={{ philotic_hotel_socket }}
+LoadCredential=philotic-vault-master-key:{{ philotic_vault_key_credential_path }}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+ReadWritePaths={{ philotic_data_dir }}
+InaccessiblePaths=/var/lib/philotic-approval
+
+[Install]
+WantedBy=multi-user.target

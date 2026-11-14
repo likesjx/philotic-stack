@@ -1,0 +1,3 @@
+# Installed only when vps_accounts_narrow_deploy is true.
+# Replaces general sudo with the pipeline entrypoint. Default role runs skip this file.
+{{ vps_accounts_deploy_user }} ALL=(root) NOPASSWD: {{ vps_accounts_ansible_entrypoint }}

@@ -81,6 +81,8 @@ pub async fn run(hotel: String, detach: bool) -> Result<()> {
     if let Some(ref p) = active_profile() {
         cmd.env("PHILOTIC_PROFILE", p);
     }
+    // This child is the hotel, not a guest. Guests spawned later still have
+    // PHILOTIC_VAULT_MASTER_KEY scrubbed. philotic-web reads a credential file.
     if std::env::var_os("PHILOTIC_VAULT_MASTER_KEY").is_none() {
         if let Some(root_key) = load_vault_master_key_env_file()? {
             cmd.env("PHILOTIC_VAULT_MASTER_KEY", root_key);

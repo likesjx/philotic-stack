@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-11-05
+last_updated: 2026-11-14
 tags:
 - source-of-truth
 - current-state
@@ -34,6 +34,8 @@ related_docs:
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- VPS_ACCOUNT_SEPARATION_PROPOSAL.md
+- OWNER_APPROVAL_VERIFIER_PROPOSAL.md
 - NATIVE_APPLE_APP_PROPOSAL.md
 task_refs:
 - docs/task.md
@@ -47,6 +49,10 @@ tracks_domains:
 - deployment-distribution
 - migration-parity
 ---
+
+## VPS accounts and approval-state isolation (2026-11-14)
+
+Test-only source on `cursor/vps-accounts-approval-isolation-9822`. The account role and the approval broker exist in the tree and were exercised locally. `deploy` and sshd are unchanged unless their flags are set, and both flags default off. The playbook refuses jane-vps. No user was created on the VPS, and the broker is not installed there. Live steps are in [the runbook](../operations/VPS_ACCOUNT_CUTOVER_RUNBOOK.md). The next render of `philotic-hotel.service` from this branch restarts the hotel; that overlaps the beta reboot window and is not authorized by the tests.
 
 ## LifeGraph recall provenance (2026-11-05)
 

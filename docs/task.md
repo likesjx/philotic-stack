@@ -1,5 +1,15 @@
 # Ansible Mesh Architecture Separation Task List
 
+## VPS accounts and approval-state isolation — 2026-11-14
+
+Test-only. Specs: `proposal:bill-vps-account-separation-20261114` slice A1 and `proposal:bill-owner-approval-hotel-verifier-20261114` slice S0.
+
+- [x] Ansible role `vps_account_separation` with `jared-admin`, `philotic-approval`, and one `agent-<name>` account per roster entry. Sudoers allowlist. Flags `vps_accounts_narrow_deploy` and `vps_accounts_harden_sshd` default off.
+- [x] [Deploy user dependency audit](operations/DEPLOY_USER_DEPENDENCY_AUDIT.md).
+- [x] Approval broker stub, burn store, guest env scrub, hotel unit `InaccessiblePaths`. No S1 verifier.
+- [ ] Live steps in [the runbook](operations/VPS_ACCOUNT_CUTOVER_RUNBOOK.md). Each one needs Jared's approval. Not started.
+- Muninn bootstrap was unreachable from this cloud session (no frontdoor token, local listener refused). Continuity for this slice is the exported spec plus the repo. Recheck Muninn before a memory-dependent decision.
+
 ## LifeGraph recall provenance — 2026-11-05
 
 - Local follow-on from develop `4c30a79f`: retain typed ranked evidence, source/passage and retrieval provenance; preserve authority and differing evidence during deduplication under existing complete-record budgets. [Contract](architecture/LIFE_GRAPH_RECALL_PROVENANCE.md).

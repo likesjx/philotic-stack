@@ -1,0 +1,5 @@
+# Managed by the vps_account_separation role.
+# The deploy user is intentionally absent. Narrowing deploy is a separate file
+# installed only when vps_accounts_narrow_deploy is true.
+{{ vps_accounts_jared_admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL
+%agent-ops ALL=(root) NOPASSWD: {{ vps_accounts_request_restart_bin }}

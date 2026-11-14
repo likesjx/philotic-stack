@@ -254,6 +254,10 @@ fn cipher() -> Result<Aes256Gcm> {
 /// operator-provisioned key always wins. The Keychain remains the zero-config
 /// bootstrap path when no explicit key exists.
 fn load_or_create_root_key() -> Result<Vec<u8>> {
+    if let Ok(from_credential) = load_systemd_or_explicit_file_root_key() {
+        return Ok(from_credential);
+    }
+
     if let Ok(from_env) = load_env_root_key() {
         return Ok(from_env);
     }
@@ -282,8 +286,47 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
 }
 
 fn load_env_root_key() -> Result<Vec<u8>> {
-    let raw = std::env::var(VAULT_ENV_KEY)?;
+    let raw = zeroize::Zeroizing::new(std::env::var(VAULT_ENV_KEY)?);
     decode_root_key(raw.trim(), VAULT_ENV_KEY)
+}
+
+/// systemd LoadCredential file, or `PHILOTIC_VAULT_MASTER_KEY_FILE`.
+/// Both must be a regular mode-0400 (no group/world access) file of raw base64.
+/// Absent files fall through so the existing env/key-file order is unchanged.
+fn load_systemd_or_explicit_file_root_key() -> Result<Vec<u8>> {
+    if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+        let path = PathBuf::from(&dir).join("philotic-vault-master-key");
+        if path.exists() {
+            return read_private_root_key_file(&path);
+        }
+    }
+    if let Some(path) = std::env::var_os("PHILOTIC_VAULT_MASTER_KEY_FILE") {
+        if !path.is_empty() {
+            return read_private_root_key_file(std::path::Path::new(&path));
+        }
+    }
+    bail!("no private vault key file")
+}
+
+fn read_private_root_key_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.mode() & 0o077 != 0
+        || meta.len() == 0
+        || meta.len() > 512
+    {
+        bail!("refusing vault key file {}", path.display());
+    }
+    let raw = zeroize::Zeroizing::new(
+        fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+    );
+    let text = zeroize::Zeroizing::new(
+        String::from_utf8(raw.to_vec()).context("vault key file was not utf-8")?,
+    );
+    decode_root_key(text.trim(), "vault-key-file")
 }
 
 fn load_env_file_root_key() -> Result<Vec<u8>> {
@@ -467,6 +510,43 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn private_credential_file_wins_over_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("philotic-vault-master-key");
+        let credential = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o400)
+            .open(&path)
+            .unwrap();
+        file.write_all(credential.as_bytes()).unwrap();
+        let previous_dir = std::env::var_os("CREDENTIALS_DIRECTORY");
+        let previous_key = std::env::var_os("PHILOTIC_VAULT_MASTER_KEY");
+        unsafe {
+            std::env::set_var("CREDENTIALS_DIRECTORY", dir.path());
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            );
+        }
+        let loaded = load_or_create_root_key().unwrap();
+        unsafe {
+            match previous_dir {
+                Some(value) => std::env::set_var("CREDENTIALS_DIRECTORY", value),
+                None => std::env::remove_var("CREDENTIALS_DIRECTORY"),
+            }
+            match previous_key {
+                Some(value) => std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", value),
+                None => std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY"),
+            }
+        }
+        assert_eq!(loaded, vec![9u8; 32]);
     }
 
     #[test]

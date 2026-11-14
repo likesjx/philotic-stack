@@ -1,0 +1,21 @@
+---
+# Named external agents. Jared assigned all four to agent-ops.
+# A later agent with no group fails the play. Do not put a real public key in git.
+vps_accounts_narrow_deploy: false
+vps_accounts_harden_sshd: false
+vps_accounts_jared_admin_keys: []
+vps_accounts_agents:
+  - name: pepper
+    description: muse
+    group: agent-ops
+  - name: priti
+    description: ChatGPT
+    group: agent-ops
+  - name: bill
+    description: Grok Bot
+    group: agent-ops
+  - name: claude
+    description: claude
+    group: agent-ops
+# Each entry also needs:
+#   public_key: "ssh-ed25519 REPLACE_WITH_THAT_AGENTS_PUBLIC_KEY agent-name"

@@ -38,6 +38,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths={{ philotic_data_dir }}
+# Same exclusion as the hotel unit: this service runs as the hotel uid.
+InaccessiblePaths=/var/lib/philotic-approval
 ProtectHome=read-only
 
 [Install]

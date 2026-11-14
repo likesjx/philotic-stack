@@ -395,6 +395,12 @@ fn harden_socket_permissions(path: &Path) -> std::io::Result<u32> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let hotel_uid = std::fs::metadata(path)?.uid();
+    if let Some(group) = web_socket_group() {
+        if let Some(gid) = group_id(&group) {
+            std::os::unix::fs::chown(path, None, Some(gid))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+        }
+    }
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         if let Ok(meta) = std::fs::metadata(dir) {
             let sticky = meta.mode() & 0o1000 != 0;
@@ -410,12 +416,136 @@ fn harden_socket_permissions(path: &Path) -> std::io::Result<u32> {
     Ok(hotel_uid)
 }
 
+fn web_unit_uid_permitted(peer_uid: u32, hotel_uid: u32) -> bool {
+    let Some(web_uid) = std::env::var("PHILOTIC_WEB_UNIT_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    web_uid != 0 && web_uid != hotel_uid && peer_uid == web_uid
+}
+
+fn web_socket_group() -> Option<String> {
+    let group = std::env::var("PHILOTIC_WEB_SOCKET_GROUP").ok()?;
+    let group = group.trim();
+    if group.is_empty() {
+        None
+    } else {
+        Some(group.to_string())
+    }
+}
+
+fn group_id(name: &str) -> Option<u32> {
+    let mut bytes = std::ffi::OsString::from(name).into_encoded_bytes();
+    bytes.push(0);
+    let c = std::ffi::CStr::from_bytes_with_nul(&bytes).ok()?;
+    let entry = unsafe { libc::getgrnam(c.as_ptr()) };
+    if entry.is_null() {
+        None
+    } else {
+        Some(unsafe { (*entry).gr_gid })
+    }
+}
+
+#[cfg(test)]
+mod web_unit_socket_tests {
+    use super::{group_id, harden_socket_permissions, web_unit_uid_permitted};
+
+    #[test]
+    fn unset_web_unit_uid_does_not_widen_peer_policy() {
+        let previous = std::env::var_os("PHILOTIC_WEB_UNIT_UID");
+        unsafe { std::env::remove_var("PHILOTIC_WEB_UNIT_UID") };
+        assert!(!web_unit_uid_permitted(971, 999));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PHILOTIC_WEB_UNIT_UID", value),
+                None => std::env::remove_var("PHILOTIC_WEB_UNIT_UID"),
+            }
+        }
+    }
+
+    #[test]
+    fn configured_web_unit_uid_is_allowed_and_hotel_uid_is_not_duplicated() {
+        let previous = std::env::var_os("PHILOTIC_WEB_UNIT_UID");
+        unsafe { std::env::set_var("PHILOTIC_WEB_UNIT_UID", "971") };
+        assert!(web_unit_uid_permitted(971, 999));
+        assert!(!web_unit_uid_permitted(999, 999));
+        assert!(!web_unit_uid_permitted(1001, 999));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PHILOTIC_WEB_UNIT_UID", value),
+                None => std::env::remove_var("PHILOTIC_WEB_UNIT_UID"),
+            }
+        }
+    }
+
+    #[test]
+    fn socket_stays_owner_only_without_a_web_group() {
+        let previous = std::env::var_os("PHILOTIC_WEB_SOCKET_GROUP");
+        unsafe { std::env::remove_var("PHILOTIC_WEB_SOCKET_GROUP") };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hotel.sock");
+        std::fs::write(&path, b"").unwrap();
+        harden_socket_permissions(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PHILOTIC_WEB_SOCKET_GROUP", value),
+                None => std::env::remove_var("PHILOTIC_WEB_SOCKET_GROUP"),
+            }
+        }
+    }
+
+    #[test]
+    fn known_group_widens_the_socket_to_group_rw() {
+        let Some(name) = std::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+        else {
+            return;
+        };
+        let name = name.trim();
+        if group_id(name).is_none() {
+            return;
+        }
+        let previous = std::env::var_os("PHILOTIC_WEB_SOCKET_GROUP");
+        unsafe { std::env::set_var("PHILOTIC_WEB_SOCKET_GROUP", name) };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hotel.sock");
+        std::fs::write(&path, b"").unwrap();
+        harden_socket_permissions(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PHILOTIC_WEB_SOCKET_GROUP", value),
+                None => std::env::remove_var("PHILOTIC_WEB_SOCKET_GROUP"),
+            }
+        }
+    }
+}
+
 /// Check the connecting process's uid (SO_PEERCRED on Linux, getpeereid on
 /// macOS). Fails closed: a connection whose credentials cannot be read is
 /// refused.
 fn peer_uid_permitted(stream: &UnixStream, hotel_uid: u32, policy: PeerUidPolicy) -> bool {
     match stream.peer_cred() {
-        Ok(cred) if policy(cred.uid(), hotel_uid) => true,
+        Ok(cred)
+            if policy(cred.uid(), hotel_uid) || web_unit_uid_permitted(cred.uid(), hotel_uid) =>
+        {
+            true
+        }
         Ok(cred) => {
             warn!(
                 peer_uid = cred.uid(),

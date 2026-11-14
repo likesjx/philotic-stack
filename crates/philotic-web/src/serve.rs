@@ -8660,6 +8660,17 @@ fn default_operator_display_name() -> String {
 fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
     let account = vault_root_key_account();
 
+    if let Some(loaded) = crate::vault_key::load_non_env_root_key(&account) {
+        return RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(loaded.vault_ref),
+            public_fingerprint: Some(root_key_fingerprint(&loaded.bytes)),
+            rotation_state: "active".into(),
+            source_kind: loaded.source_kind.into(),
+        };
+    }
+
     if let Ok(key_bytes) = load_root_key_from_env() {
         return RootUserKeyRefStatusView {
             user_id: default_operator_user_id(hotel),
@@ -8720,7 +8731,7 @@ fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
 }
 
 fn load_root_key_from_env() -> Result<Vec<u8>> {
-    let raw = std::env::var("PHILOTIC_VAULT_MASTER_KEY")?;
+    let raw = zeroize::Zeroizing::new(std::env::var("PHILOTIC_VAULT_MASTER_KEY")?);
     decode_root_key(raw.trim(), "PHILOTIC_VAULT_MASTER_KEY")
 }
 
@@ -8814,6 +8825,7 @@ fn root_user_key_source_kind(vault_ref: &Option<String>) -> String {
     match vault_ref.as_deref() {
         Some(value) if value.starts_with("keychain://") => "keychain".into(),
         Some(value) if value.starts_with("env://") => "env".into(),
+        Some(value) if value.starts_with("credential://") => "systemd-credential".into(),
         Some(value) if value.starts_with("file://") => "key-file".into(),
         Some(_) => "opaque".into(),
         None => "missing".into(),
@@ -10119,9 +10131,11 @@ mod tests {
 
     #[test]
     fn ensure_operator_auth_tables_seeds_root_user_key_ref_from_env() {
+        let _lock = crate::vault_key::test_env_lock();
         let context_path = temp_db_path("root-user-key-ref");
         let key_id = format!("test-key-{}", uuid::Uuid::new_v4());
         let root_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let empty = tempfile::tempdir().unwrap();
 
         // Restores the previous values on drop rather than deleting them.
         // Rust runs tests as threads of a single process, so an unconditional
@@ -10129,6 +10143,8 @@ mod tests {
         // concurrently — including the value CI provides.
         let _key_id_env = EnvVarGuard::set("PHILOTIC_VAULT_KEY_ID", &key_id);
         let _root_key_env = EnvVarGuard::set("PHILOTIC_VAULT_MASTER_KEY", &root_key);
+        let _cred_env = EnvVarGuard::set("CREDENTIALS_DIRECTORY", empty.path().to_str().unwrap());
+        let _file_env = EnvVarGuard::set("PHILOTIC_VAULT_MASTER_KEY_FILE", "");
 
         ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
         let refs = list_root_user_key_refs(&context_path, "mac-jane").unwrap();
@@ -10143,6 +10159,49 @@ mod tests {
         assert_eq!(root_ref.vault_ref.as_deref(), Some(expected_ref.as_str()));
         assert!(root_ref.public_fingerprint.is_some());
 
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn ensure_operator_auth_tables_prefers_a_private_systemd_credential() {
+        let _lock = crate::vault_key::test_env_lock();
+        let context_path = temp_db_path("root-user-key-credential");
+        let key_id = format!("test-key-{}", uuid::Uuid::new_v4());
+        let dir = tempfile::tempdir().unwrap();
+        let credential = dir.path().join("philotic-vault-master-key");
+        let root_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o400)
+            .open(&credential)
+            .unwrap();
+        file.write_all(root_key.as_bytes()).unwrap();
+        let _key_id_env = EnvVarGuard::set("PHILOTIC_VAULT_KEY_ID", &key_id);
+        let _root_key_env = EnvVarGuard::set(
+            "PHILOTIC_VAULT_MASTER_KEY",
+            &base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        );
+        let _cred_env = EnvVarGuard::set("CREDENTIALS_DIRECTORY", dir.path().to_str().unwrap());
+
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let refs = list_root_user_key_refs(&context_path, "mac-jane").unwrap();
+        let root_ref = refs
+            .iter()
+            .find(|entry| entry.key_purpose == "vault-root-key")
+            .expect("root key ref should exist");
+        assert_eq!(root_ref.source_kind, "systemd-credential");
+        assert_eq!(
+            root_ref.vault_ref.as_deref(),
+            Some(format!("credential://philotic-vault-master-key/{key_id}").as_str())
+        );
+        assert!(!root_ref
+            .vault_ref
+            .as_deref()
+            .unwrap_or("")
+            .contains(&root_key));
         let _ = fs::remove_file(&context_path);
     }
 

@@ -1,0 +1,50 @@
+---
+# Account layout for proposal:bill-vps-account-separation-20261114 slice A1.
+# Both flags stay false until the owner approves that live step.
+# A default run does not modify the deploy user or sshd.
+
+vps_accounts_narrow_deploy: false
+vps_accounts_harden_sshd: false
+
+# Non-local inventory is refused unless this is explicitly true, and the
+# playbook still refuses jane-vps / 31.97.130.98 unconditionally.
+vps_accounts_live_approved: false
+
+vps_accounts_jared_admin_user: jared-admin
+# Public keys only. Empty means the account exists and cannot log in.
+vps_accounts_jared_admin_keys: []
+vps_accounts_tailscale_cidr: "100.64.0.0/10"
+
+vps_accounts_approval_user: philotic-approval
+# Hypothesis: 970 is free on jane-vps. It must not be 999 (hotel and beta mongo)
+# or 1001 (deploy). Confirm with getent before the live useradd.
+vps_accounts_approval_uid: 970
+vps_accounts_approval_home: /var/lib/philotic-approval
+vps_accounts_hotel_uid: 999
+vps_accounts_hotel_user: philotic
+
+vps_accounts_deploy_user: deploy
+# Used only when vps_accounts_narrow_deploy is true.
+vps_accounts_deploy_pipeline_keys: []
+
+# One account per external agent. name becomes agent-<name>.
+# Jared assigned these four to agent-ops. group is still required: a later
+# agent with no group fails the play. public_key is supplied at apply time
+# and is not stored here.
+vps_accounts_agents:
+  - name: pepper
+    description: muse
+    group: agent-ops
+  - name: priti
+    description: ChatGPT
+    group: agent-ops
+  - name: bill
+    description: Grok Bot
+    group: agent-ops
+  - name: claude
+    description: claude
+    group: agent-ops
+
+vps_accounts_request_restart_bin: /usr/local/sbin/philotic-request-restart
+vps_accounts_ansible_entrypoint: /usr/local/sbin/philotic-ansible-entrypoint
+vps_accounts_systemd_unit_dir: /etc/systemd/system
