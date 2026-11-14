@@ -101,6 +101,33 @@ impl Transport {
         })
     }
 
+    // Shared by the TCP listener and the in-memory component test.
+    async fn serve_stream<S>(self, stream: S, peer: std::net::SocketAddr, router: Router)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let Ok(Ok(tls)) =
+            tokio::time::timeout(Duration::from_secs(5), self.acceptor.accept(stream)).await
+        else {
+            return;
+        };
+        let Some(leaf) = tls.get_ref().1.peer_certificates().and_then(|c| c.first()) else {
+            return;
+        };
+        let pin: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+        if !self.allowed.contains(&pin) {
+            return;
+        }
+        let service = TowerToHyperService::new(
+            router
+                .layer(Extension(ConnectInfo(peer)))
+                .layer(Extension(crate::server::ProxyTransport)),
+        );
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(tls), service)
+            .await;
+    }
+
     pub async fn serve(
         self,
         listener: TcpListener,
@@ -116,14 +143,7 @@ impl Transport {
                 accepted = listener.accept(), if connections.len() < 128 => {
                     let (stream, peer) = accepted?;
                     let this = self.clone(); let router = router.clone();
-                    connections.spawn(async move {
-                        let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(5), this.acceptor.accept(stream)).await else { return; };
-                        let Some(leaf) = tls.get_ref().1.peer_certificates().and_then(|c| c.first()) else { return; };
-                        let pin: [u8;32] = Sha256::digest(leaf.as_ref()).into();
-                        if !this.allowed.contains(&pin) { return; }
-                        let service = TowerToHyperService::new(router.layer(Extension(ConnectInfo(peer))).layer(Extension(crate::server::ProxyTransport)));
-                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), service).await;
-                    });
+                    connections.spawn(async move { this.serve_stream(stream, peer, router).await; });
                 }
             }
         }
@@ -243,5 +263,231 @@ mod tests {
         assert!(result.is_err() || result.unwrap() == 0);
         std::fs::write(&config, b"{}").unwrap();
         assert!(Transport::load(&config).is_err());
+    }
+}
+
+#[cfg(test)]
+mod synthetic_ca_loader_tests {
+    use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn synthetic_transport_loads_new_ca_and_refuses_bad_inputs_without_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let wrong_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::new(vec![]).unwrap();
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client = client_params
+            .signed_by(&KeyPair::generate().unwrap(), &ca, &ca_key)
+            .unwrap();
+        for (name, bytes) in [
+            ("server.pem", server.pem()),
+            ("key.pem", server_key.serialize_pem()),
+            ("ca.pem", ca.pem()),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = dir.path().join("tls.json");
+        let mut data = serde_json::json!({"certificate":dir.path().join("server.pem"), "private_key":dir.path().join("key.pem"), "client_ca":dir.path().join("ca.pem"), "allowed_client_sha256":[hex::encode(Sha256::digest(client.der()))]});
+        let write_config = |value: &serde_json::Value| {
+            std::fs::write(&config, serde_json::to_vec(value).unwrap()).unwrap()
+        };
+        write_config(&data);
+        let loaded = Transport::load(&config).unwrap();
+        let expected: [u8; 32] = Sha256::digest(client.der()).into();
+        assert_eq!(loaded.allowed.as_slice(), &[expected]);
+        std::fs::write(dir.path().join("key.pem"), wrong_key.serialize_pem()).unwrap();
+        assert!(Transport::load(&config).is_err());
+        std::fs::write(dir.path().join("key.pem"), server_key.serialize_pem()).unwrap();
+        data["allowed_client_sha256"] = serde_json::json!(["invalid"]);
+        write_config(&data);
+        assert!(Transport::load(&config).is_err());
+        data["allowed_client_sha256"] =
+            serde_json::json!([hex::encode(Sha256::digest(client.der()))]);
+        write_config(&data);
+        std::fs::write(dir.path().join("ca.pem"), b"not a certificate").unwrap();
+        assert!(Transport::load(&config).is_err());
+    }
+}
+
+#[cfg(test)]
+mod synthetic_in_memory_handshake_tests {
+    use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_rustls::TlsConnector;
+
+    #[tokio::test]
+    async fn actual_transport_handshakes_with_new_ca_and_rejects_other_ca_without_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let other_key = KeyPair::generate().unwrap();
+        let mut other_params = CertificateParams::new(vec![]).unwrap();
+        other_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let other_ca = other_params.self_signed(&other_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client = params.signed_by(&client_key, &ca, &ca_key).unwrap();
+        let old_client_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let old_client = params
+            .signed_by(&old_client_key, &other_ca, &other_key)
+            .unwrap();
+        for (name, bytes) in [
+            ("server.pem", server.pem()),
+            ("key.pem", server_key.serialize_pem()),
+            ("ca.pem", ca.pem()),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = dir.path().join("tls.json");
+        std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"certificate":dir.path().join("server.pem"), "private_key":dir.path().join("key.pem"), "client_ca":dir.path().join("ca.pem"), "allowed_client_sha256":[hex::encode(Sha256::digest(client.der()))]})).unwrap()).unwrap();
+        let transport = Transport::load(&config).unwrap();
+        let make_client = |root: &rcgen::Certificate, cert: &rcgen::Certificate, key: &KeyPair| {
+            let mut roots = RootCertStore::empty();
+            roots.add(root.der().clone()).unwrap();
+            let c = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+            TlsConnector::from(Arc::new(c))
+        };
+        async fn handshake(transport: &Transport, connector: TlsConnector) -> (bool, bool) {
+            let (server_io, client_io) = tokio::io::duplex(65536);
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let (server, client) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    transport.acceptor.accept(server_io),
+                    connector.connect(name, client_io)
+                )
+            })
+            .await
+            .expect("in-memory handshake timed out");
+            (server.is_ok(), client.is_ok())
+        }
+        assert_eq!(
+            handshake(&transport, make_client(&ca, &client, &client_key)).await,
+            (true, true)
+        );
+        let (_, wrong_server_ca) =
+            handshake(&transport, make_client(&other_ca, &client, &client_key)).await;
+        assert!(!wrong_server_ca);
+        let (old_client_accepted, _) =
+            handshake(&transport, make_client(&ca, &old_client, &old_client_key)).await;
+        assert!(!old_client_accepted);
+
+        // Same trusted CA and EKU, but a different key/leaf than the allowed pin.
+        let wrong_pin_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let wrong_pin_client = params.signed_by(&wrong_pin_key, &ca, &ca_key).unwrap();
+        assert_ne!(
+            Sha256::digest(client.der()),
+            Sha256::digest(wrong_pin_client.der())
+        );
+        // Establish that this exact wrong-pin client completes mutual TLS on
+        // both sides before testing the serving path's pin rejection.
+        assert_eq!(
+            handshake(
+                &transport,
+                make_client(&ca, &wrong_pin_client, &wrong_pin_key)
+            )
+            .await,
+            (true, true)
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let router = Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let calls = handler_calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "ok"
+                }
+            }),
+        );
+        async fn request(
+            transport: &Transport,
+            connector: TlsConnector,
+            router: Router,
+        ) -> Vec<u8> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (server, client) = tokio::io::duplex(65536);
+            // Both futures are owned here; timeout drops both, leaving no
+            // detached server task.
+            let (_, result) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    transport.clone().serve_stream(
+                        server,
+                        "127.0.0.1:1234".parse().unwrap(),
+                        router
+                    ),
+                    async {
+                        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+                        let mut tls = connector.connect(name, client).await?;
+                        let _ = tls
+                            .write_all(
+                                b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        let mut body = Vec::new();
+                        let _ = tls.read_to_end(&mut body).await;
+                        Ok::<_, std::io::Error>(body)
+                    }
+                )
+            })
+            .await
+            .expect("request timed out");
+            result.expect("client TLS handshake failed")
+        }
+        let response = request(
+            &transport,
+            make_client(&ca, &client, &client_key),
+            router.clone(),
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let response = request(
+            &transport,
+            make_client(&ca, &wrong_pin_client, &wrong_pin_key),
+            router.clone(),
+        )
+        .await;
+        assert!(response.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let response = request(&transport, make_client(&ca, &client, &client_key), router).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
