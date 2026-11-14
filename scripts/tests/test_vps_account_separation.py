@@ -27,6 +27,7 @@ ENV = os.environ.copy()
 ENV.update(
     {
         "ANSIBLE_CONFIG": str(CFG),
+        "ANSIBLE_ROLES_PATH": str(ANSIBLE / "roles"),
         "ANSIBLE_LOCALHOST_WARNING": "False",
         "ANSIBLE_DEPRECATION_WARNINGS": "False",
         "ANSIBLE_HOST_KEY_CHECKING": "False",
@@ -34,7 +35,7 @@ ENV.update(
 )
 
 CREATED_USERS: list[str] = []
-CREATED_GROUPS = ["agent-ops", "agent-readonly"]
+GROUPS_WE_CREATED: list[str] = []
 HARDENING = Path("/etc/ssh/sshd_config.d/99-philotic-sshd-hardening.conf")
 SUDOERS = Path("/etc/sudoers.d/philotic-vps-accounts")
 PIPELINE_SUDOERS = Path("/etc/sudoers.d/philotic-deploy-pipeline")
@@ -176,7 +177,7 @@ def cleanup() -> None:
     sudo(["rm", "-rf", str(APPROVAL_HOME)], check=False)
     for user in CREATED_USERS:
         sudo(["userdel", "-r", user], check=False)
-    for group in CREATED_GROUPS:
+    for group in GROUPS_WE_CREATED:
         sudo(["groupdel", group], check=False)
 
 
@@ -191,6 +192,9 @@ def main() -> None:
         raise SystemExit("uid 970 is already allocated")
     if sudo(["getent", "passwd", "999"], check=False).returncode == 0:
         raise SystemExit("uid 999 is already allocated")
+    for group in ("agent-ops", "agent-readonly"):
+        if sudo(["getent", "group", group], check=False).returncode == 0:
+            raise SystemExit(f"{group} already exists; refusing to delete a preexisting group")
 
     print("== syntax-check ==")
     syntax = playbook(["--syntax-check"])
@@ -247,6 +251,7 @@ def main() -> None:
             CREATED_USERS.append(account)
         CREATED_USERS.extend(["jared-admin", "philotic-approval"])
 
+        GROUPS_WE_CREATED.extend(["agent-ops", "agent-readonly"])
         print("== converge ==")
         first = playbook(["-e", f"@{extra}"])
         if first.returncode != 0:

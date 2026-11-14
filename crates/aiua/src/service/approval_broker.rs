@@ -10,12 +10,15 @@ use std::{io, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
+    time::timeout,
 };
 
 pub const APPROVAL_DB_PATH: &str = "/var/lib/philotic-approval/approval.db";
 pub const BROKER_SOCKET_PATH: &str = "/run/philotic-approval/broker.sock";
 const MAX_FRAME: usize = 4096;
+const MAX_HANDLERS: usize = 8;
+const READ_DEADLINE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrokerPolicy {
@@ -326,11 +329,17 @@ impl Broker {
 }
 
 pub async fn serve(listener: UnixListener, broker: Broker) -> io::Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_HANDLERS));
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let policy = broker.policy;
         let store = Arc::clone(&broker.store);
         tokio::spawn(async move {
+            let _permit = permit;
             handle_connection(stream, policy, store).await;
         });
     }
@@ -348,6 +357,7 @@ pub fn run_socket_activated() -> anyhow::Result<()> {
         std::env::var("PHILOTIC_APPROVAL_DB").unwrap_or_else(|_| APPROVAL_DB_PATH.to_string());
     let store = ApprovalStore::open(Path::new(&db_path))?;
     let listener = listener_from_activation()?;
+    validate_production_listener(&listener)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -396,17 +406,26 @@ pub fn validate_production_listener(listener: &UnixListener) -> io::Result<()> {
 }
 
 async fn handle_connection(
+    stream: UnixStream,
+    policy: BrokerPolicy,
+    store: Arc<Mutex<ApprovalStore>>,
+) {
+    handle_connection_within(stream, policy, store, READ_DEADLINE).await;
+}
+
+async fn handle_connection_within(
     mut stream: UnixStream,
     policy: BrokerPolicy,
     store: Arc<Mutex<ApprovalStore>>,
+    deadline: Duration,
 ) {
     let peer = peer_uid(&stream).ok().flatten();
     let response = if !peer_is_allowed(peer, policy) {
         reply_err()
     } else {
-        match read_frame(&mut stream).await {
-            Ok(bytes) => dispatch(&bytes, &store).await,
-            Err(_) => reply_err(),
+        match timeout(deadline, read_frame(&mut stream)).await {
+            Ok(Ok(bytes)) => dispatch(&bytes, &store).await,
+            _ => reply_err(),
         }
     };
     let _ = write_frame(&mut stream, &response).await;
@@ -784,5 +803,27 @@ mod tests {
                 None => std::env::remove_var("LISTEN_PID"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn idle_allowed_peer_fails_closed() {
+        let (_dir, path) = temp_db();
+        let store = Arc::new(Mutex::new(ApprovalStore::open(&path).unwrap()));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let uid = peer_uid(&server).unwrap().unwrap();
+        let policy = BrokerPolicy::new(uid).unwrap();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(handle_connection_within(
+            server,
+            policy,
+            store,
+            Duration::from_millis(50),
+        ));
+        let response = read_frame(&mut client).await.unwrap();
+        task.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let parsed: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], "approval_unavailable");
     }
 }
