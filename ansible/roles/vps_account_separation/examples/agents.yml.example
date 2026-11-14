@@ -1,0 +1,10 @@
+---
+# Example inputs. Do not put a real public key in git.
+# Generate a key on the agent's own machine and pass only the public line.
+vps_accounts_narrow_deploy: false
+vps_accounts_harden_sshd: false
+vps_accounts_jared_admin_keys: []
+vps_accounts_agents: []
+# - name: example
+#   group: agent-readonly
+#   public_key: "ssh-ed25519 REPLACE_WITH_THAT_AGENTS_PUBLIC_KEY example-agent"

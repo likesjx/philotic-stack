@@ -1,0 +1,21 @@
+#!/bin/sh
+# Record a restart request. This command never restarts, stops, or reloads a service.
+set -eu
+unit="${1:-}"
+case "$unit" in
+  philotic-hotel.service)
+    ;;
+  *)
+    echo "unit is not requestable" >&2
+    exit 2
+    ;;
+esac
+dest="{{ vps_accounts_approval_home }}/restart-requests"
+install -d -o "{{ vps_accounts_approval_user }}" -g "{{ vps_accounts_approval_user }}" -m 0750 "$dest"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+tmp="$(mktemp)"
+requester="${SUDO_USER:-unknown}"
+printf 'unit=%s\nrequester=%s\nat=%s\n' "$unit" "$requester" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
+install -o "{{ vps_accounts_approval_user }}" -g "{{ vps_accounts_approval_user }}" -m 0600 "$tmp" "$dest/$stamp.request"
+rm -f "$tmp"
+echo "restart requested $stamp"

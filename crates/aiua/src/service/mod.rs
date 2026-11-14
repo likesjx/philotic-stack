@@ -1,3 +1,4 @@
+pub mod approval_broker;
 pub mod blob;
 pub mod blob_transfer;
 pub mod command_manifest;

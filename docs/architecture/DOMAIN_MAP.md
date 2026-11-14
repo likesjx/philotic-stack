@@ -157,6 +157,7 @@ Active proposals:
 - [PERIMETER_EGRESS_CONTROL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md)
 - [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KEY_VAULT_PROPOSAL.md)
 - [LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md)
+- [OWNER_APPROVAL_VERIFIER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OWNER_APPROVAL_VERIFIER_PROPOSAL.md)
 
 ## Deployment And Distribution
 
@@ -170,6 +171,7 @@ Current truth:
 Active proposals:
 
 - [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md)
+- [VPS_ACCOUNT_SEPARATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VPS_ACCOUNT_SEPARATION_PROPOSAL.md)
 - [GUEST_BINARY_RESOLUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md)
 - [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md)
 - [HOMEBREW_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOMEBREW_DISTRIBUTION_PROPOSAL.md)

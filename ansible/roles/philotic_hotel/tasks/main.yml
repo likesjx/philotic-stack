@@ -152,8 +152,8 @@
   copy:
     src: "{{ philotic_artifacts_dir }}/{{ item }}"
     dest: "{{ philotic_bin_dir }}/{{ item }}"
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
+    owner: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_user }}"
+    group: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_group }}"
     mode: "0755"
   loop: "{{ philotic_binaries }}"
   when:
@@ -188,8 +188,8 @@
   copy:
     src: "{{ philotic_artifacts_dir }}/{{ item }}"
     dest: "{{ philotic_bin_dir }}/{{ item }}"
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
+    owner: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_user }}"
+    group: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_group }}"
     mode: "0755"
     remote_src: yes
   loop: >-

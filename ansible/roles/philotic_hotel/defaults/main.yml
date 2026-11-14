@@ -14,6 +14,11 @@ philotic_blob_dir: "/opt/philotic/data/blob"
 # Service user (non-root)
 philotic_user: "philotic"
 philotic_group: "philotic"
+# Legacy binary copies are owned by the hotel user today. Set this true only
+# in the approved reboot window so philotic-web (and the other bins) become
+# root-owned and the service user cannot replace them. Default keeps the
+# current owner so an ordinary hotel deploy does not chown or restart for this.
+philotic_bin_owner_root: false
 philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub caches models at $HOME/.cache/huggingface
 
 # Artifacts — binaries delivered from the control machine or a CI artifact store.

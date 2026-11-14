@@ -1,0 +1,215 @@
+---
+- name: Refuse approval uid collisions with the hotel or deploy
+  ansible.builtin.assert:
+    that:
+      - vps_accounts_approval_uid | int != 999
+      - vps_accounts_approval_uid | int != (vps_accounts_hotel_uid | int)
+      - vps_accounts_approval_uid | int != 1001
+      - vps_accounts_approval_uid | int > 0
+      - not (vps_accounts_narrow_deploy | bool) or (vps_accounts_live_approved | bool) or inventory_hostname in ['localhost', '127.0.0.1']
+    fail_msg: >-
+      Refusing an approval uid that collides with philotic (999), the configured
+      hotel uid, or deploy (1001).
+
+- name: Validate agent roster entries
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-z][a-z0-9-]{0,24}$')
+      - item.group in ['agent-ops', 'agent-readonly']
+      - item.public_key is match('^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+( .+)?$')
+  loop: "{{ vps_accounts_agents }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Validate jared-admin public keys
+  ansible.builtin.assert:
+    that:
+      - item is match('^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+( .+)?$')
+  loop: "{{ vps_accounts_jared_admin_keys }}"
+  loop_control:
+    label: "jared-admin key"
+
+- name: Create agent groups
+  ansible.builtin.group:
+    name: "{{ item }}"
+    system: true
+  loop:
+    - agent-ops
+    - agent-readonly
+
+- name: Create jared-admin
+  ansible.builtin.user:
+    name: "{{ vps_accounts_jared_admin_user }}"
+    shell: /bin/bash
+    groups: sudo
+    append: true
+    create_home: true
+    password_lock: true
+    comment: "Jared personal admin. No automation."
+
+- name: Install jared-admin keys restricted to Tailscale
+  ansible.builtin.authorized_key:
+    user: "{{ vps_accounts_jared_admin_user }}"
+    key: "{{ vps_accounts_jared_admin_keys | join('\n') }}"
+    key_options: 'from="{{ vps_accounts_tailscale_cidr }}"'
+    exclusive: true
+    manage_dir: true
+  no_log: true
+  when: vps_accounts_jared_admin_keys | length > 0
+
+- name: Create philotic-approval service user
+  ansible.builtin.user:
+    name: "{{ vps_accounts_approval_user }}"
+    uid: "{{ vps_accounts_approval_uid }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ vps_accounts_approval_home }}"
+    create_home: true
+    password_lock: true
+    comment: "Approval state owner. No login."
+
+- name: Keep philotic-approval out of privileged groups
+  ansible.builtin.command:
+    argv:
+      - id
+      - -nG
+      - "{{ vps_accounts_approval_user }}"
+  register: vps_accounts_approval_groups
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Fail if philotic-approval gained sudo, docker, or deploy
+  ansible.builtin.assert:
+    that:
+      - "'sudo' not in vps_accounts_approval_groups.stdout.split()"
+      - "'docker' not in vps_accounts_approval_groups.stdout.split()"
+      - "'deploy' not in vps_accounts_approval_groups.stdout.split()"
+      - "'agent-ops' not in vps_accounts_approval_groups.stdout.split()"
+      - "'agent-readonly' not in vps_accounts_approval_groups.stdout.split()"
+  when: not ansible_check_mode
+
+- name: Own the approval state directory
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ vps_accounts_approval_user }}"
+    group: "{{ vps_accounts_approval_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ vps_accounts_approval_home }}", mode: "0700" }
+    - { path: "{{ vps_accounts_approval_home }}/restart-requests", mode: "0750" }
+
+- name: Detect systemd-journal group
+  ansible.builtin.command: getent group systemd-journal
+  register: vps_accounts_journal_group
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Create one account per external agent
+  ansible.builtin.user:
+    name: "agent-{{ item.name }}"
+    shell: /bin/bash
+    groups: "{{ item.group ~ (',systemd-journal' if (vps_accounts_journal_group.rc | default(1) | int) == 0 else '') }}"
+    append: false
+    create_home: true
+    password_lock: true
+    comment: "External agent {{ item.name }} ({{ item.group }})"
+  loop: "{{ vps_accounts_agents }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Install that agent's own public key
+  ansible.builtin.authorized_key:
+    user: "agent-{{ item.name }}"
+    key: "{{ item.public_key }}"
+    exclusive: true
+    manage_dir: true
+  no_log: true
+  loop: "{{ vps_accounts_agents }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Install the restart-request helper
+  ansible.builtin.template:
+    src: philotic-request-restart.j2
+    dest: "{{ vps_accounts_request_restart_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the account sudoers allowlist
+  ansible.builtin.template:
+    src: philotic-vps-accounts.sudoers.j2
+    dest: /etc/sudoers.d/philotic-vps-accounts
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -c -f %s
+
+- name: Install approval broker unit templates
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ vps_accounts_systemd_unit_dir }}/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: philotic-approval-broker.service.j2, dest: philotic-approval-broker.service }
+    - { src: philotic-approval-broker.socket.j2, dest: philotic-approval-broker.socket }
+  loop_control:
+    label: "{{ item.dest }}"
+
+# Deploy narrowing. The whole block is skipped unless the flag is true.
+# A default run never reaches these tasks, so deploy's sudo, groups, and keys stay.
+- name: Narrow deploy to the pipeline entrypoint
+  when: vps_accounts_narrow_deploy | bool
+  block:
+    - name: Install the unwired pipeline entrypoint
+      ansible.builtin.template:
+        src: philotic-ansible-entrypoint.j2
+        dest: "{{ vps_accounts_ansible_entrypoint }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the narrowed deploy sudoers file
+      ansible.builtin.template:
+        src: philotic-deploy-pipeline.sudoers.j2
+        dest: /etc/sudoers.d/philotic-deploy-pipeline
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -c -f %s
+
+    - name: Remove deploy from the sudo group
+      ansible.builtin.command:
+        argv: ["gpasswd", "-d", "{{ vps_accounts_deploy_user }}", "sudo"]
+      register: vps_accounts_drop_sudo
+      changed_when: vps_accounts_drop_sudo.rc == 0
+      failed_when: vps_accounts_drop_sudo.rc not in [0, 3]
+
+    - name: Remove deploy from the docker group
+      ansible.builtin.command:
+        argv: ["gpasswd", "-d", "{{ vps_accounts_deploy_user }}", "docker"]
+      register: vps_accounts_drop_docker
+      changed_when: vps_accounts_drop_docker.rc == 0
+      failed_when: vps_accounts_drop_docker.rc not in [0, 3]
+
+    - name: Replace deploy authorized keys with the pipeline key
+      ansible.builtin.authorized_key:
+        user: "{{ vps_accounts_deploy_user }}"
+        key: "{{ vps_accounts_deploy_pipeline_keys | join('\n') }}"
+        exclusive: true
+      no_log: true
+      when: vps_accounts_deploy_pipeline_keys | length > 0
+
+# sshd hardening. Skipped unless the flag is true. No handler reloads sshd.
+- name: Install sshd hardening drop-in
+  ansible.builtin.template:
+    src: sshd-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-philotic-sshd-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: vps_accounts_harden_sshd | bool

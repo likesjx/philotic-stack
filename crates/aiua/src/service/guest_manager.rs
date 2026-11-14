@@ -162,6 +162,86 @@ impl LocalProcessMaterializer {
     }
 }
 
+/// Environment variables a guest may inherit from the hotel process.
+/// Everything else is dropped by [`apply_guest_spawn_env`]. Secrets that
+/// live in the hotel `EnvironmentFile` are intentionally absent.
+const GUEST_INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "RUST_LOG",
+    "PHILOTIC_BIN_DIR",
+    "PHILOTIC_HOTEL_SOCKET",
+    "PHILOTIC_HOTEL_PORT",
+    "PHILOTIC_PROFILE",
+    "PHILOTIC_NODE_ID",
+    "PHILOTIC_GRAPH_DB_PATH",
+    "PHILOTIC_GRAPH_DATABASE_DIR",
+    "PHILOTIC_GRAPH_PROVIDER",
+    "PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE",
+    "PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE",
+    "PHILOTIC_MEMGRAPH_URI",
+    "PHILOTIC_MEMGRAPH_USER",
+    "PHILOTIC_MEMGRAPH_DB",
+    "PHILOTIC_TABLE_DB",
+    "PHILOTIC_ENABLE_RUST_AUTH",
+    "PHILOTIC_ENABLE_RUST_DISPATCHER",
+    "PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE",
+    "PHILOTIC_DREAM_SWEEP_ENABLED",
+    "PHILOTIC_MEMORY_SLEEP_MUTATE",
+    "PHILOTIC_MEMORY_HYGIENE_ENABLED",
+    "PHILOTIC_SHADOW_DECISIONS",
+    "PHILOTIC_HEAL_DECISIONS_FALLBACK",
+    "PHILOTIC_DECISION_TRACE_DB",
+    "PHILOTIC_ONNX_SIDECAR_ADDR",
+];
+
+/// Never copied from the hotel environment and never accepted from a guest
+/// config `env` map. `PHILOTIC_MEMGRAPH_PASSWORD` is not in this list: the
+/// hotel copies it into specific guest configs on purpose, but it is also
+/// not on [`GUEST_INHERITED_ENV`], so other guests do not inherit it.
+const GUEST_ENV_NEVER: &[&str] = &[
+    "PHILOTIC_VAULT_MASTER_KEY",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+];
+
+pub(crate) fn guest_env_never(key: &str) -> bool {
+    GUEST_ENV_NEVER.iter().any(|denied| *denied == key)
+}
+
+/// Clear the inherited environment, copy the allowlist, then apply the guest
+/// config map. The vault master key cannot be reintroduced by config.
+pub(crate) fn apply_guest_spawn_env(command: &mut TokioCommand, config_json: &serde_json::Value) {
+    command.env_clear();
+    for key in GUEST_INHERITED_ENV {
+        if guest_env_never(key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+    if let Some(env_obj) = config_json.get("env").and_then(|e| e.as_object()) {
+        for (key, value) in env_obj {
+            if guest_env_never(key) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Materializer for LocalProcessMaterializer {
     async fn spawn_guest(
@@ -204,13 +284,7 @@ impl Materializer for LocalProcessMaterializer {
                     }
                 }
             }
-            if let Some(env_obj) = config_json.get("env").and_then(|e| e.as_object()) {
-                for (key, value) in env_obj {
-                    if let Some(value) = value.as_str() {
-                        command.env(key, value);
-                    }
-                }
-            }
+            apply_guest_spawn_env(&mut command, config_json);
             // Always override with hotel's own socket path.  Prefer the value
             // supplied at construction time; fall back to the process env (for
             // cases where the hotel was started with the var already set).
@@ -2679,6 +2753,108 @@ mod tests {
         assert!(!stdout_line_is_health_signal(
             "2026-07-20T13:20:12Z  INFO philote: tool result contained field error=none"
         ));
+    }
+
+    #[tokio::test]
+    async fn guest_spawn_scrubs_vault_master_key_and_unlisted_env() {
+        let dump = std::env::temp_dir().join(format!(
+            "philotic-guest-env-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&dump);
+        let guards = [
+            EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", "parent-vault-must-not-leak"),
+            EnvGuard::set(
+                "PHILOTIC_MEMGRAPH_PASSWORD",
+                "parent-memgraph-must-not-leak",
+            ),
+            EnvGuard::set("PHILOTIC_BIN_DIR", "/opt/philotic/bin-synthetic"),
+            EnvGuard::set("PHILOTIC_SYNTHETIC_INHERITED_MARKER", "not-on-allowlist"),
+            EnvGuard::set("LISTEN_FDS", "1"),
+            EnvGuard::set("LISTEN_PID", "1"),
+            EnvGuard::set("LISTEN_FDNAMES", "philotic-approval"),
+        ];
+        let script = format!("env | sort > '{}'", dump.display());
+        let mut materializer = LocalProcessMaterializer::new(":memory:");
+        let guest_id = "env-scrub-guest";
+        materializer
+            .spawn_guest(
+                guest_id,
+                &json!({
+                    "command": "/bin/sh",
+                    "args": ["-c", script],
+                    "env": {
+                        "GUEST_CONFIG_MARKER": "from-config",
+                        "PHILOTIC_VAULT_MASTER_KEY": "config-vault-must-not-win",
+                        "PHILOTIC_MEMGRAPH_PASSWORD": "from-guest-config",
+                        "LISTEN_FDS": "9"
+                    }
+                }),
+            )
+            .await
+            .expect("spawn guest");
+
+        let mut body = String::new();
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&dump) {
+                if text.contains("GUEST_CONFIG_MARKER=") {
+                    body = text;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = materializer.reclaim_guest(guest_id).await;
+        let _ = std::fs::remove_file(&dump);
+        drop(guards);
+
+        assert!(
+            body.contains("GUEST_CONFIG_MARKER=from-config"),
+            "explicit guest config should survive the scrub, got {body:?}"
+        );
+        assert!(
+            body.contains("PHILOTIC_BIN_DIR=/opt/philotic/bin-synthetic"),
+            "allowlisted hotel env should be copied, got {body:?}"
+        );
+        assert!(
+            body.contains("PHILOTIC_MEMGRAPH_PASSWORD=from-guest-config"),
+            "a secret placed in that guest's config is explicit, not inherited, got {body:?}"
+        );
+        assert!(!body.contains("parent-vault-must-not-leak"), "{body}");
+        assert!(!body.contains("config-vault-must-not-win"), "{body}");
+        assert!(!body.contains("parent-memgraph-must-not-leak"), "{body}");
+        assert!(!body.contains("not-on-allowlist"), "{body}");
+        assert!(!body.contains("LISTEN_FDS="), "{body}");
+        assert!(!body.contains("LISTEN_PID="), "{body}");
+        assert!(!body.contains("LISTEN_FDNAMES="), "{body}");
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 
     #[test]
