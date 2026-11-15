@@ -1008,6 +1008,11 @@ fn keychain_key_source() -> Option<Vec<u8>> {
 /// (`crates/aiua/src/vault.rs:164`, fixed by b87b581): env -> file -> keychain.
 fn resolve_vault_sources() -> Vec<(&'static str, Option<Vec<u8>>)> {
     vec![
+        (
+            "systemd-credential",
+            crate::vault_key::systemd_credential_bytes(),
+        ),
+        ("credential-file", crate::vault_key::explicit_file_bytes()),
         ("env", env_key_source()),
         ("file", file_key_source()),
         ("keychain", keychain_key_source()),
@@ -1541,10 +1546,10 @@ impl Check for LogsRotationMissing {
                         } else {
                             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                             Err(format!(
-                            "install-log-rotation.sh ran but {} still doesn't exist (likely no \
+                                "install-log-rotation.sh ran but {} still doesn't exist (likely no \
                              non-interactive sudo available). {manual_hint}\nscript said: {stdout}",
-                            dropin.display()
-                        ))
+                                dropin.display()
+                            ))
                         }
                     }
                     Ok(out) => {
@@ -1560,9 +1565,9 @@ impl Check for LogsRotationMissing {
                 },
                 None => write_newsyslog_dropin_directly(&dropin).map_err(|e| {
                     format!(
-                    "scripts/install-log-rotation.sh not found and direct write failed: {e:#}. \
+                        "scripts/install-log-rotation.sh not found and direct write failed: {e:#}. \
                      {manual_hint}"
-                )
+                    )
                 }),
             };
 

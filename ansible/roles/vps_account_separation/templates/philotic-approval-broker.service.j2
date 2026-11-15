@@ -1,0 +1,25 @@
+[Unit]
+Description=Philotic approval broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ vps_accounts_approval_user }}
+Group={{ vps_accounts_approval_user }}
+ExecStart=/opt/philotic/bin/aiua approval-broker
+Environment=PHILOTIC_APPROVAL_DB={{ vps_accounts_approval_home }}/approval.db
+Environment=PHILOTIC_APPROVAL_CALLER_UID={{ vps_accounts_hotel_uid }}
+NonBlocking=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+ReadWritePaths={{ vps_accounts_approval_home }}
+InaccessiblePaths=/opt/philotic/etc /opt/philotic/data
+RuntimeDirectory=philotic-approval
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

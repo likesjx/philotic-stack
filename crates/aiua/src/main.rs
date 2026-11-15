@@ -7490,6 +7490,11 @@ fn spawn_session_history_retention(graph: Arc<GraphDomain>) {
 }
 
 fn main() -> Result<()> {
+    // Socket-activated approval broker. Must run before hotel startup so this
+    // process never opens the hotel vault or guest supervisor.
+    if std::env::args().nth(1).as_deref() == Some("approval-broker") {
+        return service::approval_broker::run_socket_activated();
+    }
     let scoped_enabled = std::env::var("PHILOTIC_SCOPED_VAULT_ENABLED").as_deref() == Ok("1");
     service::scoped_vault_shutdown::install_signal_limit(
         scoped_enabled,

@@ -29,6 +29,7 @@ mod service;
 mod start;
 mod status;
 mod stop;
+mod vault_key;
 
 /// philotic-web — operator CLI for the Philotic Web
 ///

@@ -162,6 +162,206 @@ impl LocalProcessMaterializer {
     }
 }
 
+/// Environment variables a guest may inherit from the hotel process.
+/// Everything else is dropped by [`apply_guest_spawn_env`]. Secrets that
+/// live in the hotel `EnvironmentFile` are intentionally absent.
+const GUEST_INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "RUST_LOG",
+    "PHILOTIC_BIN_DIR",
+    "PHILOTIC_HOTEL_SOCKET",
+    "PHILOTIC_HOTEL_PORT",
+    "PHILOTIC_PROFILE",
+    "PHILOTIC_NODE_ID",
+    "PHILOTIC_GRAPH_DB_PATH",
+    "PHILOTIC_GRAPH_DATABASE_DIR",
+    "PHILOTIC_GRAPH_PROVIDER",
+    "PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE",
+    "PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE",
+    "PHILOTIC_MEMGRAPH_URI",
+    "PHILOTIC_MEMGRAPH_USER",
+    "PHILOTIC_MEMGRAPH_DB",
+    "PHILOTIC_TABLE_DB",
+    "PHILOTIC_ENABLE_RUST_AUTH",
+    "PHILOTIC_ENABLE_RUST_DISPATCHER",
+    "PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE",
+    "PHILOTIC_DREAM_SWEEP_ENABLED",
+    "PHILOTIC_MEMORY_SLEEP_MUTATE",
+    "PHILOTIC_MEMORY_HYGIENE_ENABLED",
+    "PHILOTIC_SHADOW_DECISIONS",
+    "PHILOTIC_HEAL_DECISIONS_FALLBACK",
+    "PHILOTIC_DECISION_TRACE_DB",
+    "PHILOTIC_ONNX_SIDECAR_ADDR",
+];
+
+/// Never copied from the hotel environment and never accepted from a guest
+/// config `env` map. `PHILOTIC_MEMGRAPH_PASSWORD` is not in this list: the
+/// hotel copies it into specific guest configs on purpose, but it is also
+/// not on [`GUEST_INHERITED_ENV`], so other guests do not inherit it.
+const GUEST_ENV_NEVER: &[&str] = &[
+    "PHILOTIC_VAULT_MASTER_KEY",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+];
+
+pub(crate) fn guest_env_never(key: &str) -> bool {
+    GUEST_ENV_NEVER.iter().any(|denied| *denied == key)
+}
+
+/// Clear the inherited environment, copy the allowlist, then apply the guest
+/// config map. The vault master key cannot be reintroduced by config.
+pub(crate) fn apply_guest_spawn_env(command: &mut TokioCommand, config_json: &serde_json::Value) {
+    command.env_clear();
+    for key in GUEST_INHERITED_ENV {
+        if guest_env_never(key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+    if let Some(env_obj) = config_json.get("env").and_then(|e| e.as_object()) {
+        for (key, value) in env_obj {
+            if guest_env_never(key) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
+/// philotic-web needs the vault key and must not receive it as an environment
+/// variable. When the hotel was started under systemd LoadCredential, pass
+/// only `CREDENTIALS_DIRECTORY`. Otherwise write the hotel's key to a mode-0400
+/// file and pass that path. Other guests get neither.
+fn hand_philotic_web_vault_key(command: &mut TokioCommand, resolved_cmd: &str) -> Result<()> {
+    let name = std::path::Path::new(resolved_cmd)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if name != Some("philotic-web") {
+        return Ok(());
+    }
+    // The separate systemd unit receives the key through its own
+    // LoadCredential= directory, which the hotel uid cannot read.
+    if std::env::var("PHILOTIC_WEB_SEPARATE_UNIT").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+        let path = std::path::PathBuf::from(&dir).join("philotic-vault-master-key");
+        if path.is_file() {
+            command.env("CREDENTIALS_DIRECTORY", dir);
+            return Ok(());
+        }
+    }
+    if std::env::var("PHILOTIC_WEB_VAULT_KEY_FILE_HANDOFF").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    let Ok(raw) = std::env::var("PHILOTIC_VAULT_MASTER_KEY") else {
+        return Ok(());
+    };
+    let raw = zeroize::Zeroizing::new(raw);
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains('\n') || raw.contains('\0') {
+        return Ok(());
+    }
+    let path = web_vault_key_file()?;
+    write_mode_0400(&path, raw)
+        .with_context(|| format!("write philotic-web vault key file {}", path.display()))?;
+    command.env("PHILOTIC_VAULT_MASTER_KEY_FILE", &path);
+    Ok(())
+}
+
+fn philotic_web_separate_unit() -> bool {
+    std::env::var("PHILOTIC_WEB_SEPARATE_UNIT").as_deref() == Ok("1")
+}
+
+fn config_is_philotic_web(config: &serde_json::Value) -> bool {
+    config
+        .get("command")
+        .and_then(|value| value.as_str())
+        .and_then(|cmd| std::path::Path::new(cmd).file_name())
+        .and_then(|name| name.to_str())
+        == Some("philotic-web")
+}
+
+fn web_vault_key_file() -> Result<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("PHILOTIC_WEB_VAULT_KEY_FILE") {
+        if !path.is_empty() {
+            return Ok(std::path::PathBuf::from(path));
+        }
+    }
+    let dir = if let Ok(dir) = std::env::var("PHILOTIC_WEB_VAULT_KEY_DIR") {
+        std::path::PathBuf::from(dir)
+    } else if let Ok(dir) = std::env::var("RUNTIME_DIRECTORY") {
+        std::path::PathBuf::from(dir)
+    } else if std::path::Path::new("/run/philotic").is_dir() {
+        std::path::PathBuf::from("/run/philotic")
+    } else {
+        std::env::temp_dir().join(format!("philotic-web-vault-{}", unsafe { libc::geteuid() }))
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms)?;
+    }
+    Ok(dir.join("philotic-web-vault-master-key"))
+}
+
+fn write_mode_0400(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing to write through a symlink");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o400);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Materializer for LocalProcessMaterializer {
     async fn spawn_guest(
@@ -204,13 +404,8 @@ impl Materializer for LocalProcessMaterializer {
                     }
                 }
             }
-            if let Some(env_obj) = config_json.get("env").and_then(|e| e.as_object()) {
-                for (key, value) in env_obj {
-                    if let Some(value) = value.as_str() {
-                        command.env(key, value);
-                    }
-                }
-            }
+            apply_guest_spawn_env(&mut command, config_json);
+            hand_philotic_web_vault_key(&mut command, &resolved_cmd)?;
             // Always override with hotel's own socket path.  Prefer the value
             // supplied at construction time; fall back to the process env (for
             // cases where the hotel was started with the var already set).
@@ -811,6 +1006,14 @@ impl GuestManager {
             // --- SPAWNING ---
             let config: serde_json::Value =
                 serde_json::from_str(&rec.config_json).unwrap_or_default();
+            if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+                info!(
+                    "Guest [{}] is philotic-web and PHILOTIC_WEB_SEPARATE_UNIT=1; leaving it to philotic-web.service",
+                    rec.guest_id
+                );
+                Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
+                continue;
+            }
 
             let mut mat = self.materializer.lock().await;
             match mat.spawn_guest(&rec.guest_id, &config).await {
@@ -946,6 +1149,14 @@ impl GuestManager {
 
         let config: serde_json::Value =
             serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+            info!(
+                "On-demand materialization: Guest [{}] is owned by philotic-web.service",
+                current_rec.guest_id
+            );
+            Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+            return Ok(false);
+        }
         match mat.spawn_guest(&current_rec.guest_id, &config).await {
             Ok(new_pid) => {
                 info!(
@@ -998,6 +1209,14 @@ impl GuestManager {
 
         let config: serde_json::Value =
             serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+            info!(
+                "Restart materialization: Guest [{}] is owned by philotic-web.service",
+                current_rec.guest_id
+            );
+            Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+            return Ok(false);
+        }
         let new_pid = mat.spawn_guest(&current_rec.guest_id, &config).await?;
         self.graph
             .set_guest_pid(&self.hotel_name, &current_rec.guest_id, Some(&new_pid))?;
@@ -1194,6 +1413,18 @@ impl GuestManager {
                     }
                     let config: serde_json::Value =
                         serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+                    if philotic_web_separate_unit() && config_is_philotic_web(&config) {
+                        info!(
+                            "Supervisor: Guest [{}] is owned by philotic-web.service",
+                            current_rec.guest_id
+                        );
+                        Self::clear_guest_pid(
+                            self.graph.as_ref(),
+                            &self.hotel_name,
+                            &current_rec.guest_id,
+                        );
+                        continue;
+                    }
                     info!(
                         "Supervisor: Guest [{}] is marked active but has no ID. Spawning...",
                         current_rec.guest_id
@@ -2679,6 +2910,217 @@ mod tests {
         assert!(!stdout_line_is_health_signal(
             "2026-07-20T13:20:12Z  INFO philote: tool result contained field error=none"
         ));
+    }
+
+    #[tokio::test]
+    async fn guest_spawn_scrubs_vault_master_key_and_unlisted_env() {
+        let dump = std::env::temp_dir().join(format!(
+            "philotic-guest-env-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&dump);
+        let guards = [
+            EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", "parent-vault-must-not-leak"),
+            EnvGuard::set(
+                "PHILOTIC_MEMGRAPH_PASSWORD",
+                "parent-memgraph-must-not-leak",
+            ),
+            EnvGuard::set("PHILOTIC_BIN_DIR", "/opt/philotic/bin-synthetic"),
+            EnvGuard::set("PHILOTIC_SYNTHETIC_INHERITED_MARKER", "not-on-allowlist"),
+            EnvGuard::set("LISTEN_FDS", "1"),
+            EnvGuard::set("LISTEN_PID", "1"),
+            EnvGuard::set("LISTEN_FDNAMES", "philotic-approval"),
+        ];
+        let script = format!("env | sort > '{}'", dump.display());
+        let mut materializer = LocalProcessMaterializer::new(":memory:");
+        let guest_id = "env-scrub-guest";
+        materializer
+            .spawn_guest(
+                guest_id,
+                &json!({
+                    "command": "/bin/sh",
+                    "args": ["-c", script],
+                    "env": {
+                        "GUEST_CONFIG_MARKER": "from-config",
+                        "PHILOTIC_VAULT_MASTER_KEY": "config-vault-must-not-win",
+                        "PHILOTIC_MEMGRAPH_PASSWORD": "from-guest-config",
+                        "LISTEN_FDS": "9"
+                    }
+                }),
+            )
+            .await
+            .expect("spawn guest");
+
+        let mut body = String::new();
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&dump) {
+                if text.contains("GUEST_CONFIG_MARKER=") {
+                    body = text;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = materializer.reclaim_guest(guest_id).await;
+        let _ = std::fs::remove_file(&dump);
+        drop(guards);
+
+        assert!(
+            body.contains("GUEST_CONFIG_MARKER=from-config"),
+            "explicit guest config should survive the scrub, got {body:?}"
+        );
+        assert!(
+            body.contains("PHILOTIC_BIN_DIR=/opt/philotic/bin-synthetic"),
+            "allowlisted hotel env should be copied, got {body:?}"
+        );
+        assert!(
+            body.contains("PHILOTIC_MEMGRAPH_PASSWORD=from-guest-config"),
+            "a secret placed in that guest's config is explicit, not inherited, got {body:?}"
+        );
+        assert!(!body.contains("parent-vault-must-not-leak"), "{body}");
+        assert!(!body.contains("config-vault-must-not-win"), "{body}");
+        assert!(!body.contains("parent-memgraph-must-not-leak"), "{body}");
+        assert!(!body.contains("not-on-allowlist"), "{body}");
+        assert!(!body.contains("LISTEN_FDS="), "{body}");
+        assert!(!body.contains("LISTEN_PID="), "{body}");
+        assert!(!body.contains("LISTEN_FDNAMES="), "{body}");
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn philotic_web_gets_a_mode_0400_key_file_and_other_guests_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("philotic-web");
+        std::fs::write(&bin, "#!/bin/sh\nenv | sort > \"$1\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+        let web_dump = dir.path().join("web.env");
+        let other_dump = dir.path().join("other.env");
+        let key_file = dir.path().join("handed-key");
+        let secret = "synthetic-not-a-secret";
+        let _key = EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", secret);
+        let _path = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE", key_file.to_str().unwrap());
+        let _handoff = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE_HANDOFF", "1");
+        let _separate = EnvGuard::set("PHILOTIC_WEB_SEPARATE_UNIT", "0");
+        let mut materializer = LocalProcessMaterializer::new(":memory:");
+        materializer
+            .spawn_guest(
+                "web",
+                &json!({
+                    "command": bin.to_str().unwrap(),
+                    "args": [web_dump.to_str().unwrap()]
+                }),
+            )
+            .await
+            .unwrap();
+        materializer
+            .spawn_guest(
+                "other",
+                &json!({
+                    "command": "/bin/sh",
+                    "args": ["-c", format!("env | sort > '{}'", other_dump.display())]
+                }),
+            )
+            .await
+            .unwrap();
+        let web_body = wait_for_dump(&web_dump);
+        let other_body = wait_for_dump(&other_dump);
+        let _ = materializer.reclaim_guest("web").await;
+        let _ = materializer.reclaim_guest("other").await;
+        assert!(
+            !web_body.contains(secret),
+            "web environment contained the vault key"
+        );
+        assert!(
+            web_body.contains("PHILOTIC_VAULT_MASTER_KEY_FILE="),
+            "{web_body}"
+        );
+        assert!(!other_body.contains(secret), "{other_body}");
+        assert!(!other_body.contains("PHILOTIC_VAULT_MASTER_KEY_FILE="));
+        let written = std::fs::read_to_string(&key_file).unwrap();
+        assert_eq!(written, secret);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::symlink_metadata(&key_file).unwrap().mode() & 0o777,
+                0o400
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn separate_web_unit_does_not_write_the_handoff_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("philotic-web");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+        let key_file = dir.path().join("must-not-exist");
+        let _key = EnvGuard::set("PHILOTIC_VAULT_MASTER_KEY", "synthetic-not-a-secret");
+        let _path = EnvGuard::set("PHILOTIC_WEB_VAULT_KEY_FILE", key_file.to_str().unwrap());
+        let _flag = EnvGuard::set("PHILOTIC_WEB_SEPARATE_UNIT", "1");
+        let mut materializer = LocalProcessMaterializer::new(":memory:");
+        materializer
+            .spawn_guest(
+                "web",
+                &json!({
+                    "command": bin.to_str().unwrap()
+                }),
+            )
+            .await
+            .expect("separate-unit mode still lets a direct spawn return");
+        let _ = materializer.reclaim_guest("web").await;
+        assert!(!key_file.exists());
+    }
+
+    fn wait_for_dump(path: &std::path::Path) -> String {
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
     }
 
     #[test]

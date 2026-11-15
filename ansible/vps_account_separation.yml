@@ -1,0 +1,36 @@
+---
+# Test-only playbook for VPS account separation.
+# Do not point this at jane-vps. The guards below refuse that inventory
+# even if vps_accounts_live_approved is set. Live steps are in
+# docs/operations/VPS_ACCOUNT_CUTOVER_RUNBOOK.md.
+#
+#   ANSIBLE_CONFIG=ansible/tests/ansible.cfg \
+#     ansible-playbook ansible/vps_account_separation.yml \
+#     -i ansible/tests/localhost.ini
+
+- name: VPS account separation
+  hosts: vps_account_separation
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Refuse production inventory outright
+      ansible.builtin.fail:
+        msg: >-
+          Refusing {{ inventory_hostname }} ({{ ansible_host | default('') }}).
+          Creating users on jane-vps is a live step and needs the owner's approval.
+      when: >-
+        inventory_hostname in ['jane-vps', 'vps-jane', '31.97.130.98']
+        or (ansible_host | default('')) in ['jane-vps', 'vps-jane', '31.97.130.98']
+
+    - name: Refuse other non-local inventory without an explicit flag
+      ansible.builtin.fail:
+        msg: >-
+          Refusing non-local inventory {{ inventory_hostname }}.
+          Set vps_accounts_live_approved=true only for a staging host the owner named.
+      when:
+        - inventory_hostname not in ['localhost', '127.0.0.1']
+        - not (vps_accounts_live_approved | bool)
+
+    - name: Apply the account role
+      ansible.builtin.import_role:
+        name: vps_account_separation

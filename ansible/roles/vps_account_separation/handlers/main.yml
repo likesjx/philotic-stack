@@ -1,0 +1,3 @@
+---
+# This role has no handlers. It does not reload sshd or restart the hotel.
+# Those are live steps in docs/operations/VPS_ACCOUNT_CUTOVER_RUNBOOK.md.

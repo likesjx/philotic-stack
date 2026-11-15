@@ -3,7 +3,7 @@ title: Red Hat Ansible And VPS Deployment Proposal
 doc_type: proposal
 domain: deployment-distribution
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-11-14
 tags:
 - deployment
 - vps
@@ -14,6 +14,8 @@ related_docs:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
 - GUEST_BINARY_RESOLUTION_PROPOSAL.md
+- VPS_ACCOUNT_SEPARATION_PROPOSAL.md
+- OWNER_APPROVAL_VERIFIER_PROPOSAL.md
 - NATIVE_OVERLAY_VPN_PROPOSAL.md
 task_refs:
 - docs/task.md
@@ -103,7 +105,7 @@ Long-term intent is a native VPN built through the hotels themselves. That work 
 
 - Ubuntu 22.04+ (Debian family)
 - Tailscale installed and authenticated (**transitional** — required for inter-hotel mesh until native hotel VPN lands)
-- SSH access: `deploy` user with sudo capability
+- SSH access: `deploy` user with sudo capability. That prerequisite stays until [VPS account separation](VPS_ACCOUNT_SEPARATION_PROPOSAL.md) is applied on a host the owner named. The new role does not change `deploy` unless `vps_accounts_narrow_deploy` is set, and that flag defaults off.
 - Inbound UDP 8999 open for inter-hotel beacon traffic
 - Inbound TCP 9001 restricted to Tailscale CGNAT range (`100.64.0.0/10`) for blob transport
 

@@ -152,8 +152,8 @@
   copy:
     src: "{{ philotic_artifacts_dir }}/{{ item }}"
     dest: "{{ philotic_bin_dir }}/{{ item }}"
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
+    owner: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_user }}"
+    group: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_group }}"
     mode: "0755"
   loop: "{{ philotic_binaries }}"
   when:
@@ -188,8 +188,8 @@
   copy:
     src: "{{ philotic_artifacts_dir }}/{{ item }}"
     dest: "{{ philotic_bin_dir }}/{{ item }}"
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
+    owner: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_user }}"
+    group: "{{ 'root' if (philotic_bin_owner_root | bool) else philotic_group }}"
     mode: "0755"
     remote_src: yes
   loop: >-
@@ -421,6 +421,76 @@
   changed_when: false
 
 # ── systemd service ────────────────────────────────────────────────────────────
+
+- name: Install the vault master key credential file
+  ansible.builtin.copy:
+    dest: "{{ philotic_vault_key_credential_path }}"
+    content: "{{ vault_philotic_vault_master_key }}"
+    owner: root
+    group: root
+    mode: "0400"
+  no_log: true
+  when:
+    - (philotic_vault_key_via_load_credential | bool) or (philotic_web_separate_unit | bool)
+    - vault_philotic_vault_master_key is defined
+  tags: [config]
+
+- name: Create the philotic-web IPC group
+  ansible.builtin.group:
+    name: "{{ philotic_web_socket_group }}"
+    system: true
+  when: philotic_web_separate_unit | bool
+  tags: [config]
+
+- name: Create the philotic-web service user
+  ansible.builtin.user:
+    name: "{{ philotic_web_user }}"
+    uid: "{{ philotic_web_uid }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    groups: "{{ philotic_web_socket_group }}"
+    append: true
+    password_lock: true
+    comment: "philotic-web service. No login."
+  when: philotic_web_separate_unit | bool
+  tags: [config]
+
+- name: Let the hotel user open the group IPC socket
+  ansible.builtin.user:
+    name: "{{ philotic_user }}"
+    groups: "{{ philotic_web_socket_group }}"
+    append: true
+  when: philotic_web_separate_unit | bool
+  tags: [config]
+
+- name: Stat the hotel context database
+  ansible.builtin.stat:
+    path: "{{ philotic_data_dir }}/aiua_context.db"
+  register: philotic_context_db_stat
+  when: philotic_web_separate_unit | bool
+  tags: [config]
+
+- name: Let philotic-web open the hotel context database
+  ansible.builtin.file:
+    path: "{{ philotic_data_dir }}/aiua_context.db"
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_web_socket_group }}"
+    mode: "0660"
+  when:
+    - philotic_web_separate_unit | bool
+    - philotic_context_db_stat.stat.exists | default(false)
+  tags: [config]
+
+- name: Install philotic-web systemd unit
+  ansible.builtin.template:
+    src: philotic-web.service.j2
+    dest: /etc/systemd/system/philotic-web.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: philotic_web_separate_unit | bool
+  tags: [config]
 
 - name: Deploy philotic-hotel systemd unit
   template:

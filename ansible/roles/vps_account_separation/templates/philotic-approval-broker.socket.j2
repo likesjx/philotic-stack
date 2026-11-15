@@ -1,0 +1,17 @@
+[Unit]
+Description=Philotic approval broker socket
+
+[Socket]
+ListenStream=/run/philotic-approval/broker.sock
+# Callable by the hotel uid only. In-hotel guests that still share that uid
+# can connect; separating those uids is not this slice.
+SocketUser={{ vps_accounts_hotel_user }}
+SocketGroup={{ vps_accounts_hotel_user }}
+SocketMode=0600
+DirectoryMode=0755
+FileDescriptorName=philotic-approval
+Accept=no
+Service=philotic-approval-broker.service
+
+[Install]
+WantedBy=sockets.target

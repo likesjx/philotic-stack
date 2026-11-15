@@ -14,6 +14,26 @@ philotic_blob_dir: "/opt/philotic/data/blob"
 # Service user (non-root)
 philotic_user: "philotic"
 philotic_group: "philotic"
+# Legacy binary copies are owned by the hotel user today. Set this true only
+# in the approved reboot window so philotic-web (and the other bins) become
+# root-owned and the service user cannot replace them. Default keeps the
+# current owner so an ordinary hotel deploy does not chown or restart for this.
+philotic_bin_owner_root: false
+# Off until the reboot-window cutover. When false, secrets.env still carries
+# PHILOTIC_VAULT_MASTER_KEY and the unit does not gain LoadCredential=.
+# The hotel binary hands philotic-web a mode-0400 file instead of the env var.
+philotic_vault_key_via_load_credential: false
+philotic_vault_key_credential_path: "/etc/philotic/philotic-vault-master-key"
+# Off until the reboot window. When true, philotic-web is its own unit and
+# user, with LoadCredential= only on that unit. The hotel stops writing the
+# web key file. A normal deploy leaves this false and does not create the user.
+philotic_web_separate_unit: false
+philotic_web_user: philotic-web
+philotic_web_group: philotic-web
+# Hypothesis: 971 is free on jane-vps. Not 999, 970, or 1001.
+philotic_web_uid: 971
+philotic_web_port: 7700
+philotic_web_socket_group: philotic-ipc
 philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub caches models at $HOME/.cache/huggingface
 
 # Artifacts — binaries delivered from the control machine or a CI artifact store.

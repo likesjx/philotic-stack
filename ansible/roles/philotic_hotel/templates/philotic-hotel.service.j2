@@ -13,6 +13,8 @@ Group={{ philotic_group }}
 
 WorkingDirectory={{ philotic_data_dir }}
 RuntimeDirectory=philotic
+# Live vps-jane was observed at 0755 on 2026-11-14. This template stays 0700.
+# Reinstalling the unit is a live step; do not loosen the mode to match the host.
 RuntimeDirectoryMode=0700
 
 # Runtime environment
@@ -68,6 +70,18 @@ Environment="PHILOTIC_HEAL_DECISIONS_FALLBACK=1"
 Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.db"
 {% endif %}
 
+{% if philotic_web_separate_unit | default(false) | bool %}
+# philotic-web runs as its own user. Do not hand it the vault key from here.
+Environment=PHILOTIC_WEB_SEPARATE_UNIT=1
+Environment=PHILOTIC_WEB_UNIT_UID={{ philotic_web_uid }}
+Environment=PHILOTIC_WEB_SOCKET_GROUP={{ philotic_web_socket_group }}
+{% endif %}
+
+{% if philotic_vault_key_via_load_credential | default(false) | bool %}
+# Root-owned credential. Not in the environment of the hotel or its guests.
+LoadCredential=philotic-vault-master-key:{{ philotic_vault_key_credential_path }}
+{% endif %}
+
 # Hotel secrets (vault master key, provider keys) — rendered from Ansible vault
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
 
@@ -81,6 +95,8 @@ TimeoutStopSec=30
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }} {{ philotic_runtime_dir }}
+# Approval state is owned by philotic-approval. Never add that directory here.
+InaccessiblePaths=/var/lib/philotic-approval
 {% set read_only_paths = [] %}
 {% for item in philotic_agents.values() %}
 {% if item.import_workspace is defined %}
