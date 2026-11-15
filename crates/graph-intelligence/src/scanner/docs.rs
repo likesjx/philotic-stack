@@ -234,21 +234,24 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
         if let Some(slices) = &frontmatter.implemented_by {
             for slice in slices {
                 let slice_id = format!("slice:{}", slice);
-                engine.upsert_node(&Node {
-                    id: slice_id.clone(),
-                    kind: NodeKind::Slice,
-                    name: slice.clone(),
-                    properties: serde_json::json!({}),
-                    file_path: None,
-                    worktree: String::new(),
-                    created_at: now,
-                    embedding: None,
-                    embedding_model: None,
-                    embedding_dims: None,
-                    embedding_updated: None,
-                    embedding_hash: None,
-                    updated_at: now,
-                })?;
+                // A reference ensures existence; it must not overwrite owned state.
+                if engine.get_node(&slice_id)?.is_none() {
+                    engine.upsert_node(&Node {
+                        id: slice_id.clone(),
+                        kind: NodeKind::Slice,
+                        name: slice.clone(),
+                        properties: serde_json::json!({}),
+                        file_path: None,
+                        worktree: String::new(),
+                        created_at: now,
+                        embedding: None,
+                        embedding_model: None,
+                        embedding_dims: None,
+                        embedding_updated: None,
+                        embedding_hash: None,
+                        updated_at: now,
+                    })?;
+                }
                 engine.upsert_edge(&Edge {
                     source_id: node_id.clone(),
                     target_id: slice_id,
@@ -264,21 +267,24 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             for seam in seams {
                 let seam_id = format!("seam:{}", seam);
                 // Ensure the seam node exists
-                engine.upsert_node(&Node {
-                    id: seam_id.clone(),
-                    kind: NodeKind::Seam,
-                    name: seam.clone(),
-                    properties: serde_json::json!({}),
-                    file_path: None,
-                    worktree: String::new(),
-                    created_at: now,
-                    embedding: None,
-                    embedding_model: None,
-                    embedding_dims: None,
-                    embedding_updated: None,
-                    embedding_hash: None,
-                    updated_at: now,
-                })?;
+                // A reference ensures existence; it must not overwrite owned state.
+                if engine.get_node(&seam_id)?.is_none() {
+                    engine.upsert_node(&Node {
+                        id: seam_id.clone(),
+                        kind: NodeKind::Seam,
+                        name: seam.clone(),
+                        properties: serde_json::json!({}),
+                        file_path: None,
+                        worktree: String::new(),
+                        created_at: now,
+                        embedding: None,
+                        embedding_model: None,
+                        embedding_dims: None,
+                        embedding_updated: None,
+                        embedding_hash: None,
+                        updated_at: now,
+                    })?;
+                }
                 engine.upsert_edge(&Edge {
                     source_id: node_id.clone(),
                     target_id: seam_id,
