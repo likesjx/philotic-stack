@@ -807,11 +807,11 @@ impl GraphEngine {
             "SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}) \
              AND file_path IS NOT NULL AND file_path != ''"
         );
-        // Doc nodes authored in the graph rather than scanned from a file.
-        let authored_doc_nodes = format!(
-            "SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}) \
-             AND (file_path IS NULL OR file_path = '')"
-        );
+        // Preserve links owned by every graph-authored node kind, including
+        // decisions, sessions and workstreams. These links cannot be rebuilt
+        // from a scanned document even when their target is file-backed.
+        let authored_nodes = "SELECT id FROM nodes WHERE worktree = '' \
+             AND (file_path IS NULL OR file_path = '')";
         // Scanner-derived edges originate from a doc file's frontmatter and are
         // recreated by the rebuild. Edges whose SOURCE is a graph-authored node
         // are not declared in any file, so nothing would recreate them.
@@ -819,7 +819,7 @@ impl GraphEngine {
             &format!(
                 "DELETE FROM edges WHERE (source_id IN ({scanned_doc_nodes}) \
                  OR target_id IN ({scanned_doc_nodes})) \
-                 AND source_id NOT IN ({authored_doc_nodes})"
+                 AND source_id NOT IN ({authored_nodes})"
             ),
             [],
         )?;

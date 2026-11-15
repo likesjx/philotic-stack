@@ -289,7 +289,31 @@ fn test_graph_authored_fileless_proposal_survives_rescan() {
         })
         .expect("Failed to create edge from authored node");
 
+    let mut decision = authored.clone();
+    decision.id = "decision:graph-native-authoring-test".to_string();
+    decision.kind = NodeKind::Decision;
+    engine
+        .upsert_node(&decision)
+        .expect("Failed to create decision");
+    engine
+        .upsert_edge(&Edge {
+            source_id: decision.id.clone(),
+            target_id: scanned_proposal.id.clone(),
+            relation: EdgeRelation::References,
+            properties: serde_json::json!({}),
+            worktree: String::new(),
+        })
+        .expect("Failed to create decision reference");
+
     full_scan(&root, &config, &mut engine).expect("Rescan failed");
+    assert!(
+        engine
+            .get_edges_from(&decision.id)
+            .unwrap()
+            .iter()
+            .any(|e| e.target_id == scanned_proposal.id),
+        "Graph-authored decision reference to scanned document must survive"
+    );
 
     let survived = engine
         .get_node(&authored.id)
@@ -312,4 +336,31 @@ fn test_graph_authored_fileless_proposal_survives_rescan() {
         edges.iter().any(|e| e.target_id == scanned_proposal.id),
         "Edge from the graph-authored node must survive rescan"
     );
+}
+
+#[test]
+fn test_reference_placeholders_preserve_existing_graph_properties() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    std::fs::write(root.path().join("docs/proposal.md"),
+        "---\ntitle: Placeholder fixture\ndoc_type: proposal\nactive_seams:\n- retained-seam\nimplemented_by:\n- retained-slice\n---\n# Fixture\n").unwrap();
+    let engine = GraphEngine::open(":memory:").unwrap();
+    graph_intelligence::scanner::docs::scan_docs(root.path(), &engine).unwrap();
+    for id in ["seam:retained-seam", "slice:retained-slice"] {
+        let mut node = engine.get_node(id).unwrap().unwrap();
+        node.properties = serde_json::json!({"status":"completed", "summary":"Keep the verified outcome", "owner":"Priti"});
+        engine.upsert_node(&node).unwrap();
+    }
+    for _ in 0..2 {
+        graph_intelligence::scanner::docs::scan_docs(root.path(), &engine).unwrap();
+        for id in ["seam:retained-seam", "slice:retained-slice"] {
+            let node = engine.get_node(id).unwrap().unwrap();
+            assert_eq!(
+                node.properties["status"], "completed",
+                "{id} status was overwritten by a reference placeholder"
+            );
+            assert_eq!(node.properties["summary"], "Keep the verified outcome");
+            assert_eq!(node.properties["owner"], "Priti");
+        }
+    }
 }
