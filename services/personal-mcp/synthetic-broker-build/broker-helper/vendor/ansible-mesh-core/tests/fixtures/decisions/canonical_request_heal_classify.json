@@ -1,0 +1,31 @@
+{
+  "site": "heal.classify",
+  "state": { "guest": "beacon", "log_tail": "connection refused" },
+  "questions": [
+    {
+      "id": "severity",
+      "type": "choice",
+      "instructions": "How severe is this failure?",
+      "options": [
+        { "key": "critical", "description": "Service is down" },
+        { "key": "high", "description": "Degraded, needs attention soon" }
+      ]
+    },
+    {
+      "id": "needs_restart",
+      "type": "noul",
+      "instructions": "Would restarting the guest fix this?",
+      "when_true": "A restart clears the condition",
+      "when_false": "A restart would not help"
+    },
+    {
+      "id": "harm",
+      "type": "score",
+      "instructions": "How much operator-visible harm has occurred?",
+      "levels": [
+        { "key": "none", "description": "No harm" },
+        { "key": "mild", "description": "Mild harm" }
+      ]
+    }
+  ]
+}
