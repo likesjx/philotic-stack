@@ -41,6 +41,7 @@ These deploy to the live fleet and should cost one confirmation. See
 | Hook | Event | Purpose |
 |---|---|---|
 | `hooks/guard-destructive-git.sh` | `PreToolUse(Bash)` | Blocks force-push, pushes targeting main/master, bare `git push` while on main, and `git merge` while on main. Exit 2 blocks; malformed input fails **open** so a broken guard can never wedge a session. |
+| `hooks/guard-graph-writes.sh` | `PreToolUse(mcp__intel-graph__.*)`, runner sessions only | Loaded only via `runner/settings.json`. Lets an unattended graph-runner session read the graph and report `session_activity` on its own session; blocks every ledger write. Fails **closed** (nobody is watching). No-op outside `CLAUDE_GRAPH_RUNNER=1`. |
 | `hooks/fmt-rust.sh` | `PostToolUse(Edit\|Write)` | Runs `rustfmt` on written `.rs` files, resolving the edition from the nearest `Cargo.toml` (the workspace mixes 2021 and 2024). Always exits 0. |
 
 Known false positive in the guard: a branch whose name contains `main` as a word
@@ -76,3 +77,13 @@ here:
 4. Ask for `git push --force` on a throwaway ref and confirm the guard blocks it.
 
 Full context: `docs/claude-code-harness-review.md`.
+
+## `runner/`
+
+Settings and MCP config for unattended sessions launched by
+`scripts/claude_graph_runner.py` (design:
+`docs/architecture/CLAUDE_CODE_GRAPH_RUNNER_PROPOSAL.md`). They are passed
+with `--settings`, `--mcp-config --strict-mcp-config` and
+`--setting-sources project`, so a runner session sees this project file plus
+the runner file, and nothing from `settings.local.json` or user settings.
+Interactive sessions never load them.
