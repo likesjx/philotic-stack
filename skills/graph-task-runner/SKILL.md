@@ -26,6 +26,8 @@ You may:
 - Report progress with `session_activity` on `$IG_SESSION_ID` only
   (phase changes: `coding`, `testing`; files touched).
 - Edit files in the worktree, run the build and tests, `git add`, `git commit`.
+- Read and search files with the Read, Grep and Glob tools; shell readers
+  (`cat`, `head`, `tail`, `rg`) are not available in runner sessions.
 
 You may not (blocked by `.claude/runner/settings.json` and
 `.claude/hooks/guard-graph-writes.sh`):
