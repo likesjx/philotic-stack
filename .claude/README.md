@@ -42,6 +42,7 @@ These deploy to the live fleet and should cost one confirmation. See
 |---|---|---|
 | `hooks/guard-destructive-git.sh` | `PreToolUse(Bash)` | Blocks force-push, pushes targeting main/master, bare `git push` while on main, and `git merge` while on main. Exit 2 blocks; malformed input fails **open** so a broken guard can never wedge a session. |
 | `hooks/guard-graph-writes.sh` | `PreToolUse(mcp__intel-graph__.*)`, runner sessions only | Loaded only via `runner/settings.json`. Lets an unattended graph-runner session read the graph and report `session_activity` on its own session; blocks every ledger write. Fails **closed** (nobody is watching). No-op outside `CLAUDE_GRAPH_RUNNER=1`. |
+| `hooks/guard-runner-paths.sh` | `PreToolUse(Read\|Grep\|Glob\|Bash)`, runner sessions only | Loaded only via `runner/settings.json`. Keeps file reads and command arguments inside the runner's worktree (no absolute paths, `~` or `..` outside it, no `$`/backtick expansion, no `git --no-index`/`--output`/`-C`/`-c`/`--git-dir`/`--work-tree`). Fails **closed**. No-op outside `CLAUDE_GRAPH_RUNNER=1`. |
 | `hooks/fmt-rust.sh` | `PostToolUse(Edit\|Write)` | Runs `rustfmt` on written `.rs` files, resolving the edition from the nearest `Cargo.toml` (the workspace mixes 2021 and 2024). Always exits 0. |
 
 Known false positive in the guard: a branch whose name contains `main` as a word

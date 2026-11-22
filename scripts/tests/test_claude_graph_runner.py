@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -144,10 +145,124 @@ class RunnerUnitTest(unittest.TestCase):
         done = {"id": "task:b", "properties": {"status": "done"}}
         self.assertTrue(self.r.evaluate(self.task(), set(), [done]).eligible)
 
+    def test_rendered_settings_use_this_checkouts_hooks(self):
+        # The worktree's base branch may not carry the guards, and a missing hook
+        # script fails open, so the rendered settings must point at real files here.
+        with tempfile.TemporaryDirectory() as d:
+            s = json.loads(self.r.render_settings(Path(d)).read_text())
+        cmds = [h["command"] for g in s["hooks"]["PreToolUse"] for h in g["hooks"]]
+        self.assertEqual(len(cmds), 2)
+        for c in cmds:
+            self.assertNotIn("CLAUDE_PROJECT_DIR", c)
+            self.assertTrue(Path(c.strip("'")).is_file(), c)
+            self.assertTrue(c.strip("'").startswith(str(ROOT)), c)
+
     def test_parse_outcome(self):
         text = 'blah\n```json\n{"outcome": "blocked", "blocker": "needs a decision"}\n```'
         self.assertEqual(self.r.parse_outcome(text)["outcome"], "blocked")
         self.assertEqual(self.r.parse_outcome("no block")["outcome"], "unknown")
+
+
+HOOKS = ROOT / ".claude" / "hooks"
+
+
+class RunnerHookTest(unittest.TestCase):
+    """The two runner-only PreToolUse guards, driven the way Claude Code calls them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.wt = Path(self.tmp.name) / "worktree"
+        (self.wt / "src").mkdir(parents=True)
+        (self.wt / "src" / "lib.rs").write_text("fn main() {}\n")
+        self.outside = Path(self.tmp.name) / "home" / ".ssh"
+        self.outside.mkdir(parents=True)
+        (self.outside / "id_ed25519").write_text("secret\n")
+        (self.wt / "escape").symlink_to(self.outside)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def hook(self, script, tool, tool_input, runner=True, session="sess-1"):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_GRAPH_RUNNER"}
+        env.update(CLAUDE_PROJECT_DIR=str(self.wt), IG_SESSION_ID=session)
+        if runner:
+            env["CLAUDE_GRAPH_RUNNER"] = "1"
+        payload = json.dumps({"tool_name": tool, "tool_input": tool_input, "cwd": str(self.wt)})
+        r = subprocess.run(["bash", str(HOOKS / script)], input=payload, text=True,
+                           capture_output=True, env=env, timeout=30)
+        return r.returncode
+
+    def paths(self, tool, tool_input, **kw):
+        return self.hook("guard-runner-paths.sh", tool, tool_input, **kw)
+
+    def test_file_tools_stay_in_worktree(self):
+        allowed = [("Read", {"file_path": str(self.wt / "src" / "lib.rs")}),
+                   ("Read", {"file_path": "src/lib.rs"}),
+                   ("Grep", {"pattern": "fn main", "path": "src"}),
+                   ("Grep", {"pattern": "/etc/passwd"}),
+                   ("Glob", {"pattern": "src/**/*.rs"})]
+        blocked = [("Read", {"file_path": str(self.outside / "id_ed25519")}),
+                   ("Read", {"file_path": "~/.ssh/id_ed25519"}),
+                   ("Read", {"file_path": "../home/.ssh/id_ed25519"}),
+                   ("Read", {"file_path": "escape/id_ed25519"}),
+                   ("Grep", {"pattern": "BEGIN", "path": str(self.outside)}),
+                   ("Grep", {"pattern": "x", "glob": "../**"}),
+                   ("Glob", {"pattern": "/etc/*"}),
+                   ("Glob", {"pattern": "*", "path": "~/.aws"})]
+        for tool, args in allowed:
+            with self.subTest(allow=(tool, args)):
+                self.assertEqual(self.paths(tool, args), 0)
+        for tool, args in blocked:
+            with self.subTest(block=(tool, args)):
+                self.assertEqual(self.paths(tool, args), 2)
+
+    def test_bash_arguments_stay_in_worktree(self):
+        allowed = ["cargo test -p graph-intelligence", "just test-suite",
+                   "python3 -m unittest discover -s scripts/tests",
+                   "git diff --stat", "git log -1 --format=%s", "git add src/lib.rs",
+                   "git commit -m 'fix: tighten the parser'", "cargo check -p aiua 2>/dev/null"]
+        blocked = ["head -5 ~/.ssh/id_ed25519", f"tail {self.outside}/id_ed25519",
+                   "git diff --no-index /etc/hosts /dev/null",
+                   "git diff --stat --no-index a b", "git log --output=/tmp/x",
+                   "git -C /tmp status", "git -c core.pager=sh log", "git show --git-dir=/x",
+                   "cargo test --manifest-path ../other/Cargo.toml",
+                   "python3 -m unittest discover -s escape", "cat $HOME/.ssh/id_ed25519",
+                   "git log `whoami`", "git commit -m 'unbalanced"]
+        for cmd in allowed:
+            with self.subTest(allow=cmd):
+                self.assertEqual(self.paths("Bash", {"command": cmd}), 0)
+        for cmd in blocked:
+            with self.subTest(block=cmd):
+                self.assertEqual(self.paths("Bash", {"command": cmd}), 2)
+
+    def test_guards_fail_closed_and_are_noops_outside_runner(self):
+        for script in ("guard-runner-paths.sh", "guard-graph-writes.sh"):
+            env = dict(os.environ, CLAUDE_GRAPH_RUNNER="1", CLAUDE_PROJECT_DIR=str(self.wt))
+            r = subprocess.run(["bash", str(HOOKS / script)], input="not json", text=True,
+                               capture_output=True, env=env, timeout=30)
+            self.assertEqual(r.returncode, 2, script)
+        self.assertEqual(self.paths("Read", {"file_path": "~/.ssh/id_ed25519"}, runner=False), 0)
+
+    def test_graph_writes_guard(self):
+        g = "guard-graph-writes.sh"
+        self.assertEqual(self.hook(g, "mcp__intel-graph__graph_node", {"id": "x"}), 0)
+        self.assertEqual(self.hook(g, "mcp__intel-graph__session_activity", {"session_id": "sess-1"}), 0)
+        self.assertEqual(self.hook(g, "mcp__intel-graph__session_activity", {"session_id": "other"}), 2)
+        self.assertEqual(self.hook(g, "mcp__intel-graph__graph_update_node", {"id": "x"}), 2)
+        self.assertEqual(self.hook(g, "mcp__intel-graph__graph_decide", {}), 2)
+
+    def test_runner_settings_wire_both_guards(self):
+        s = json.loads((ROOT / ".claude" / "runner" / "settings.json").read_text())
+        wired = {h["matcher"]: h["hooks"][0]["command"] for h in s["hooks"]["PreToolUse"]}
+        self.assertIn("guard-graph-writes.sh", wired["mcp__intel-graph__.*"])
+        self.assertIn("guard-runner-paths.sh", wired["Read|Grep|Glob|Bash"])
+        allow, deny = s["permissions"]["allow"], s["permissions"]["deny"]
+        self.assertNotIn("Read", allow)
+        self.assertIn("Read(./**)", allow)
+        self.assertIn("Bash(just test-suite)", allow)
+        for reader in ("cat", "head", "tail", "less"):
+            self.assertIn(f"Bash({reader}:*)", deny)
+            self.assertFalse(any(a.startswith(f"Bash({reader}") for a in allow), reader)
 
 
 class RunnerEndToEndTest(unittest.TestCase):
@@ -164,6 +279,8 @@ class RunnerEndToEndTest(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "--bare", "-b", "develop", str(origin)], check=True)
         subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True, env=self.env,
                        capture_output=True)
+        for sub in ("runner", "hooks"):
+            shutil.copytree(ROOT / ".claude" / sub, repo / ".claude" / sub)
         (repo / "tests").mkdir()
         (repo / "tests" / "test_ok.py").write_text(
             "import unittest, pathlib\n"

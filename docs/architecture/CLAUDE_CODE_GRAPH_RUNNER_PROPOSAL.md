@@ -108,7 +108,7 @@ says why).
 | Ledger writes | none; the runner writes from verifiable facts | deny list + hook |
 | MCP servers | `intel-graph` only (no Muninn, no public `philotic` endpoint) | `--strict-mcp-config` |
 | Settings | project settings only (not the 872-grant local file or user file) | `--setting-sources project` |
-| File reads | Read/Grep/Glob tools only, which honour the Read deny rules; shell readers (`cat`, `head`, `tail`, `less`, `rg`, `jq`) are not allowlisted, and `cat`/`head`/`tail`/`less` are denied outright | allow/deny list |
+| File reads | Read/Grep/Glob inside the worktree only; shell readers (`cat`, `head`, `tail`, `less`, `rg`, `jq`) are not allowlisted, and `cat`/`head`/`tail`/`less` are denied outright; no command argument may name a path outside the worktree, use `$`/backtick expansion, or use git's `--no-index`/`--output`/`-C`/`-c`/`--git-dir`/`--work-tree` | allow/deny list + `guard-runner-paths.sh` (fails closed) |
 | Git | add/commit/diff/log in its worktree | allow list; push/merge/rebase/checkout/worktree/remote denied, plus existing `guard-destructive-git.sh` |
 | Network, deploy, secrets | none: `curl`, `ssh`, `gh`, `ansible*`, `phil`, WebFetch denied; `~/.ssh`, `~/.config`, `~/.philotic`, vault and keys unreadable | deny list |
 

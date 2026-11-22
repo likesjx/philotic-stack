@@ -10,12 +10,21 @@
           }
         ],
         "matcher": "mcp__intel-graph__.*"
+      },
+      {
+        "hooks": [
+          {
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-runner-paths.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Read|Grep|Glob|Bash"
       }
     ]
   },
   "permissions": {
     "allow": [
-      "Read",
+      "Read(./**)",
       "Glob",
       "Grep",
       "Edit(./**)",
@@ -79,6 +88,7 @@
       "Bash(git switch:*)",
       "Bash(git worktree:*)",
       "Bash(git remote:*)",
+      "Bash(git diff --no-index:*)",
       "Bash(gh:*)",
       "Bash(curl:*)",
       "Bash(wget:*)",

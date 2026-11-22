@@ -265,7 +265,34 @@ def parse_outcome(result_text: str) -> dict:
     return {"outcome": "unknown", "summary": (result_text or "")[-500:]}
 
 
+def render_settings(log_dir: Path) -> Path:
+    """Write the runner settings with absolute hook paths into this checkout.
+
+    The settings file says `$CLAUDE_PROJECT_DIR/.claude/hooks/...`, but the
+    session's project dir is the task worktree, whose base branch may not
+    carry the runner guards. A hook command that is missing exits non-2,
+    which Claude Code treats as "allow", so the guards must come from the
+    runner's own checkout, not the worktree.
+    """
+    settings = json.loads(RUNNER_SETTINGS.read_text())
+    hooks_dir = REPO / ".claude" / "hooks"
+    for group in settings.get("hooks", {}).values():
+        for entry in group:
+            for hook in entry.get("hooks", []):
+                cmd = hook.get("command", "")
+                prefix = "$CLAUDE_PROJECT_DIR/.claude/hooks/"
+                if cmd.startswith(prefix):
+                    script = hooks_dir / cmd[len(prefix):]
+                    if not script.is_file():
+                        raise RuntimeError(f"runner hook missing: {script}")
+                    hook["command"] = shlex.quote(str(script))
+    out = log_dir / "settings.json"
+    out.write_text(json.dumps(settings, indent=2) + "\n")
+    return out
+
+
 def run_claude(worktree: Path, prompt: str, env: dict, log_dir: Path) -> dict:
+    settings_path = render_settings(log_dir)
     cmd = [
         CLAUDE_BIN,
         "-p",
@@ -279,7 +306,7 @@ def run_claude(worktree: Path, prompt: str, env: dict, log_dir: Path) -> dict:
         "--setting-sources",
         "project",
         "--settings",
-        str(RUNNER_SETTINGS),
+        str(settings_path),
         "--mcp-config",
         str(RUNNER_MCP),
         "--strict-mcp-config",
