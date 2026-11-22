@@ -81,6 +81,27 @@ harness-skills-sync:
 intel-graph-freshness-schedule:
     ./scripts/install-intel-graph-freshness-schedule.sh
 
+# Claude Code graph-task runner (docs/architecture/CLAUDE_CODE_GRAPH_RUNNER_PROPOSAL.md).
+# Dry run: which claude-local tasks are eligible, and why the rest are skipped.
+claude-runner-list:
+    python3 scripts/claude_graph_runner.py list
+
+# Check the graph server, the claude CLI, the runner config and the enable switch.
+claude-runner-doctor:
+    python3 scripts/claude_graph_runner.py doctor
+
+# Claim and work one task now, even if the schedule's enable switch is off.
+claude-runner-once:
+    python3 scripts/claude_graph_runner.py once --force
+
+# Operator only: push a reviewed runner branch so it can become a draft PR.
+claude-runner-publish task:
+    python3 scripts/claude_graph_runner.py publish {{task}}
+
+# Install the launchd schedule (does nothing until the enable switch exists).
+claude-runner-schedule minutes="30":
+    ./scripts/install-claude-graph-runner-schedule.sh {{minutes}}
+
 # Install the launchd service that SUPERVISES the graph server (KeepAlive, RunAtLoad).
 intel-graph-service:
     ./scripts/install-intel-graph-service.sh

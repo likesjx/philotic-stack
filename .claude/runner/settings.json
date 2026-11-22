@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-graph-writes.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "mcp__intel-graph__.*"
+      },
+      {
+        "hooks": [
+          {
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-runner-paths.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Read|Grep|Glob|Bash"
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Read(./**)",
+      "Glob",
+      "Grep",
+      "Edit(./**)",
+      "Write(./**)",
+      "Bash(just check)",
+      "Bash(just test)",
+      "Bash(just build)",
+      "Bash(just format)",
+      "Bash(just test-suite)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(python3 -m unittest:*)",
+      "Bash(python3 -B -m unittest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git rev-parse:*)",
+      "mcp__intel-graph__graph_status",
+      "mcp__intel-graph__graph_digest",
+      "mcp__intel-graph__graph_proposals",
+      "mcp__intel-graph__graph_node",
+      "mcp__intel-graph__graph_query",
+      "mcp__intel-graph__graph_search",
+      "mcp__intel-graph__graph_snippet",
+      "mcp__intel-graph__graph_skeleton",
+      "mcp__intel-graph__graph_context_for",
+      "mcp__intel-graph__graph_impact",
+      "mcp__intel-graph__graph_semantic_search",
+      "mcp__intel-graph__graph_agent_dashboard",
+      "mcp__intel-graph__session_activity"
+    ],
+    "deny": [
+      "mcp__intel-graph__graph_create_node",
+      "mcp__intel-graph__graph_update_node",
+      "mcp__intel-graph__graph_create_edge",
+      "mcp__intel-graph__graph_decide",
+      "mcp__intel-graph__graph_manage_proposal",
+      "mcp__intel-graph__graph_advance_verification",
+      "mcp__intel-graph__graph_record_test_run",
+      "mcp__intel-graph__graph_writeback",
+      "mcp__intel-graph__graph_export_docs",
+      "mcp__intel-graph__graph_export_sver",
+      "mcp__intel-graph__graph_persist_diagrams",
+      "mcp__intel-graph__graph_memory_true_up",
+      "mcp__intel-graph__graph_scan",
+      "mcp__intel-graph__graph_embed",
+      "mcp__intel-graph__graph_embed_batch",
+      "mcp__intel-graph__session_start",
+      "mcp__intel-graph__session_close",
+      "Bash(git push:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git worktree:*)",
+      "Bash(git remote:*)",
+      "Bash(git diff --no-index:*)",
+      "Bash(gh:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(ansible:*)",
+      "Bash(ansible-playbook:*)",
+      "Bash(phil:*)",
+      "Bash(muninn:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(less:*)",
+      "Bash(security:*)",
+      "WebFetch",
+      "WebSearch",
+      "Read(./mesh-config.secrets.json)",
+      "Read(./ansible/vault/**)",
+      "Read(./**/*.key)",
+      "Read(./**/*.pem)",
+      "Read(~/.ssh/**)",
+      "Read(~/.config/**)",
+      "Read(~/.philotic/**)"
+    ]
+  }
+}
