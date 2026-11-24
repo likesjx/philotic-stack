@@ -1,0 +1,67 @@
+name: Synthetic broker build only
+on:
+  push:
+    branches: [codex/synthetic-broker-build-only]
+    paths:
+      - 'services/personal-mcp/synthetic-broker-build/**'
+      - '.github/workflows/synthetic-broker-build.yml'
+permissions:
+  contents: read
+concurrency:
+  group: synthetic-broker-build-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  linux-helper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.94.1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      PHILOTIC_VAULT_KEYCHAIN: '0'
+    defaults:
+      run:
+        shell: bash
+        working-directory: services/personal-mcp/synthetic-broker-build
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify reviewed source before downloads
+        run: |
+          python3 - <<'PYVERIFY'
+          import hashlib,json,pathlib
+          for name,digest in json.loads(pathlib.Path('reviewed-source.json').read_text()).items():
+              path=pathlib.Path(name)
+              assert path.is_file() and not path.is_symlink()
+              assert hashlib.sha256(path.read_bytes()).hexdigest()==digest, name
+          PYVERIFY
+      - name: Offline handoff input contracts (public fixtures only)
+        run: |
+          python3 -B -m unittest discover -s . -p 'test_*.py'
+          python3 -B private_key_handoff.py
+      - name: Install exact official Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --target x86_64-unknown-linux-gnu
+      - name: Download checksum-locked registry dependencies
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu --manifest-path broker-helper/Cargo.toml
+      - name: Offline public tests and release build
+        run: sh linux-offline-build.sh --build-offline
+      - name: Public namespace acceptance on disposable runner
+        run: sudo --preserve-env=GITHUB_ACTIONS /usr/bin/python3 linux_handoff_acceptance.py --disposable-public-fixture > private-key-handoff-acceptance.json
+      - name: Record provenance and minimal artifact
+        run: |
+          mkdir artifact
+          cp broker-helper-linux-amd64 linux-build-receipt.json private-key-handoff-acceptance.json reviewed-source.json dependency-downloads.json artifact/
+          git rev-parse HEAD > artifact/SOURCE_COMMIT
+          rustc --version --verbose > artifact/RUSTC_VERSION
+          cc --version > artifact/CC_VERSION
+          ldd --version > artifact/LIBC_VERSION
+          readelf -d broker-helper-linux-amd64 > artifact/ELF_DYNAMIC
+          (cd artifact && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: synthetic-broker-linux-amd64-${{ github.sha }}
+          path: services/personal-mcp/synthetic-broker-build/artifact/
+          if-no-files-found: error
+          retention-days: 7
