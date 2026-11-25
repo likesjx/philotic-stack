@@ -2,7 +2,10 @@
   "mcpServers": {
     "intel-graph": {
       "type": "http",
-      "url": "http://127.0.0.1:8901/mcp"
+      "url": "http://127.0.0.1:8901/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PHILOTIC_GRAPH_TOKEN:-}"
+      }
     },
     "muninn-local": {
       "type": "stdio",

@@ -90,6 +90,13 @@ claude-runner-list:
 claude-runner-doctor:
     python3 scripts/claude_graph_runner.py doctor
 
+# Why are agents getting 401s? Checks the graph server's token mode, a bare and
+# a token-carrying MCP call, the launchd plist, the repo's client configs, the
+# frontdoor (when PHILOTIC_FRONTDOOR_URL is set) and frontdoor token ages.
+# Prints no secrets. On vps-jane: just agent-auth-doctor --skip-graph
+agent-auth-doctor *args:
+    python3 scripts/agent_auth_doctor.py {{args}}
+
 # Claim and work one task now, even if the schedule's enable switch is off.
 claude-runner-once:
     python3 scripts/claude_graph_runner.py once --force

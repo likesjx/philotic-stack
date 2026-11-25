@@ -99,6 +99,29 @@ impl GraphEngine {
         Ok(engine)
     }
 
+    /// Open an existing database for reading only.
+    ///
+    /// The connection is opened with `SQLITE_OPEN_READ_ONLY` and
+    /// `PRAGMA query_only=ON`, so any write path that slips past the tool
+    /// allowlist still fails inside SQLite instead of changing the graph.
+    /// The schema is not initialised (that would be a write), so the file
+    /// must already exist: point this at the database the normal server owns.
+    pub fn open_read_only(path: &str) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("Failed to open graph database read-only at {path}"))?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        // Fail at startup, not on the first call, if this is not a graph db.
+        conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, i64>(0))
+            .with_context(|| format!("{path} is not an initialised graph database"))?;
+        Ok(Self { conn })
+    }
+
     pub fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -581,6 +604,74 @@ impl GraphEngine {
             ],
         )?;
         Ok(())
+    }
+
+    /// Mutations recorded strictly after `since`, oldest first, at most `limit`.
+    ///
+    /// Timestamps are stored as UTC RFC 3339 strings, which sort in time order
+    /// as text, so SQL does the coarse cut; the parsed timestamp is checked
+    /// again so a differently formatted row cannot slip through.
+    pub fn mutations_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<Mutation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, agent, session, action, target_node, from_value, to_value, reason, details
+             FROM mutations WHERE timestamp > ?1 ORDER BY timestamp ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339(), limit as i64], |row| {
+            Ok(row_to_mutation(row))
+        })?;
+        let mut mutations = Vec::new();
+        for row in rows {
+            let m = row??;
+            if m.timestamp > since {
+                mutations.push(m);
+            }
+        }
+        Ok(mutations)
+    }
+
+    /// Nodes of the given kinds whose `updated_at` is strictly after `since`,
+    /// oldest first, at most `limit`. An empty `kinds` slice means every kind.
+    pub fn nodes_updated_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        kinds: &[NodeKind],
+        limit: usize,
+    ) -> Result<Vec<Node>> {
+        let mut sql = String::from(
+            "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                    embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
+             FROM nodes WHERE updated_at > ?1",
+        );
+        let mut values: Vec<String> = vec![since.to_rfc3339()];
+        if !kinds.is_empty() {
+            let placeholders: Vec<String> =
+                (0..kinds.len()).map(|i| format!("?{}", i + 2)).collect();
+            sql.push_str(&format!(" AND kind IN ({})", placeholders.join(", ")));
+            values.extend(kinds.iter().map(|k| k.as_str().to_string()));
+        }
+        sql.push_str(&format!(
+            " ORDER BY updated_at ASC LIMIT ?{}",
+            values.len() + 1
+        ));
+        values.push(limit.to_string());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = values
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |row| Ok(row_to_node(row)))?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            let n = row??;
+            if n.updated_at > since {
+                nodes.push(n);
+            }
+        }
+        Ok(nodes)
     }
 
     pub fn get_mutations(&self, target_node: Option<&str>, limit: usize) -> Result<Vec<Mutation>> {

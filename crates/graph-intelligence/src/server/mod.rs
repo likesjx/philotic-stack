@@ -37,6 +37,10 @@ pub struct ServerConfig {
     pub auth_token: Option<String>,
     /// Allow a non-loopback bind without an auth token (explicit opt-in)
     pub allow_insecure_bind: bool,
+    /// Serve a read-only MCP endpoint only: the database is opened read-only,
+    /// no scan runs, no REST/WS server starts, and only
+    /// [`mcp::READ_ONLY_TOOLS`] are listed or callable. Requires a token.
+    pub read_only: bool,
 }
 
 impl Default for ServerConfig {
@@ -55,6 +59,7 @@ impl Default for ServerConfig {
             repo_root: ".".to_string(),
             auth_token: None,
             allow_insecure_bind: false,
+            read_only: false,
         }
     }
 }
@@ -89,11 +94,44 @@ async fn require_token(
                 .get("x-philotic-graph-token")
                 .and_then(|v| v.to_str().ok())
         });
-    if presented == Some(token.as_str()) {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, "missing or invalid graph token").into_response()
+    let rejection = match presented {
+        Some(p) if token_matches(p, token.as_str()) => None,
+        Some(_) => Some("wrong"),
+        None => Some("missing"),
+    };
+    match rejection {
+        None => next.run(req).await,
+        Some(why) => {
+            // One line per rejection so a wave of 401s is visible in the
+            // server log. The presented value is never logged.
+            eprintln!(
+                "auth: 401 {} {}: {} graph token",
+                req.method(),
+                req.uri().path(),
+                why
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "{} graph token: this server requires `Authorization: Bearer <PHILOTIC_GRAPH_TOKEN>` \
+                     (or `x-philotic-graph-token`) on every MCP call and mutating REST call, \
+                     loopback included",
+                    why
+                ),
+            )
+                .into_response()
+        }
     }
+}
+
+/// Compare a presented token with the configured one without an early exit
+/// on the first differing byte. The length still shows; the value does not.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn apply_auth(router: Router, token: &Option<String>) -> Router {
@@ -135,8 +173,35 @@ fn server_identity() -> serde_json::Value {
     })
 }
 
-/// Start both the HTTP/WS server and the MCP server.
+/// What `/api/status` reports about auth, so a client getting 401s can see
+/// that a token is required without having to guess. Never includes the token.
+fn auth_identity(config: &ServerConfig) -> serde_json::Value {
+    serde_json::json!({
+        "token_required": config.auth_token.is_some(),
+        "token_scope": if config.auth_token.is_some() {
+            "every MCP call and every non-GET REST call, loopback included"
+        } else {
+            "none"
+        },
+        "read_only": config.read_only,
+    })
+}
+
+fn server_info_for(config: &ServerConfig) -> serde_json::Value {
+    let mut info = server_identity();
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("auth".to_string(), auth_identity(config));
+    }
+    info
+}
+
+/// Start both the HTTP/WS server and the MCP server (or, with
+/// `config.read_only`, only the read-only MCP server).
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    if config.read_only {
+        return serve_read_only(config).await;
+    }
+
     if !is_loopback_bind(&config.bind_addr)
         && config.auth_token.is_none()
         && !config.allow_insecure_bind
@@ -163,12 +228,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // Create broadcast channel for WebSocket events
     let (change_tx, _) = broadcast::channel::<ws::ChangeEvent>(256);
 
+    announce_auth(&config);
+    let server_info = server_info_for(&config);
     let state = Arc::new(AppState {
         engine: Mutex::new(engine),
         scan_config: config.scan_config,
         repo_root: config.repo_root,
         change_tx,
-        server_info: server_identity(),
+        server_info,
     });
 
     // Build the HTTP + WebSocket router
@@ -213,9 +280,97 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Say at startup whether a token is enforced. A token in the launchd or
+/// shell environment applies on loopback too, so every local client that does
+/// not send it gets 401; this line makes that visible in the log.
+fn announce_auth(config: &ServerConfig) {
+    if config.auth_token.is_some() && is_loopback_bind(&config.bind_addr) {
+        eprintln!(
+            "Auth: graph token is set, so every MCP call and mutating REST call needs \
+             `Authorization: Bearer <token>`, also on loopback. Clients without it get 401."
+        );
+    }
+}
+
+/// Read-only mode: one MCP endpoint over a read-only database connection.
+///
+/// No initial scan (that writes), no REST/WS server (it has write routes),
+/// and a token is mandatory because this mode exists to be reached by a
+/// caller outside the machine through a proxy.
+async fn serve_read_only(config: ServerConfig) -> Result<()> {
+    if config.auth_token.is_none() {
+        anyhow::bail!(
+            "refusing to start read-only mode without a token: set PHILOTIC_GRAPH_TOKEN \
+             (or --token) to a value only the connector proxy holds"
+        );
+    }
+    if config.db_path == ":memory:" {
+        anyhow::bail!("read-only mode needs an existing database file, not :memory:");
+    }
+
+    let engine = GraphEngine::open_read_only(&config.db_path)?;
+    let (change_tx, _) = broadcast::channel::<ws::ChangeEvent>(16);
+    let server_info = server_info_for(&config);
+    let state = Arc::new(AppState {
+        engine: Mutex::new(engine),
+        scan_config: config.scan_config,
+        repo_root: config.repo_root,
+        change_tx,
+        server_info,
+    });
+
+    let mcp_addr = format!("{}:{}", config.bind_addr, config.mcp_port);
+    let mcp_router = apply_auth(mcp::read_only_router(state), &config.auth_token);
+    eprintln!(
+        "Read-only MCP server listening on {} ({} tools, database opened read-only)",
+        mcp_addr,
+        mcp::READ_ONLY_TOOLS.len()
+    );
+    let listener = tokio::net::TcpListener::bind(&mcp_addr).await?;
+    tokio::select! {
+        res = axum::serve(listener, mcp_router) => {
+            res.map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("Shutting down...");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_bind;
+    use super::{is_loopback_bind, token_matches};
+
+    #[test]
+    fn token_compare_needs_exact_match() {
+        assert!(token_matches("s3cret", "s3cret"));
+        assert!(!token_matches("s3cres", "s3cret"));
+        assert!(!token_matches("s3cre", "s3cret"));
+        assert!(!token_matches("", "s3cret"));
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_refuses_to_start_without_token() {
+        let config = super::ServerConfig {
+            read_only: true,
+            db_path: "/nonexistent/graph.db".to_string(),
+            ..Default::default()
+        };
+        let err = super::serve(config).await.unwrap_err().to_string();
+        assert!(err.contains("without a token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_refuses_missing_database() {
+        let config = super::ServerConfig {
+            read_only: true,
+            db_path: "/nonexistent/dir/graph.db".to_string(),
+            auth_token: Some("t".to_string()),
+            ..Default::default()
+        };
+        assert!(super::serve(config).await.is_err());
+    }
 
     #[test]
     fn loopback_binds_are_recognized() {

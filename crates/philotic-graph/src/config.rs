@@ -82,6 +82,9 @@ impl PhiloticGraphConfig {
             allow_insecure_bind: std::env::var("PHILOTIC_GRAPH_INSECURE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            read_only: std::env::var("PHILOTIC_GRAPH_READ_ONLY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }
