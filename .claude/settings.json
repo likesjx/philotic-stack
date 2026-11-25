@@ -32,6 +32,27 @@
           }
         ],
         "matcher": "startup"
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/claude_session_hooks.py\" start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/claude_session_hooks.py\" end",
+            "timeout": 15
+          }
+        ]
       }
     ]
   },
