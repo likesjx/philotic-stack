@@ -98,6 +98,10 @@ claude-runner-once:
 claude-runner-publish task:
     python3 scripts/claude_graph_runner.py publish {{task}}
 
+# Interactive Claude Code session receipts (SessionEnd hook), newest first. Local only.
+claude-receipts n="10":
+    @ls -1t ~/.philotic/claude-local/receipts/*.json 2>/dev/null | head -n {{n}}
+
 # Install the launchd schedule (does nothing until the enable switch exists).
 claude-runner-schedule minutes="30":
     ./scripts/install-claude-graph-runner-schedule.sh {{minutes}}
