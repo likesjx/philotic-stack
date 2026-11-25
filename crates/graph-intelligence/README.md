@@ -54,6 +54,32 @@ scans), so non-loopback exposure requires an explicit choice:
 CORS is restricted to localhost origins (permissive CORS previously allowed
 any web page to POST JSON to the write endpoints).
 
+The token applies on loopback too. If the server starts with
+`PHILOTIC_GRAPH_TOKEN` in its environment (launchd plist or shell), every
+local MCP client that does not send it gets `401 missing graph token`. The
+repo's `.mcp.json` sends `Authorization: Bearer ${PHILOTIC_GRAPH_TOKEN:-}`, so
+export the same value in the shell that starts Claude Code. `/api/status`
+reports `server.auth.token_required`, the server logs one line per 401
+(never the token), and `just agent-auth-doctor` walks through the usual causes.
+
+### Read-only mode
+
+`--read-only` / `PHILOTIC_GRAPH_READ_ONLY=1` serves one MCP endpoint for a
+caller outside the machine (for example a claude.ai custom connector reached
+through the agent frontdoor). Run it beside the normal server, on its own
+port, against the same database:
+
+```bash
+PHILOTIC_GRAPH_TOKEN=<connector-only token> graph-intelligence \
+  --read-only --mcp-port 8902 --db ~/.local/share/philotic/graph.db
+```
+
+- The database is opened with `SQLITE_OPEN_READ_ONLY` and `query_only`, no
+  scan runs, and no REST/WS server starts.
+- Only the read tools in `mcp::READ_ONLY_TOOLS` are listed; any other tool is
+  refused before dispatch. Each call is logged as one line (tool name only).
+- A token is required: the server refuses to start without one.
+
 ---
 
 ## Architecture
@@ -188,6 +214,7 @@ Agents interact with the graph via Model Context Protocol tools:
 | `graph_skeleton` | Generate PlantUML class diagram for crate |
 | `graph_snippet` | Get code snippets for node |
 | `graph_search` | Full-text search |
+| `graph_changes_since` | Ledger changes (mutations, task/proposal/decision/... updates) after a timestamp; `for_agent` keeps changes owned by or addressed to one agent; page with `next_since` |
 | `graph_scan` | Trigger full rescan |
 
 ### Mutation Tools

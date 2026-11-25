@@ -66,6 +66,21 @@ fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "graph_changes_since",
+                "description": "List what changed in the work ledger after a point in time: mutations recorded and ledger nodes (tasks, proposals, decisions, seams, slices, agents, sessions, workstreams) updated. Use for_agent to keep only changes to nodes owned by or addressed to one agent. Page with next_since.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "since": { "type": "string", "description": "RFC 3339 timestamp; only changes strictly after it are returned (e.g. '2026-11-25T09:00:00Z')" },
+                        "for_agent": { "type": "string", "description": "Keep only nodes whose owner/assignee/assigned_to/agent property names this agent (or its agent node), and mutations on those nodes" },
+                        "exclude_agent": { "type": "string", "description": "Drop mutations recorded by this agent (e.g. your own writes)" },
+                        "kinds": { "type": "array", "items": { "type": "string" }, "description": "Node kinds to include. Default: the work-ledger kinds. Pass [\"all\"] for every kind, including code nodes touched by rescans" },
+                        "limit": { "type": "integer", "description": "Maximum nodes and maximum mutations to return (default 100, max 500)" }
+                    },
+                    "required": ["since"]
+                }
+            },
+            {
                 "name": "graph_node",
                 "description": "Get a single node by ID with all its edges and related nodes",
                 "inputSchema": {
@@ -444,15 +459,67 @@ fn tool_definitions() -> serde_json::Value {
     })
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
+/// Tools served by the read-only endpoint (`--read-only`). Every one of
+/// them only reads the graph. Anything not listed is hidden from
+/// `tools/list` and refused before dispatch, and the database connection is
+/// itself read-only, so a write that slipped through would still fail.
+///
+/// `graph_semantic_search` is left out on purpose: it calls the local
+/// embeddings sidecar, which a remote read-only caller should not depend on.
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "graph_status",
+    "graph_digest",
+    "graph_proposals",
+    "graph_node",
+    "graph_query",
+    "graph_search",
+    "graph_snippet",
+    "graph_skeleton",
+    "graph_context_for",
+    "graph_impact",
+    "graph_agent_dashboard",
+    "graph_changes_since",
+];
+
+/// Which tool surface an MCP router serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpMode {
+    Full,
+    ReadOnly,
+}
+
+fn read_only_tool_definitions() -> serde_json::Value {
+    let mut defs = tool_definitions();
+    if let Some(tools) = defs.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| READ_ONLY_TOOLS.contains(&n))
+                .unwrap_or(false)
+        });
+    }
+    defs
+}
+
+fn mcp_cors() -> CorsLayer {
+    CorsLayer::new()
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_origin(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+}
 
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp))
-        .layer(cors)
+        .layer(mcp_cors())
+        .with_state(state)
+}
+
+/// MCP router that serves only [`READ_ONLY_TOOLS`]. Used by `--read-only`.
+pub fn read_only_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/mcp", post(handle_mcp_read_only))
+        .layer(mcp_cors())
         .with_state(state)
 }
 
@@ -460,8 +527,19 @@ async fn handle_mcp(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcResponse> {
+    Json(dispatch(&state, req, McpMode::Full).await)
+}
+
+async fn handle_mcp_read_only(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JsonRpcRequest>,
+) -> Json<JsonRpcResponse> {
+    Json(dispatch(&state, req, McpMode::ReadOnly).await)
+}
+
+async fn dispatch(state: &AppState, req: JsonRpcRequest, mode: McpMode) -> JsonRpcResponse {
     if req.jsonrpc != "2.0" {
-        return Json(JsonRpcResponse {
+        return JsonRpcResponse {
             jsonrpc: "2.0",
             result: None,
             error: Some(JsonRpcError {
@@ -469,11 +547,14 @@ async fn handle_mcp(
                 message: "Invalid JSON-RPC version".to_string(),
             }),
             id: req.id,
-        });
+        };
     }
 
     let result = match req.method.as_str() {
-        "tools/list" => Ok(tool_definitions()),
+        "tools/list" => Ok(match mode {
+            McpMode::Full => tool_definitions(),
+            McpMode::ReadOnly => read_only_tool_definitions(),
+        }),
         "tools/call" => {
             let params = req.params.unwrap_or(serde_json::json!({}));
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -481,7 +562,31 @@ async fn handle_mcp(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
-            execute_tool(&state, tool_name, &arguments).await
+            if mode == McpMode::ReadOnly {
+                let allowed = READ_ONLY_TOOLS.contains(&tool_name);
+                // One line per call so the operator can audit what a remote
+                // read-only caller asked for. Arguments are not logged.
+                eprintln!(
+                    "read-only mcp: tool={} {}",
+                    tool_name,
+                    if allowed { "allowed" } else { "refused" }
+                );
+                if !allowed {
+                    return JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32601,
+                            message: format!(
+                                "Tool '{}' is not available on this read-only endpoint",
+                                tool_name
+                            ),
+                        }),
+                        id: req.id,
+                    };
+                }
+            }
+            execute_tool(state, tool_name, &arguments).await
         }
         "initialize" => Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
@@ -489,7 +594,10 @@ async fn handle_mcp(
                 "tools": {}
             },
             "serverInfo": {
-                "name": "intel-graph",
+                "name": match mode {
+                    McpMode::Full => "intel-graph",
+                    McpMode::ReadOnly => "intel-graph-read-only",
+                },
                 "version": "0.1.0"
             }
         })),
@@ -503,18 +611,18 @@ async fn handle_mcp(
     };
 
     match result {
-        Ok(value) => Json(JsonRpcResponse {
+        Ok(value) => JsonRpcResponse {
             jsonrpc: "2.0",
             result: Some(value),
             error: None,
             id: req.id,
-        }),
-        Err(err) => Json(JsonRpcResponse {
+        },
+        Err(err) => JsonRpcResponse {
             jsonrpc: "2.0",
             result: None,
             error: Some(err),
             id: req.id,
-        }),
+        },
     }
 }
 
@@ -526,6 +634,7 @@ async fn execute_tool(
     match tool_name {
         "graph_status" => tool_graph_status(state).await,
         "graph_query" => tool_graph_query(state, arguments).await,
+        "graph_changes_since" => tool_graph_changes_since(state, arguments).await,
         "graph_node" => tool_graph_node(state, arguments).await,
         "graph_skeleton" => tool_graph_skeleton(state, arguments).await,
         "graph_snippet" => tool_graph_snippet(state, arguments).await,
@@ -685,6 +794,191 @@ async fn tool_graph_query(
 
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }]
+    }))
+}
+
+/// Work-ledger kinds `graph_changes_since` looks at by default. Code nodes
+/// (crates, modules, functions, docs...) are left out because every rescan
+/// touches them and they would drown the changes an agent has to act on.
+const LEDGER_KINDS: &[NodeKind] = &[
+    NodeKind::Task,
+    NodeKind::Proposal,
+    NodeKind::Decision,
+    NodeKind::Seam,
+    NodeKind::Slice,
+    NodeKind::Agent,
+    NodeKind::AgentWorkFocus,
+    NodeKind::Session,
+    NodeKind::Workstream,
+];
+
+const CHANGES_DEFAULT_LIMIT: usize = 100;
+const CHANGES_MAX_LIMIT: usize = 500;
+
+/// Properties that name who a ledger node belongs to or is addressed to.
+const ADDRESS_KEYS: &[&str] = &["owner", "assignee", "assigned_to", "agent", "for_agent"];
+
+fn names_agent(value: &str, agent: &str, agent_id: &str) -> bool {
+    value == agent || value == agent_id
+}
+
+/// True when `node` is owned by or addressed to `agent`.
+fn node_addressed_to(node: &Node, agent: &str) -> bool {
+    let agent_id = format!("agent:{}", agent);
+    if node.kind == NodeKind::Agent && (node.id == agent_id || node.name == agent) {
+        return true;
+    }
+    ADDRESS_KEYS
+        .iter()
+        .any(|key| match node.properties.get(*key) {
+            Some(serde_json::Value::String(s)) => names_agent(s, agent, &agent_id),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|s| names_agent(s, agent, &agent_id)),
+            _ => false,
+        })
+}
+
+async fn tool_graph_changes_since(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let since_raw = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: since"))?;
+    let since = chrono::DateTime::parse_from_rfc3339(since_raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            mcp_err(&format!(
+                "since must be an RFC 3339 timestamp like 2026-11-25T09:00:00Z: {}",
+                e
+            ))
+        })?;
+    let for_agent = args
+        .get("for_agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let exclude_agent = args
+        .get("exclude_agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, CHANGES_MAX_LIMIT))
+        .unwrap_or(CHANGES_DEFAULT_LIMIT);
+
+    let kinds: Vec<NodeKind> = match args.get("kinds").and_then(|v| v.as_array()) {
+        Some(list) if list.iter().any(|v| v.as_str() == Some("all")) => Vec::new(),
+        Some(list) => {
+            let mut kinds = Vec::new();
+            for item in list {
+                let name = item.as_str().unwrap_or("");
+                let kind = NodeKind::from_str(name)
+                    .ok_or_else(|| mcp_err(&format!("Unknown node kind in kinds: {}", name)))?;
+                kinds.push(kind);
+            }
+            if kinds.is_empty() {
+                LEDGER_KINDS.to_vec()
+            } else {
+                kinds
+            }
+        }
+        None => LEDGER_KINDS.to_vec(),
+    };
+
+    let engine = state.engine.lock().await;
+
+    let mut nodes = engine
+        .nodes_updated_since(since, &kinds, limit + 1)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+    let nodes_truncated = nodes.len() > limit;
+    nodes.truncate(limit);
+
+    let mut mutations = engine
+        .mutations_since(since, limit + 1)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+    let mutations_truncated = mutations.len() > limit;
+    mutations.truncate(limit);
+
+    // Cursor for the next call, worked out before filtering so filtered-out
+    // rows are not fetched again. When a list was cut short, stop at its last
+    // row so the rows after it come back on the next page.
+    let last_node = nodes.last().map(|n| n.updated_at);
+    let last_mutation = mutations.last().map(|m| m.timestamp);
+    let next_since = match (nodes_truncated, mutations_truncated) {
+        (true, true) => last_node.min(last_mutation),
+        (true, false) => last_node,
+        (false, true) => last_mutation,
+        (false, false) => last_node.max(last_mutation),
+    }
+    .unwrap_or(since);
+
+    if let Some(agent) = for_agent {
+        nodes.retain(|n| node_addressed_to(n, agent));
+        let agent_id = format!("agent:{}", agent);
+        let mut keep = Vec::with_capacity(mutations.len());
+        for m in mutations {
+            let addressed = match m.target_node.as_deref() {
+                Some(target) if target == agent_id => true,
+                Some(target) => engine
+                    .get_node(target)
+                    .map_err(|e| mcp_err(&e.to_string()))?
+                    .map(|n| node_addressed_to(&n, agent))
+                    .unwrap_or(false),
+                None => false,
+            };
+            if addressed {
+                keep.push(m);
+            }
+        }
+        mutations = keep;
+    }
+    if let Some(excluded) = exclude_agent {
+        mutations.retain(|m| m.agent.as_deref() != Some(excluded));
+    }
+    drop(engine);
+
+    let node_rows: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "kind": n.kind.as_str(),
+                "name": n.name,
+                "status": n.properties.get("status"),
+                "owner": n.properties.get("owner"),
+                "updated_at": n.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    let mutation_rows: Vec<serde_json::Value> = mutations
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "timestamp": m.timestamp.to_rfc3339(),
+                "agent": m.agent,
+                "session": m.session,
+                "action": m.action,
+                "target_node": m.target_node,
+                "reason": m.reason,
+            })
+        })
+        .collect();
+
+    let summary = serde_json::json!({
+        "since": since.to_rfc3339(),
+        "next_since": next_since.to_rfc3339(),
+        "truncated": nodes_truncated || mutations_truncated,
+        "for_agent": for_agent,
+        "nodes": node_rows,
+        "mutations": mutation_rows,
+    });
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&summary).unwrap_or_default() }]
     }))
 }
 
